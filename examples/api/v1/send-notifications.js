@@ -5,7 +5,7 @@
  */
 
 const webpush = require('web-push');
-const { processSingleMessage, processMessagesByUuid } = require('../../lib/message-processor');
+const { processSingleMessage } = require('../../lib/message-processor');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
 // const { sql } = require('@vercel/postgres');
 
@@ -334,6 +334,3 @@ exports.handler = async function(event) {
     return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ success: false, error: { code: 'INTERNAL_SERVER_ERROR', message: '服务器内部错误，请稍后重试' } }) };
   }
 };
-
-// 导出供 schedule-message 调用的函数
-exports.processMessagesByUuid = processMessagesByUuid;

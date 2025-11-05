@@ -21,7 +21,11 @@ if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   );
   console.log('[message-processor] VAPID configured');
 } else {
-  console.warn('[message-processor] VAPID not configured - push notifications will fail');
+  console.error('[message-processor] VAPID configuration error:', {
+    hasEmail: !!VAPID_EMAIL,
+    hasPublicKey: !!VAPID_PUBLIC_KEY,
+    hasPrivateKey: !!VAPID_PRIVATE_KEY
+  });
 }
 
 /**
@@ -148,6 +152,11 @@ async function processSingleMessage(task) {
 
     // 如果没有句子，作为单条消息发送
     const messages = sentences.length > 0 ? sentences : [messageContent];
+
+    // 验证 VAPID 配置
+    if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+      throw new Error('VAPID configuration missing - push notifications cannot be sent');
+    }
 
     // 批量推送通知（消息间添加延迟）
     const pushSubscription = decryptedPayload.pushSubscription;

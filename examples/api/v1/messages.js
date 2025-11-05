@@ -134,16 +134,16 @@ async function core(url, headers) {
       success: true,
       data: {
         tasks: tasksToReturn.map(task => {
-          // 实际项目中应解密 encrypted_payload 并返回解密后的字段
-          // const userKey = deriveUserEncryptionKey(userId);
-          // const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
-          
+          // 解密 encrypted_payload 并返回解密后的字段
+          const userKey = deriveUserEncryptionKey(userId);
+          const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+
           return {
             id: task.id,
             uuid: task.uuid,
-            // contactName: decrypted.contactName,           // 从解密数据获取
-            // messageSubtype: decrypted.messageSubtype,     // 从解密数据获取
-            // recurrenceType: decrypted.recurrenceType,     // 从解密数据获取
+            contactName: decrypted.contactName,              // 从解密数据获取
+            messageSubtype: decrypted.messageSubtype,        // 从解密数据获取
+            recurrenceType: decrypted.recurrenceType,        // 从解密数据获取
             messageType: task.message_type,                  // 索引字段（明文）
             nextSendAt: task.next_send_at,                   // 索引字段（明文）
             status: task.status,                             // 索引字段（明文）
