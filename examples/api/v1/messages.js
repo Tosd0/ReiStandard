@@ -5,6 +5,7 @@
  */
 
 // const { sql } = require('@vercel/postgres');
+const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
 
 function normalizeHeaders(h) {
   const out = {};
@@ -43,7 +44,7 @@ async function core(url, headers) {
   const limit = Math.min(parseInt(u.searchParams.get('limit') || '20'), 100);
   const offset = parseInt(u.searchParams.get('offset') || '0');
 
-  // 构建查询条件
+  // 构建查询条件（仅使用索引字段，敏感字段已全部加密）
   const conditions = ['user_id = $1'];
   const params = [userId];
   let paramIndex = 2;
@@ -53,23 +54,15 @@ async function core(url, headers) {
     params.push(status);
     paramIndex++;
   }
-  if (contactName) {
-    conditions.push(`contact_name = $${paramIndex}`);
-    params.push(contactName);
-    paramIndex++;
-  }
-  if (messageSubtype) {
-    conditions.push(`message_subtype = $${paramIndex}`);
-    params.push(messageSubtype);
-    paramIndex++;
-  }
+  // 注意：contactName 和 messageSubtype 已加密，需要在解密后内存过滤
+  // 由于性能考虑，这里不支持加密字段的数据库层过滤
 
   /*
-  // 查询任务列表
+  // 查询任务列表（全字段加密版本：只查询索引字段 + encrypted_payload）
   const tasks = await sql`
     SELECT
-      id, uuid, contact_name, message_type, message_subtype,
-      next_send_at, recurrence_type, status, retry_count,
+      id, user_id, uuid, encrypted_payload,
+      message_type, next_send_at, status, retry_count,
       created_at, updated_at
     FROM scheduled_messages
     WHERE ${sql.raw(conditions.join(' AND '))}
@@ -88,9 +81,30 @@ async function core(url, headers) {
   const total = parseInt(totalResult.rows[0].count);
   */
 
-  // 模拟数据
+  // 模拟数据（实际项目替换为上述数据库查询）
   const tasks = [];
   const total = 0;
+  
+  // 解密并组装响应（实际项目取消注释）
+  /*
+  const userKey = deriveUserEncryptionKey(userId);
+  const decryptedTasks = tasks.map(task => {
+    const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+    return {
+      id: task.id,
+      uuid: task.uuid,
+      contactName: decrypted.contactName,
+      messageType: task.message_type,          // 索引字段（明文）
+      messageSubtype: decrypted.messageSubtype, // 解密字段
+      nextSendAt: task.next_send_at,           // 索引字段（明文）
+      recurrenceType: decrypted.recurrenceType, // 解密字段
+      status: task.status,                     // 索引字段（明文）
+      retryCount: task.retry_count,            // 索引字段（明文）
+      createdAt: task.created_at,
+      updatedAt: task.updated_at
+    };
+  });
+  */
 
   console.log('[messages] Query tasks:', {
     userId,
@@ -100,24 +114,47 @@ async function core(url, headers) {
     total
   });
 
+  // 解密任务并过滤（如果有加密字段过滤需求）
+  // 注意：实际项目中使用 decryptedTasks 替换 tasks
+  let tasksToReturn = tasks;
+  
+  // 如果需要按加密字段过滤（内存过滤，性能开销较大）
+  /*
+  if (contactName || messageSubtype) {
+    const userKey = deriveUserEncryptionKey(userId);
+    tasksToReturn = tasks.filter(task => {
+      const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+      if (contactName && decrypted.contactName !== contactName) return false;
+      if (messageSubtype && decrypted.messageSubtype !== messageSubtype) return false;
+      return true;
+    });
+  }
+  */
+  
   return {
     status: 200,
     body: {
       success: true,
       data: {
-        tasks: tasks.map(task => ({
-          id: task.id,
-          uuid: task.uuid,
-          contactName: task.contact_name,
-          messageType: task.message_type,
-          messageSubtype: task.message_subtype,
-          nextSendAt: task.next_send_at,
-          recurrenceType: task.recurrence_type,
-          status: task.status,
-          retryCount: task.retry_count,
-          createdAt: task.created_at,
-          updatedAt: task.updated_at
-        })),
+        tasks: tasksToReturn.map(task => {
+          // 实际项目中应解密 encrypted_payload 并返回解密后的字段
+          // const userKey = deriveUserEncryptionKey(userId);
+          // const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+          
+          return {
+            id: task.id,
+            uuid: task.uuid,
+            // contactName: decrypted.contactName,           // 从解密数据获取
+            // messageSubtype: decrypted.messageSubtype,     // 从解密数据获取
+            // recurrenceType: decrypted.recurrenceType,     // 从解密数据获取
+            messageType: task.message_type,                  // 索引字段（明文）
+            nextSendAt: task.next_send_at,                   // 索引字段（明文）
+            status: task.status,                             // 索引字段（明文）
+            retryCount: task.retry_count,                    // 索引字段（明文）
+            createdAt: task.created_at,
+            updatedAt: task.updated_at
+          };
+        }),
         pagination: {
           total,
           limit,

@@ -107,35 +107,20 @@ async function handleGet(req, res) {
         -- 跨设备查询标识符
         uuid VARCHAR(36),
 
-        -- 角色信息（用于通知显示）
-        contact_name VARCHAR(255) NOT NULL,
-        avatar_url VARCHAR(500),
+        -- 全字段加密存储
+        -- 包含所有隐私数据：contactName, avatarUrl, messageSubtype, userMessage,
+        -- recurrenceType, apiUrl, apiKey, primaryModel, completePrompt, 
+        -- pushSubscription, metadata
 
-        -- 消息配置
-        message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto')),
-        message_subtype VARCHAR(50) DEFAULT 'chat' CHECK (message_subtype IN ('chat', 'forum', 'moment')),
-        user_message TEXT,
+        encrypted_payload TEXT NOT NULL,
 
-        -- 调度配置
+        -- 📌 索引字段（明文，用于查询优化）
+        message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
         next_send_at TIMESTAMP WITH TIME ZONE NOT NULL,
-        recurrence_type VARCHAR(50) NOT NULL DEFAULT 'none' CHECK (recurrence_type IN ('none', 'daily', 'weekly')),
-
-        -- AI配置（仅用于 prompted 和 auto 类型）
-        api_url VARCHAR(500),
-        api_key VARCHAR(500),
-        primary_model VARCHAR(100),
-        complete_prompt TEXT,
-
-        -- 推送配置
-        push_subscription JSONB NOT NULL,
 
         -- 状态管理
         status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
         retry_count INTEGER DEFAULT 0,
-        failure_reason TEXT,
-
-        -- 自定义元数据
-        metadata JSONB DEFAULT '{}'::JSONB,
 
         -- 时间戳
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -151,7 +136,7 @@ async function handleGet(req, res) {
         name: 'idx_pending_tasks_optimized',
         sql: `
           CREATE INDEX IF NOT EXISTS idx_pending_tasks_optimized
-          ON scheduled_messages (status, next_send_at, id, contact_name, retry_count)
+          ON scheduled_messages (status, next_send_at, id, retry_count)
           WHERE status = 'pending'
         `,
         description: '主查询索引（Cron Job 查找待处理任务）'
@@ -235,6 +220,15 @@ async function handleGet(req, res) {
         AND table_name = 'scheduled_messages'
       ORDER BY ordinal_position
     `;
+    
+    // 验证关键列是否存在
+    const columnNames = columns.map(c => c.column_name);
+    const requiredColumns = ['id', 'user_id', 'uuid', 'encrypted_payload', 'message_type', 'next_send_at', 'status', 'retry_count'];
+    const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
+    
+    if (missingColumns.length > 0) {
+      console.warn('[init-database] ⚠️  缺少关键列:', missingColumns);
+    }
 
     console.log('[init-database] ✅ 数据库初始化完成');
 

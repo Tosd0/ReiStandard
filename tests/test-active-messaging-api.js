@@ -6,7 +6,7 @@
  * 功能：
  * 1. 测试所有端点（schedule-message, send-notifications, update-message, cancel-message, messages）
  * 2. 测试加密/解密流程
- * 3. 测试各种消息类型（fixed, prompted, auto）
+ * 3. 测试各种消息类型（fixed, prompted, auto, instant）
  * 4. 自动清理测试数据
  *
  * 使用方法：
@@ -255,7 +255,7 @@ async function testCreateFixedMessage() {
   const nextSendTime = new Date(Date.now() + 60 * 1000).toISOString(); // 1分钟后
 
   const plainPayload = {
-    contactName: 'TestBot',
+    contactName: 'ReiTest',
     messageType: 'fixed',
     userMessage: '这是一条测试消息！',
     firstSendTime: nextSendTime,
@@ -297,7 +297,7 @@ async function testCreatePromptedMessage() {
   const nextSendTime = new Date(Date.now() + 120 * 1000).toISOString(); // 2分钟后
 
   const plainPayload = {
-    contactName: 'TestBot',
+    contactName: 'ReiTest',
     messageType: 'prompted',
     firstSendTime: nextSendTime,
     recurrenceType: 'none',
@@ -305,7 +305,7 @@ async function testCreatePromptedMessage() {
     apiUrl: CONFIG.testApiUrl,
     apiKey: CONFIG.testApiKey,
     primaryModel: CONFIG.testModel,
-    completePrompt: '【角色】你是TestBot，一个测试机器人。\n【用户提示】发送一条简短的测试消息\n【任务】根据用户提示发送消息',
+    completePrompt: '【角色】你是ReiTest，一个测试机器人。\n【用户提示】发送一条简短的测试消息\n【任务】根据用户提示发送消息',
     avatarUrl: 'https://example.com/avatar.png'
   };
 
@@ -340,7 +340,7 @@ async function testCreateAutoMessage() {
   const nextSendTime = new Date(Date.now() + 180 * 1000).toISOString(); // 3分钟后
 
   const plainPayload = {
-    contactName: 'TestBot',
+    contactName: 'ReiTest',
     messageType: 'auto',
     firstSendTime: nextSendTime,
     recurrenceType: 'daily',
@@ -348,7 +348,7 @@ async function testCreateAutoMessage() {
     apiUrl: CONFIG.testApiUrl,
     apiKey: CONFIG.testApiKey,
     primaryModel: CONFIG.testModel,
-    completePrompt: '【角色】你是TestBot，一个测试机器人。\n【历史对话】无\n【当前时间】' + new Date().toISOString() + '\n【任务】根据当前时间自主生成消息',
+    completePrompt: '【角色】你是ReiTest，一个测试机器人。\n【历史对话】无\n【当前时间】' + new Date().toISOString() + '\n【任务】根据当前时间自主生成消息',
     messageSubtype: 'chat'
   };
 
@@ -372,6 +372,93 @@ async function testCreateAutoMessage() {
     return true;
   } else {
     logError(`创建失败: ${response.status} - ${JSON.stringify(response.data)}`);
+    return false;
+  }
+}
+
+// 4.5 测试创建 instant 消息（固定内容）
+async function testCreateInstantFixedMessage() {
+  logSection('测试 4.5: POST /api/v1/schedule-message (instant 固定类型)');
+
+  const plainPayload = {
+    contactName: 'InstantRei',
+    messageType: 'instant',
+    userMessage: '这是一条即时测试消息！',
+    firstSendTime: new Date().toISOString(),
+    recurrenceType: 'none',
+    pushSubscription: CONFIG.testPushSubscription,
+    avatarUrl: 'https://example.com/instant-avatar.png',
+    metadata: { testType: 'instant-fixed' }
+  };
+
+  logInfo('加密请求体...');
+  const encryptedPayload = encryptPayload(plainPayload, userEncryptionKey);
+
+  logInfo('发送请求（期望立即发送）...');
+  const response = await makeRequest('POST', '/api/v1/schedule-message', {
+    headers: {
+      'X-Payload-Encrypted': 'true',
+      'X-Encryption-Version': '1',
+      'X-User-Id': CONFIG.testUserId
+    },
+    body: encryptedPayload
+  });
+
+  if (response.ok && response.data.success) {
+    logSuccess(`即时消息发送成功！`);
+    logInfo(`UUID: ${response.data.data.uuid}`);
+    logInfo(`消息数: ${response.data.data.messagesSent}`);
+    logInfo(`状态: ${response.data.data.status}`);
+    logInfo(`发送时间: ${response.data.data.sentAt}`);
+    // instant 消息发送后立即删除，不加入 createdTasks
+    return true;
+  } else {
+    logError(`发送失败: ${response.status} - ${JSON.stringify(response.data)}`);
+    return false;
+  }
+}
+
+// 4.6 测试创建 instant 消息（AI 生成）
+async function testCreateInstantAiMessage() {
+  logSection('测试 4.6: POST /api/v1/schedule-message (instant AI 类型)');
+
+  const plainPayload = {
+    contactName: 'InstantRei',
+    messageType: 'instant',
+    firstSendTime: new Date().toISOString(),
+    recurrenceType: 'none',
+    pushSubscription: CONFIG.testPushSubscription,
+    apiUrl: CONFIG.testApiUrl,
+    apiKey: CONFIG.testApiKey,
+    primaryModel: CONFIG.testModel,
+    completePrompt: '【角色】你是InstantRei，一个即时响应机器人。\n【任务】立即发送一条简短的测试消息（不超过20字）',
+    avatarUrl: 'https://example.com/instant-avatar.png',
+    metadata: { testType: 'instant-ai' }
+  };
+
+  logInfo('加密请求体...');
+  const encryptedPayload = encryptPayload(plainPayload, userEncryptionKey);
+
+  logInfo('发送请求（期望立即调用 AI 并发送）...');
+  const response = await makeRequest('POST', '/api/v1/schedule-message', {
+    headers: {
+      'X-Payload-Encrypted': 'true',
+      'X-Encryption-Version': '1',
+      'X-User-Id': CONFIG.testUserId
+    },
+    body: encryptedPayload
+  });
+
+  if (response.ok && response.data.success) {
+    logSuccess(`即时 AI 消息发送成功！`);
+    logInfo(`UUID: ${response.data.data.uuid}`);
+    logInfo(`消息数: ${response.data.data.messagesSent}`);
+    logInfo(`状态: ${response.data.data.status}`);
+    logInfo(`发送时间: ${response.data.data.sentAt}`);
+    // instant 消息发送后立即删除，不加入 createdTasks
+    return true;
+  } else {
+    logError(`发送失败: ${response.status} - ${JSON.stringify(response.data)}`);
     return false;
   }
 }
@@ -649,6 +736,8 @@ async function runAllTests() {
     { name: '创建固定消息', fn: testCreateFixedMessage, critical: false },
     { name: '创建 prompted 消息', fn: testCreatePromptedMessage, critical: false },
     { name: '创建 auto 消息', fn: testCreateAutoMessage, critical: false },
+    { name: '创建 instant 固定消息', fn: testCreateInstantFixedMessage, critical: false },
+    { name: '创建 instant AI 消息', fn: testCreateInstantAiMessage, critical: false },
     { name: '查询任务列表', fn: testGetMessages, critical: false },
     { name: '更新任务', fn: testUpdateMessage, critical: false },
     { name: '触发通知发送', fn: testSendNotifications, critical: false },

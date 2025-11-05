@@ -11,7 +11,7 @@
 
 ✅ **完整的端点测试**
 - GET `/api/v1/get-master-key` - 获取加密主密钥
-- POST `/api/v1/schedule-message` - 创建定时任务（fixed, prompted, auto）
+- POST `/api/v1/schedule-message` - 创建定时任务（fixed, prompted, auto, instant）
 - GET `/api/v1/messages` - 查询任务列表
 - PUT `/api/v1/update-message/:id` - 更新任务
 - DELETE `/api/v1/cancel-message/:id` - 取消任务

@@ -111,7 +111,7 @@ npm install @neondatabase/serverless web-push
 | 字段名 | 类型 | 必需 | 说明 |
 |-------|------|------|------|
 | contactName | string | 是 | 角色/联系人名称，最大长度 255 字符 |
-| messageType | string | 是 | 消息类型，枚举值：`fixed`(固定消息)、`prompted`(用户提示词消息)、`auto`(完全自动消息) |
+| messageType | string | 是 | 消息类型，枚举值：`fixed`(固定消息)、`prompted`(用户提示词消息)、`auto`(完全自动消息)、`instant`(即时消息) |
 | firstSendTime | string | 是 | 首次发送时间，ISO 8601 格式（UTC时区）例：`2025-01-15T10:00:00Z` |
 | pushSubscription | object | 是 | 浏览器推送订阅信息对象 |
 
@@ -159,7 +159,7 @@ npm install @neondatabase/serverless web-push
 
 ### 1.4 消息类型说明 (Message Types)
 
-本标准定义三种消息类型，满足不同场景需求：
+本标准定义四种消息类型，满足不同场景需求：
 
 #### fixed - 固定消息
 - **用途**: 发送预先定义的固定文本，无需AI生成
@@ -195,12 +195,29 @@ npm install @neondatabase/serverless web-push
   【任务】根据当前时间和历史记录，贴合人设，生成此角色在这个时间、参照这个对话历史会发送的主动消息。  ← 无具体指示
   ```
 
+#### instant - 即时消息
+- **用途**: 立即发送的消息，不等待定时触发
+- **必需字段**: 根据消息内容类型而定（可配合 `userMessage`、`completePrompt` 等）
+- **是否调用AI**: 取决于是否提供 AI 配置
+- **触发方式**: `schedule-message` 端点**立即触发发送**，不需要等待 cronjob
+- **recurrenceType**: 固定为 `none`（即时消息发送后立即销毁）
+- **特点**: 
+  - 调用 `schedule-message` 后**立即发送**推送通知
+  - 不进入定时任务队列，不等待每分钟的 cronjob 触发
+  - 发送完成后任务立即删除
+  - 可以包含固定消息或 AI 生成消息
+  - 通过 UUID 识别任务
+- **与普通一次性消息的区别**:
+  - **普通一次性消息**（`recurrenceType: none`）: 创建后进入定时队列，等待 cronjob 在指定时间触发
+  - **instant 消息**: 创建后**立即触发**，无需等待 cronjob，适用于需要即时响应的场景
+
 **核心区别总结**:
-| 类型 | 是否用AI | 前端构建 completePrompt | 是否含用户提示词 |
-|------|---------|----------------------|---------------|
-| fixed | ❌ | ❌ | ❌ |
-| prompted | ✅ | ✅ | ✅（completePrompt 中） |
-| auto | ✅ | ✅ | ❌ |
+| 类型 | 是否用AI | 前端构建 completePrompt | 是否含用户提示词 | 触发方式 | recurrenceType |
+|------|---------|----------------------|---------------|---------|----------------|
+| fixed | ❌ | ❌ | ❌ | 定时触发 | 可配置 |
+| prompted | ✅ | ✅ | ✅（completePrompt 中） | 定时触发 | 可配置 |
+| auto | ✅ | ✅ | ❌ | 定时触发 | 可配置 |
+| instant | 可选 | 可选 | 可选 | **立即触发** | 固定为 none |
 
 ### 1.5 请求示例
 
@@ -292,7 +309,64 @@ X-User-Id: user_123456
 }
 ```
 
-#### 示例 4: 扩展功能（论坛消息）
+#### 示例 4: 即时消息（instant）- 固定内容
+
+**加密前的原始数据**:
+```json
+{
+  "contactName": "系统助手",
+  "messageType": "instant",
+  "userMessage": "您的订单已经发货，请注意查收！",
+  "firstSendTime": "2025-01-15T14:00:00Z",
+  "recurrenceType": "none",
+  "pushSubscription": {
+    "endpoint": "https://fcm.googleapis.com/fcm/send/xxxxx",
+    "keys": {
+      "p256dh": "BEl2...kR4=",
+      "auth": "k8J...3Q="
+    }
+  },
+  "uuid": "550e8400-e29b-41d4-a716-446655440001"
+}
+```
+
+**说明**: 
+- `messageType` 为 `instant` 时，消息将在调用 API 后立即发送
+- 不需要等待 cronjob 触发
+- `firstSendTime` 字段在 instant 类型中仅用于记录，实际发送时间为立即
+- 发送完成后任务立即删除，不保留在数据库中
+
+#### 示例 5: 即时消息（instant）- AI 生成内容
+
+**加密前的原始数据**:
+```json
+{
+  "contactName": "Rei",
+  "messageType": "instant",
+  "firstSendTime": "2025-01-15T14:00:00Z",
+  "recurrenceType": "none",
+  "pushSubscription": {
+    "endpoint": "https://fcm.googleapis.com/fcm/send/xxxxx",
+    "keys": {
+      "p256dh": "BEl2...kR4=",
+      "auth": "k8J...3Q="
+    }
+  },
+  "apiUrl": "https://api.openai.com/v1/chat/completions",
+  "apiKey": "sk-xxxxxxxxxxxxxxxx",
+  "primaryModel": "claude-4-sonnet",
+  "completePrompt": "【角色】你是Rei，性格温柔体贴。\n【任务】立即回复用户的问候，表达关心。",
+  "avatarUrl": "https://example.com/rei-avatar.png",
+  "uuid": "550e8400-e29b-41d4-a716-446655440002"
+}
+```
+
+**说明**: 
+- instant 类型也支持 AI 生成内容
+- 调用 API 后立即生成并发送消息
+- 整体走 active message 的流程（加密、分句、推送通知）
+
+#### 示例 6: 扩展功能（论坛消息）
 
 **加密前的原始数据**:
 ```json
@@ -330,7 +404,7 @@ if (!contactName || !messageType || !firstSendTime || !pushSubscription) {
 }
 
 // 消息类型验证
-if (!['fixed', 'prompted', 'auto'].includes(messageType)) {
+if (!['fixed', 'prompted', 'auto', 'instant'].includes(messageType)) {
     return 400 Bad Request
 }
 
@@ -365,6 +439,23 @@ if (messageType === 'prompted' || messageType === 'auto') {
         return 400 Bad Request
     }
 }
+
+// instant 类型验证
+if (messageType === 'instant') {
+    // instant 类型 recurrenceType 必须为 none
+    if (recurrenceType && recurrenceType !== 'none') {
+        return 400 Bad Request
+    }
+    
+    // instant 类型可以是固定消息或 AI 消息
+    // 如果有 AI 配置，则使用 AI 生成；否则必须提供 userMessage
+    const hasAiConfig = completePrompt && apiUrl && apiKey && primaryModel;
+    const hasUserMessage = userMessage;
+    
+    if (!hasAiConfig && !hasUserMessage) {
+        return 400 Bad Request // 必须提供 userMessage 或完整的 AI 配置
+    }
+}
 ```
 
 #### 扩展字段验证
@@ -385,7 +476,42 @@ if (uuid && !isValidUUID(uuid)) {
 }
 ```
 
-### 1.6 成功响应 (Success Response)
+### 1.6 特殊处理：instant 类型的即时触发
+
+当 `messageType` 为 `instant` 时，`schedule-message` 端点会执行特殊的处理逻辑：
+
+1. **存入数据库**: 将任务存入数据库（与普通任务相同）
+2. **立即触发发送**: 存储完成后，立即调用 `send-notifications` 的核心处理函数，通过 UUID 识别并处理这一条消息
+3. **整体流程**: 遵循完整的 active message 流程（参数验证、存储、AI 调用、消息分句、推送通知）
+4. **任务标识**: 通过 UUID 识别本次发送任务
+5. **生命周期**: 发送完成后任务立即删除（`recurrenceType` 固定为 `none`）
+6. **错误处理**: 如果发送失败，任务进入失败状态，不会重试（或按配置重试）
+
+**处理流程对比**:
+
+| 步骤 | 普通类型 (fixed/prompted/auto) | instant 类型 |
+|------|-------------------------------|--------------|
+| 1. 参数验证 | ✅ | ✅ |
+| 2. 加密敏感字段 | ✅ | ✅ |
+| 3. 存入数据库 | ✅ 存入待处理队列 | ✅ 存入数据库 |
+| 4. 触发处理 | 等待 cronjob 定时触发 | **立即调用** send-notifications 核心函数 |
+| 5. 生成消息内容 | 在 send-notifications 中执行 | 在 send-notifications 中执行 |
+| 6. 发送推送通知 | 在 send-notifications 中执行 | 在 send-notifications 中执行 |
+| 7. 更新任务状态 | 更新或删除数据库记录 | 删除数据库记录（recurrenceType = none） |
+
+**实现建议**:
+- 在 `schedule-message` 端点中检测到 `messageType === 'instant'` 时：
+  1. 将任务存入数据库（与普通任务相同）
+  2. 立即调用 `send-notifications` 中提取的核心处理函数
+  3. 通过 UUID 参数指定只处理这一条消息
+- 将 `send-notifications` 的消息处理逻辑提取为可复用函数，支持：
+  - 处理所有待处理任务（cronjob 调用）
+  - 处理指定 UUID 的单个任务（instant 调用）
+- **所有 AI 调用逻辑集中在 `send-notifications` 中**，保持职责分离
+
+### 1.7 成功响应 (Success Response)
+
+#### 普通类型响应 (fixed/prompted/auto)
 
 **状态码**: `201 Created`
 
@@ -412,7 +538,32 @@ if (uuid && !isValidUUID(uuid)) {
 - `status`: 任务状态（`pending`表示待处理）
 - `createdAt`: 任务创建时间
 
-### 1.7 错误响应 (Error Response)
+#### instant 类型响应
+
+**状态码**: `200 OK`
+
+**响应体结构**:
+```json
+{
+  "success": true,
+  "data": {
+    "uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "contactName": "Rei",
+    "messagesSent": 3,
+    "sentAt": "2025-01-15T09:00:00Z",
+    "status": "sent"
+  }
+}
+```
+
+**字段说明**:
+- `uuid`: 用户级别的唯一标识符
+- `contactName`: 角色名称（返回确认）
+- `messagesSent`: 发送的消息条数（分句后的数量）
+- `sentAt`: 实际发送时间
+- `status`: 固定为 `sent`（表示已发送）
+
+### 1.8 错误响应 (Error Response)
 
 #### 400 Bad Request - 参数错误
 
@@ -441,7 +592,7 @@ if (uuid && !isValidUUID(uuid)) {
 
 **业务参数错误**:
 - `INVALID_PARAMETERS`: 缺少必需参数或参数格式错误
-- `INVALID_MESSAGE_TYPE`: 无效的消息类型（必须为 `fixed`、`prompted` 或 `auto`）
+- `INVALID_MESSAGE_TYPE`: 无效的消息类型（必须为 `fixed`、`prompted`、`auto` 或 `instant`）
 - `INVALID_RECURRENCE_TYPE`: 无效的重复类型
 - `INVALID_TIMESTAMP`: 时间格式错误或时间不在未来
 - `INVALID_PUSH_SUBSCRIPTION`: 推送订阅信息格式错误
@@ -1002,10 +1153,18 @@ exports.POST = async function(request) {
     // 解密请求体（略）
     const payload = decryptPayload(encryptedBody, deriveUserKey(userId));
 
-    // 创建任务，存储 user_id
+    // 加密敏感字段存储到 encrypted_payload
+    const encryptedPayload = encryptForStorage(JSON.stringify(payload), userKey);
+
+    // 创建任务，仅存储索引字段 + 加密的 payload
     await sql`
-        INSERT INTO scheduled_messages (user_id, contact_name, ...)
-        VALUES (${userId}, ${payload.contactName}, ...)
+        INSERT INTO scheduled_messages (
+          user_id, uuid, encrypted_payload, message_type, next_send_at, status
+        )
+        VALUES (
+          ${userId}, ${payload.uuid}, ${encryptedPayload}, 
+          ${payload.messageType}, ${payload.firstSendTime}, 'pending'
+        )
     `;
 }
 ```
@@ -1342,18 +1501,32 @@ exports.POST = async function(request) {
 | 解密后 JSON 解析失败 | 400 | `INVALID_PAYLOAD_FORMAT` | 解密后的数据不是有效 JSON |
 | 加密版本不支持 | 400 | `UNSUPPORTED_ENCRYPTION_VERSION` | 当前仅支持版本 1 |
 
-#### 6.2.2 数据库字段加密（强制）
+#### 6.2.2 数据库全字段加密（强制）
 
-除了传输加密，数据库中存储的敏感字段也必须加密：
+**核心设计**：本标准采用**全字段加密**架构，所有敏感业务数据统一加密后存储在 `encrypted_payload` 字段中。
 
-| 字段 | 是否加密 | 说明 |
-|-----|---------|------|
-| `api_key` | ✅ 必须 | AI API 密钥 |
-| `complete_prompt` | ✅ 推荐 | 包含角色数据 |
-| `user_message` | ✅ 推荐 | 用户输入的消息内容 |
-| `push_subscription.keys` | ✅ 推荐 | Push 订阅的密钥部分（p256dh、auth） |
+**加密字段**（存储在 `encrypted_payload` 中）：
+- `contactName`: 角色名称
+- `avatarUrl`: 头像 URL
+- `messageSubtype`: 消息子类型
+- `userMessage`: 固定消息内容
+- `recurrenceType`: 重复类型
+- `apiUrl`: AI API 地址
+- `apiKey`: AI API 密钥（高度敏感）
+- `primaryModel`: AI 模型名称
+- `completePrompt`: 完整 prompt（包含角色设定、历史记录等）
+- `pushSubscription`: 推送订阅信息（包含密钥）
+- `metadata`: 自定义元数据
 
-**存储格式**: 统一使用 `iv:authTag:encryptedData`（十六进制编码，更节省空间）
+**明文索引字段**（用于查询优化）：
+- `user_id`: 用户标识
+- `uuid`: 跨设备查询标识符
+- `message_type`: 消息类型（`fixed`, `prompted`, `auto`, `instant`）
+- `next_send_at`: 下次发送时间
+- `status`: 任务状态
+- `retry_count`: 重试次数
+
+**存储格式**: `iv:authTag:encryptedData`（十六进制编码）
 
 ```javascript
 // 数据库存储加密示例
@@ -1378,9 +1551,16 @@ function decryptFromStorage(encryptedText, encryptionKey) {
 ```
 
 **解密时机**:
-- 仅在需要使用时解密（如调用 AI API 前解密 `api_key`）
-- 查询任务列表时**不解密**敏感字段
-- 日志中**不输出**明文敏感数据
+- **处理任务时解密**：在 `send-notifications` 中处理任务时，解密完整 payload 以获取所有配置信息
+- **查询任务时解密**：在 `/api/v1/messages` 端点返回任务列表时，解密 payload 以组装完整响应
+- **更新任务时解密**：在 `/api/v1/update-message` 端点更新任务时，先解密现有数据，合并更新，再重新加密
+- **日志保护**：日志中**不输出**明文敏感数据（如 API key）
+
+**安全优势**：
+- 数据库泄露不会暴露任何敏感信息
+- 用户间数据完全隔离（每个用户独立密钥）
+- 查询性能优化（索引字段为明文，支持高效查询）
+- 降低安全风险（无需对每个字段单独加密/解密）
 
 #### 6.2.3 密钥分发与管理
 
@@ -1584,11 +1764,11 @@ Access-Control-Max-Age: 86400
 | messageId | string | 是 | 消息唯一标识符 |
 | messageIndex | integer | 是 | 当前消息序号（从1开始） |
 | totalMessages | integer | 是 | 消息总数 |
-| messageType | string | 是 | 消息类型（`fixed`、`prompted`、`auto`） |
+| messageType | string | 是 | 消息类型（`fixed`、`prompted`、`auto`、`instant`） |
 | messageSubtype | string | 否 | 消息子类型（`chat`、`forum`、`moment`） |
 | taskId | integer | 是 | 任务ID |
 | timestamp | string | 是 | 消息时间戳（ISO 8601） |
-| source | string | 是 | 消息来源（固定为 `scheduled`） |
+| source | string | 是 | 消息来源（`scheduled` 或 `instant`，instant 类型时为 `'instant'`） |
 | avatarUrl | string | 否 | 头像URL |
 | metadata | object | 否 | 自定义元数据 |
 
@@ -1661,9 +1841,9 @@ Access-Control-Max-Age: 86400
 必需的数据库索引配置：
 
 ```sql
--- 主查询索引
+-- 主查询索引（移除 contact_name，因为该字段已加密）
 CREATE INDEX idx_pending_tasks_optimized
-ON scheduled_messages (status, next_send_at, id, contact_name, retry_count)
+ON scheduled_messages (status, next_send_at, id, retry_count)
 WHERE status = 'pending';
 
 -- 清理查询索引
@@ -1986,35 +2166,19 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     -- 跨设备查询标识符
     uuid VARCHAR(36),  -- UUID v4 格式，可选，用于跨设备查询和管理
 
-    -- 角色信息（用于通知显示）
-    contact_name VARCHAR(255) NOT NULL,  -- 用于通知标题
-    avatar_url VARCHAR(500),  -- 角色头像 URL
+    -- 🔐 核心：全字段加密存储
+    -- 包含所有敏感数据：contactName, avatarUrl, messageSubtype, userMessage,
+    -- recurrenceType, apiUrl, apiKey, primaryModel, completePrompt, 
+    -- pushSubscription, metadata
+    encrypted_payload TEXT NOT NULL,
 
-    -- 消息配置
-    message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto')),
-    message_subtype VARCHAR(50) DEFAULT 'chat' CHECK (message_subtype IN ('chat', 'forum', 'moment')),
-    user_message TEXT,  -- 仅用于 fixed 类型（推荐加密存储）
-
-    -- 调度配置
+    -- 📌 索引字段（明文，用于查询优化）
+    message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    recurrence_type VARCHAR(50) NOT NULL DEFAULT 'none' CHECK (recurrence_type IN ('none', 'daily', 'weekly')),
-
-    -- AI配置（仅用于 prompted 和 auto 类型）
-    api_url VARCHAR(500),
-    api_key VARCHAR(500),  -- 必须加密存储（格式：iv:authTag:encryptedData）
-    primary_model VARCHAR(100),
-    complete_prompt TEXT,  -- 推荐加密存储
-
-    -- 推送配置
-    push_subscription JSONB NOT NULL,
 
     -- 状态管理
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER DEFAULT 0,
-    failure_reason TEXT,
-
-    -- 自定义元数据
-    metadata JSONB DEFAULT '{}'::JSONB,
 
     -- 时间戳
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -2023,7 +2187,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 
 -- 主查询索引（用于 Cron Job 查找待处理任务）
 CREATE INDEX idx_pending_tasks_optimized
-ON scheduled_messages (status, next_send_at, id, contact_name, retry_count)
+ON scheduled_messages (status, next_send_at, id, retry_count)
 WHERE status = 'pending';
 
 -- 清理查询索引（用于定期清理已完成或失败的任务）
@@ -2045,25 +2209,61 @@ ON scheduled_messages (uuid)
 WHERE uuid IS NOT NULL;
 ```
 
-### 15.2 字段使用规则
+### 15.2 全字段加密架构说明
 
-| message_type | user_message | complete_prompt | api_url | api_key | primary_model |
-|--------------|--------------|-----------------|---------|-------------------|---------------|
-| fixed | ✅ 必需 | ❌ NULL | ❌ NULL | ❌ NULL | ❌ NULL |
-| prompted | ❌ NULL | ✅ 必需 | ✅ 必需 | ✅ 必需 | ✅ 必需 |
-| auto | ❌ NULL | ✅ 必需 | ✅ 必需 | ✅ 必需 | ✅ 必需 |
+**核心设计**：所有敏感数据统一存储在 `encrypted_payload` 字段中，仅保留少量索引字段用于查询优化。
 
-### 15.3 加密字段说明
+**明文索引字段**（用于查询）：
+- `user_id`: 用户标识
+- `uuid`: 跨设备查询标识符
+- `message_type`: 消息类型（`fixed`, `prompted`, `auto`, `instant`）
+- `next_send_at`: 下次发送时间
+- `status`: 任务状态
+- `retry_count`: 重试次数
 
-以下字段在数据库中必须以加密形式存储：
+**加密字段**（存储在 `encrypted_payload` 中的 JSON 对象）：
+```json
+{
+  "contactName": "角色名称",
+  "avatarUrl": "头像URL",
+  "messageSubtype": "chat/forum/moment",
+  "userMessage": "固定消息内容（仅 fixed 类型）",
+  "recurrenceType": "none/daily/weekly",
+  "apiUrl": "AI API 地址",
+  "apiKey": "AI API 密钥",
+  "primaryModel": "AI 模型名称",
+  "completePrompt": "完整 prompt",
+  "pushSubscription": { /* 推送订阅对象 */ },
+  "metadata": { /* 自定义元数据 */ }
+}
+```
 
-- `api_key`: 必须加密存储，格式为 `iv:authTag:encryptedData`（十六进制编码）
-- `complete_prompt`: 推荐加密存储，使用相同格式。**必须包含完整的角色名、人设、历史记录、任务及其他自定义字段**
-- `user_message`: 推荐加密存储，使用相同格式
+### 15.3 加密实现细节
 
-加密使用用户专属密钥（通过 `SHA256(ENCRYPTION_KEY + userId)` 派生），详见 6.2.2 节。
+**加密方法**：
+- 算法：AES-256-GCM
+- 格式：`iv:authTag:encryptedData`（十六进制编码）
+- 密钥：用户专属密钥（通过 `SHA256(ENCRYPTION_KEY + userId)` 派生）
 
-**注意**: `contact_name` 为明文存储，仅用于通知显示（如通知标题"来自 Rei 的消息"）。完整的角色信息（包括人设）应包含在 `complete_prompt` 中。
+**存储流程**：
+1. 客户端发送加密的请求体到 API
+2. 服务器解密请求体，验证参数
+3. 将完整的业务数据对象序列化为 JSON
+4. 使用用户专属密钥加密整个 JSON 字符串
+5. 存储加密后的字符串到 `encrypted_payload` 字段
+
+**查询流程**：
+1. 查询数据库时只返回索引字段 + `encrypted_payload`
+2. 派生用户专属密钥
+3. 解密 `encrypted_payload` 获取完整数据
+4. 组装响应并返回给客户端
+
+**安全优势**：
+- 数据库泄露不会暴露敏感信息（API key、prompt 等）
+- 用户间数据隔离（每个用户独立密钥）
+- 查询性能优化（索引字段为明文）
+
+详细加密实现参见 §6.2 节。
 
 ---
 

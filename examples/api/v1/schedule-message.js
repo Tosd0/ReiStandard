@@ -4,10 +4,27 @@
  * ReiStandard v1.0.0
  */
 
+const webpush = require('web-push');
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
 const { validateScheduleMessagePayload } = require('../../lib/validation');
 const { randomUUID } = require('crypto');
 // const { sql } = require('@vercel/postgres');
+
+// 🔧 初始化 VAPID（instant 消息路径需要）
+const VAPID_EMAIL = process.env.VAPID_EMAIL;
+const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+
+if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    `mailto:${VAPID_EMAIL}`,
+    VAPID_PUBLIC_KEY,
+    VAPID_PRIVATE_KEY
+  );
+  console.log('[schedule-message] VAPID configured for instant messages');
+} else {
+  console.warn('[schedule-message] VAPID not configured - instant messages will fail');
+}
 
 function normalizeHeaders(h) {
   const out = {};
@@ -137,68 +154,65 @@ async function core(headers, body) {
     };
   }
 
-  // 4. 加密敏感字段用于数据库存储
-  const userKey = deriveUserEncryptionKey(userId);
-  const encryptedApiKey = payload.apiKey ? encryptForStorage(payload.apiKey, userKey) : null;
-  const encryptedPrompt = payload.completePrompt ? encryptForStorage(payload.completePrompt, userKey) : null;
-  const encryptedUserMessage = payload.userMessage ? encryptForStorage(payload.userMessage, userKey) : null;
-
-  // 5. 生成 UUID（如果未提供）
+  // 4. 生成 UUID（如果未提供）
   const taskUuid = payload.uuid || randomUUID();
+  
+  // 5. 加密整个 payload 用于数据库存储（全字段加密）
+  const userKey = deriveUserEncryptionKey(userId);
+  
+  // 创建要存储的完整数据对象
+  const fullTaskData = {
+    contactName: payload.contactName,
+    avatarUrl: payload.avatarUrl || null,
+    messageType: payload.messageType,
+    messageSubtype: payload.messageSubtype || 'chat',
+    userMessage: payload.userMessage || null,
+    firstSendTime: payload.firstSendTime,
+    recurrenceType: payload.recurrenceType || 'none',
+    apiUrl: payload.apiUrl || null,
+    apiKey: payload.apiKey || null,
+    primaryModel: payload.primaryModel || null,
+    completePrompt: payload.completePrompt || null,
+    pushSubscription: payload.pushSubscription,
+    metadata: payload.metadata || {}
+  };
+  
+  // 将整个数据对象加密成一个字符串
+  const encryptedPayload = encryptForStorage(JSON.stringify(fullTaskData), userKey);
 
-  // 6. 插入数据库
+  // 6. 插入数据库（全字段加密存储）
   /*
   const result = await sql`
     INSERT INTO scheduled_messages (
       user_id,
       uuid,
-      contact_name,
-      avatar_url,
-      message_type,
-      message_subtype,
-      user_message,
+      encrypted_payload,
       next_send_at,
-      recurrence_type,
-      api_url,
-      api_key,
-      primary_model,
-      complete_prompt,
-      push_subscription,
+      message_type,
       status,
       retry_count,
-      metadata,
       created_at,
       updated_at
     ) VALUES (
       ${userId},
       ${taskUuid},
-      ${payload.contactName},
-      ${payload.avatarUrl || null},
-      ${payload.messageType},
-      ${payload.messageSubtype || 'chat'},
-      ${encryptedUserMessage},
+      ${encryptedPayload},
       ${payload.firstSendTime},
-      ${payload.recurrenceType || 'none'},
-      ${payload.apiUrl || null},
-      ${encryptedApiKey},
-      ${payload.primaryModel || null},
-      ${encryptedPrompt},
-      ${JSON.stringify(payload.pushSubscription)},
+      ${payload.messageType},
       'pending',
       0,
-      ${JSON.stringify(payload.metadata || {})},
       NOW(),
       NOW()
     )
-    RETURNING id, uuid, contact_name, next_send_at, status, created_at
+    RETURNING id, uuid, next_send_at, status, created_at
   `;
   */
 
   // 模拟数据库响应（实际项目中替换为真实数据库调用）
+  // 注意：实际使用时，从数据库返回的只有加密数据，需要解密后才能显示
   const mockResult = {
     id: 12345,
     uuid: taskUuid,
-    contact_name: payload.contactName,
     next_send_at: payload.firstSendTime,
     status: 'pending',
     created_at: new Date().toISOString()
@@ -206,11 +220,90 @@ async function core(headers, body) {
 
   console.log('[schedule-message] New task created:', {
     taskId: mockResult.id,
-    contactName: mockResult.contact_name,
-    nextSendAt: mockResult.next_send_at
+    contactName: payload.contactName,  // 从原始payload获取，因为数据库中已加密
+    nextSendAt: mockResult.next_send_at,
+    messageType: payload.messageType
   });
 
-  // 7. 返回成功响应
+  // 7. instant 类型：立即触发 send-notifications 处理
+  if (payload.messageType === 'instant') {
+    // 导入 message-processor 的核心处理函数（避免循环依赖）
+    const { processMessagesByUuid } = require('../../lib/message-processor');
+    
+    try {
+      // 立即处理这条消息（带重试机制）
+      const sendResult = await processMessagesByUuid(taskUuid, 2); // 最多重试2次
+      
+      if (!sendResult.success) {
+        // 发送失败，更新数据库任务状态为失败（如果数据库可用）
+        /*
+        await sql`
+          UPDATE scheduled_messages
+          SET status = 'failed',
+              failure_reason = ${JSON.stringify(sendResult.error)},
+              updated_at = NOW()
+          WHERE uuid = ${taskUuid}
+        `;
+        */
+        
+        console.error('[schedule-message] Instant message failed:', {
+          uuid: taskUuid,
+          error: sendResult.error,
+          retriesAttempted: sendResult.error.retriesAttempted || 0
+        });
+
+        return {
+          status: 500,
+          body: {
+            success: false,
+            error: {
+              code: 'MESSAGE_SEND_FAILED',
+              message: '消息发送失败',
+              details: sendResult.error
+            }
+          }
+        };
+      }
+
+      console.log('[schedule-message] Instant message sent:', {
+        uuid: taskUuid,
+        contactName: payload.contactName,
+        messagesSent: sendResult.messagesSent,
+        retriesUsed: sendResult.retriesUsed || 0
+      });
+
+      // 返回 instant 类型的成功响应
+      return {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            uuid: taskUuid,
+            contactName: payload.contactName,
+            messagesSent: sendResult.messagesSent,
+            sentAt: new Date().toISOString(),
+            status: 'sent',
+            retriesUsed: sendResult.retriesUsed || 0
+          }
+        }
+      };
+    } catch (error) {
+      console.error('[schedule-message] Instant message error:', error);
+      return {
+        status: 500,
+        body: {
+          success: false,
+          error: {
+            code: 'MESSAGE_SEND_FAILED',
+            message: '消息发送失败',
+            details: { error: error.message }
+          }
+        }
+      };
+    }
+  }
+
+  // 8. 返回普通类型的成功响应（敏感信息已加密存储）
   return {
     status: 201,
     body: {
@@ -218,7 +311,7 @@ async function core(headers, body) {
       data: {
         id: mockResult.id,
         uuid: mockResult.uuid,
-        contactName: mockResult.contact_name,
+        contactName: payload.contactName,  // 从原始payload返回，数据库中已加密
         nextSendAt: mockResult.next_send_at,
         status: mockResult.status,
         createdAt: mockResult.created_at

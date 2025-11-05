@@ -135,13 +135,35 @@ Invoke-RestMethod -Uri "https://your-domain.com/api/v1/send-notifications" `
 |------|------|------|
 | `/api/v1/init-database` | GET/POST | 一键初始化数据库（首次部署后删除）|
 | `/api/v1/get-master-key` | GET | 分发主密钥给客户端 |
-| `/api/v1/schedule-message` | POST | 创建定时消息任务 |
+| `/api/v1/schedule-message` | POST | 创建定时消息任务 / 发送即时消息（instant类型） |
 | `/api/v1/send-notifications` | POST | Cron 触发处理到期任务 |
 | `/api/v1/update-message` | PUT | 更新任务配置 |
 | `/api/v1/cancel-message` | DELETE | 取消/删除任务 |
 | `/api/v1/messages` | GET | 查询任务列表 |
 
 > **📖 详细 API 文档**：完整的请求/响应格式、错误代码、加密实现等请参考 [standards/active-messaging-api.md](../standards/active-messaging-api.md)
+
+### 消息类型说明
+
+本标准支持四种消息类型：
+
+| 类型 | 说明 | 触发方式 | 使用场景 |
+|------|------|---------|---------|
+| `fixed` | 固定消息 | 定时触发（cronjob） | 预设文本提醒 |
+| `prompted` | 用户提示词消息 | 定时触发（cronjob） | AI根据用户要求生成 |
+| `auto` | 完全自动消息 | 定时触发（cronjob） | AI自主决定内容 |
+| `instant` | 即时消息 | **立即触发** | 需要即时响应的场景 |
+
+**instant 类型特点**：
+- 调用 `schedule-message` 后**立即发送**，不等待 cronjob
+- 可以包含固定消息或 AI 生成消息
+- 发送完成后任务立即销毁
+- `recurrenceType` 固定为 `none`
+- 整体走 active message 流程（加密、分句、推送通知）
+
+**instant 与普通一次性消息的区别**：
+- **普通一次性消息**（`recurrenceType: none`）：创建后进入定时队列，等待 cronjob 在指定时间触发
+- **instant 消息**：创建后**立即触发**，无需等待 cronjob，适用于需要即时响应的场景（如订单通知、系统消息等）
 
 ---
 

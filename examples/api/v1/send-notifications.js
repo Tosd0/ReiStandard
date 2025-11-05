@@ -5,6 +5,7 @@
  */
 
 const webpush = require('web-push');
+const { processSingleMessage, processMessagesByUuid } = require('../../lib/message-processor');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
 // const { sql } = require('@vercel/postgres');
 
@@ -86,15 +87,14 @@ async function core(headers) {
 
     const startTime = Date.now();
 
-    // 2. 查询待处理任务
+    // 2. 查询待处理任务（全字段加密版本）
     /*
     const tasks = await sql`
       SELECT
-        id, user_id, uuid, contact_name, avatar_url,
-        message_type, message_subtype, user_message,
-        next_send_at, recurrence_type,
-        api_url, api_key, primary_model, complete_prompt,
-        push_subscription, retry_count, metadata
+        id, user_id, uuid,
+        encrypted_payload,
+        message_type, next_send_at,
+        status, retry_count
       FROM scheduled_messages
       WHERE status = 'pending'
         AND next_send_at <= NOW()
@@ -124,111 +124,23 @@ async function core(headers) {
       try {
         console.log('[send-notifications] Processing task:', {
           taskId: task.id,
-          contactName: task.contact_name,
+          messageType: task.message_type,  // 使用索引字段
           retryCount: task.retry_count
         });
 
-        // 派生用户专属密钥
+        // 使用统一的消息处理函数
+        const result = await processSingleMessage(task);
+
+        if (!result.success) {
+          throw new Error(result.error);
+        }
+
+        // 解密payload以获取recurrence_type（用于判断是否删除）
         const userKey = deriveUserEncryptionKey(task.user_id);
-
-        let messageContent;
-
-        // 根据消息类型生成内容
-        if (task.message_type === 'fixed') {
-          // 固定消息：直接使用用户消息
-          messageContent = decryptFromStorage(task.user_message, userKey);
-
-        } else if (task.message_type === 'prompted' || task.message_type === 'auto') {
-          // AI 消息：调用 AI API
-          const apiUrl = task.api_url;
-          const apiKey = decryptFromStorage(task.api_key, userKey);
-          const completePrompt = decryptFromStorage(task.complete_prompt, userKey);
-
-          // 调用 AI API（OpenAI 兼容接口）
-          const aiResponse = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-              model: task.primary_model,
-              messages: [
-                {
-                  role: 'user',
-                  content: completePrompt
-                }
-              ],
-              max_tokens: 500,
-              temperature: 0.8
-            }),
-            signal: AbortSignal.timeout(300000) // 300秒超时
-          });
-
-          if (!aiResponse.ok) {
-            throw new Error(`AI API error: ${aiResponse.status} ${aiResponse.statusText}`);
-          }
-
-          const aiData = await aiResponse.json();
-          messageContent = aiData.choices[0].message.content.trim();
-        }
-
-        // 消息分句处理（按句号、问号、感叹号分割）
-        const sentences = messageContent
-          .split(/([。！？!?]+)/)
-          .reduce((acc, part, i, arr) => {
-            if (i % 2 === 0 && part.trim()) {
-              const punctuation = arr[i + 1] || '';
-              acc.push(part.trim() + punctuation);
-            }
-            return acc;
-          }, [])
-          .filter(s => s.length > 0);
-
-        // 如果没有句子，作为单条消息发送
-        const messages = sentences.length > 0 ? sentences : [messageContent];
-
-        // 批量推送通知（消息间添加延迟）
-        const pushSubscription = typeof task.push_subscription === 'string'
-          ? JSON.parse(task.push_subscription)
-          : task.push_subscription;
-
-        for (let i = 0; i < messages.length; i++) {
-          const notificationPayload = {
-            title: `来自 ${task.contact_name}`,
-            message: messages[i],
-            contactName: task.contact_name,
-            messageId: `msg_${Date.now()}_${task.id}_${i}`,
-            messageIndex: i + 1,
-            totalMessages: messages.length,
-            messageType: task.message_type,
-            messageSubtype: task.message_subtype,
-            taskId: task.id,
-            timestamp: new Date().toISOString(),
-            source: 'scheduled',
-            avatarUrl: task.avatar_url || null,
-            metadata: task.metadata || {}
-          };
-
-          await webpush.sendNotification(
-            pushSubscription,
-            JSON.stringify(notificationPayload)
-          );
-
-          console.log('[push] Notification sent:', {
-            taskId: task.id,
-            messageIndex: i + 1,
-            totalMessages: messages.length
-          });
-
-          // 消息间延迟（避免过快发送）
-          if (i < messages.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 1500));
-          }
-        }
+        const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
         // 更新任务状态
-        if (task.recurrence_type === 'none') {
+        if (decryptedPayload.recurrenceType === 'none') {
           // 一次性任务：删除
           /*
           await sql`
@@ -243,9 +155,9 @@ async function core(headers) {
           let nextSendAt;
           const currentSendAt = new Date(task.next_send_at);
 
-          if (task.recurrence_type === 'daily') {
+          if (decryptedPayload.recurrenceType === 'daily') {
             nextSendAt = new Date(currentSendAt.getTime() + 24 * 60 * 60 * 1000);
-          } else if (task.recurrence_type === 'weekly') {
+          } else if (decryptedPayload.recurrenceType === 'weekly') {
             nextSendAt = new Date(currentSendAt.getTime() + 7 * 24 * 60 * 60 * 1000);
           }
 
@@ -422,3 +334,6 @@ exports.handler = async function(event) {
     return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ success: false, error: { code: 'INTERNAL_SERVER_ERROR', message: '服务器内部错误，请稍后重试' } }) };
   }
 };
+
+// 导出供 schedule-message 调用的函数
+exports.processMessagesByUuid = processMessagesByUuid;

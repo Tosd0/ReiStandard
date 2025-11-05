@@ -105,7 +105,7 @@ async function runTests(baseUrl, config) {
   // 测试 2: 创建 fixed 消息
   try {
     const payload = {
-      contactName: 'TestBot',
+      contactName: 'ReiTest',
       messageType: 'fixed',
       userMessage: '测试消息',
       firstSendTime: new Date(Date.now() + 60000).toISOString(),
@@ -148,7 +148,7 @@ async function runTests(baseUrl, config) {
   // 测试 3: 创建 prompted 消息（使用占位符 API key）
   try {
     const payload = {
-      contactName: 'TestBot',
+      contactName: 'ReiTest',
       messageType: 'prompted',
       firstSendTime: new Date(Date.now() + 120000).toISOString(),
       recurrenceType: 'none',
@@ -186,6 +186,87 @@ async function runTests(baseUrl, config) {
   } catch (error) {
     results.push({
       test: 'POST /api/v1/schedule-message (prompted)',
+      passed: false,
+      error: error.message
+    });
+  }
+
+  // 测试 3.5: 创建 instant 固定消息
+  try {
+    const payload = {
+      contactName: 'InstantRei',
+      messageType: 'instant',
+      userMessage: '即时测试消息',
+      firstSendTime: new Date().toISOString(),
+      recurrenceType: 'none',
+      pushSubscription: {
+        endpoint: 'https://fcm.googleapis.com/test',
+        keys: { p256dh: 'test', auth: 'test' }
+      }
+    };
+
+    const encrypted = encryptPayload(payload, userKey);
+    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
+      headers: {
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1',
+        'X-User-Id': config.userId
+      },
+      body: encrypted
+    });
+
+    results.push({
+      test: 'POST /api/v1/schedule-message (instant fixed)',
+      passed: res.ok && res.data.success,
+      status: res.status,
+      messagesSent: res.data.data?.messagesSent,
+      message: res.ok ? `发送 ${res.data.data?.messagesSent || 0} 条消息` : res.data.error?.message || '失败'
+    });
+  } catch (error) {
+    results.push({
+      test: 'POST /api/v1/schedule-message (instant fixed)',
+      passed: false,
+      error: error.message
+    });
+  }
+
+  // 测试 3.6: 创建 instant AI 消息
+  try {
+    const payload = {
+      contactName: 'InstantRei',
+      messageType: 'instant',
+      firstSendTime: new Date().toISOString(),
+      recurrenceType: 'none',
+      pushSubscription: {
+        endpoint: 'https://fcm.googleapis.com/test',
+        keys: { p256dh: 'test', auth: 'test' }
+      },
+      apiUrl: 'https://api.openai.com/v1/chat/completions',
+      apiKey: 'sk-test-placeholder',
+      primaryModel: 'gpt-5',
+      completePrompt: '立即发送一条简短测试消息'
+    };
+
+    const encrypted = encryptPayload(payload, userKey);
+    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
+      headers: {
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1',
+        'X-User-Id': config.userId
+      },
+      body: encrypted
+    });
+
+    results.push({
+      test: 'POST /api/v1/schedule-message (instant AI)',
+      passed: res.ok && res.data.success,
+      status: res.status,
+      messagesSent: res.data.data?.messagesSent,
+      message: res.ok ? `发送 ${res.data.data?.messagesSent || 0} 条消息` : res.data.error?.message || '失败'
+    });
+  } catch (error) {
+    results.push({
+      test: 'POST /api/v1/schedule-message (instant AI)',
       passed: false,
       error: error.message
     });

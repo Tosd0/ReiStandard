@@ -78,81 +78,47 @@ async function core(url, headers, body) {
     updates = parsedBody;
   }
 
-  // 构建更新字段
-  const updateFields = {};
-  const userKey = deriveUserEncryptionKey(userId);
-
-  if (updates.completePrompt) {
-    updateFields.complete_prompt = encryptForStorage(updates.completePrompt, userKey);
-  }
-  if (updates.userMessage) {
-    updateFields.user_message = encryptForStorage(updates.userMessage, userKey);
-  }
-  if (updates.nextSendAt) {
-    if (!isValidISO8601(updates.nextSendAt)) {
-      return {
-        status: 400,
-        body: {
-          success: false,
-          error: {
-            code: 'INVALID_UPDATE_DATA',
-            message: '更新数据格式错误',
-            details: { invalidFields: ['nextSendAt'] }
-          }
-        }
-      };
-    }
-    updateFields.next_send_at = updates.nextSendAt;
-  }
-  if (updates.recurrenceType) {
-    if (!['none', 'daily', 'weekly'].includes(updates.recurrenceType)) {
-      return {
-        status: 400,
-        body: {
-          success: false,
-          error: {
-            code: 'INVALID_UPDATE_DATA',
-            message: '更新数据格式错误',
-            details: { invalidFields: ['recurrenceType'] }
-          }
-        }
-      };
-    }
-    updateFields.recurrence_type = updates.recurrenceType;
-  }
-  if (updates.avatarUrl) {
-    updateFields.avatar_url = updates.avatarUrl;
-  }
-  if (updates.metadata) {
-    updateFields.metadata = JSON.stringify(updates.metadata);
-  }
-
-  if (Object.keys(updateFields).length === 0) {
+  // 验证更新字段
+  if (updates.nextSendAt && !isValidISO8601(updates.nextSendAt)) {
     return {
       status: 400,
       body: {
         success: false,
         error: {
           code: 'INVALID_UPDATE_DATA',
-          message: '没有提供有效的更新字段'
+          message: '更新数据格式错误',
+          details: { invalidFields: ['nextSendAt'] }
+        }
+      }
+    };
+  }
+  
+  if (updates.recurrenceType && !['none', 'daily', 'weekly'].includes(updates.recurrenceType)) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: 'INVALID_UPDATE_DATA',
+          message: '更新数据格式错误',
+          details: { invalidFields: ['recurrenceType'] }
         }
       }
     };
   }
 
-  // 更新数据库（确保用户只能更新自己的任务）
+  // 查询现有任务并解密（全字段加密版本）
   /*
-  const result = await sql`
-    UPDATE scheduled_messages
-    SET ${sql(updateFields)},
-        updated_at = NOW()
+  const existingTask = await sql`
+    SELECT id, encrypted_payload, message_type, next_send_at, status
+    FROM scheduled_messages
     WHERE uuid = ${taskUuid}
       AND user_id = ${userId}
       AND status = 'pending'
-    RETURNING uuid, updated_at
+    LIMIT 1
   `;
-
-  if (result.count === 0) {
+  
+  if (existingTask.length === 0) {
     // 检查任务是否存在
     const existing = await sql`
       SELECT status FROM scheduled_messages
@@ -184,6 +150,70 @@ async function core(url, headers, body) {
       }
     };
   }
+  */
+  
+  // 模拟从数据库获取的任务（实际应从数据库查询）
+  const existingTask = null; // 实际从数据库获取
+  
+  if (!existingTask) {
+    // 模拟场景：任务不存在时的处理
+    console.log('[update-message] Simulated: task not found or not pending');
+  }
+
+  // 解密现有payload并合并更新
+  const userKey = deriveUserEncryptionKey(userId);
+  
+  // 模拟解密现有数据（实际从existingTask.encrypted_payload解密）
+  // const existingData = JSON.parse(decryptFromStorage(existingTask.encrypted_payload, userKey));
+  
+  // 模拟现有数据结构
+  const existingData = {
+    contactName: 'Example Contact',
+    avatarUrl: null,
+    messageType: 'fixed',
+    messageSubtype: 'chat',
+    userMessage: 'Example message',
+    firstSendTime: '2024-01-01T00:00:00Z',
+    recurrenceType: 'none',
+    apiUrl: null,
+    apiKey: null,
+    primaryModel: null,
+    completePrompt: null,
+    pushSubscription: {},
+    metadata: {}
+  };
+
+  // 合并更新
+  const updatedData = {
+    ...existingData,
+    ...(updates.completePrompt && { completePrompt: updates.completePrompt }),
+    ...(updates.userMessage && { userMessage: updates.userMessage }),
+    ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
+    ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
+    ...(updates.metadata && { metadata: updates.metadata })
+  };
+  
+  // 重新加密整个payload
+  const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);
+  
+  // 构建数据库更新字段
+  const updateFields = {
+    encrypted_payload: encryptedPayload,
+    ...(updates.nextSendAt && { next_send_at: updates.nextSendAt })
+  };
+
+  // 更新数据库（全字段加密版本）
+  /*
+  const result = await sql`
+    UPDATE scheduled_messages
+    SET encrypted_payload = ${updateFields.encrypted_payload},
+        ${updateFields.next_send_at ? sql`next_send_at = ${updateFields.next_send_at},` : sql``}
+        updated_at = NOW()
+    WHERE uuid = ${taskUuid}
+      AND user_id = ${userId}
+      AND status = 'pending'
+    RETURNING uuid, updated_at
+  `;
   */
 
   console.log('[update-message] Task updated:', {

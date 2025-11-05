@@ -16,7 +16,7 @@
 完整的后端 API 技术规范，包括：
 - 7 个 API 端点的详细定义（请求/响应格式、错误代码）
 - 端到端加密架构（AES-256-GCM）
-- 三种消息类型（fixed、prompted、auto）
+- 四种消息类型（fixed、prompted、auto、instant）
 - 认证与授权体系
 - 数据库 Schema
 - 安全考虑和最佳实践

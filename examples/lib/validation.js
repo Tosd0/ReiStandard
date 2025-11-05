@@ -48,12 +48,12 @@ function validateScheduleMessagePayload(payload) {
   }
 
   // 消息类型验证 - 特殊错误码
-  if (!payload.messageType || !['fixed', 'prompted', 'auto'].includes(payload.messageType)) {
+  if (!payload.messageType || !['fixed', 'prompted', 'auto', 'instant'].includes(payload.messageType)) {
     return {
       valid: false,
       errorCode: 'INVALID_MESSAGE_TYPE',
       errorMessage: '消息类型无效',
-      details: { providedType: payload.messageType, allowedTypes: ['fixed', 'prompted', 'auto'] }
+      details: { providedType: payload.messageType, allowedTypes: ['fixed', 'prompted', 'auto', 'instant'] }
     };
   }
 
@@ -121,6 +121,32 @@ function validateScheduleMessagePayload(payload) {
         errorCode: 'INVALID_PARAMETERS',
         errorMessage: '缺少必需参数或参数格式错误',
         details: { missingFields: missingAiFields }
+      };
+    }
+  }
+
+  if (payload.messageType === 'instant') {
+    // instant 类型 recurrenceType 必须为 none
+    if (payload.recurrenceType && payload.recurrenceType !== 'none') {
+      return {
+        valid: false,
+        errorCode: 'INVALID_PARAMETERS',
+        errorMessage: 'instant 类型的 recurrenceType 必须为 none',
+        details: { invalidFields: ['recurrenceType (must be "none" for instant type)'] }
+      };
+    }
+
+    // instant 类型可以是固定消息或 AI 消息
+    // 如果有 AI 配置，则使用 AI 生成；否则必须提供 userMessage
+    const hasAiConfig = payload.completePrompt && payload.apiUrl && payload.apiKey && payload.primaryModel;
+    const hasUserMessage = payload.userMessage;
+
+    if (!hasAiConfig && !hasUserMessage) {
+      return {
+        valid: false,
+        errorCode: 'INVALID_PARAMETERS',
+        errorMessage: 'instant 类型必须提供 userMessage 或完整的 AI 配置',
+        details: { missingFields: ['userMessage or (completePrompt + apiUrl + apiKey + primaryModel)'] }
       };
     }
   }
