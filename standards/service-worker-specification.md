@@ -383,6 +383,259 @@ function buildNotificationOptions(data) {
 }
 ```
 
+### 4.1.1 前台/后台检测与处理（推荐最佳实践）
+
+**重要性**: 对于 **instant** 类型的即时消息和所有实时消息场景，需实现前台/后台检测逻辑，以提供最佳用户体验。
+
+**核心原则**:
+- **后台状态**: 用户未打开应用或切换到其他应用时，显示系统通知
+- **前台状态**: 用户正在使用应用时，直接在 UI 中渲染消息，不显示系统通知
+- **渲染一致性**: 前台接收的消息应与实时收到的消息在视觉和交互上完全一致
+
+#### 实现方式
+
+**方法 1: 检测可见的客户端（推荐）**
+
+```javascript
+self.addEventListener('push', async event => {
+  console.log('[SW] 收到推送通知');
+
+  // 解析推送数据
+  let notificationData = {};
+  try {
+    notificationData = event.data ? event.data.json() : {};
+  } catch (error) {
+    console.error('[SW] 推送数据解析失败:', error);
+    notificationData = {
+      title: '新消息',
+      message: event.data ? event.data.text() : '您有一条新消息'
+    };
+  }
+
+  event.waitUntil(
+    (async () => {
+      // 1. 检测是否有前台可见的客户端
+      const allClients = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true
+      });
+
+      // 检查是否有处于焦点（前台）的页面
+      const visibleClients = allClients.filter(client => {
+        return client.visibilityState === 'visible' && client.focused;
+      });
+
+      // 2. 如果用户在前台，直接发送消息给页面，不弹通知
+      if (visibleClients.length > 0) {
+        console.log('[SW] 用户在前台，发送消息到页面');
+
+        // 向所有前台页面发送消息数据
+        visibleClients.forEach(client => {
+          client.postMessage({
+            type: 'PUSH_MESSAGE_RECEIVED',
+            data: notificationData,
+            timestamp: Date.now()
+          });
+        });
+
+        // 不显示系统通知
+        return;
+      }
+
+      // 3. 如果用户在后台，显示系统通知
+      console.log('[SW] 用户在后台，显示系统通知');
+      const options = buildNotificationOptions(notificationData);
+      await self.registration.showNotification(options.title, options);
+    })()
+  );
+});
+```
+
+**方法 2: 使用页面心跳检测（备用方案）**
+
+如果需要更精确的前台检测，可以配合页面心跳机制：
+
+```javascript
+// 在 Service Worker 中维护活跃客户端列表
+let activeClients = new Set();
+
+// 监听页面心跳消息
+self.addEventListener('message', event => {
+  const { type, clientId } = event.data || {};
+
+  if (type === 'CLIENT_HEARTBEAT') {
+    // 记录活跃客户端（5秒内有心跳认为是前台）
+    activeClients.add(clientId);
+
+    // 5秒后移除，如果没有新的心跳
+    setTimeout(() => {
+      activeClients.delete(clientId);
+    }, 5000);
+  }
+});
+
+// 在 push 事件中使用
+self.addEventListener('push', async event => {
+  // ... 解析数据
+
+  event.waitUntil(
+    (async () => {
+      // 检查是否有活跃客户端
+      if (activeClients.size > 0) {
+        // 发送到前台页面
+        const allClients = await self.clients.matchAll({ type: 'window' });
+        allClients.forEach(client => {
+          if (activeClients.has(client.id)) {
+            client.postMessage({
+              type: 'PUSH_MESSAGE_RECEIVED',
+              data: notificationData
+            });
+          }
+        });
+        return; // 不显示系统通知
+      }
+
+      // 显示系统通知
+      const options = buildNotificationOptions(notificationData);
+      await self.registration.showNotification(options.title, options);
+    })()
+  );
+});
+```
+
+#### 前端页面配合实现
+
+> **⚠️ 重要提示**: 以下代码中的 `renderMessageInUI`、`playNotificationSound`、`showInAppBanner` 等函数为**伪代码示例**，开发者需要根据自己应用的 UI 框架和设计风格进行具体实现。不同应用的消息渲染逻辑、动画效果、提示音方式都可能不同。
+
+**步骤 1: 监听 Service Worker 消息**
+
+```javascript
+// 在主页面中监听来自 Service Worker 的消息
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', event => {
+    const { type, data } = event.data || {};
+
+    if (type === 'PUSH_MESSAGE_RECEIVED') {
+      console.log('[页面] 收到推送消息:', data);
+
+      // 直接在 UI 中渲染消息（需自行实现）
+      renderMessageInUI(data);
+
+      // 可选：播放提示音（需自行实现）
+      playNotificationSound();
+
+      // 可选：显示应用内通知横幅（需自行实现）
+      showInAppBanner(data);
+    }
+  });
+}
+
+// 伪代码：渲染消息到 UI
+function renderMessageInUI(messageData) {
+  // 1. 从 messageData 中提取必要字段
+  // const { contactName, message, messageId, avatarUrl, timestamp } = messageData;
+
+  // 2. 根据应用的 UI 框架创建消息元素
+  // 例如：React 中调用 setState，Vue 中更新响应式数据
+  // 例如：原生 JS 中创建 DOM 元素并插入到对应容器
+
+  // 3. 应用消息样式，确保与实时收到的消息样式完全一致
+  // 包括：头像、发送者名称、时间戳、消息内容、气泡样式等
+
+  // 4. 添加入场动画（如淡入、滑入等）
+
+  // 5. 滚动到最新消息位置
+}
+
+// 伪代码：播放提示音（可选）
+function playNotificationSound() {
+  // 根据应用需求选择合适的提示音播放方式
+  // 例如：使用 Audio API、Web Audio API，或现有的音频库
+  // 注意：音量应适中，不干扰用户
+}
+
+// 伪代码：显示应用内横幅（可选）
+function showInAppBanner(data) {
+  // 在应用顶部或其他位置显示临时通知横幅
+  // 包括：发送者头像、名称、消息预览
+  // 自动消失时间建议：2-4 秒
+  // 可添加点击事件跳转到对应对话
+}
+```
+
+**步骤 2: 发送心跳（可选，用于方法 2）**
+
+```javascript
+// 页面可见时定期发送心跳
+if ('serviceWorker' in navigator) {
+  let heartbeatInterval;
+
+  // 页面可见时启动心跳
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      startHeartbeat();
+    } else {
+      stopHeartbeat();
+    }
+  });
+
+  // 页面加载时启动
+  if (document.visibilityState === 'visible') {
+    startHeartbeat();
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat(); // 防止重复
+
+    heartbeatInterval = setInterval(() => {
+      if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+          type: 'CLIENT_HEARTBEAT',
+          clientId: getClientId() // 获取唯一客户端 ID
+        });
+      }
+    }, 3000); // 每3秒发送一次心跳
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+  }
+
+  function getClientId() {
+    // 使用 sessionStorage 存储客户端 ID
+    let clientId = sessionStorage.getItem('clientId');
+    if (!clientId) {
+      clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      sessionStorage.setItem('clientId', clientId);
+    }
+    return clientId;
+  }
+}
+```
+
+#### 关键注意事项
+
+1. **一致性要求**: 前台渲染的消息必须与后台通知携带的消息在内容、格式、时间戳上完全一致
+2. **动画效果**: 前台消息应添加适当的入场动画，模拟实时收到消息的体验
+3. **声音提示**: 考虑在前台也播放轻微的提示音，但音量应低于系统通知
+4. **去重处理**: 如果用户在消息到达时从后台切换到前台，可能同时触发通知和前台渲染，需要做好去重
+5. **性能考虑**: 心跳机制会增加一定开销，优先推荐使用方法 1（visibilityState 检测）
+
+#### 适用场景
+
+此模式特别适用于以下消息类型：
+- **instant** 类型的即时消息（强烈推荐）
+- 聊天应用的实时消息
+- 系统提醒和通知
+- 任何需要即时反馈的场景
+
+**不适用场景**:
+- 用户明确希望收到系统通知的场景（如重要提醒）
+- 需要在通知中心保留记录的场景
+
 ### 4.2 NotificationClick 事件
 
 **功能**: 处理用户点击通知的行为

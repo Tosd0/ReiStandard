@@ -228,6 +228,68 @@ npm install @neondatabase/serverless web-push
   - **普通一次性消息**（`recurrenceType: none`）: 创建后进入定时队列，等待 cronjob 在指定时间触发
   - **instant 消息**: 创建后**立即触发**，无需等待 cronjob，适用于需要即时响应的场景
 
+##### ⚠️ instant 消息的前端实现最佳实践（重要）
+
+使用 instant 消息类型时，需在前端实现前台/后台检测逻辑，以提供最佳用户体验：
+
+**核心原则**:
+1. **后台状态**: 用户切换到其他应用或锁屏时，通过 Service Worker 显示系统通知
+2. **前台状态**: 用户正在使用应用时，直接在 UI 中渲染消息，**不弹系统通知**
+3. **渲染一致性**: 前台收到的消息渲染效果必须与实时收到的消息**完全一致**
+
+**实现要求**:
+
+```javascript
+// Service Worker 中的实现（完整示例见 service-worker-specification.md 第 4.1.1 节）
+self.addEventListener('push', async event => {
+  const notificationData = event.data.json();
+
+  // 检测用户是否在前台
+  const allClients = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: true
+  });
+
+  const visibleClients = allClients.filter(client => {
+    return client.visibilityState === 'visible' && client.focused;
+  });
+
+  if (visibleClients.length > 0) {
+    // 前台：发送消息到页面，不弹系统通知
+    visibleClients.forEach(client => {
+      client.postMessage({
+        type: 'PUSH_MESSAGE_RECEIVED',
+        data: notificationData
+      });
+    });
+  } else {
+    // 后台：显示系统通知
+    await self.registration.showNotification(notificationData.title, options);
+  }
+});
+```
+
+```javascript
+// 前端页面中的实现
+navigator.serviceWorker.addEventListener('message', event => {
+  if (event.data.type === 'PUSH_MESSAGE_RECEIVED') {
+    const messageData = event.data.data;
+
+    // 直接在 UI 中渲染消息（与实时消息完全相同的渲染逻辑）
+    // 注意：renderMessageInUI 为伪代码，需根据应用的 UI 框架自行实现
+    renderMessageInUI(messageData);
+
+    // 可选：播放提示音（需自行实现）
+    playNotificationSound();
+  }
+});
+```
+
+**详细实现指南**:
+- 完整的代码示例和实现细节请参考 [Service Worker 标准规范](./service-worker-specification.md)
+- 包含两种实现方法：visibilityState 检测（推荐）和心跳机制（备用）
+- 提供完整的前端页面配合代码示例
+
 **核心区别总结**:
 | 类型 | 是否用AI | 前端构建 completePrompt | 是否含用户提示词 | 触发方式 | recurrenceType |
 |------|---------|----------------------|---------------|---------|----------------|
