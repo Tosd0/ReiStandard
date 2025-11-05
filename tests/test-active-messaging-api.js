@@ -156,26 +156,6 @@ function encryptPayload(plainPayload, encryptionKey) {
   };
 }
 
-// 解密响应体（如果需要）
-function decryptPayload(encryptedPayload, encryptionKey) {
-  const { iv, authTag, encryptedData } = encryptedPayload;
-
-  const decipher = crypto.createDecipheriv(
-    'aes-256-gcm',
-    Buffer.from(encryptionKey, 'hex'),
-    Buffer.from(iv, 'base64')
-  );
-
-  decipher.setAuthTag(Buffer.from(authTag, 'base64'));
-
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(encryptedData, 'base64')),
-    decipher.final()
-  ]);
-
-  return JSON.parse(decrypted.toString('utf8'));
-}
-
 // HTTP 请求封装
 async function makeRequest(method, endpoint, options = {}) {
   const url = `${CONFIG.apiBaseUrl}${endpoint}`;

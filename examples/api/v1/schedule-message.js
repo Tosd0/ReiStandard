@@ -23,7 +23,11 @@ if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   );
   console.log('[schedule-message] VAPID configured for instant messages');
 } else {
-  console.warn('[schedule-message] VAPID not configured - instant messages will fail');
+  console.error('[schedule-message] VAPID configuration error:', {
+    hasEmail: !!VAPID_EMAIL,
+    hasPublicKey: !!VAPID_PUBLIC_KEY,
+    hasPrivateKey: !!VAPID_PRIVATE_KEY
+  });
 }
 
 function normalizeHeaders(h) {
@@ -227,9 +231,30 @@ async function core(headers, body) {
 
   // 7. instant 类型：立即触发 send-notifications 处理
   if (payload.messageType === 'instant') {
+    // 验证 VAPID 配置（instant 消息需要立即发送）
+    if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+      return {
+        status: 500,
+        body: {
+          success: false,
+          error: {
+            code: 'VAPID_CONFIG_ERROR',
+            message: 'VAPID 配置缺失，无法发送即时消息',
+            details: {
+              missingKeys: [
+                !VAPID_EMAIL && 'VAPID_EMAIL',
+                !VAPID_PUBLIC_KEY && 'NEXT_PUBLIC_VAPID_PUBLIC_KEY',
+                !VAPID_PRIVATE_KEY && 'VAPID_PRIVATE_KEY'
+              ].filter(Boolean)
+            }
+          }
+        }
+      };
+    }
+
     // 导入 message-processor 的核心处理函数（避免循环依赖）
     const { processMessagesByUuid } = require('../../lib/message-processor');
-    
+
     try {
       // 立即处理这条消息（带重试机制）
       const sendResult = await processMessagesByUuid(taskUuid, 2); // 最多重试2次

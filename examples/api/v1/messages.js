@@ -85,8 +85,6 @@ async function core(url, headers) {
   const tasks = [];
   const total = 0;
   
-  // 解密并组装响应（实际项目取消注释）
-  /*
   const userKey = deriveUserEncryptionKey(userId);
   const decryptedTasks = tasks.map(task => {
     const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
@@ -104,7 +102,6 @@ async function core(url, headers) {
       updatedAt: task.updated_at
     };
   });
-  */
 
   console.log('[messages] Query tasks:', {
     userId,
@@ -137,16 +134,15 @@ async function core(url, headers) {
       success: true,
       data: {
         tasks: tasksToReturn.map(task => {
-          // 实际项目中应解密 encrypted_payload 并返回解密后的字段
-          // const userKey = deriveUserEncryptionKey(userId);
-          // const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
-          
+          // 解密 encrypted_payload 并返回解密后的字段（复用上方已派生的 userKey）
+          const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+
           return {
             id: task.id,
             uuid: task.uuid,
-            // contactName: decrypted.contactName,           // 从解密数据获取
-            // messageSubtype: decrypted.messageSubtype,     // 从解密数据获取
-            // recurrenceType: decrypted.recurrenceType,     // 从解密数据获取
+            contactName: decrypted.contactName,              // 从解密数据获取
+            messageSubtype: decrypted.messageSubtype,        // 从解密数据获取
+            recurrenceType: decrypted.recurrenceType,        // 从解密数据获取
             messageType: task.message_type,                  // 索引字段（明文）
             nextSendAt: task.next_send_at,                   // 索引字段（明文）
             status: task.status,                             // 索引字段（明文）
