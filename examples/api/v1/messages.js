@@ -85,8 +85,6 @@ async function core(url, headers) {
   const tasks = [];
   const total = 0;
   
-  // 解密并组装响应（实际项目取消注释）
-  /*
   const userKey = deriveUserEncryptionKey(userId);
   const decryptedTasks = tasks.map(task => {
     const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
@@ -104,7 +102,6 @@ async function core(url, headers) {
       updatedAt: task.updated_at
     };
   });
-  */
 
   console.log('[messages] Query tasks:', {
     userId,
