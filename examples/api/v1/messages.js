@@ -134,8 +134,7 @@ async function core(url, headers) {
       success: true,
       data: {
         tasks: tasksToReturn.map(task => {
-          // 解密 encrypted_payload 并返回解密后的字段
-          const userKey = deriveUserEncryptionKey(userId);
+          // 解密 encrypted_payload 并返回解密后的字段（复用上方已派生的 userKey）
           const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
           return {
