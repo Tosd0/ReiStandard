@@ -1,7 +1,7 @@
 /**
  * GET /api/v1/get-master-key
  * 功能：分发主密钥（客户端首次登录时使用）
- * ReiStandard v1.0.0
+ * ReiStandard v1.1.0
  */
 
 function normalizeHeaders(h) {

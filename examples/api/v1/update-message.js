@@ -1,7 +1,7 @@
 /**
  * PUT /api/v1/update-message?id={uuid}
  * 功能：更新已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.0.0
+ * ReiStandard v1.1.0
  */
 
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');

@@ -1,6 +1,6 @@
 # ReiStandard API 快速部署指南
 
-本目录包含符合 [ReiStandard v1.0.0 规范](../standards/active-messaging-api.md) 的完整 API 实现示例，可在修改 Database 连接相关代码后部署到 Vercel、Netlify 等 Serverless 平台。
+本目录包含符合 [ReiStandard v1.1.0 规范](../standards/active-messaging-api.md) 的完整 API 实现示例，可在修改 Database 连接相关代码后部署到 Vercel、Netlify 等 Serverless 平台。
 
 > **📖 相关技术规范**：
 > - **后端 API**：详细的 API 参数说明、加密架构、安全设计等请参考 [standards/active-messaging-api.md](../standards/active-messaging-api.md)

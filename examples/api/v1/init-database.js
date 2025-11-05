@@ -1,6 +1,6 @@
 /**
  * 数据库初始化 API
- * ReiStandard v1.0.0
+ * ReiStandard v1.1.0
  *
  * 功能：一键创建 scheduled_messages 表及所有索引
  * 使用：访问一次后即可删除此文件
