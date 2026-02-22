@@ -6,3 +6,7 @@ ref
 
 # Node.js
 node_modules/
+
+# Build output
+packages/*/dist/
+packages/*/*/dist/

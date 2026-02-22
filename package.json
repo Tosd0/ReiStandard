@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:esm": "node scripts/check-esm-syntax.mjs",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "ci": "npm run check:esm && npm run build && npm run test",
+    "publish:workspaces": "node scripts/publish-workspaces.mjs"
+  },
+  "workspaces": [
+    "packages/rei-standard-amsg/*",
+    "examples"
+  ]
+}

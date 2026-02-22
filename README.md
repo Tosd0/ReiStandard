@@ -2,6 +2,31 @@
 
 **主动消息 API 标准**：统一的定时消息推送 API 规范，支持端到端加密、多消息类型和 Serverless 部署。
 
+## 📦 当前 Packages
+
+| Package | 版本 | 说明 | 文档 |
+|---------|------|------|------|
+| `@rei-standard/amsg-server` | `1.1.0` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `1.1.0` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `1.1.0` | Service Worker 插件（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
+
+按功能拆分后，主应用直接按包引用：
+
+- `@rei-standard/amsg-server`：`createReiServer`，用于创建 7 个标准 API 处理器
+- `@rei-standard/amsg-client`：`ReiClient`，用于前端加密和 API 调用
+- `@rei-standard/amsg-sw`：`installReiSW`，用于 SW 推送展示和离线请求队列
+
+快速引用示例：
+
+```js
+import { createReiServer } from '@rei-standard/amsg-server';
+import { ReiClient } from '@rei-standard/amsg-client';
+import { installReiSW } from '@rei-standard/amsg-sw';
+```
+
+如果你要看字段说明、请求头要求、主应用接入方式，请直接看：
+[SDK 总览文档](./packages/rei-standard-amsg/README.md)。
+
 ---
 
 > **⚠️ AI 编程助手使用须知**
@@ -26,7 +51,7 @@
 
 ### 🎯 快速开始
 
-[部署教程](./examples/README.md) → [本地测试](./docs/TEST_README.md) 
+[SDK 总览](./packages/rei-standard-amsg/README.md) → [部署教程](./examples/README.md) → [本地测试](./docs/TEST_README.md)
 
 ### 📖 核心文档
 
@@ -141,6 +166,12 @@ ReiStandard/
 │   │   ├── cancel-message.js            # 取消任务
 │   │   └── messages.js                  # 查询任务列表
 │   └── README.md                        # 部署教程
+├── packages/
+│   └── rei-standard-amsg/
+│       ├── README.md                    # SDK 包总览（聚合文档）
+│       ├── server/                      # 服务端 SDK 包
+│       ├── client/                      # 浏览器 Client SDK 包
+│       └── sw/                          # Service Worker SDK 包
 ├── docs/
 │   ├── TEST_README.md                   # 本地测试指南
 │   └── VERCEL_TEST_DEPLOY.md            # 生产监控部署

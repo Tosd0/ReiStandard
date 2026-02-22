@@ -770,10 +770,10 @@ async function runAllTests() {
 
 // ============ 入口 ============
 
-// 检查 Node.js 版本（需要 18+ 支持原生 fetch）
+// 检查 Node.js 版本（需要 20+）
 const nodeVersion = parseInt(process.version.slice(1).split('.')[0]);
-if (nodeVersion < 18) {
-  logError('此脚本需要 Node.js 18 或更高版本（支持原生 fetch API）');
+if (nodeVersion < 20) {
+  logError('此脚本需要 Node.js 20 或更高版本');
   logInfo(`当前版本: ${process.version}`);
   process.exit(1);
 }
