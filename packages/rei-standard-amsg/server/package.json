@@ -1,0 +1,51 @@
+{
+  "name": "@rei-standard/amsg-server",
+  "version": "1.1.0",
+  "description": "ReiStandard Active Messaging server SDK with pluggable database adapters",
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  },
+  "peerDependencies": {
+    "@neondatabase/serverless": ">=0.9.0",
+    "pg": ">=8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@neondatabase/serverless": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@neondatabase/serverless": "^1.0.2",
+    "pg": "^8.18.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

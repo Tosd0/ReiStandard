@@ -35,10 +35,10 @@
 
 ### 1. 准备环境
 
-需要 Node.js 18+ （支持原生 fetch API）
+需要 Node.js 20+（推荐使用当前 LTS）
 
 ```bash
-node --version  # 确保 >= 18.0.0
+node --version  # 确保 >= 20.0.0
 ```
 
 ### 2. 配置测试参数

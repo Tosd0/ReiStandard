@@ -12,8 +12,8 @@ echo ""
 # 检查 Node.js 版本
 echo "检查 Node.js 版本..."
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-if [ "$NODE_VERSION" -lt 18 ]; then
-    echo "❌ 错误: 需要 Node.js 18 或更高版本"
+if [ "$NODE_VERSION" -lt 20 ]; then
+    echo "❌ 错误: 需要 Node.js 20 或更高版本"
     echo "   当前版本: $(node -v)"
     exit 1
 fi
