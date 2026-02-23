@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/send-notifications
  * 功能：Cron Job 触发，处理到期的定时消息任务
- * ReiStandard v1.2.0
+ * ReiStandard v1.2.1
  */
 
 const webpush = require('web-push');

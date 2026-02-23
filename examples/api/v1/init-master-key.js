@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/init-master-key
  * 功能：初始化并返回一次性系统密钥（仅首次可见）
- * ReiStandard v1.2.0
+ * ReiStandard v1.2.1
  */
 
 const { generateMasterKey, makeFingerprint, setMasterKeyOnce } = require('../../lib/master-key-store');

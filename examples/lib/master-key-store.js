@@ -1,6 +1,6 @@
 /**
  * 系统密钥存储工具
- * ReiStandard v1.2.0
+ * ReiStandard v1.2.1
  */
 
 const { createHash, randomBytes } = require('crypto');

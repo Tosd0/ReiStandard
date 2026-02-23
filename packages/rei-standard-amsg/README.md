@@ -6,9 +6,9 @@
 
 | Package | 当前版本 | 说明 | 文档 |
 |---------|----------|------|------|
-| `@rei-standard/amsg-server` | `1.2.0` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [server/README.md](./server/README.md) |
-| `@rei-standard/amsg-client` | `1.2.0` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [client/README.md](./client/README.md) |
-| `@rei-standard/amsg-sw` | `1.2.0` | Service Worker 插件（推送展示、离线队列） | [sw/README.md](./sw/README.md) |
+| `@rei-standard/amsg-server` | `1.2.1` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [server/README.md](./server/README.md) |
+| `@rei-standard/amsg-client` | `1.2.1` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [client/README.md](./client/README.md) |
+| `@rei-standard/amsg-sw` | `1.2.1` | Service Worker 插件（推送展示、离线队列） | [sw/README.md](./sw/README.md) |
 
 ## 使用示例
 

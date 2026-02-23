@@ -6,9 +6,9 @@
 
 | Package | 版本 | 说明 | 文档 |
 |---------|------|------|------|
-| `@rei-standard/amsg-server` | `1.2.0` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
-| `@rei-standard/amsg-client` | `1.2.0` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
-| `@rei-standard/amsg-sw` | `1.2.0` | Service Worker 插件（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
+| `@rei-standard/amsg-server` | `1.2.1` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `1.2.1` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `1.2.1` | Service Worker 插件（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
 
 按功能拆分后，主应用直接按包引用：
 
