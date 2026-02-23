@@ -2,6 +2,11 @@
   "name": "@rei-standard/amsg-client",
   "version": "1.2.0",
   "description": "ReiStandard Active Messaging browser client SDK",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tosd0/ReiStandard",
+    "directory": "packages/rei-standard-amsg/client"
+  },
   "license": "MIT",
   "type": "module",
   "publishConfig": {
