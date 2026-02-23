@@ -29,6 +29,9 @@ jobs:
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@^11.5.1
 
+      - name: Remove deprecated npm config
+        run: npm config delete always-auth || true
+
       - name: Install dependencies
         run: npm ci
 

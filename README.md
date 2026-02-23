@@ -6,9 +6,9 @@
 
 | Package | 版本 | 说明 | 文档 |
 |---------|------|------|------|
-| `@rei-standard/amsg-server` | `1.1.0` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
-| `@rei-standard/amsg-client` | `1.1.0` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
-| `@rei-standard/amsg-sw` | `1.1.0` | Service Worker 插件（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
+| `@rei-standard/amsg-server` | `1.2.0` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `1.2.0` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `1.2.0` | Service Worker 插件（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
 
 按功能拆分后，主应用直接按包引用：
 
@@ -125,7 +125,7 @@ CRON_SECRET=$(openssl rand -base64 32)
 # 4. 初始化数据库
 curl -X GET "http://localhost:3000/api/v1/init-database"
 
-# 5. 一次性初始化主密钥（仅首次可见，请离线保存）
+# 5. 一次性初始化系统密钥（仅首次执行）
 curl -X POST "http://localhost:3000/api/v1/init-master-key"
 
 # 6. 部署到 Vercel
@@ -160,7 +160,7 @@ ReiStandard/
 ├── examples/
 │   ├── api/v1/                          # API 实现示例代码
 │   │   ├── init-database.js             # 数据库初始化
-│   │   ├── init-master-key.js           # 主密钥一次性初始化
+│   │   ├── init-master-key.js           # 系统密钥一次性初始化
 │   │   ├── get-user-key.js              # 用户密钥分发
 │   │   ├── schedule-message.js          # 创建定时任务
 │   │   ├── send-notifications.js        # Cron 触发处理

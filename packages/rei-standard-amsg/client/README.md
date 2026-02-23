@@ -29,7 +29,7 @@ await client.init();
 
 主要能力：
 
-- `init()` 自动调用 `/get-user-key` 获取用户专属密钥（不再持有 masterKey）
+- `init()` 自动调用 `/get-user-key` 获取用户专属密钥（客户端不再持有系统主密钥）
 - 自动处理 `schedule-message` / `update-message` 的加密请求
 - 自动处理 `messages` 的解密响应
 - Push 订阅辅助方法

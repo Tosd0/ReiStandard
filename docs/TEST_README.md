@@ -10,7 +10,7 @@
 ## 功能特性
 
 ✅ **完整的端点测试**
-- GET `/api/v1/get-master-key` - 获取加密主密钥
+- GET `/api/v1/get-user-key` - 获取用户专属密钥
 - POST `/api/v1/schedule-message` - 创建定时任务（fixed, prompted, auto, instant）
 - GET `/api/v1/messages` - 查询任务列表
 - PUT `/api/v1/update-message/:id` - 更新任务
@@ -18,7 +18,7 @@
 - POST `/api/v1/send-notifications` - 触发通知发送（Cron）
 
 ✅ **加密测试**
-- 自动派生用户专属密钥
+- 自动获取用户专属密钥
 - AES-256-GCM 加密/解密
 - 完整的端到端加密流程
 
@@ -43,10 +43,9 @@ node --version  # 确保 >= 20.0.0
 
 ### 2. 配置测试参数
 
-**⚠️ 重要**: 必须正确配置以下三个环境变量，否则测试将无法运行：
+**⚠️ 重要**: 必须正确配置以下两个环境变量，否则测试将无法运行：
 - `API_BASE_URL`: 主动消息 API 服务器地址（不是 AI API 地址）
 - `CRON_SECRET`: Cron Job 认证密钥
-- `ENCRYPTION_KEY`: 64位十六进制加密主密钥
 
 **API_BASE_URL 使用场景说明**：
 - ✅ **测试脚本需要**：用于指定要测试的主动消息 API 地址
@@ -61,7 +60,7 @@ node --version  # 确保 >= 20.0.0
 # 1. 复制配置模板（从 examples 目录）
 cp ../examples/.env.test.example .env.test
 
-# 2. 编辑配置文件（填写必需的三个变量）
+# 2. 编辑配置文件（填写必需的两个变量）
 nano .env.test
 
 # 3. 运行快速启动脚本（会自动检查配置）
@@ -84,10 +83,7 @@ cp ../examples/.env.test.example .env.test
 # 2. 编辑配置文件
 nano .env.test
 
-# 3. 生成加密密钥（如果还没有）
-openssl rand -hex 32
-
-# 4. 加载环境变量并运行测试
+# 3. 加载环境变量并运行测试
 export $(cat .env.test | xargs) && node test-active-messaging-api.js
 ```
 
@@ -109,13 +105,12 @@ node test-active-messaging-api.js
 ```bash
 API_BASE_URL=https://your-domain.com \
 CRON_SECRET=your_secret \
-ENCRYPTION_KEY=$(openssl rand -hex 32) \
 node test-active-messaging-api.js
 ```
 
 **注意**:
-- `ENCRYPTION_KEY` 必须与服务器端配置的密钥一致
-- 如果密钥不一致，测试中的加密/解密会失败
+- `TEST_USER_ID` 如不传会自动生成 UUID v4
+- 如需方便清理测试数据，建议手动指定固定 UUID（如 `550e8400-e29b-41d4-a716-446655440000`）
 
 ### 3. 运行测试
 
@@ -137,15 +132,15 @@ chmod +x test-active-messaging-api.js
 主动消息 API 综合测试
 ============================================================
 ℹ️  API 地址: https://your-domain.com
-ℹ️  测试用户 ID: test_user_1697123456
+ℹ️  测试用户 ID: 550e8400-e29b-41d4-a716-446655440000
 ℹ️  开始时间: 2025-10-13 20:00:00
 
 ============================================================
-测试 1: GET /api/v1/get-master-key
+测试 1: GET /api/v1/get-user-key
 ============================================================
 ℹ️  发送请求...
-✅ 成功获取主密钥 (version: 1)
-ℹ️  用户专属密钥已派生: 1234567890abcdef...
+✅ 成功获取用户密钥 (version: 1)
+ℹ️  用户密钥: 1234567890abcdef...
 
 ============================================================
 测试 2: POST /api/v1/schedule-message (fixed 类型)
@@ -173,7 +168,7 @@ chmod +x test-active-messaging-api.js
 
 测试按以下顺序执行：
 
-1. **获取主密钥** - 从服务器获取加密主密钥并派生用户专属密钥
+1. **获取用户密钥** - 从服务器获取用户专属密钥
 2. **创建固定消息** - 测试 `fixed` 类型消息（不需要 AI）
 3. **创建 prompted 消息** - 测试用户提示词消息（需要 AI）
 4. **创建 auto 消息** - 测试完全自动消息（需要 AI）
@@ -189,7 +184,7 @@ chmod +x test-active-messaging-api.js
 
 A: 检查以下几点：
 1. API 服务器是否正常运行
-2. 配置参数是否正确（特别是 `CRON_SECRET` 和 `ENCRYPTION_KEY`）
+2. 配置参数是否正确（特别是 `CRON_SECRET`）
 3. 数据库连接是否正常
 4. 查看服务器日志了解详细错误
 
@@ -199,7 +194,7 @@ A: 修改脚本中的 `tests` 数组，注释掉不需要的测试：
 
 ```javascript
 const tests = [
-  { name: '获取主密钥', fn: testGetMasterKey, critical: true },
+  { name: '获取用户密钥', fn: testGetUserKey, critical: true },
   // { name: '创建 prompted 消息', fn: testCreatePromptedMessage, critical: false },  // 跳过此测试
   { name: '创建 auto 消息', fn: testCreateAutoMessage, critical: false },
   // ...
@@ -219,17 +214,17 @@ A: 如果测试中断导致数据未清理，可以手动查询并删除：
 ```bash
 # 使用测试脚本的用户 ID 查询任务
 curl -X GET "https://your-domain.com/api/v1/messages?status=pending" \
-  -H "X-User-Id: test_user_1697123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 
 # 手动删除任务
 curl -X DELETE "https://your-domain.com/api/v1/cancel-message/{uuid}" \
-  -H "X-User-Id: test_user_1697123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 ```
 
 或者直接在数据库中删除：
 
 ```sql
-DELETE FROM scheduled_messages WHERE user_id LIKE 'test_user_%';
+DELETE FROM scheduled_messages WHERE user_id = '550e8400-e29b-41d4-a716-446655440000';
 ```
 
 ## Serverless 部署注意事项

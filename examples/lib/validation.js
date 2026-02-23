@@ -1,6 +1,6 @@
 /**
  * 参数验证工具函数库
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 /**

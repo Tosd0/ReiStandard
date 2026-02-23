@@ -52,7 +52,7 @@ const rei = await createReiServer({
 推荐初始化顺序：
 
 1. 调用 `initDatabase.GET`（幂等创建表）
-2. 调用 `initMasterKey.POST`（仅首次返回 `masterKey`）
+2. 调用 `initMasterKey.POST`（一次性初始化系统密钥）
 3. 客户端携带 UUID v4 `X-User-Id` 调用 `getUserKey.GET`
 
 ## 相关包

@@ -15,7 +15,6 @@
  * 环境变量配置（.env 或直接修改下方配置）：
  *   API_BASE_URL - API 基础 URL
  *   CRON_SECRET - Cron Job 密钥
- *   ENCRYPTION_KEY - 加密主密钥
  *   TEST_USER_ID - 测试用户 ID（可选，默认自动生成）
  */
 
@@ -80,26 +79,25 @@ function getOptionalEnv(key, defaultValue = null) {
 
 // ============ 配置区 ============
 
-// 验证加密密钥格式
-function validateEncryptionKey(key) {
-  if (!/^[0-9a-fA-F]{64}$/.test(key)) {
-    logError('ENCRYPTION_KEY 格式错误');
-    logInfo('必须是 64 位十六进制字符串（32 字节）');
-    logInfo('使用以下命令生成: openssl rand -hex 32');
-    logInfo(`当前值长度: ${key.length} 字符`);
-    process.exit(1);
+function createDefaultTestUserId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
   }
-  return key;
+
+  const bytes = crypto.randomBytes(16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 const CONFIG = {
   // API 配置（必需）
   apiBaseUrl: getRequiredEnv('API_BASE_URL', 'API 服务器地址，例如: https://your-domain.com 或 http://localhost:3000'),
   cronSecret: getRequiredEnv('CRON_SECRET', 'Cron Job 认证密钥，用于触发 /send-notifications 端点'),
-  encryptionKey: validateEncryptionKey(getRequiredEnv('ENCRYPTION_KEY', '64位十六进制加密主密钥，使用 openssl rand -hex 32 生成')),
 
   // 测试用户配置（可选，默认自动生成）
-  testUserId: getOptionalEnv('TEST_USER_ID', `test_user_${Date.now()}`),
+  testUserId: getOptionalEnv('TEST_USER_ID', createDefaultTestUserId()),
 
   // Vercel 配置（可选）
   vercelBypassKey: getOptionalEnv('VERCEL_PROTECTION_BYPASS', ''),
@@ -121,15 +119,6 @@ const CONFIG = {
 };
 
 // ============ 工具函数 - 加密相关 ============
-
-// 派生用户专属密钥
-function deriveUserEncryptionKey(userId, masterKey) {
-  return crypto
-    .createHash('sha256')
-    .update(masterKey + userId)
-    .digest('hex')
-    .slice(0, 64);
-}
 
 // 加密请求体
 function encryptPayload(plainPayload, encryptionKey) {
@@ -197,33 +186,31 @@ async function makeRequest(method, endpoint, options = {}) {
 const createdTasks = [];
 let userEncryptionKey = null;
 
-// 1. 测试获取主密钥
-async function testGetMasterKey() {
-  logSection('测试 1: GET /api/v1/get-master-key');
+// 1. 测试获取用户密钥
+async function testGetUserKey() {
+  logSection('测试 1: GET /api/v1/get-user-key');
 
   logInfo('发送请求...');
-  const response = await makeRequest('GET', '/api/v1/get-master-key', {
+  const response = await makeRequest('GET', '/api/v1/get-user-key', {
     headers: {
       'X-User-Id': CONFIG.testUserId
     }
   });
 
   if (response.ok && response.data.success) {
-    logSuccess(`成功获取主密钥 (version: ${response.data.data.version})`);
+    const userKey = response.data?.data?.userKey;
+    if (typeof userKey !== 'string' || !/^[0-9a-f]{64}$/i.test(userKey)) {
+      logError(`userKey 格式错误: ${JSON.stringify(response.data)}`);
+      return false;
+    }
 
-    // 派生用户专属密钥
-    userEncryptionKey = deriveUserEncryptionKey(
-      CONFIG.testUserId,
-      response.data.data.masterKey
-    );
-    logInfo(`用户专属密钥已派生: ${userEncryptionKey.slice(0, 16)}...`);
+    userEncryptionKey = userKey;
+    logSuccess(`成功获取用户密钥 (version: ${response.data.data.version})`);
+    logInfo(`用户密钥: ${userEncryptionKey.slice(0, 16)}...`);
 
     return true;
   } else {
-    logError(`获取主密钥失败: ${response.status} - ${JSON.stringify(response.data)}`);
-    // 使用配置的密钥作为后备
-    userEncryptionKey = deriveUserEncryptionKey(CONFIG.testUserId, CONFIG.encryptionKey);
-    logWarning(`使用配置的密钥作为后备`);
+    logError(`获取用户密钥失败: ${response.status} - ${JSON.stringify(response.data)}`);
     return false;
   }
 }
@@ -712,7 +699,7 @@ async function runAllTests() {
   };
 
   const tests = [
-    { name: '获取主密钥', fn: testGetMasterKey, critical: true },
+    { name: '获取用户密钥', fn: testGetUserKey, critical: true },
     { name: '创建固定消息', fn: testCreateFixedMessage, critical: false },
     { name: '创建 prompted 消息', fn: testCreatePromptedMessage, critical: false },
     { name: '创建 auto 消息', fn: testCreateAutoMessage, critical: false },

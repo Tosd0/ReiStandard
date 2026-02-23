@@ -1,6 +1,6 @@
 /**
  * 数据库初始化 API
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  *
  * 功能：创建 scheduled_messages 与 system_config 表及索引
  */
@@ -45,7 +45,7 @@ async function initDatabase() {
     )
   `;
 
-  // 2. 系统配置表（存放主密钥）
+  // 2. 系统配置表（存放系统密钥）
   await sql`
     CREATE TABLE IF NOT EXISTS system_config (
       key TEXT PRIMARY KEY,
@@ -137,7 +137,7 @@ async function initDatabase() {
         indexesFailed: indexResults.filter((r) => r.status === 'failed').length,
         indexes: indexResults,
         nextSteps: [
-          '1. 调用 /api/v1/init-master-key 一次性生成主密钥并妥善保存',
+          '1. 调用 /api/v1/init-master-key 一次性生成系统密钥并妥善保存',
           '2. 客户端使用 UUID v4 作为 X-User-Id',
           '3. 客户端通过 /api/v1/get-user-key 获取用户密钥并缓存'
         ]

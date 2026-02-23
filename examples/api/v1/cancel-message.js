@@ -1,7 +1,7 @@
 /**
  * DELETE /api/v1/cancel-message?id={uuid}
  * 功能：取消/删除已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const { isValidUUIDv4 } = require('../../lib/validation');

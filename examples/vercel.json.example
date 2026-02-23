@@ -12,8 +12,7 @@
   "env": {
     "NODE_ENV": "production",
     "API_BASE_URL": "https://your-actual-api-domain.vercel.app",
-    "TEST_USER_ID": "test_user_vercel",
-    "ENCRYPTION_KEY": "@encryption-key",
+    "TEST_USER_ID": "550e8400-e29b-41d4-a716-446655440000",
     "CRON_SECRET": "@cron-secret",
     "INIT_SECRET": "@init-secret",
     "VERCEL_PROTECTION_BYPASS": "@vercel-bypass-key"

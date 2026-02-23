@@ -1,6 +1,6 @@
 # ReiStandard API 快速部署指南
 
-本目录包含符合 [ReiStandard v1.1.0 规范](../standards/active-messaging-api.md) 的完整 API 实现示例，可在修改 Database 连接相关代码后部署到 Vercel、Netlify 等 Serverless 平台。
+本目录包含符合 [ReiStandard v1.2.0 规范](../standards/active-messaging-api.md) 的完整 API 实现示例，可在修改 Database 连接相关代码后部署到 Vercel、Netlify 等 Serverless 平台。
 
 > **📖 相关技术规范**：
 > - **后端 API**：详细的 API 参数说明、加密架构、安全设计等请参考 [standards/active-messaging-api.md](../standards/active-messaging-api.md)
@@ -25,7 +25,7 @@ export async function GET(request) { ... }
 examples/
 ├── api/v1/                          # API 实现文件
 │   ├── init-database.js             # 数据库初始化（首次部署后删除）
-│   ├── init-master-key.js           # 主密钥一次性初始化
+│   ├── init-master-key.js           # 系统密钥一次性初始化
 │   ├── get-user-key.js              # 用户密钥分发
 │   ├── schedule-message.js          # 创建定时任务
 │   ├── send-notifications.js        # Cron 触发处理
@@ -93,7 +93,7 @@ npm run dev
 # 2. 调用初始化 API
 curl -X GET "http://localhost:3000/api/v1/init-database"
 
-# 3. 初始化主密钥（仅首次可见）
+# 3. 初始化系统密钥（仅首次执行）
 curl -X POST "http://localhost:3000/api/v1/init-master-key"
 
 # 4. 成功后推荐立即删除
@@ -134,7 +134,7 @@ Invoke-RestMethod -Uri "https://your-domain.com/api/v1/send-notifications" `
 | 端点 | 方法 | 功能 |
 |------|------|------|
 | `/api/v1/init-database` | GET | 一键初始化数据库（幂等） |
-| `/api/v1/init-master-key` | POST | 一次性初始化主密钥（首次可见） |
+| `/api/v1/init-master-key` | POST | 一次性初始化系统密钥（服务端内部使用） |
 | `/api/v1/get-user-key` | GET | 基于 UUID v4 的用户密钥分发 |
 | `/api/v1/schedule-message` | POST | 创建定时消息任务 / 发送即时消息（instant类型） |
 | `/api/v1/send-notifications` | POST | Cron 触发处理到期任务 |
@@ -178,7 +178,7 @@ Invoke-RestMethod -Uri "https://your-domain.com/api/v1/send-notifications" `
 
 1. **环境变量管理**：`CRON_SECRET` 必须妥善保管，不要提交到代码仓库
 2. **初始化 API**：数据库初始化完成后立即删除 `init-database.js` 文件
-3. **主密钥保管**：`init-master-key` 仅首次返回 `masterKey`，请离线保存
+3. **客户端密钥使用**：客户端只应使用 `/get-user-key` 返回的 `userKey`，不直接持有系统密钥
 4. **加密要求**：所有请求体必须使用 AES-256-GCM 加密
 
 ### 生产环境优化

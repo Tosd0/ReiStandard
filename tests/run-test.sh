@@ -25,12 +25,11 @@ if [ ! -f .env.test ]; then
     echo "❌ 错误: 找不到 .env.test 配置文件"
     echo ""
     echo "请执行以下步骤:"
-    echo "  1. 复制配置模板: cp .env.test.example .env.test"
+    echo "  1. 复制配置模板: cp ../examples/.env.test.example .env.test"
     echo "  2. 编辑配置文件: nano .env.test"
-    echo "  3. 填写必需的配置项:"
+    echo "  3. 填写必需配置项:"
     echo "     - API_BASE_URL"
     echo "     - CRON_SECRET"
-    echo "     - ENCRYPTION_KEY"
     echo ""
     exit 1
 fi
@@ -50,10 +49,6 @@ fi
 
 if [ -z "$CRON_SECRET" ]; then
     MISSING_VARS="$MISSING_VARS CRON_SECRET"
-fi
-
-if [ -z "$ENCRYPTION_KEY" ]; then
-    MISSING_VARS="$MISSING_VARS ENCRYPTION_KEY"
 fi
 
 if [ -n "$MISSING_VARS" ]; then

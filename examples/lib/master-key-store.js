@@ -1,6 +1,6 @@
 /**
- * 主密钥存储工具
- * ReiStandard v1.1.0
+ * 系统密钥存储工具
+ * ReiStandard v1.2.0
  */
 
 const { createHash, randomBytes } = require('crypto');
@@ -77,7 +77,7 @@ async function getMasterKeyFromDb(options = {}) {
 
   const masterKey = rows[0].value;
   if (!isValidMasterKey(masterKey)) {
-    throw createError('INVALID_MASTER_KEY_FORMAT', '数据库中的主密钥格式无效', 500);
+    throw createError('INVALID_MASTER_KEY_FORMAT', '数据库中的系统密钥格式无效', 500);
   }
 
   setMasterKeyCache(masterKey);
@@ -91,7 +91,7 @@ async function isMasterKeyInitialized() {
 
 async function setMasterKeyOnce(masterKey) {
   if (!isValidMasterKey(masterKey)) {
-    throw createError('INVALID_MASTER_KEY_FORMAT', '主密钥格式错误，必须是 64 位十六进制字符串', 400);
+    throw createError('INVALID_MASTER_KEY_FORMAT', '系统密钥格式错误，必须是 64 位十六进制字符串', 400);
   }
 
   const sql = getSqlClient();
@@ -105,7 +105,7 @@ async function setMasterKeyOnce(masterKey) {
   `;
 
   if (inserted.length === 0) {
-    throw createError('MASTER_KEY_ALREADY_INITIALIZED', '主密钥已初始化，无法再次获取', 409);
+    throw createError('MASTER_KEY_ALREADY_INITIALIZED', '系统密钥已初始化，无法再次获取', 409);
   }
 
   setMasterKeyCache(masterKey);

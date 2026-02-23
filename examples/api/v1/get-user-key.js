@@ -1,7 +1,7 @@
 /**
  * GET /api/v1/get-user-key
  * 功能：根据用户 ID 派生用户专属密钥
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const { deriveUserEncryptionKey } = require('../../lib/encryption');
@@ -58,7 +58,7 @@ async function core(headers) {
         success: false,
         error: {
           code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };

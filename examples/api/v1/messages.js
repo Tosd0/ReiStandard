@@ -1,7 +1,7 @@
 /**
  * GET /api/v1/messages
  * 功能：查询用户的定时任务列表
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 // const { sql } = require('@vercel/postgres');
@@ -59,7 +59,7 @@ async function core(url, headers) {
         success: false,
         error: {
           code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };

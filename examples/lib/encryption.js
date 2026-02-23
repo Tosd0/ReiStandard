@@ -1,6 +1,6 @@
 /**
  * 加密工具函数库
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const { createCipheriv, createDecipheriv, createHash, randomBytes } = require('crypto');
@@ -8,7 +8,7 @@ const { createCipheriv, createDecipheriv, createHash, randomBytes } = require('c
 /**
  * 派生用户专属加密密钥
  * @param {string} userId - 用户唯一标识符
- * @param {string} masterKey - 64字符十六进制主密钥
+ * @param {string} masterKey - 64字符十六进制系统密钥
  * @returns {string} 64字符十六进制密钥
  */
 function deriveUserEncryptionKey(userId, masterKey) {

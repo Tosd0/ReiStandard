@@ -19,14 +19,6 @@ function getEnv(key, defaultValue = null) {
 }
 
 // ============ 加密工具 ============
-function deriveUserEncryptionKey(userId, masterKey) {
-  return crypto
-    .createHash('sha256')
-    .update(masterKey + userId)
-    .digest('hex')
-    .slice(0, 64);
-}
-
 function encryptPayload(plainPayload, encryptionKey) {
   const plaintext = JSON.stringify(plainPayload);
   const iv = crypto.randomBytes(16);
@@ -79,27 +71,47 @@ async function makeRequest(method, url, options = {}) {
 async function runTests(baseUrl, config) {
   const results = [];
   const createdTasks = [];
+  let userKey = null;
 
-  // 派生用户密钥
-  const userKey = deriveUserEncryptionKey(config.userId, config.encryptionKey);
-
-  // 测试 1: 获取主密钥
+  // 测试 1: 获取用户密钥
   try {
-    const res = await makeRequest('GET', `${baseUrl}/api/v1/get-master-key`, {
+    const res = await makeRequest('GET', `${baseUrl}/api/v1/get-user-key`, {
       headers: { 'X-User-Id': config.userId }
     });
+    const fetchedUserKey = res.data?.data?.userKey;
+    if (res.ok && res.data.success && typeof fetchedUserKey === 'string' && /^[0-9a-f]{64}$/i.test(fetchedUserKey)) {
+      userKey = fetchedUserKey;
+    }
     results.push({
-      test: 'GET /api/v1/get-master-key',
-      passed: res.ok && res.data.success,
+      test: 'GET /api/v1/get-user-key',
+      passed: Boolean(userKey),
       status: res.status,
-      message: res.ok ? '成功' : res.data.error?.message || '失败'
+      message: userKey ? '成功' : res.data.error?.message || '失败'
     });
   } catch (error) {
     results.push({
-      test: 'GET /api/v1/get-master-key',
+      test: 'GET /api/v1/get-user-key',
       passed: false,
       error: error.message
     });
+  }
+
+  if (!userKey) {
+    return {
+      summary: {
+        total: results.length,
+        passed: 0,
+        failed: results.length,
+        successRate: '0.0%'
+      },
+      results,
+      cleanup: {
+        attempted: 0,
+        successful: 0,
+        details: []
+      },
+      timestamp: new Date().toISOString()
+    };
   }
 
   // 测试 2: 创建 fixed 消息
@@ -417,20 +429,12 @@ export default async function handler(req, res) {
 
   // 读取配置
   const config = {
-    userId: getEnv('TEST_USER_ID', `test_user_${Date.now()}`),
-    encryptionKey: getEnv('ENCRYPTION_KEY'),
+    userId: getEnv('TEST_USER_ID', crypto.randomUUID()),
     cronSecret: getEnv('CRON_SECRET'),
     vercelBypassKey: getEnv('VERCEL_PROTECTION_BYPASS', '')
   };
 
   // 验证必需配置
-  if (!config.encryptionKey) {
-    return res.status(500).json({
-      error: 'Configuration error',
-      message: '缺少 ENCRYPTION_KEY 环境变量'
-    });
-  }
-
   if (!config.cronSecret) {
     return res.status(500).json({
       error: 'Configuration error',
@@ -457,15 +461,14 @@ export default async function handler(req, res) {
 if (require.main === module) {
   // 本地运行测试
   const config = {
-    userId: getEnv('TEST_USER_ID', `test_user_${Date.now()}`),
-    encryptionKey: getEnv('ENCRYPTION_KEY'),
+    userId: getEnv('TEST_USER_ID', crypto.randomUUID()),
     cronSecret: getEnv('CRON_SECRET'),
     vercelBypassKey: getEnv('VERCEL_PROTECTION_BYPASS', '')
   };
 
-  if (!config.encryptionKey || !config.cronSecret) {
+  if (!config.cronSecret) {
     console.error('❌ 错误: 缺少必需的环境变量');
-    console.error('请设置: ENCRYPTION_KEY, CRON_SECRET, API_BASE_URL');
+    console.error('请设置: CRON_SECRET, API_BASE_URL');
     process.exit(1);
   }
 

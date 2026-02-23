@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/send-notifications
  * 功能：Cron Job 触发，处理到期的定时消息任务
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const webpush = require('web-push');
@@ -95,7 +95,7 @@ async function core(headers) {
           success: false,
           error: {
             code: 'MASTER_KEY_NOT_INITIALIZED',
-            message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+            message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
           }
         }
       };

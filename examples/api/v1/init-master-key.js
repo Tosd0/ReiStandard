@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/init-master-key
- * 功能：初始化并返回一次性主密钥（仅首次可见）
- * ReiStandard v1.1.0
+ * 功能：初始化并返回一次性系统密钥（仅首次可见）
+ * ReiStandard v1.2.0
  */
 
 const { generateMasterKey, makeFingerprint, setMasterKeyOnce } = require('../../lib/master-key-store');
@@ -25,7 +25,7 @@ async function core() {
           success: false,
           error: {
             code: 'MASTER_KEY_ALREADY_INITIALIZED',
-            message: '主密钥已初始化，无法再次获取'
+            message: '系统密钥已初始化，无法再次获取'
           }
         }
       };

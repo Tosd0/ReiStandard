@@ -30,13 +30,12 @@ cp tests/test-vercel-function.js /api/test-active-messaging.js
 在 Vercel Dashboard 或 `.env` 文件中添加：
 
 ```env
-# 必需配置（应该已经存在）
-ENCRYPTION_KEY=your_64_char_hex_key
+# 必需配置
 CRON_SECRET=your_cron_secret
 
 # 可选配置
 INIT_SECRET=your_init_secret
-TEST_USER_ID=test_user_vercel
+TEST_USER_ID=550e8400-e29b-41d4-a716-446655440000
 API_BASE_URL=https://your-domain.vercel.app
 ```
 
@@ -78,7 +77,7 @@ curl https://your-domain.vercel.app/api/test-active-messaging
   },
   "results": [
     {
-      "test": "GET /api/v1/get-master-key",
+      "test": "GET /api/v1/get-user-key",
       "passed": true,
       "status": 200,
       "message": "成功"
@@ -131,7 +130,6 @@ active-messaging-test/
   "version": 2,
   "env": {
     "API_BASE_URL": "https://your-actual-api-domain.vercel.app",
-    "ENCRYPTION_KEY": "@encryption-key",
     "CRON_SECRET": "@cron-secret",
     "INIT_SECRET": "@init-secret"
   },
@@ -140,7 +138,7 @@ active-messaging-test/
 ```
 
 **说明**:
-- `@encryption-key` 和 `@cron-secret` 是 Vercel Secret（在 Dashboard 中添加）
+- `@cron-secret` 是 Vercel Secret（在 Dashboard 中添加）
 - `API_BASE_URL` 指向你要测试的实际 API 地址
 
 ### 4. 创建 `.gitignore`
@@ -170,7 +168,6 @@ vercel
 
 ```bash
 # 添加敏感配置（不会出现在代码中）
-vercel secrets add encryption-key "your_64_char_hex_key"
 vercel secrets add cron-secret "your_cron_secret"
 vercel secrets add init-secret "your_init_secret"
 ```
@@ -250,10 +247,10 @@ https://jsonformatter.org/
 ### 1. 自定义测试用户 ID
 
 ```env
-TEST_USER_ID=my_custom_test_user
+TEST_USER_ID=550e8400-e29b-41d4-a716-446655440000
 ```
 
-好处: 可以在数据库中轻松识别测试数据
+好处: 可以在数据库中固定同一个测试用户，便于排查和清理
 
 ### 2. 测试不同环境
 
@@ -337,7 +334,6 @@ curl http://localhost:3000/api/test-active-messaging
 ```bash
 # 使用本地测试脚本（tests/test-active-messaging-api.js）
 API_BASE_URL=http://localhost:3000 \
-ENCRYPTION_KEY=your_key \
 CRON_SECRET=your_secret \
 node tests/test-active-messaging-api.js
 ```
@@ -346,7 +342,7 @@ node tests/test-active-messaging-api.js
 
 ## 故障排查
 
-### 问题 1: `500 Configuration error: 缺少 ENCRYPTION_KEY`
+### 问题 1: `500 Configuration error: 缺少 CRON_SECRET`
 
 **解决方案**:
 ```bash
@@ -354,7 +350,7 @@ node tests/test-active-messaging-api.js
 vercel env ls
 
 # 如果缺少，添加环境变量
-vercel env add ENCRYPTION_KEY production
+vercel env add CRON_SECRET production
 ```
 
 ### 问题 2: 测试通过但实际 API 不工作
@@ -389,7 +385,7 @@ res.setHeader('Access-Control-Allow-Credentials', 'true');
 ```sql
 -- 定期清理测试数据（数据库层面）
 DELETE FROM scheduled_messages
-WHERE user_id LIKE 'test_user_%'
+WHERE user_id = '550e8400-e29b-41d4-a716-446655440000'
   AND created_at < NOW() - INTERVAL '7 days';
 ```
 

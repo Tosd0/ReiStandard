@@ -1,7 +1,7 @@
 /**
  * 消息处理工具函数库
  * 用于处理单个消息任务的生成和发送
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const webpush = require('web-push');
@@ -240,7 +240,7 @@ async function processMessagesByUuid(uuid, maxRetries = 2, providedMasterKey = n
       success: false,
       error: {
         code: 'MASTER_KEY_NOT_INITIALIZED',
-        message: '主密钥尚未初始化'
+        message: '系统密钥尚未初始化'
       }
     };
   }

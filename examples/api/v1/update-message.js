@@ -1,7 +1,7 @@
 /**
  * PUT /api/v1/update-message?id={uuid}
  * 功能：更新已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
@@ -75,7 +75,7 @@ async function core(url, headers, body) {
         success: false,
         error: {
           code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };

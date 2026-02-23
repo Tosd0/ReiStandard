@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/schedule-message
  * 功能：创建定时消息任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.1.0
+ * ReiStandard v1.2.0
  */
 
 const webpush = require('web-push');
@@ -103,7 +103,7 @@ async function core(headers, body) {
     };
   }
 
-  // 2. 读取主密钥
+  // 2. 读取系统密钥
   const masterKey = await getMasterKeyFromDb();
   if (!masterKey) {
     return {
@@ -112,7 +112,7 @@ async function core(headers, body) {
         success: false,
         error: {
           code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };

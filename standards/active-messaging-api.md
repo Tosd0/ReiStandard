@@ -19,8 +19,8 @@
 > - **不应该直接修改标准文档**，标准的修改需要经过仓库负责人的审核和批准
 
 ## 版本信息
-- **版本号**: v1.1.0
-- **最后更新**: 2025-11-05
+- **版本号**: v1.2.0
+- **最后更新**: 2026-02-23
 - **状态**: Stable
 
 ## 概述
@@ -1331,7 +1331,7 @@ exports.DELETE = async function(request, { params }) {
 **密钥管理架构**:
 - **服务器端**：主密钥 `ENCRYPTION_KEY`（64字符十六进制）存储在 serverless 平台环境变量
 - **客户端**：用户专属密钥存储在 **IndexedDB 加密表**中
-- **密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(masterKey + userId)` 派生
+- **密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
 - **安全性**：用户 A 无法解密用户 B 的数据
 
 **实现流程**:
@@ -1362,26 +1362,19 @@ async function getOrCreateUserEncryptionKey(userId) {
     let userKey = await db.get('encryptionKeys', userId);
 
     if (!userKey) {
-        // 首次使用：从服务器获取主密钥
-        const response = await fetch('/api/v1/get-master-key', {
+        // 首次使用：从服务器获取用户专属密钥
+        const response = await fetch('/api/v1/get-user-key', {
             headers: {
                 'X-User-Id': userId
             }
         });
 
         if (!response.ok) {
-            throw new Error('Failed to get master key');
+            throw new Error('Failed to get user key');
         }
 
         const { data } = await response.json();
-        const masterKey = data.masterKey;
-
-        // 客户端派生用户专属密钥（SHA-256）
-        const encoder = new TextEncoder();
-        const data = encoder.encode(masterKey + userId);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        userKey = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        userKey = data.userKey;
 
         // 存储到 IndexedDB（持久化，页面刷新后仍然可用）
         await db.put('encryptionKeys', userKey, userId);
@@ -1466,10 +1459,10 @@ const originalPayload = {
 await sendEncryptedRequest(originalPayload, userId);
 ```
 
-3. **服务器端主密钥分发**
+3. **服务器端用户密钥分发**
 
 ```javascript
-// GET /api/v1/get-master-key
+// GET /api/v1/get-user-key
 // 仅在用户首次登录时调用一次（客户端缓存到 IndexedDB）
 exports.GET = async function(request) {
     const userId = request.headers.get('x-user-id');
@@ -1481,11 +1474,11 @@ exports.GET = async function(request) {
         );
     }
 
-    // 直接返回主密钥（客户端自己派生用户专属密钥）
+    // 返回用户专属密钥（由服务器内部派生）
     return NextResponse.json({
         success: true,
         data: {
-            masterKey: process.env.ENCRYPTION_KEY,  // 仅读取环境变量，无额外计算
+            userKey: deriveUserEncryptionKey(userId, process.env.ENCRYPTION_KEY),
             version: 1
         }
     });
@@ -1644,23 +1637,23 @@ function decryptFromStorage(encryptedText, encryptionKey) {
 #### 6.2.3 密钥分发与管理
 
 **密钥隔离架构**:
-- 每个用户使用**独立的加密密钥**，通过 `SHA256(masterKey + userId)` 派生
+- 每个用户使用**独立的加密密钥**，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
 - 客户端将用户专属密钥存储在 **IndexedDB 加密表**中（持久化，页面刷新后仍然可用）
 - 服务器仅存储主密钥，每次请求时动态派生用户密钥（< 1ms，对 Serverless Function 负担极小）
 
-**新增 API 端点**: `GET /api/v1/get-master-key`
+**新增 API 端点**: `GET /api/v1/get-user-key`
 
-此端点用于分发主密钥，客户端仅在**首次登录**或 **IndexedDB 中无密钥**时调用一次。
+此端点用于分发用户专属密钥，客户端仅在**首次登录**或 **IndexedDB 中无密钥**时调用一次。
 
 **端点定义**:
-- **URL路径**: `/api/v1/get-master-key`
+- **URL路径**: `/api/v1/get-user-key`
 - **请求方法**: `GET`
-- **功能描述**: 向用户返回主密钥，用于客户端派生用户专属密钥
+- **功能描述**: 向用户返回用户专属密钥（`userKey`）
 - **认证要求**: 需要 User ID（通过 `X-User-Id` 请求头）
 
 **请求示例**:
 ```bash
-curl -X GET "https://your-domain.com/api/v1/get-master-key" \
+curl -X GET "https://your-domain.com/api/v1/get-user-key" \
   -H "X-User-Id: user_123456"
 ```
 
@@ -1669,7 +1662,7 @@ curl -X GET "https://your-domain.com/api/v1/get-master-key" \
 {
   "success": true,
   "data": {
-    "masterKey": "0123456789abcdef...",
+    "userKey": "0123456789abcdef...",
     "version": 1
   }
 }
@@ -1687,11 +1680,10 @@ curl -X GET "https://your-domain.com/api/v1/get-master-key" \
 ```
 
 **客户端密钥管理最佳实践**:
-1. 用户首次登录后，调用 `/api/v1/get-master-key` 获取主密钥
-2. 客户端使用 `SHA256(masterKey + userId)` 派生用户专属密钥
-3. 将用户专属密钥存储到 **IndexedDB** 的 `SecureKeyStore` 数据库中
-4. 页面刷新后直接从 IndexedDB 读取，无需重新请求服务器
-5. 用户登出后清除 IndexedDB 中的密钥
+1. 用户首次登录后，调用 `/api/v1/get-user-key` 获取 `userKey`
+2. 将 `userKey` 存储到 **IndexedDB** 的 `SecureKeyStore` 数据库中
+3. 页面刷新后直接从 IndexedDB 读取，无需重新请求服务器
+4. 用户登出后清除 IndexedDB 中的密钥
 
 **服务器端密钥派生**:
 - 每次收到加密请求时，从 `X-User-Id` 头部获取用户 ID
@@ -2100,11 +2092,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_messages TO app_user;
 - [ ] 无效的 `pushSubscription` 格式返回 400
 - [ ] 响应包含正确的任务 ID 和创建时间
 
-#### GET /api/v1/get-master-key
+#### GET /api/v1/get-user-key
 
-- [ ] 提供有效的 User ID 成功获取主密钥
+- [ ] 提供有效的 User ID 成功获取用户密钥
 - [ ] 缺少 `X-User-Id` 请求头返回 400
-- [ ] 响应包含正确的 masterKey 和 version
+- [ ] 响应包含正确的 userKey 和 version
 
 #### POST /api/v1/send-notifications
 
@@ -2348,6 +2340,16 @@ WHERE uuid IS NOT NULL;
 
 ## 16. 变更日志
 
+### v1.2.0 (2026-02-23)
+
+#### 改进优化
+
+- 客户端密钥获取端点统一为 `GET /api/v1/get-user-key`
+- 客户端不再接收 `masterKey`，改为直接接收 `userKey`
+- 文档示例、测试清单与部署说明已同步到 `userKey` 方案
+
+---
+
 ### v1.1.0 (2025-11-05)
 
 #### 新增功能
@@ -2407,11 +2409,11 @@ WHERE uuid IS NOT NULL;
 
 **端到端加密（重要安全特性）**:
 - **强制要求**对所有请求体进行 AES-256-GCM 加密
-- **用户密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(masterKey + userId)` 派生
+- **用户密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
 - **客户端密钥存储**：用户专属密钥存储在 IndexedDB 加密表中（持久化）
 - **最小服务器负担**：服务器仅做一次 SHA-256 计算（< 1ms），Serverless 理念
 - 定义完整的加密/解密实现流程（客户端 IndexedDB + 服务器端动态派生）
-- 新增 API 端点：`GET /api/v1/get-master-key`（主密钥分发）
+- 新增 API 端点：`GET /api/v1/get-user-key`（用户密钥分发）
 - 新增加密相关请求头：`X-Payload-Encrypted`、`X-Encryption-Version`、`X-User-Id`
 - 新增加密相关错误代码：`ENCRYPTION_REQUIRED`、`USER_ID_REQUIRED`、`DECRYPTION_FAILED` 等
 - 要求数据库敏感字段加密存储（API Key、Prompt、用户消息等）
