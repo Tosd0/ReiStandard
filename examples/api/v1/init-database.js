@@ -1,6 +1,6 @@
 /**
  * 数据库初始化 API
- * ReiStandard v1.2.1
+ * ReiStandard v1.2.2
  *
  * 功能：创建 scheduled_messages 与 system_config 表及索引
  */

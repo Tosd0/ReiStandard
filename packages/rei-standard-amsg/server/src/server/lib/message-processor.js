@@ -1,6 +1,6 @@
 /**
  * Message Processor (SDK version)
- * ReiStandard SDK v1.2.1
+ * ReiStandard SDK v1.2.2
  *
  * Handles single message content generation and Web Push delivery.
  * Receives its dependencies (encryption helpers, webpush, VAPID config)

@@ -1,6 +1,6 @@
 /**
  * Adapter Factory
- * ReiStandard SDK v1.2.1
+ * ReiStandard SDK v1.2.2
  *
  * Creates a database adapter instance based on the supplied configuration.
  *

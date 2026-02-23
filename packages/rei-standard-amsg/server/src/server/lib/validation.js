@@ -1,6 +1,6 @@
 /**
  * Validation utility library (SDK version)
- * ReiStandard SDK v1.2.1
+ * ReiStandard SDK v1.2.2
  */
 
 /**
