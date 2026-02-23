@@ -33,9 +33,33 @@
 
 ---
 
-## 快速开始：环境变量配置
+## 快速开始：使用 Packages
 
-在开始实现之前，请先配置以下环境变量：
+推荐先使用仓库 `packages/rei-standard-amsg` 下的 SDK 包接入（服务端 + 客户端），仅在需要深度自定义时再按本文档手写实现。
+
+### 推荐接入顺序（Packages）
+
+1. 安装 SDK 包：
+```bash
+npm install @rei-standard/amsg-server @rei-standard/amsg-client web-push
+
+# 数据库驱动二选一
+npm install @neondatabase/serverless
+# 或
+npm install pg
+```
+2. 服务端优先使用 `@rei-standard/amsg-server` 的标准 handlers（`initDatabase`、`initMasterKey`、`getUserKey`、`scheduleMessage` 等）。
+3. 前端优先使用 `@rei-standard/amsg-client`，通过 `init()` 自动获取 `userKey` 并处理加解密。
+4. 如需 Service Worker 集成，可接入 `@rei-standard/amsg-sw`。
+
+SDK 使用示例请参考：
+- `packages/rei-standard-amsg/server/README.md`
+- `packages/rei-standard-amsg/client/README.md`
+- `packages/rei-standard-amsg/sw/README.md`
+
+### 环境变量配置（服务端）
+
+若不使用上述 Packages 接入，请在开始服务端实现之前，先配置以下环境变量：
 
 ```env
 # 数据库连接
@@ -48,8 +72,6 @@ VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
 
 # 安全配置
 CRON_SECRET=YOUR-SECRET                              # Cron Job 认证密钥
-ENCRYPTION_KEY=YOUR-64-CHAR-HEX-ENCRYPTION-KEY       # AES-256 加密主密钥（64位十六进制）
-INIT_SECRET=YOUR-INIT-SECRET                         # 数据库初始化密钥（可选，初始化后可删除）
 
 # Vercel 特定（如适用）
 VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
@@ -57,21 +79,20 @@ VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 
 **密钥生成命令**：
 ```bash
-# 生成 ENCRYPTION_KEY（64字符十六进制 = 32字节）
-openssl rand -hex 32
-
 # 生成 CRON_SECRET（32字符随机字符串）
-openssl rand -base64 32
-
-# 生成 INIT_SECRET（数据库初始化密钥，可选）
 openssl rand -base64 32
 ```
 
+**主密钥初始化**：
+- 通过 `POST /api/v1/init-master-key` 在服务端一次性生成 `masterKey`
+- 该接口仅首次返回明文主密钥，后续请求返回 `MASTER_KEY_ALREADY_INITIALIZED`
+- 主密钥持久化在数据库 `system_config` 表（`key = 'master_key'`）
+
 **VAPID 密钥生成**：访问 https://vapidkeys.com 生成 VAPID 公钥和私钥。
 
-### 必需依赖配置
+### 底层依赖配置（仅自研实现时）
 
-在实现本标准前，请确保在项目的 `package.json` 中添加以下依赖：
+如果你不使用 `@rei-standard/amsg-server`，而是直接按本文档自行实现 API，请确保在项目的 `package.json` 中添加以下依赖：
 
 ```json
 "dependencies": {
@@ -98,7 +119,7 @@ npm install @neondatabase/serverless web-push
 - **URL路径**: `/api/v1/schedule-message`
 - **请求方法**: `POST`
 - **功能描述**: 创建定时消息任务
-- **认证要求**: 可选（由实现方决定是否需要用户认证）
+- **认证要求**: 必需（`X-User-Id` + `X-Payload-Encrypted` + `X-Encryption-Version`）
 
 ### 1.2 请求头 (Request Headers)
 
@@ -107,7 +128,7 @@ npm install @neondatabase/serverless web-push
 | Content-Type | 是 | string | 必须为 `application/json` |
 | X-Payload-Encrypted | 是 | string | 固定值：`true`（标识请求体已加密） |
 | X-Encryption-Version | 是 | string | 加密协议版本，当前为 `1` |
-| X-User-Id | 是 | string | 用户唯一标识符（用于服务器端密钥派生和数据隔离） |
+| X-User-Id | 是 | string | UUID v4 用户唯一标识符（用于服务器端密钥派生和数据隔离） |
 
 ### 1.3 请求体 (Request Body)
 
@@ -329,7 +350,7 @@ Host: your-domain.com
 Content-Type: application/json
 X-Payload-Encrypted: true
 X-Encryption-Version: 1
-X-User-Id: user_123456
+X-User-Id: 550e8400-e29b-41d4-a716-446655440000
 
 {
   "iv": "cmFuZG9tSVYxNmJ5dGVz",
@@ -664,6 +685,8 @@ if (uuid && !isValidUUID(uuid)) {
 **加密相关错误**:
 - `ENCRYPTION_REQUIRED`: 请求体必须加密（缺少 `X-Payload-Encrypted` 头部）
 - `USER_ID_REQUIRED`: 缺少 `X-User-Id` 头部
+- `INVALID_USER_ID_FORMAT`: `X-User-Id` 不是 UUID v4
+- `MASTER_KEY_NOT_INITIALIZED`: 主密钥未初始化
 - `DECRYPTION_FAILED`: 请求体解密失败（authTag 验证失败或密钥错误）
 - `INVALID_ENCRYPTED_PAYLOAD`: 加密数据格式错误（缺少 iv/authTag/encryptedData 字段）
 - `INVALID_PAYLOAD_FORMAT`: 解密后的数据不是有效 JSON
@@ -672,15 +695,13 @@ if (uuid && !isValidUUID(uuid)) {
 **业务参数错误**:
 - `INVALID_PARAMETERS`: 缺少必需参数或参数格式错误
 - `INVALID_MESSAGE_TYPE`: 无效的消息类型（必须为 `fixed`、`prompted`、`auto` 或 `instant`）
-- `INVALID_RECURRENCE_TYPE`: 无效的重复类型
 - `INVALID_TIMESTAMP`: 时间格式错误或时间不在未来
-- `INVALID_PUSH_SUBSCRIPTION`: 推送订阅信息格式错误
-- `MISSING_USER_MESSAGE`: `fixed` 类型缺少 `userMessage` 字段
-- `MISSING_AI_CONFIG`: `prompted` 或 `auto` 类型缺少 AI 配置（`completePrompt`、`apiUrl`、`apiKey`、`primaryModel`）
-- `INVALID_URL_FORMAT`: URL 格式错误（avatarUrl 或 apiUrl）
-- `INVALID_UUID_FORMAT`: UUID 格式错误
+- `TASK_UUID_CONFLICT`: 提交的任务 UUID 已存在
+- `VAPID_CONFIG_ERROR`: `instant` 消息发送前发现 VAPID 配置缺失
+- `TASK_CREATE_FAILED`: 数据库存储任务失败
+- `MESSAGE_SEND_FAILED`: `instant` 消息发送失败
 
-#### 401 Unauthorized - 认证失败
+#### 401 Unauthorized - 认证失败（仅在接入方额外增加鉴权时）
 
 ```json
 {
@@ -729,14 +750,14 @@ if (uuid && !isValidUUID(uuid)) {
 }
 ```
 
-#### 503 Service Unavailable - 服务不可用
+#### 503 Service Unavailable - 主密钥未初始化
 
 ```json
 {
   "success": false,
   "error": {
-    "code": "SERVICE_UNAVAILABLE",
-    "message": "数据库连接失败或服务暂时不可用"
+    "code": "MASTER_KEY_NOT_INITIALIZED",
+    "message": "主密钥尚未初始化，请先调用 /api/v1/init-master-key"
   }
 }
 ```
@@ -756,9 +777,8 @@ if (uuid && !isValidUUID(uuid)) {
 | 头部字段 | 必需 | 类型 | 说明 |
 |---------|------|------|------|
 | Authorization | 是 | string | Cron 密钥，格式：`Bearer {CRON_SECRET}` |
-| x-vercel-protection-bypass | 条件必需* | string | Vercel 平台自动化保护绕过密钥 |
 
-*条件必需：仅在使用 Vercel 部署且启用了 Deployment Protection 时需要
+> 平台说明：若你在 Vercel 开启了 Deployment Protection，平台层可能额外要求 `x-vercel-protection-bypass`。该校验不属于 ReiStandard SDK 的接口规范。
 
 ### 2.3 请求体 (Request Body)
 
@@ -768,8 +788,7 @@ if (uuid && !isValidUUID(uuid)) {
 
 ```bash
 curl -X POST "https://your-domain.com/api/v1/send-notifications" \
-  -H "Authorization: Bearer your_cron_secret_here" \
-  -H "x-vercel-protection-bypass: your_bypass_key_here"
+  -H "Authorization: Bearer your_cron_secret_here"
 ```
 
 ### 2.5 认证验证逻辑
@@ -784,12 +803,14 @@ if (`Bearer ${process.env.CRON_SECRET}` !== secret) {
 ### 2.6 核心处理流程
 
 1. **鉴权验证**: 验证请求来源的合法性
-2. **查询待处理任务**: 从数据库获取所有到期且状态为 `pending` 的任务
-3. **并发处理任务**: 使用动态任务池（并发数: 8）处理多个任务
-4. **AI API 调用**: 根据任务配置请求 AI 生成消息内容
-5. **消息分句处理**: 将长消息拆分为多条短消息
-6. **批量推送通知**: 逐条发送推送通知，消息间添加延迟
-7. **更新任务状态**: 根据执行结果更新数据库任务状态
+2. **配置检查**: 验证 VAPID 配置是否完整
+3. **主密钥检查**: 从 `system_config` 读取主密钥，不存在则返回 `MASTER_KEY_NOT_INITIALIZED`
+4. **查询待处理任务**: 从数据库获取所有到期且状态为 `pending` 的任务
+5. **并发处理任务**: 使用动态任务池（并发数: 8）处理多个任务
+6. **AI API 调用**: 根据任务配置请求 AI 生成消息内容
+7. **消息分句处理**: 将长消息拆分为多条短消息
+8. **批量推送通知**: 逐条发送推送通知，消息间添加延迟
+9. **更新任务状态**: 根据执行结果更新数据库任务状态
 
 ### 2.7 成功响应 (Success Response)
 
@@ -851,33 +872,34 @@ if (`Bearer ${process.env.CRON_SECRET}` !== secret) {
 }
 ```
 
-#### 500 Internal Server Error - 处理失败
+#### 500 Internal Server Error - VAPID 配置缺失
 
 ```json
 {
   "success": false,
   "error": {
-    "code": "PROCESSING_ERROR",
-    "message": "任务处理过程中发生错误",
+    "code": "VAPID_CONFIG_ERROR",
+    "message": "VAPID 配置缺失，无法发送推送通知",
     "details": {
-      "errorType": "DATABASE_CONNECTION_ERROR",
-      "errorMessage": "Failed to connect to database"
+      "missingKeys": ["VAPID_EMAIL", "NEXT_PUBLIC_VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"]
     }
   }
 }
 ```
 
-#### 503 Service Unavailable - 数据库不可用
+#### 503 Service Unavailable - 主密钥未初始化
 
 ```json
 {
   "success": false,
   "error": {
-    "code": "DATABASE_UNAVAILABLE",
-    "message": "数据库连接失败，无法获取待处理任务"
+    "code": "MASTER_KEY_NOT_INITIALIZED",
+    "message": "主密钥尚未初始化，请先调用 /api/v1/init-master-key"
   }
 }
 ```
+
+> 说明：单条任务的处理失败会记录在成功响应 `data.details.failedTasks` 中，而不是让端点整体返回 500。
 
 ### 2.9 重试机制
 
@@ -913,7 +935,7 @@ if (retryCount >= 3) {
 - **URL路径**: `/api/v1/update-message?id={uuid}`
 - **请求方法**: `PUT`
 - **功能描述**: 更新已存在的定时任务的上下文或配置（进阶功能）
-- **认证要求**: 可选（由实现方决定）
+- **认证要求**: 必需（`X-User-Id` + `X-Payload-Encrypted` + `X-Encryption-Version`）
 
 ### 3.2 查询参数
 
@@ -926,11 +948,23 @@ if (retryCount >= 3) {
 | 头部字段 | 必需 | 类型 | 说明 |
 |---------|------|------|------|
 | Content-Type | 是 | string | 必须为 `application/json` |
-| Authorization | 可选 | string | 用户认证令牌（如需要） |
+| X-User-Id | 是 | string | UUID v4 用户唯一标识符 |
+| X-Payload-Encrypted | 是 | string | 固定值：`true` |
+| X-Encryption-Version | 是 | string | 固定值：`1` |
 
 ### 3.4 请求体 (Request Body)
 
-所有字段均为可选，只需传递需要更新的字段。
+请求体必须先加密后再发送，实际请求体结构为：
+
+```json
+{
+  "iv": "Base64编码的初始化向量",
+  "authTag": "Base64编码的认证标签",
+  "encryptedData": "Base64编码的加密数据"
+}
+```
+
+加密前原始更新数据中，所有字段均为可选，只需传递需要更新的字段：
 
 | 字段名 | 类型 | 说明 |
 |-------|------|------|
@@ -943,11 +977,22 @@ if (retryCount >= 3) {
 
 ### 3.5 请求示例
 
+**加密前原始数据示例**：
 ```json
 {
   "completePrompt": "【角色】你是Rei，更新后的性格设定...\n【历史对话】...\n【任务】...",
   "nextSendAt": "2025-10-13T09:00:00Z"
 }
+```
+
+**实际发送（加密后）**：
+```bash
+curl -X PUT "https://your-domain.com/api/v1/update-message?id=550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-Payload-Encrypted: true" \
+  -H "X-Encryption-Version: 1" \
+  -d '{"iv":"...","authTag":"...","encryptedData":"..."}'
 ```
 
 ### 3.6 成功响应 (Success Response)
@@ -967,19 +1012,22 @@ if (retryCount >= 3) {
 
 ### 3.7 错误响应 (Error Response)
 
-#### 404 Not Found - 任务不存在
+| 场景 | HTTP 状态码 | 错误代码 |
+|------|-------------|----------|
+| 缺少查询参数 `id` | 400 | `TASK_ID_REQUIRED` |
+| 缺少 `X-User-Id` | 400 | `USER_ID_REQUIRED` |
+| `X-User-Id` 非 UUID v4 | 400 | `INVALID_USER_ID_FORMAT` |
+| 缺少加密头部 | 400 | `ENCRYPTION_REQUIRED` |
+| 加密版本错误 | 400 | `UNSUPPORTED_ENCRYPTION_VERSION` |
+| 请求体不是合法加密结构 | 400 | `INVALID_ENCRYPTED_PAYLOAD` |
+| 解密失败 | 400 | `DECRYPTION_FAILED` |
+| 更新数据格式错误 | 400 | `INVALID_UPDATE_DATA` |
+| 任务不存在 | 404 | `TASK_NOT_FOUND` |
+| 任务非 pending（已完成/失败） | 409 | `TASK_ALREADY_COMPLETED` |
+| 并发冲突导致更新失败 | 409 | `UPDATE_CONFLICT` |
+| 主密钥未初始化 | 503 | `MASTER_KEY_NOT_INITIALIZED` |
 
-```json
-{
-  "success": false,
-  "error": {
-    "code": "TASK_NOT_FOUND",
-    "message": "指定的任务不存在或已被删除"
-  }
-}
-```
-
-#### 400 Bad Request - 参数错误
+#### 400 Bad Request - 更新数据格式错误示例
 
 ```json
 {
@@ -994,7 +1042,7 @@ if (retryCount >= 3) {
 }
 ```
 
-#### 409 Conflict - 任务已完成
+#### 409 Conflict - 任务已完成示例
 
 ```json
 {
@@ -1002,6 +1050,18 @@ if (retryCount >= 3) {
   "error": {
     "code": "TASK_ALREADY_COMPLETED",
     "message": "任务已完成或已失败，无法更新"
+  }
+}
+```
+
+#### 503 Service Unavailable - 主密钥未初始化
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MASTER_KEY_NOT_INITIALIZED",
+    "message": "主密钥尚未初始化，请先调用 /api/v1/init-master-key"
   }
 }
 ```
@@ -1014,7 +1074,7 @@ if (retryCount >= 3) {
 - **URL路径**: `/api/v1/cancel-message?id={uuid}`
 - **请求方法**: `DELETE`
 - **功能描述**: 取消/删除已存在的定时任务（进阶功能）
-- **认证要求**: 可选（由实现方决定）
+- **认证要求**: 必需（`X-User-Id`）
 
 ### 4.2 查询参数
 
@@ -1026,13 +1086,13 @@ if (retryCount >= 3) {
 
 | 头部字段 | 必需 | 类型 | 说明 |
 |---------|------|------|------|
-| X-User-Id | 是 | string | 用户唯一标识符（用于数据隔离） |
+| X-User-Id | 是 | string | UUID v4 用户唯一标识符（用于数据隔离） |
 
 ### 4.4 请求示例
 
 ```bash
 curl -X DELETE "https://your-domain.com/api/v1/cancel-message?id=550e8400-e29b-41d4-a716-446655440000" \
-  -H "X-User-Id: user_123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 ```
 
 ### 4.5 成功响应 (Success Response)
@@ -1052,6 +1112,25 @@ curl -X DELETE "https://your-domain.com/api/v1/cancel-message?id=550e8400-e29b-4
 
 ### 4.6 错误响应 (Error Response)
 
+| 场景 | HTTP 状态码 | 错误代码 |
+|------|-------------|----------|
+| 缺少查询参数 `id` | 400 | `TASK_ID_REQUIRED` |
+| 缺少 `X-User-Id` | 400 | `USER_ID_REQUIRED` |
+| `X-User-Id` 非 UUID v4 | 400 | `INVALID_USER_ID_FORMAT` |
+| 任务不存在 | 404 | `TASK_NOT_FOUND` |
+
+#### 400 Bad Request - 参数错误
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "TASK_ID_REQUIRED",
+    "message": "缺少任务ID"
+  }
+}
+```
+
 #### 404 Not Found - 任务不存在
 
 ```json
@@ -1060,18 +1139,6 @@ curl -X DELETE "https://your-domain.com/api/v1/cancel-message?id=550e8400-e29b-4
   "error": {
     "code": "TASK_NOT_FOUND",
     "message": "指定的任务不存在或已被删除"
-  }
-}
-```
-
-#### 409 Conflict - 任务正在执行
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "TASK_IN_PROGRESS",
-    "message": "任务正在执行中，无法取消"
   }
 }
 ```
@@ -1090,15 +1157,15 @@ curl -X DELETE "https://your-domain.com/api/v1/cancel-message?id=550e8400-e29b-4
 
 | 头部字段 | 必需 | 类型 | 说明 |
 |---------|------|------|------|
-| X-User-Id | 是 | string | 用户唯一标识符（用于数据隔离，服务器将只返回该用户的任务） |
+| X-User-Id | 是 | string | UUID v4 用户唯一标识符（用于数据隔离，服务器将只返回该用户的任务） |
+| X-Response-Encrypted | 否 | string | 建议值 `true`，表示客户端期望收到加密响应体 |
+| X-Encryption-Version | 否 | string | 建议值 `1` |
 
 ### 5.3 查询参数 (Query Parameters)
 
 | 参数名 | 类型 | 必需 | 默认值 | 说明 |
 |-------|------|------|--------|------|
 | status | string | 否 | `all` | 任务状态筛选：`pending`、`sent`、`failed`、`all` |
-| contactName | string | 否 | - | 按角色名称筛选 |
-| messageSubtype | string | 否 | - | 按消息子类型筛选 |
 | limit | integer | 否 | 20 | 每页返回数量（最大 100） |
 | offset | integer | 否 | 0 | 分页偏移量 |
 
@@ -1106,7 +1173,7 @@ curl -X DELETE "https://your-domain.com/api/v1/cancel-message?id=550e8400-e29b-4
 
 ```bash
 curl -X GET "https://your-domain.com/api/v1/messages?status=pending&limit=10" \
-  -H "X-User-Id: user_123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 ```
 
 ### 5.5 成功响应 (Success Response)
@@ -1116,33 +1183,53 @@ curl -X GET "https://your-domain.com/api/v1/messages?status=pending&limit=10" \
 ```json
 {
   "success": true,
+  "encrypted": true,
+  "version": 1,
   "data": {
-    "tasks": [
-      {
-        "id": 12345,
-        "uuid": "550e8400-e29b-41d4-a716-446655440000",
-        "contactName": "Rei",
-        "messageType": "auto",
-        "messageSubtype": "chat",
-        "nextSendAt": "2025-10-13T09:00:00Z",
-        "recurrenceType": "daily",
-        "status": "pending",
-        "retryCount": 0,
-        "createdAt": "2025-01-15T08:30:00Z",
-        "updatedAt": "2025-01-15T08:30:00Z"
-      }
-    ],
-    "pagination": {
-      "total": 25,
-      "limit": 10,
-      "offset": 0,
-      "hasMore": true
-    }
+    "iv": "Base64编码的初始化向量",
+    "authTag": "Base64编码的认证标签",
+    "encryptedData": "Base64编码的加密数据"
   }
 }
 ```
 
-### 5.5 错误响应 (Error Response)
+客户端使用 `userKey` 解密后可得到如下结构：
+
+```json
+{
+  "tasks": [
+    {
+      "id": 12345,
+      "uuid": "550e8400-e29b-41d4-a716-446655440000",
+      "contactName": "Rei",
+      "messageType": "auto",
+      "messageSubtype": "chat",
+      "nextSendAt": "2025-10-13T09:00:00Z",
+      "recurrenceType": "daily",
+      "status": "pending",
+      "retryCount": 0,
+      "createdAt": "2025-01-15T08:30:00Z",
+      "updatedAt": "2025-01-15T08:30:00Z"
+    }
+  ],
+  "pagination": {
+    "total": 25,
+    "limit": 10,
+    "offset": 0,
+    "hasMore": true
+  }
+}
+```
+
+### 5.6 错误响应 (Error Response)
+
+| 场景 | HTTP 状态码 | 错误代码 |
+|------|-------------|----------|
+| 缺少 `X-User-Id` | 400 | `USER_ID_REQUIRED` |
+| `X-User-Id` 非 UUID v4 | 400 | `INVALID_USER_ID_FORMAT` |
+| `limit` 非正整数 | 400 | `INVALID_PARAMETERS` |
+| `offset` 非负整数 | 400 | `INVALID_PARAMETERS` |
+| 主密钥未初始化 | 503 | `MASTER_KEY_NOT_INITIALIZED` |
 
 #### 400 Bad Request - 缺少 User ID
 
@@ -1152,6 +1239,18 @@ curl -X GET "https://your-domain.com/api/v1/messages?status=pending&limit=10" \
   "error": {
     "code": "USER_ID_REQUIRED",
     "message": "必须提供 X-User-Id 请求头"
+  }
+}
+```
+
+#### 503 Service Unavailable - 主密钥未初始化
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MASTER_KEY_NOT_INITIALIZED",
+    "message": "主密钥尚未初始化，请先调用 /api/v1/init-master-key"
   }
 }
 ```
@@ -1190,8 +1289,8 @@ exports.POST = async function(request) {
 #### 6.1.2 用户标识符（User ID）
 
 **核心原则**：
-- 客户端生成并管理 User ID（使用 UUID）
-- 所有请求必须携带 User ID（`X-User-Id` 头部）
+- 客户端生成并管理 User ID（使用 UUID v4）
+- 所有用户侧业务请求必须携带 User ID（`X-User-Id` 头部）
 - 服务器根据 User ID 进行数据隔离
 
 **User ID 生成**（客户端）:
@@ -1229,8 +1328,16 @@ exports.POST = async function(request) {
         );
     }
 
-    // 解密请求体（略）
-    const payload = decryptPayload(encryptedBody, deriveUserKey(userId));
+    if (!isValidUUIDv4(userId)) {
+        return NextResponse.json(
+            { success: false, error: { code: 'INVALID_USER_ID_FORMAT' } },
+            { status: 400 }
+        );
+    }
+
+    const masterKey = await getMasterKeyFromDb();
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
+    const payload = decryptPayload(encryptedBody, userKey);
 
     // 加密敏感字段存储到 encrypted_payload
     const encryptedPayload = encryptForStorage(JSON.stringify(payload), userKey);
@@ -1272,9 +1379,9 @@ exports.GET = async function(request) {
 
 **3. 更新任务**:
 ```javascript
-exports.PUT = async function(request, { params }) {
+exports.PUT = async function(request) {
     const userId = request.headers.get('x-user-id');
-    const taskUuid = params.id;
+    const taskUuid = new URL(request.url).searchParams.get('id');
 
     const result = await sql`
         UPDATE scheduled_messages
@@ -1293,9 +1400,9 @@ exports.PUT = async function(request, { params }) {
 
 **4. 删除任务**:
 ```javascript
-exports.DELETE = async function(request, { params }) {
+exports.DELETE = async function(request) {
     const userId = request.headers.get('x-user-id');
-    const taskUuid = params.id;
+    const taskUuid = new URL(request.url).searchParams.get('id');
 
     const result = await sql`
         DELETE FROM scheduled_messages
@@ -1316,7 +1423,7 @@ exports.DELETE = async function(request, { params }) {
 **安全级别**：
 - **数据隔离**：用户 A 无法查询/修改用户 B 的任务
 - **客户端管理**：User ID 由客户端生成和存储
-- **泄漏风险**：如果 User ID 泄漏或被伪造，他人可以访问该用户的任务（经综合考虑，暂不提升防护等级）
+- **泄漏风险**：如果 User ID 泄漏或被伪造，他人可以访问该用户的任务（User ID 与 其他聊天记录同存放于 localStorage，与其有同样的安全级别，通常不会单独泄漏。）
 
 ### 6.2 数据安全
 
@@ -1324,14 +1431,14 @@ exports.DELETE = async function(request, { params }) {
 
 #### 6.2.1 请求体加密（强制）
 
-所有对 `/api/v1/schedule-message` 和 `/api/v1/update-message/:id` 端点的请求必须对请求体进行加密。
+所有对 `/api/v1/schedule-message` 和 `/api/v1/update-message?id={uuid}` 端点的请求必须对请求体进行加密。
 
 **加密算法**: AES-256-GCM
 
 **密钥管理架构**:
-- **服务器端**：主密钥 `ENCRYPTION_KEY`（64字符十六进制）存储在 serverless 平台环境变量
+- **服务器端**：主密钥 `masterKey`（64字符十六进制）存储在数据库 `system_config` 表（`key='master_key'`）
 - **客户端**：用户专属密钥存储在 **IndexedDB 加密表**中
-- **密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
+- **密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(masterKey + userId)` 派生
 - **安全性**：用户 A 无法解密用户 B 的数据
 
 **实现流程**:
@@ -1391,8 +1498,8 @@ async function getOrCreateUserEncryptionKey(userId) {
 async function encryptPayload(plainPayload, encryptionKey) {
     const plaintext = JSON.stringify(plainPayload);
 
-    // 生成随机 IV（16字节）
-    const iv = crypto.getRandomValues(new Uint8Array(16));
+    // 生成随机 IV（12字节，GCM 推荐长度）
+    const iv = crypto.getRandomValues(new Uint8Array(12));
 
     // 导入密钥
     const keyBuffer = new Uint8Array(encryptionKey.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
@@ -1474,11 +1581,26 @@ exports.GET = async function(request) {
         );
     }
 
+    if (!isValidUUIDv4(userId)) {
+        return NextResponse.json(
+            { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } },
+            { status: 400 }
+        );
+    }
+
+    const masterKey = await getMasterKeyFromDb();
+    if (!masterKey) {
+        return NextResponse.json(
+            { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } },
+            { status: 503 }
+        );
+    }
+
     // 返回用户专属密钥（由服务器内部派生）
     return NextResponse.json({
         success: true,
         data: {
-            userKey: deriveUserEncryptionKey(userId, process.env.ENCRYPTION_KEY),
+            userKey: deriveUserEncryptionKey(userId, masterKey),
             version: 1
         }
     });
@@ -1539,9 +1661,25 @@ exports.POST = async function(request) {
         );
     }
 
+    // 验证 UUID v4
+    if (!isValidUUIDv4(userId)) {
+        return NextResponse.json(
+            { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } },
+            { status: 400 }
+        );
+    }
+
+    const masterKey = await getMasterKeyFromDb();
+    if (!masterKey) {
+        return NextResponse.json(
+            { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } },
+            { status: 503 }
+        );
+    }
+
     try {
         // 派生用户专属密钥（仅一次 SHA-256 计算，< 1ms）
-        const userKey = deriveUserEncryptionKey(userId, process.env.ENCRYPTION_KEY);
+        const userKey = deriveUserEncryptionKey(userId, masterKey);
 
         // 解密请求体
         const encryptedBody = await request.json();
@@ -1568,6 +1706,8 @@ exports.POST = async function(request) {
 |---------|------------|---------|------|
 | 缺少加密头部 `X-Payload-Encrypted` | 400 | `ENCRYPTION_REQUIRED` | 请求体必须加密 |
 | 缺少 `X-User-Id` 头部 | 400 | `USER_ID_REQUIRED` | 缺少用户标识符 |
+| `X-User-Id` 非 UUID v4 | 400 | `INVALID_USER_ID_FORMAT` | 用户标识符格式无效 |
+| 主密钥未初始化 | 503 | `MASTER_KEY_NOT_INITIALIZED` | 需先调用 `/api/v1/init-master-key` |
 | 解密失败（authTag 验证失败） | 400 | `DECRYPTION_FAILED` | 数据被篡改或密钥错误 |
 | 缺少加密字段（iv/authTag/encryptedData） | 400 | `INVALID_ENCRYPTED_PAYLOAD` | 加密数据格式错误 |
 | 解密后 JSON 解析失败 | 400 | `INVALID_PAYLOAD_FORMAT` | 解密后的数据不是有效 JSON |
@@ -1629,19 +1769,22 @@ function decryptFromStorage(encryptedText, encryptionKey) {
 - **日志保护**：日志中**不输出**明文敏感数据（如 API key）
 
 **安全优势**：
-- 数据库泄露不会暴露任何敏感信息
+- 在仅泄露 `scheduled_messages` 数据且主密钥未泄露时，敏感字段仍保持密文
 - 用户间数据完全隔离（每个用户独立密钥）
 - 查询性能优化（索引字段为明文，支持高效查询）
 - 降低安全风险（无需对每个字段单独加密/解密）
+- 若 `system_config` 中主密钥或数据库凭据泄露，则所有用户数据都可能被解密（高危边界）
 
 #### 6.2.3 密钥分发与管理
 
 **密钥隔离架构**:
-- 每个用户使用**独立的加密密钥**，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
+- 每个用户使用**独立的加密密钥**，通过 `SHA256(masterKey + userId)` 派生
 - 客户端将用户专属密钥存储在 **IndexedDB 加密表**中（持久化，页面刷新后仍然可用）
-- 服务器仅存储主密钥，每次请求时动态派生用户密钥（< 1ms，对 Serverless Function 负担极小）
+- 服务器将主密钥持久化在数据库 `system_config` 表，每次请求时动态派生用户密钥（< 1ms，对 Serverless Function 负担极小）
 
-**新增 API 端点**: `GET /api/v1/get-user-key`
+**相关 API 端点**:
+- `POST /api/v1/init-master-key`：首次初始化主密钥（仅首次返回明文）
+- `GET /api/v1/get-user-key`：分发用户专属密钥（`userKey`）
 
 此端点用于分发用户专属密钥，客户端仅在**首次登录**或 **IndexedDB 中无密钥**时调用一次。
 
@@ -1654,7 +1797,7 @@ function decryptFromStorage(encryptedText, encryptionKey) {
 **请求示例**:
 ```bash
 curl -X GET "https://your-domain.com/api/v1/get-user-key" \
-  -H "X-User-Id: user_123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 ```
 
 **成功响应** (200 OK):
@@ -1679,23 +1822,47 @@ curl -X GET "https://your-domain.com/api/v1/get-user-key" \
 }
 ```
 
+**错误响应** (400 Bad Request - UUID 格式错误):
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_USER_ID_FORMAT",
+    "message": "X-User-Id 必须是 UUID v4 格式"
+  }
+}
+```
+
+**错误响应** (503 Service Unavailable - 主密钥未初始化):
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MASTER_KEY_NOT_INITIALIZED",
+    "message": "主密钥尚未初始化，请先调用 /api/v1/init-master-key"
+  }
+}
+```
+
 **客户端密钥管理最佳实践**:
-1. 用户首次登录后，调用 `/api/v1/get-user-key` 获取 `userKey`
-2. 将 `userKey` 存储到 **IndexedDB** 的 `SecureKeyStore` 数据库中
-3. 页面刷新后直接从 IndexedDB 读取，无需重新请求服务器
-4. 用户登出后清除 IndexedDB 中的密钥
+1. 首次部署后先调用 `/api/v1/init-database`（幂等）
+2. 调用 `/api/v1/init-master-key` 初始化主密钥并离线保存
+3. 用户首次登录后，调用 `/api/v1/get-user-key` 获取 `userKey`
+4. 将 `userKey` 存储到 **IndexedDB** 中
+5. 页面刷新后直接从 IndexedDB 读取，无需重新请求服务器
 
 **服务器端密钥派生**:
 - 每次收到加密请求时，从 `X-User-Id` 头部获取用户 ID
-- 使用 `SHA256(ENCRYPTION_KEY + userId)` 派生该用户的专属密钥
+- 从数据库读取主密钥 `masterKey`
+- 使用 `SHA256(masterKey + userId)` 派生该用户的专属密钥
 - 使用派生的密钥解密请求体
-- 无需查询数据库，无需缓存，性能开销极低（< 1ms）
 
 **安全保障**:
 - 用户 A 无法解密用户 B 的数据（即使获得了自己的专属密钥）
 - 攻击者无法通过自己的账号解密他人的数据
-- 密钥泄露影响范围限制在单个用户
+- `userKey` 泄露影响范围可限制在单个用户
 - 防止重放攻击：即使截获加密请求，也无法用其他用户的身份解密
+- `masterKey` 泄露属于全局风险，需由接入方自行承担并采取额外防护
 
 #### 6.2.4 HTTPS 强制
 - 所有 API 端点必须使用 HTTPS
@@ -1710,8 +1877,8 @@ curl -X GET "https://your-domain.com/api/v1/get-user-key" \
 |-----|------|---------|
 | `/api/v1/schedule-message` | 30 次 | 每小时每用户 |
 | `/api/v1/send-notifications` | 无限制* | - |
-| `/api/v1/update-message/:id` | 100 次 | 每小时每用户 |
-| `/api/v1/cancel-message/:id` | 30 次 | 每小时每用户 |
+| `/api/v1/update-message` | 100 次 | 每小时每用户 |
+| `/api/v1/cancel-message` | 30 次 | 每小时每用户 |
 | `/api/v1/messages` | 50 次 | 每小时每用户 |
 
 *仅允许来自 Cron Job 的认证请求
@@ -1736,7 +1903,7 @@ HTTP 状态码：`429 Too Many Requests`
 ```
 Access-Control-Allow-Origin: https://your-app-domain.com
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted
 Access-Control-Max-Age: 86400
 ```
 
@@ -1745,7 +1912,7 @@ Access-Control-Max-Age: 86400
 | 端点 | 最大请求体大小 |
 |-----|--------------|
 | `/api/v1/schedule-message` | 1 MB |
-| `/api/v1/update-message/:id` | 1 MB |
+| `/api/v1/update-message` | 1 MB |
 
 超出限制返回 `413 Payload Too Large`
 
@@ -1761,8 +1928,6 @@ Access-Control-Max-Age: 86400
 ### 6.7 版本控制
 
 - API 版本通过 URL 路径控制（如 `/api/v1/`）
-- 向后兼容至少保持 2 个主版本
-- 废弃的 API 版本至少提前 6 个月通知
 
 ### 6.8 错误处理统一格式
 
@@ -1862,8 +2027,8 @@ Access-Control-Max-Age: 86400
 
 **实现方式**:
 - 在创建任务时分配或接收 UUID
-- `GET /api/v1/messages?uuid={uuid}` 查询用户所有任务
-- 支持通过 UUID 更新和删除任务
+- 当前版本通过 `PUT /api/v1/update-message?id={uuid}` 与 `DELETE /api/v1/cancel-message?id={uuid}` 按 UUID 管理任务
+- 如需按 UUID 精确查询，可先调用 `/api/v1/messages` 后在客户端按 `uuid` 过滤
 
 ### 8.3 多类型消息支持
 
@@ -1931,8 +2096,8 @@ WHERE status = 'failed' AND retry_count < 3;
 CREATE INDEX idx_user_id
 ON scheduled_messages (user_id);
 
--- UUID查询索引（扩展功能）
-CREATE INDEX idx_uuid
+-- UUID 唯一索引（防止重复 UUID）
+CREATE UNIQUE INDEX uidx_uuid
 ON scheduled_messages (uuid)
 WHERE uuid IS NOT NULL;
 ```
@@ -1956,7 +2121,7 @@ WHERE uuid IS NOT NULL;
 | 数据类型 | 缓存时长 | 缓存层 | 说明 |
 |---------|---------|--------|------|
 | VAPID 公钥 | 永久 | Serverless 内存 | 启动时加载 |
-| 主密钥（ENCRYPTION_KEY） | 永久 | 环境变量 | 无需缓存，直接读取 |
+| 主密钥（masterKey） | 短期 | Serverless 内存 | 从 `system_config` 读取后可短时缓存 |
 | 用户专属密钥 | 无需缓存 | - | 每次请求动态派生（< 1ms） |
 | 数据库连接 | 会话期间 | 连接池 | 复用连接 |
 
@@ -2050,8 +2215,9 @@ Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'sel
 
 - 所有数据（API Key、用户消息、Prompt）使用 AES-256-GCM 加密存储
 - 永不在响应或日志中返回明文敏感信息
-- 加密密钥存储在安全的环境变量中
+- 主密钥存储在数据库 `system_config` 表（`key='master_key'`）
 - 每个用户使用独立的加密密钥（详见 6.2 节）
+- 风险边界：若数据库凭据或 `masterKey` 泄露，不承诺可抵抗此级别攻击
 
 ### 12.5 数据库安全
 
@@ -2083,7 +2249,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_messages TO app_user;
 - [ ] 成功创建加密的 AI 消息任务
 - [ ] 缺少加密头部时返回 400（`ENCRYPTION_REQUIRED`）
 - [ ] 缺少 `X-User-Id` 时返回 400（`USER_ID_REQUIRED`）
-- [ ] 用户 ID 与 Token 不匹配时返回 401
+- [ ] `X-User-Id` 非 UUID v4 时返回 400（`INVALID_USER_ID_FORMAT`）
+- [ ] 主密钥未初始化时返回 503（`MASTER_KEY_NOT_INITIALIZED`）
 - [ ] 解密失败时返回 400（`DECRYPTION_FAILED`）
 - [ ] 缺少必需参数时返回 400
 - [ ] 无效的 `messageType` 返回 400
@@ -2092,16 +2259,25 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_messages TO app_user;
 - [ ] 无效的 `pushSubscription` 格式返回 400
 - [ ] 响应包含正确的任务 ID 和创建时间
 
+#### POST /api/v1/init-master-key
+
+- [ ] 首次调用返回 201（包含 `masterKey`、`fingerprint`、`version`）
+- [ ] 二次调用返回 409（`MASTER_KEY_ALREADY_INITIALIZED`）
+
 #### GET /api/v1/get-user-key
 
 - [ ] 提供有效的 User ID 成功获取用户密钥
 - [ ] 缺少 `X-User-Id` 请求头返回 400
+- [ ] `X-User-Id` 非 UUID v4 返回 400（`INVALID_USER_ID_FORMAT`）
+- [ ] 主密钥未初始化时返回 503（`MASTER_KEY_NOT_INITIALIZED`）
 - [ ] 响应包含正确的 userKey 和 version
 
 #### POST /api/v1/send-notifications
 
 - [ ] 正确的 Cron Secret 允许访问
 - [ ] 错误的 Cron Secret 返回 401
+- [ ] 缺失 VAPID 配置返回 500（`VAPID_CONFIG_ERROR`）
+- [ ] 主密钥未初始化返回 503（`MASTER_KEY_NOT_INITIALIZED`）
 - [ ] 成功处理到期任务
 - [ ] 正确更新一次性任务（删除）
 - [ ] 正确更新循环任务（计算下次时间）
@@ -2112,15 +2288,34 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_messages TO app_user;
 #### PUT /api/v1/update-message
 
 - [ ] 成功更新任务字段
+- [ ] 缺少 `id` 查询参数返回 400（`TASK_ID_REQUIRED`）
+- [ ] 缺少 `X-User-Id` 返回 400（`USER_ID_REQUIRED`）
+- [ ] `X-User-Id` 非 UUID v4 返回 400（`INVALID_USER_ID_FORMAT`）
+- [ ] 缺少加密头部返回 400（`ENCRYPTION_REQUIRED`）
+- [ ] 加密版本不正确返回 400（`UNSUPPORTED_ENCRYPTION_VERSION`）
+- [ ] 主密钥未初始化返回 503（`MASTER_KEY_NOT_INITIALIZED`）
+- [ ] 请求体加密结构错误返回 400（`INVALID_ENCRYPTED_PAYLOAD`）
+- [ ] 解密失败返回 400（`DECRYPTION_FAILED`）
 - [ ] 不存在的 UUID 返回 404
 - [ ] 无效的更新数据返回 400
 - [ ] 已完成的任务无法更新（返回 409）
+- [ ] 并发冲突返回 409（`UPDATE_CONFLICT`）
 
 #### DELETE /api/v1/cancel-message
 
 - [ ] 成功删除任务
+- [ ] 缺少 `id` 查询参数返回 400（`TASK_ID_REQUIRED`）
+- [ ] 缺少 `X-User-Id` 返回 400（`USER_ID_REQUIRED`）
+- [ ] `X-User-Id` 非 UUID v4 返回 400（`INVALID_USER_ID_FORMAT`）
 - [ ] 不存在的 UUID 返回 404
-- [ ] 正在执行的任务无法删除（返回 409）
+
+#### GET /api/v1/messages
+
+- [ ] 提供有效 `X-User-Id` 返回 200，且响应体为加密结构（`encrypted: true`）
+- [ ] 缺少 `X-User-Id` 返回 400（`USER_ID_REQUIRED`）
+- [ ] `X-User-Id` 非 UUID v4 返回 400（`INVALID_USER_ID_FORMAT`）
+- [ ] 非法 `limit/offset` 返回 400（`INVALID_PARAMETERS`）
+- [ ] 主密钥未初始化返回 503（`MASTER_KEY_NOT_INITIALIZED`）
 
 ### 13.2 集成测试场景
 
@@ -2143,12 +2338,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_messages TO app_user;
 
 **可能原因**:
 - Cron Secret 错误
-- Vercel Protection Bypass 密钥缺失或错误
+- VAPID 配置缺失
 - 服务器网络问题
 
 **解决方案**:
 1. 验证环境变量 `CRON_SECRET` 是否正确
-2. 检查 `x-vercel-protection-bypass` 头部
+2. 检查 `VAPID_EMAIL`、`NEXT_PUBLIC_VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY`
 3. 手动执行 curl 命令测试
 
 #### 问题：推送通知未收到
@@ -2256,6 +2451,13 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS system_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- 主查询索引（用于 Cron Job 查找待处理任务）
 CREATE INDEX idx_pending_tasks_optimized
 ON scheduled_messages (status, next_send_at, id, retry_count)
@@ -2274,8 +2476,8 @@ WHERE status = 'failed' AND retry_count < 3;
 -- 用户任务查询索引（用于查询特定用户的所有任务）
 CREATE INDEX idx_user_id ON scheduled_messages (user_id);
 
--- UUID 查询索引（用于跨设备查询，扩展功能）
-CREATE INDEX idx_uuid
+-- UUID 唯一索引（防止重复 UUID）
+CREATE UNIQUE INDEX uidx_uuid
 ON scheduled_messages (uuid)
 WHERE uuid IS NOT NULL;
 ```
@@ -2314,7 +2516,7 @@ WHERE uuid IS NOT NULL;
 **加密方法**：
 - 算法：AES-256-GCM
 - 格式：`iv:authTag:encryptedData`（十六进制编码）
-- 密钥：用户专属密钥（通过 `SHA256(ENCRYPTION_KEY + userId)` 派生）
+- 密钥：用户专属密钥（通过 `SHA256(masterKey + userId)` 派生）
 
 **存储流程**：
 1. 客户端发送加密的请求体到 API
@@ -2330,9 +2532,10 @@ WHERE uuid IS NOT NULL;
 4. 组装响应并返回给客户端
 
 **安全优势**：
-- 数据库泄露不会暴露敏感信息（API key、prompt 等）
+- 在仅泄露 `scheduled_messages` 且主密钥未泄露时，敏感字段仍为密文
 - 用户间数据隔离（每个用户独立密钥）
 - 查询性能优化（索引字段为明文）
+- 若主密钥或数据库凭据泄露，所有用户数据都可能受影响（需由接入方承担该风险）
 
 详细加密实现参见 §6.2 节。
 
@@ -2346,6 +2549,7 @@ WHERE uuid IS NOT NULL;
 
 - 客户端密钥获取端点统一为 `GET /api/v1/get-user-key`
 - 客户端不再接收 `masterKey`，改为直接接收 `userKey`
+- 新增 `POST /api/v1/init-master-key`（一次性初始化主密钥）
 - 文档示例、测试清单与部署说明已同步到 `userKey` 方案
 
 ---
@@ -2404,12 +2608,12 @@ WHERE uuid IS NOT NULL;
 - **用户隔离**：确保用户只能操作自己的任务（通过 `user_id` 字段过滤）
 - **权限验证逻辑**：详细定义创建/查询/更新/删除任务的权限检查
 - 新增请求头：`X-User-Id`（用户唯一标识符）
-- 新增错误代码：`USER_ID_REQUIRED`、`FORBIDDEN` 等
+- 新增错误代码：`USER_ID_REQUIRED`、`INVALID_USER_ID_FORMAT` 等
 - 客户端 User ID 管理最佳实践（localStorage 存储、自动生成）
 
 **端到端加密（重要安全特性）**:
 - **强制要求**对所有请求体进行 AES-256-GCM 加密
-- **用户密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(ENCRYPTION_KEY + userId)` 派生
+- **用户密钥隔离**：每个用户使用独立的加密密钥，通过 `SHA256(masterKey + userId)` 派生
 - **客户端密钥存储**：用户专属密钥存储在 IndexedDB 加密表中（持久化）
 - **最小服务器负担**：服务器仅做一次 SHA-256 计算（< 1ms），Serverless 理念
 - 定义完整的加密/解密实现流程（客户端 IndexedDB + 服务器端动态派生）
@@ -2441,12 +2645,19 @@ WHERE uuid IS NOT NULL;
 以下示例展示关键 API 端点的请求格式（加密请求体已略）：
 
 ```bash
+# 初始化主密钥（仅首次成功返回 masterKey）
+curl -X POST "https://your-domain.com/api/v1/init-master-key"
+
+# 获取用户专属密钥（客户端初始化时调用）
+curl -X GET "https://your-domain.com/api/v1/get-user-key" \
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
+
 # 创建定时任务（加密）
 curl -X POST "https://your-domain.com/api/v1/schedule-message" \
   -H "Content-Type: application/json" \
   -H "X-Payload-Encrypted: true" \
   -H "X-Encryption-Version: 1" \
-  -H "X-User-Id: user_123456" \
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{"iv": "...", "authTag": "...", "encryptedData": "..."}'
 
 # Cron 触发通知
@@ -2455,7 +2666,7 @@ curl -X POST "https://your-domain.com/api/v1/send-notifications" \
 
 # 查询任务列表
 curl -X GET "https://your-domain.com/api/v1/messages?status=pending" \
-  -H "X-User-Id: user_123456"
+  -H "X-User-Id: 550e8400-e29b-41d4-a716-446655440000"
 ```
 
 > **完整示例和部署指导**：请参考 [examples/README.md](../examples/README.md)
