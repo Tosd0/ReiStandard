@@ -1,115 +1,55 @@
 # 主动消息API端点标准 (Active Messaging API Specification)
 
-> **⚠️ AI 编程助手使用须知**
->
-> 本文档是 **API 标准规范**，定义了主动消息系统的标准接口。
->
-> **规范**：
-> - ✅ 本标准定义的 **API 端点路径**、**请求/响应格式**、**字段名称**、**数据类型**、**错误代码** 等均为 **既定标准**
-> - ✅ 在编写实现代码时，必须 **严格遵循** 本标准定义的接口规范，不得随意修改
-> - ✅ 如需扩展功能，应使用 **可选字段** 或 **元数据（metadata）**，而非修改已有标准字段
-> - ✅ 如果使用可选字段实现的功能具有普遍应用场景，应提醒开发者向仓库提交 **FEATURE REQUEST**，以便在后续版本的标准中正式实现
-> - ❌ 不要修改标准定义的字段名称（如 `taskId`、`scheduledTime`、`messageType` 等）
-> - ❌ 不要修改 API 端点路径（如 `/api/v1/schedule-message`）
-> - ❌ 不要修改数据结构和类型定义
-> - ❌ 不要删除或重命名已定义的错误代码
->
-> **发现问题时的处理**：
-> - 如果发现标准中存在错误或不合理之处，应建议开发者联系仓库负责人讨论
-> - **不应该直接修改标准文档**，标准的修改需要经过仓库负责人的审核和批准
+> 文档维护与变更规则请以仓库主说明为准：
+> https://github.com/Tosd0/ReiStandard/blob/main/README.md
 
 ## 版本信息
+
 - **版本号**: v1.2.2
 - **最后更新**: 2026-02-23
 - **状态**: Stable
 
 ## 概述
 
-本标准定义了主动消息功能的统一API接口规范，包括请求/响应格式、认证方式、错误处理、端到端加密等。遵循本标准可确保不同应用间的互操作性和数据一致性。
+本标准定义主动消息 API 的端点、请求/响应结构、错误码和加密要求。
 
-**核心安全特性**：本标准强制要求对所有请求体进行 AES-256-GCM 加密，确保信息在传输和存储过程中的安全性。
+- 这是 **权威规范**，用于字段和行为定义。
+- 如果你是接入方，优先走 Package-First 路径。
 
-> **📱 前端集成**：本标准定义后端 API 规范，前端需配合 Service Worker 接收推送通知。Service Worker 实现规范请参考：[service-worker-specification.md](./service-worker-specification.md)
+## 快速开始（Package-First）
 
----
+推荐接入顺序：
 
-## 快速开始：使用 Packages
+1. 服务端：`@rei-standard/amsg-server`
+2. 浏览器端：`@rei-standard/amsg-client`
+3. Service Worker：`@rei-standard/amsg-sw`
 
-推荐先使用仓库 `packages/rei-standard-amsg` 下的 SDK 包接入（服务端 + 客户端），仅在需要深度自定义时再按本文档手写实现。
+安装：
 
-### 推荐接入顺序（Packages）
-
-1. 安装 SDK 包：
 ```bash
-npm install @rei-standard/amsg-server @rei-standard/amsg-client web-push
+npm install @rei-standard/amsg-server @rei-standard/amsg-client @rei-standard/amsg-sw web-push
 
 # 数据库驱动二选一
 npm install @neondatabase/serverless
 # 或
 npm install pg
 ```
-2. 服务端优先使用 `@rei-standard/amsg-server` 的标准 handlers（`initDatabase`、`initMasterKey`、`getUserKey`、`scheduleMessage` 等）。
-3. 前端优先使用 `@rei-standard/amsg-client`，通过 `init()` 自动获取 `userKey` 并处理加解密。
-4. 如需 Service Worker 集成，可接入 `@rei-standard/amsg-sw`。
 
-SDK 使用示例请参考：
-- `packages/rei-standard-amsg/server/README.md`
-- `packages/rei-standard-amsg/client/README.md`
-- `packages/rei-standard-amsg/sw/README.md`
+包文档（绝对链接）：
 
-### 环境变量配置（服务端）
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md
 
-若不使用上述 Packages 接入，请在开始服务端实现之前，先配置以下环境变量：
+## 手动接入（备用）
 
-```env
-# 数据库连接
-DATABASE_URL=postgresql://[user]:[password]@[host]:[port]/[database]
+若不使用 SDK 包，请按以下文档准备环境变量、部署与测试：
 
-# VAPID 配置（推送通知）
-VAPID_EMAIL=youremail@example.com
-NEXT_PUBLIC_VAPID_PUBLIC_KEY=YOUR-PUBLIC-KEY
-VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
+- 手动部署：https://github.com/Tosd0/ReiStandard/blob/main/examples/README.md
+- 本地测试：https://github.com/Tosd0/ReiStandard/blob/main/docs/TEST_README.md
+- 生产监控：https://github.com/Tosd0/ReiStandard/blob/main/docs/VERCEL_TEST_DEPLOY.md
 
-# 安全配置
-CRON_SECRET=YOUR-SECRET                              # Cron Job 认证密钥
-
-# Vercel 特定（如适用）
-VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
-```
-
-**密钥生成命令**：
-```bash
-# 生成 CRON_SECRET（32字符随机字符串）
-openssl rand -base64 32
-```
-
-**主密钥初始化**：
-- 通过 `POST /api/v1/init-master-key` 在服务端一次性生成 `masterKey`
-- 该接口仅首次返回明文主密钥，后续请求返回 `MASTER_KEY_ALREADY_INITIALIZED`
-- 主密钥持久化在数据库 `system_config` 表（`key = 'master_key'`）
-
-**VAPID 密钥生成**：访问 https://vapidkeys.com 生成 VAPID 公钥和私钥。
-
-### 底层依赖配置（仅自研实现时）
-
-如果你不使用 `@rei-standard/amsg-server`，而是直接按本文档自行实现 API，请确保在项目的 `package.json` 中添加以下依赖：
-
-```json
-"dependencies": {
-  "@neondatabase/serverless": "^1.0.0",
-  "web-push": "^3.6.7"
-}
-```
-
-安装依赖：
-```bash
-npm install @neondatabase/serverless web-push
-```
-
-**重要提醒**：
-- `@neondatabase/serverless`：用于数据库连接和查询
-- `web-push`：用于浏览器推送通知功能
-- 同时需要创建 `manifest.json` 文件以支持 PWA 推送通知功能
+> 说明：本文件后续章节只保留规范定义与必要示例；完整接入代码请优先看 package README。
 
 ---
 

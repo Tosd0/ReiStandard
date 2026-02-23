@@ -1,23 +1,10 @@
 # Service Worker 标准规范 (Service Worker Specification)
 
-> **⚠️ AI 编程助手使用须知**
->
-> 本文档是 **Service Worker 实现标准规范**，定义了前端推送通知和离线功能的参考实现。
->
-> **规范**：
-> - ✅ 本标准定义的 **事件处理方式**、**缓存策略**、**通知数据结构**、**生命周期管理** 等为 **推荐实现方案**
-> - ✅ Service Worker 实现可以根据具体需求灵活调整，**不强制要求完全遵循**本标准
-> - ✅ 但 **通知数据结构应与 [主动消息API标准](./active-messaging-api.md) 保持一致**，以确保前后端协同工作
-> - ✅ 如需扩展功能，可以通过 **可选配置** 或 **自定义事件** 实现
-> - ✅ 如果实现的功能具有普遍应用场景，应提醒开发者向仓库提交 **FEATURE REQUEST**，以便在后续版本的标准中正式实现
-> - 💡 可以根据实际场景优化事件处理流程（如 `install`、`activate`、`push` 等）
-> - 💡 可以根据项目需求调整缓存策略
->
-> **发现问题时的处理**：
-> - 如果发现标准中存在错误或不合理之处，应建议开发者联系仓库负责人讨论
-> - **不应该直接修改标准文档**，标准的修改需要经过仓库负责人的审核和批准
+> 文档维护与变更规则请以仓库主说明为准：
+> https://github.com/Tosd0/ReiStandard/blob/main/README.md
 
 ## 版本信息
+
 - **版本号**: v1.2.2
 - **最后更新**: 2026-02-23
 - **状态**: Stable
@@ -25,9 +12,50 @@
 
 ## 概述
 
-本标准定义了支持主动消息推送功能的 Service Worker 实现规范，包括缓存策略、推送通知处理、生命周期管理等。遵循本标准可确保应用的离线可用性、推送通知的可靠性和版本更新的平滑性。
+本标准定义主动消息场景下的 Service Worker 行为、通知处理、缓存策略和兼容性要求。
+
+## 0. 快速接入路径（推荐：使用 SDK 包）
+
+推荐三包组合：
+
+1. `@rei-standard/amsg-server`
+2. `@rei-standard/amsg-client`
+3. `@rei-standard/amsg-sw`
+
+最小接入示例：
+
+```javascript
+// service-worker.js
+import { installReiSW } from '@rei-standard/amsg-sw';
+
+installReiSW(self, {
+  defaultIcon: '/icon-192x192.png',
+  defaultBadge: '/badge-72x72.png'
+});
+```
+
+```javascript
+// page.js
+import { ReiClient } from '@rei-standard/amsg-client';
+
+const client = new ReiClient({
+  baseUrl: '/api/v1',
+  userId: '550e8400-e29b-41d4-a716-446655440000'
+});
+
+await client.init();
+await navigator.serviceWorker.register('/service-worker.js');
+```
+
+完整接入（包括离线队列、消息协议、notificationclick 处理）请看：
+
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md
+- https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md
 
 ---
+
+> 以下第 1～14 章主要用于手动接入（不使用 SDK 包）或深度定制场景。
 
 ## 1. 核心功能要求
 
@@ -1259,167 +1287,49 @@ Cache-Control: no-cache, no-store, must-revalidate
 
 ---
 
-## 14. 完整模板示例
+## 14. 完整模板示例（不使用 @rei-standard/amsg-sw）
+
+> 说明：该模板仅用于手动接入。若可使用 npm 包，请优先：
+> https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md
 
 ```javascript
-// service-worker.js
-// 版本: 1.2.2
-// 更新: 2026-02-23
+// service-worker.js（手动接入最小模板）
+const CACHE_NAME = 'my-app-v1';
 
-// ==================== 配置 ====================
-const CACHE_NAME = 'my-app-v1.0.0';
-const CACHE_VERSION = Date.now();
-
-const CACHE_CONFIG = {
-  STATIC_CACHE: 'my-app-static-v1',
-  DYNAMIC_CACHE: 'my-app-dynamic-v1',
-  IMAGE_CACHE: 'my-app-images-v1',
-  MAX_DYNAMIC_ITEMS: 50,
-  MAX_IMAGE_ITEMS: 100
-};
-
-const STATIC_ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/css/style.css',
-  '/js/app.js'
-];
-
-// ==================== Install ====================
-self.addEventListener('install', event => {
-  console.log('[SW] 安装中...', CACHE_VERSION);
-
-  event.waitUntil(
-    caches.open(CACHE_CONFIG.STATIC_CACHE)
-      .then(cache => cache.addAll(STATIC_ASSETS))
-      .then(() => self.skipWaiting())
-      .catch(error => console.error('[SW] 安装失败:', error))
-  );
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE_NAME));
+  self.skipWaiting();
 });
 
-// ==================== Activate ====================
-self.addEventListener('activate', event => {
-  console.log('[SW] 激活中...', CACHE_VERSION);
-
-  event.waitUntil(
-    Promise.all([
-      caches.keys().then(cacheNames => {
-        const currentCaches = Object.values(CACHE_CONFIG);
-        return Promise.all(
-          cacheNames.map(name => {
-            if (!currentCaches.includes(name)) {
-              console.log('[SW] 删除旧缓存:', name);
-              return caches.delete(name);
-            }
-          })
-        );
-      }),
-      self.clients.matchAll().then(clients => {
-        clients.forEach(client => {
-          client.postMessage({
-            type: 'SW_ACTIVATED',
-            version: CACHE_VERSION
-          });
-        });
-      })
-    ])
-    .then(() => self.clients.claim())
-  );
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
 });
 
-// ==================== Fetch ====================
-self.addEventListener('fetch', event => {
-  const { request } = event;
-  const url = new URL(request.url);
-
-  if (!url.protocol.startsWith('http')) {
-    return;
-  }
-
-  event.respondWith(
-    caches.match(request)
-      .then(response => response || fetch(request))
-      .catch(error => {
-        console.warn('[SW] Fetch 失败:', request.url);
-        if (request.destination === 'document') {
-          return caches.match('/offline.html');
-        }
-        throw error;
-      })
-  );
-});
-
-// ==================== Push ====================
-self.addEventListener('push', event => {
-  console.log('[SW] 收到推送通知');
-
+self.addEventListener('push', (event) => {
   let data = {};
   try {
     data = event.data ? event.data.json() : {};
-  } catch (error) {
+  } catch (_error) {
     data = { title: '新消息', message: '您有一条新消息' };
   }
 
-  const options = {
-    body: data.message || '您有一条新消息',
-    icon: data.avatarUrl || '/icons/icon-192.png',
-    badge: '/icons/badge.png',
-    tag: data.messageId || `msg-${Date.now()}`,
-    data: data,
-    actions: [
-      { action: 'open', title: '查看' },
-      { action: 'dismiss', title: '关闭' }
-    ]
-  };
-
   event.waitUntil(
-    self.registration.showNotification(data.title || '新消息', options)
+    self.registration.showNotification(data.title || '新消息', {
+      body: data.message || '您有一条新消息',
+      icon: data.avatarUrl || '/icons/icon-192.png',
+      badge: '/icons/badge.png',
+      data
+    })
   );
 });
 
-// ==================== Notification Click ====================
-self.addEventListener('notificationclick', event => {
-  const { notification, action } = event;
-  notification.close();
-
-  if (action === 'dismiss') {
-    return;
-  }
-
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window' })
-      .then(clients => {
-        for (const client of clients) {
-          if (client.url === '/' && 'focus' in client) {
-            client.postMessage({
-              type: 'NOTIFICATION_CLICKED',
-              data: notification.data
-            });
-            return client.focus();
-          }
-        }
-        if (self.clients.openWindow) {
-          return self.clients.openWindow('/');
-        }
-      })
-  );
-});
-
-// ==================== Message ====================
-self.addEventListener('message', event => {
-  const { type } = event.data || {};
-
-  if (type === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
-});
-
-// ==================== Error ====================
-self.addEventListener('error', event => {
-  console.error('[SW] 错误:', event.error);
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(self.clients.openWindow('/'));
 });
 ```
+
+完整增强版（缓存策略、消息通信、离线队列）请按本规范前文各章节逐项补齐。
 
 ---
 
@@ -1444,7 +1354,9 @@ self.addEventListener('error', event => {
   - 后台：发送系统通知提醒用户
 
 **3. 文档更新**
-- 添加 AI 编程助手使用须知
+- 新增 SDK 包（server/client/sw）的快速接入流程说明
+- 明确手动模板属于“不使用包接入”的参考实现
+- 压缩完整模板示例，减少与包文档的重复
 
 #### 📝 兼容性说明
 

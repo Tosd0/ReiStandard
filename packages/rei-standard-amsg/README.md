@@ -1,35 +1,24 @@
 # ReiStandard AMSG SDK Workspace
 
-`packages/rei-standard-amsg` 目录是 ReiStandard 主动消息能力的 SDK 工作区，包含 3 个可发布包。
+`packages/rei-standard-amsg` 是主动消息能力的 SDK 工作区，包含 3 个可发布 npm 包。
 
 ## 包总览
 
-| Package | 当前版本 | 说明 | 文档 |
-|---------|----------|------|------|
-| `@rei-standard/amsg-server` | `1.2.2` | 主动消息 API 服务端 SDK（标准 handler + DB adapter） | [server/README.md](./server/README.md) |
-| `@rei-standard/amsg-client` | `1.2.2` | 浏览器端 SDK（加密、请求封装、Push 订阅） | [client/README.md](./client/README.md) |
-| `@rei-standard/amsg-sw` | `1.2.2` | Service Worker 插件（推送展示、离线队列） | [sw/README.md](./sw/README.md) |
+| Package | 版本 | 用途 | 文档 |
+|---------|------|------|------|
+| `@rei-standard/amsg-server` | `1.2.2` | 服务端标准 handlers 与 DB adapter | [server README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `1.2.2` | 浏览器端加密、请求封装、Push 订阅 | [client README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `1.2.2` | SW 推送展示、离线队列、后台重试 | [sw README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md) |
 
-## 使用示例
+## 推荐接入顺序
 
-```js
-import { createReiServer } from '@rei-standard/amsg-server';
-import { ReiClient } from '@rei-standard/amsg-client';
-import { installReiSW } from '@rei-standard/amsg-sw';
-```
-
-## Workspace 命令
-
-在仓库根目录执行：
-
-```bash
-npm run build
-npm run test
-```
+1. 先接入 `@rei-standard/amsg-server`，挂载标准 API。
+2. 再接入 `@rei-standard/amsg-sw`，完成通知展示与离线能力。
+3. 最后接入 `@rei-standard/amsg-client`，完成前端加密与任务创建。
 
 ## 相关文档
 
-- [主 README](../../README.md)
-- [API 技术规范](../../standards/active-messaging-api.md)
-- [Service Worker 规范](../../standards/service-worker-specification.md)
-- [部署教程](../../examples/README.md)
+- [Root README](https://github.com/Tosd0/ReiStandard/blob/main/README.md)
+- [API 规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)
+- [Service Worker 规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/service-worker-specification.md)
+- [手动接入示例](https://github.com/Tosd0/ReiStandard/blob/main/examples/README.md)

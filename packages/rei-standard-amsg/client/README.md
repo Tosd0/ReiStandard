@@ -1,12 +1,7 @@
 # @rei-standard/amsg-client
 
-`@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包。
+`@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应和 Push 订阅。
 
-## 文档导航
-
-- [SDK 总览](../README.md)
-- [主 README](../../../README.md)
-- [Service Worker 规范](../../../standards/service-worker-specification.md)
 
 ## 安装
 
@@ -14,7 +9,7 @@
 npm install @rei-standard/amsg-client
 ```
 
-## 使用
+## 快速使用
 
 ```js
 import { ReiClient } from '@rei-standard/amsg-client';
@@ -25,16 +20,54 @@ const client = new ReiClient({
 });
 
 await client.init();
+
+await navigator.serviceWorker.register('/service-worker.js');
+const registration = await navigator.serviceWorker.ready;
+const subscription = await client.subscribePush(
+  window.__VAPID_PUBLIC_KEY__,
+  registration
+);
+
+await client.scheduleMessage({
+  contactName: 'Rei',
+  messageType: 'fixed',
+  userMessage: '下班记得带伞～',
+  firstSendTime: new Date(Date.now() + 60 * 1000).toISOString(),
+  recurrenceType: 'none',
+  pushSubscription: subscription.toJSON()
+});
 ```
 
-主要能力：
+## 导出 API（Exports）
 
-- `init()` 自动调用 `/get-user-key` 获取用户专属密钥（客户端不再持有系统主密钥）
-- 自动处理 `schedule-message` / `update-message` 的加密请求
-- 自动处理 `messages` 的解密响应
-- Push 订阅辅助方法
+- `ReiClient`
 
-## 相关包
+`ReiClient` 主要方法：
 
-- 服务端 SDK：[`@rei-standard/amsg-server`](../server/README.md)
-- Service Worker SDK：[`@rei-standard/amsg-sw`](../sw/README.md)
+- `init()`
+- `scheduleMessage(payload)`
+- `updateMessage(uuid, updates)`
+- `cancelMessage(uuid)`
+- `listMessages(opts)`
+- `subscribePush(vapidPublicKey, registration)`
+
+## 模块格式与类型（ESM/CJS/Types）
+
+- ESM：`import { ReiClient } from '@rei-standard/amsg-client'`
+- CJS：`const { ReiClient } = require('@rei-standard/amsg-client')`
+- 类型：包内提供 `types` 入口（`dist/index.d.ts`）
+
+## 运行环境与要求
+
+- 浏览器环境（需 `fetch`、`crypto.subtle`）
+- Push 订阅需可用 Service Worker 与 Push API
+- 需要可用的 `baseUrl`（示例：`/api/v1`）
+- `userId` 必须是 UUID v4
+
+## 相关链接（绝对 URL）
+
+- [SDK Workspace 总览](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/README.md)
+- [Server 包 README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md)
+- [SW 包 README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md)
+- [Service Worker 规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/service-worker-specification.md)
+- [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)
