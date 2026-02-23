@@ -1,6 +1,6 @@
 /**
  * Encryption utility library (SDK version)
- * ReiStandard SDK v1.1.0
+ * ReiStandard SDK v1.2.0
  *
  * Wraps AES-256-GCM operations for request/response and storage encryption.
  */

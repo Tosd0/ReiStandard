@@ -1,6 +1,6 @@
 /**
  * Neon Serverless Database Adapter
- * ReiStandard SDK v1.1.0
+ * ReiStandard SDK v1.2.0
  *
  * @implements {import('./interface.js').DbAdapter}
  */
