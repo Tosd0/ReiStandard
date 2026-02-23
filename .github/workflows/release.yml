@@ -32,17 +32,7 @@ jobs:
       - name: Build and test
         run: npm run ci
 
-      - name: Verify npm token
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "Missing NPM_TOKEN secret"
-            exit 1
-          fi
-
       - name: Publish public workspaces
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_PUBLISH_PROVENANCE: 'true'
         run: npm run publish:workspaces
