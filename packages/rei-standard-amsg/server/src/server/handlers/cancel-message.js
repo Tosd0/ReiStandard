@@ -6,6 +6,8 @@
  * @returns {{ DELETE: function }}
  */
 
+import { isValidUUIDv4 } from '../lib/validation.js';
+
 export function createCancelMessageHandler(ctx) {
   async function DELETE(url, headers) {
     const u = new URL(url, 'https://dummy');
@@ -18,6 +20,9 @@ export function createCancelMessageHandler(ctx) {
     const userId = headers['x-user-id'];
     if (!userId) {
       return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
+    }
+    if (!isValidUUIDv4(userId)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
     }
 
     const deleted = await ctx.db.deleteTaskByUuid(taskUuid, userId);

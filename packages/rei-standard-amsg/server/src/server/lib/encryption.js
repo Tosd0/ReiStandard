@@ -11,7 +11,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypt
  * Derive a user-specific encryption key from the master key.
  *
  * @param {string} userId    - Unique user identifier.
- * @param {string} masterKey - 64-char hex master key (ENCRYPTION_KEY env var).
+ * @param {string} masterKey - 64-char hex master key.
  * @returns {string} 64-char hex key.
  */
 export function deriveUserEncryptionKey(userId, masterKey) {

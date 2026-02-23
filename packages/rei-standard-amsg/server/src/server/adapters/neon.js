@@ -6,7 +6,15 @@
  */
 
 import { neon } from '@neondatabase/serverless';
-import { TABLE_SQL, INDEXES, VERIFY_TABLE_SQL, COLUMNS_SQL } from './schema.js';
+import {
+  TABLE_SQL,
+  SYSTEM_CONFIG_SQL,
+  INDEXES,
+  VERIFY_TABLE_SQL,
+  VERIFY_SYSTEM_CONFIG_SQL,
+  COLUMNS_SQL,
+  SYSTEM_CONFIG_COLUMNS_SQL
+} from './schema.js';
 
 export class NeonAdapter {
   /** @param {string} connectionString */
@@ -29,6 +37,7 @@ export class NeonAdapter {
     const sql = this._getSql();
 
     await sql.query(TABLE_SQL);
+    await sql.query(SYSTEM_CONFIG_SQL);
 
     const indexResults = [];
     for (const index of INDEXES) {
@@ -64,14 +73,22 @@ export class NeonAdapter {
     if (tableCheck.length === 0) {
       throw new Error('Table creation verification failed');
     }
+    const systemConfigCheck = await sql.query(VERIFY_SYSTEM_CONFIG_SQL);
+    if (systemConfigCheck.length === 0) {
+      throw new Error('system_config table creation verification failed');
+    }
 
     const columns = await sql.query(COLUMNS_SQL);
+    const systemConfigColumns = await sql.query(SYSTEM_CONFIG_COLUMNS_SQL);
 
     return {
-      columnsCreated: columns.length,
+      columnsCreated: columns.length + systemConfigColumns.length,
       indexesCreated: indexResults.filter(r => r.status === 'success').length,
       indexesFailed: indexResults.filter(r => r.status === 'failed').length,
-      columns: columns.map(c => ({ name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' })),
+      columns: [
+        ...columns.map(c => ({ table: 'scheduled_messages', name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' })),
+        ...systemConfigColumns.map(c => ({ table: 'system_config', name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' }))
+      ],
       indexes: indexResults
     };
   }
@@ -245,5 +262,28 @@ export class NeonAdapter {
       [uuid, userId]
     );
     return rows.length > 0 ? rows[0].status : null;
+  }
+
+  async getMasterKey() {
+    const sql = this._getSql();
+    const rows = await sql.query(
+      `SELECT value
+       FROM system_config
+       WHERE key = 'master_key'
+       LIMIT 1`
+    );
+    return rows.length > 0 ? rows[0].value : null;
+  }
+
+  async setMasterKeyOnce(masterKey) {
+    const sql = this._getSql();
+    const rows = await sql.query(
+      `INSERT INTO system_config (key, value, created_at, updated_at)
+       VALUES ('master_key', $1, NOW(), NOW())
+       ON CONFLICT (key) DO NOTHING
+       RETURNING key`,
+      [masterKey]
+    );
+    return rows.length > 0;
   }
 }

@@ -21,7 +21,7 @@ import { ReiClient } from '@rei-standard/amsg-client';
 
 const client = new ReiClient({
   baseUrl: '/api/v1',
-  userId: 'user-123'
+  userId: '550e8400-e29b-41d4-a716-446655440000'
 });
 
 await client.init();
@@ -29,6 +29,7 @@ await client.init();
 
 主要能力：
 
+- `init()` 自动调用 `/get-user-key` 获取用户专属密钥（不再持有 masterKey）
 - 自动处理 `schedule-message` / `update-message` 的加密请求
 - 自动处理 `messages` 的解密响应
 - Push 订阅辅助方法

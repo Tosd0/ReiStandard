@@ -6,6 +6,8 @@
 
 // const { sql } = require('@vercel/postgres');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
+const { getMasterKeyFromDb } = require('../../lib/master-key-store');
+const { isValidUUIDv4 } = require('../../lib/validation');
 
 function normalizeHeaders(h) {
   const out = {};
@@ -31,6 +33,33 @@ async function core(url, headers) {
         error: {
           code: 'USER_ID_REQUIRED',
           message: '必须提供 X-User-Id 请求头'
+        }
+      }
+    };
+  }
+
+  if (!isValidUUIDv4(userId)) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: 'INVALID_USER_ID_FORMAT',
+          message: 'X-User-Id 必须是 UUID v4 格式'
+        }
+      }
+    };
+  }
+
+  const masterKey = await getMasterKeyFromDb();
+  if (!masterKey) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        error: {
+          code: 'MASTER_KEY_NOT_INITIALIZED',
+          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };
@@ -85,7 +114,7 @@ async function core(url, headers) {
   const tasks = [];
   const total = 0;
   
-  const userKey = deriveUserEncryptionKey(userId);
+  const userKey = deriveUserEncryptionKey(userId, masterKey);
   const decryptedTasks = tasks.map(task => {
     const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
     return {
@@ -169,6 +198,9 @@ module.exports = async function(req, res) {
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[messages] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return sendNodeJson(res, 500, { success: false, error: { code: 'DATABASE_URL_MISSING', message: '缺少 DATABASE_URL 环境变量' } });
+    }
     return sendNodeJson(res, 500, { success: false, error: { code: 'INTERNAL_SERVER_ERROR', message: '服务器内部错误，请稍后重试' } });
   }
 };
@@ -181,6 +213,9 @@ exports.handler = async function(event) {
     return { statusCode: result.status, headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(result.body) };
   } catch (error) {
     console.error('[messages] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ success: false, error: { code: 'DATABASE_URL_MISSING', message: '缺少 DATABASE_URL 环境变量' } }) };
+    }
     return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ success: false, error: { code: 'INTERNAL_SERVER_ERROR', message: '服务器内部错误，请稍后重试' } }) };
   }
 };

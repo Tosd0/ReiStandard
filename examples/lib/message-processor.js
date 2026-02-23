@@ -6,6 +6,7 @@
 
 const webpush = require('web-push');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('./encryption');
+const { getMasterKeyFromDb } = require('./master-key-store');
 // const { sql } = require('@vercel/postgres');
 
 // 初始化 VAPID，确保在所有调用路径都可用
@@ -39,10 +40,19 @@ if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
  * @param {string} task.status - 任务状态
  * @returns {Promise<{success: boolean, messagesSent: number, error?: string}>}
  */
-async function processSingleMessage(task) {
+async function processSingleMessage(task, providedMasterKey = null) {
   try {
+    const masterKey = providedMasterKey || await getMasterKeyFromDb();
+    if (!masterKey) {
+      return {
+        success: false,
+        messagesSent: 0,
+        error: 'MASTER_KEY_NOT_INITIALIZED'
+      };
+    }
+
     // 派生用户专属密钥
-    const userKey = deriveUserEncryptionKey(task.user_id);
+    const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
     
     // 解密整个payload获取完整数据
     const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
@@ -221,8 +231,19 @@ async function processSingleMessage(task) {
  * @param {number} maxRetries - 最大重试次数（默认2次）
  * @returns {Promise<{success: boolean, messagesSent?: number, error?: object}>}
  */
-async function processMessagesByUuid(uuid, maxRetries = 2) {
+async function processMessagesByUuid(uuid, maxRetries = 2, providedMasterKey = null) {
   let retryCount = 0;
+  const masterKey = providedMasterKey || await getMasterKeyFromDb();
+
+  if (!masterKey) {
+    return {
+      success: false,
+      error: {
+        code: 'MASTER_KEY_NOT_INITIALIZED',
+        message: '主密钥尚未初始化'
+      }
+    };
+  }
   
   while (retryCount <= maxRetries) {
     try {
@@ -261,7 +282,7 @@ async function processMessagesByUuid(uuid, maxRetries = 2) {
       });
 
       // 处理消息
-      const result = await processSingleMessage(task);
+      const result = await processSingleMessage(task, masterKey);
 
       if (!result.success) {
         // 如果还有重试机会，继续重试

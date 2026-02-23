@@ -10,7 +10,7 @@ import { randomUUID } from 'crypto';
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../lib/encryption.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
 import { parseEncryptedBody, isPlainObject } from '../lib/request.js';
-import { validateScheduleMessagePayload } from '../lib/validation.js';
+import { validateScheduleMessagePayload, isValidUUIDv4 } from '../lib/validation.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
 
 export function createScheduleMessageHandler(ctx) {
@@ -25,8 +25,16 @@ export function createScheduleMessageHandler(ctx) {
     if (!userId) {
       return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
     }
+    if (!isValidUUIDv4(userId)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
+    }
     if (encryptionVersion !== '1') {
       return { status: 400, body: { success: false, error: { code: 'UNSUPPORTED_ENCRYPTION_VERSION', message: '加密版本不支持' } } };
+    }
+
+    const masterKey = await ctx.db.getMasterKey();
+    if (!masterKey) {
+      return { status: 503, body: { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } } };
     }
 
     // Decrypt request body
@@ -39,7 +47,7 @@ export function createScheduleMessageHandler(ctx) {
 
     let payload;
     try {
-      const userKey = deriveUserEncryptionKey(userId, ctx.encryptionKey);
+      const userKey = deriveUserEncryptionKey(userId, masterKey);
       payload = decryptPayload(encryptedBody, userKey);
     } catch (error) {
       if (error instanceof SyntaxError) {
@@ -65,7 +73,7 @@ export function createScheduleMessageHandler(ctx) {
     }
 
     const taskUuid = payload.uuid || randomUUID();
-    const userKey = deriveUserEncryptionKey(userId, ctx.encryptionKey);
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
 
     const fullTaskData = {
       contactName: payload.contactName,
@@ -141,7 +149,7 @@ export function createScheduleMessageHandler(ctx) {
     // Instant type: send immediately
     if (payload.messageType === 'instant') {
       try {
-        const sendResult = await processMessagesByUuid(taskUuid, ctx, 2, userId);
+        const sendResult = await processMessagesByUuid(taskUuid, ctx, 2, userId, masterKey);
 
         if (!sendResult.success) {
           return { status: 500, body: { success: false, error: { code: 'MESSAGE_SEND_FAILED', message: '消息发送失败', details: sendResult.error } } };

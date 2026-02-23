@@ -7,6 +7,7 @@
 const webpush = require('web-push');
 const { processSingleMessage } = require('../../lib/message-processor');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
+const { getMasterKeyFromDb } = require('../../lib/master-key-store');
 // const { sql } = require('@vercel/postgres');
 
 // VAPID 配置验证
@@ -86,6 +87,19 @@ async function core(headers) {
     }
 
     const startTime = Date.now();
+    const masterKey = await getMasterKeyFromDb();
+    if (!masterKey) {
+      return {
+        status: 503,
+        body: {
+          success: false,
+          error: {
+            code: 'MASTER_KEY_NOT_INITIALIZED',
+            message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          }
+        }
+      };
+    }
 
     // 2. 查询待处理任务（全字段加密版本）
     /*
@@ -129,14 +143,14 @@ async function core(headers) {
         });
 
         // 使用统一的消息处理函数
-        const result = await processSingleMessage(task);
+        const result = await processSingleMessage(task, masterKey);
 
         if (!result.success) {
           throw new Error(result.error);
         }
 
         // 解密payload以获取recurrence_type（用于判断是否删除）
-        const userKey = deriveUserEncryptionKey(task.user_id);
+        const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
         const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
         // 更新任务状态

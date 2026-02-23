@@ -25,7 +25,8 @@ export async function GET(request) { ... }
 examples/
 ├── api/v1/                          # API 实现文件
 │   ├── init-database.js             # 数据库初始化（首次部署后删除）
-│   ├── get-master-key.js            # 主密钥分发
+│   ├── init-master-key.js           # 主密钥一次性初始化
+│   ├── get-user-key.js              # 用户密钥分发
 │   ├── schedule-message.js          # 创建定时任务
 │   ├── send-notifications.js        # Cron 触发处理
 │   ├── update-message.js            # 更新任务
@@ -69,7 +70,6 @@ VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
 
 # 安全配置
 CRON_SECRET=YOUR-SECRET
-ENCRYPTION_KEY=YOUR-64-CHAR-HEX-ENCRYPTION-KEY
 
 # Vercel 特定（如适用）
 VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
@@ -77,9 +77,7 @@ VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 
 **密钥生成命令**：
 ```bash
-openssl rand -hex 32    # ENCRYPTION_KEY
 openssl rand -base64 32 # CRON_SECRET
-openssl rand -base64 32 # INIT_SECRET（可选）
 ```
 
 **VAPID 密钥生成**：访问 https://vapidkeys.com
@@ -93,10 +91,12 @@ openssl rand -base64 32 # INIT_SECRET（可选）
 npm run dev
 
 # 2. 调用初始化 API
-curl -X GET "http://localhost:3000/api/v1/init-database" \
-  -H "Authorization: Bearer YOUR_INIT_SECRET"
+curl -X GET "http://localhost:3000/api/v1/init-database"
 
-# 3. 成功后推荐立即删除
+# 3. 初始化主密钥（仅首次可见）
+curl -X POST "http://localhost:3000/api/v1/init-master-key"
+
+# 4. 成功后推荐立即删除
 rm api/v1/init-database.js
 ```
 
@@ -133,8 +133,9 @@ Invoke-RestMethod -Uri "https://your-domain.com/api/v1/send-notifications" `
 
 | 端点 | 方法 | 功能 |
 |------|------|------|
-| `/api/v1/init-database` | GET/POST | 一键初始化数据库（首次部署后删除）|
-| `/api/v1/get-master-key` | GET | 分发主密钥给客户端 |
+| `/api/v1/init-database` | GET | 一键初始化数据库（幂等） |
+| `/api/v1/init-master-key` | POST | 一次性初始化主密钥（首次可见） |
+| `/api/v1/get-user-key` | GET | 基于 UUID v4 的用户密钥分发 |
 | `/api/v1/schedule-message` | POST | 创建定时消息任务 / 发送即时消息（instant类型） |
 | `/api/v1/send-notifications` | POST | Cron 触发处理到期任务 |
 | `/api/v1/update-message` | PUT | 更新任务配置 |
@@ -175,9 +176,10 @@ Invoke-RestMethod -Uri "https://your-domain.com/api/v1/send-notifications" `
 
 ### 安全建议
 
-1. **环境变量管理**：`ENCRYPTION_KEY` 和 `CRON_SECRET` 必须妥善保管，不要提交到代码仓库
+1. **环境变量管理**：`CRON_SECRET` 必须妥善保管，不要提交到代码仓库
 2. **初始化 API**：数据库初始化完成后立即删除 `init-database.js` 文件
-3. **加密要求**：所有请求体必须使用 AES-256-GCM 加密
+3. **主密钥保管**：`init-master-key` 仅首次返回 `masterKey`，请离线保存
+4. **加密要求**：所有请求体必须使用 AES-256-GCM 加密
 
 ### 生产环境优化
 

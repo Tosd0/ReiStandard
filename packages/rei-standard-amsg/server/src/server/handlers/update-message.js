@@ -8,7 +8,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { parseEncryptedBody, isPlainObject } from '../lib/request.js';
-import { isValidISO8601 } from '../lib/validation.js';
+import { isValidISO8601, isValidUUIDv4 } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -23,6 +23,9 @@ export function createUpdateMessageHandler(ctx) {
     if (!userId) {
       return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
     }
+    if (!isValidUUIDv4(userId)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
+    }
 
     const isEncrypted = headers['x-payload-encrypted'] === 'true';
     const encryptionVersion = headers['x-encryption-version'];
@@ -35,13 +38,18 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'UNSUPPORTED_ENCRYPTION_VERSION', message: '加密版本不支持' } } };
     }
 
+    const masterKey = await ctx.db.getMasterKey();
+    if (!masterKey) {
+      return { status: 503, body: { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } } };
+    }
+
     const parsedBody = parseEncryptedBody(body);
     if (!parsedBody.ok) {
       return { status: 400, body: { success: false, error: parsedBody.error } };
     }
 
     const encryptedBody = parsedBody.data;
-    const userKey = deriveUserEncryptionKey(userId, ctx.encryptionKey);
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
     let updates;
 
     try {

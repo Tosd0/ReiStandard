@@ -5,7 +5,8 @@
  */
 
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
-const { isValidISO8601 } = require('../../lib/validation');
+const { isValidISO8601, isValidUUIDv4 } = require('../../lib/validation');
+const { getMasterKeyFromDb } = require('../../lib/master-key-store');
 // const { sql } = require('@vercel/postgres');
 
 function normalizeHeaders(h) {
@@ -53,13 +54,40 @@ async function core(url, headers, body) {
     };
   }
 
+  if (!isValidUUIDv4(userId)) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: 'INVALID_USER_ID_FORMAT',
+          message: 'X-User-Id 必须是 UUID v4 格式'
+        }
+      }
+    };
+  }
+
+  const masterKey = await getMasterKeyFromDb();
+  if (!masterKey) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        error: {
+          code: 'MASTER_KEY_NOT_INITIALIZED',
+          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+        }
+      }
+    };
+  }
+
   // 解析请求体（可以是加密或非加密）
   const parsedBody = typeof body === 'string' ? JSON.parse(body) : body;
   let updates;
 
   // 如果是加密请求，先解密
   if (parsedBody.iv && parsedBody.authTag && parsedBody.encryptedData) {
-    const userKey = deriveUserEncryptionKey(userId);
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
     try {
       updates = decryptPayload(parsedBody, userKey);
     } catch (error) {
@@ -161,7 +189,7 @@ async function core(url, headers, body) {
   }
 
   // 解密现有payload并合并更新
-  const userKey = deriveUserEncryptionKey(userId);
+  const userKey = deriveUserEncryptionKey(userId, masterKey);
   
   // 模拟解密现有数据（实际从existingTask.encrypted_payload解密）
   // const existingData = JSON.parse(decryptFromStorage(existingTask.encrypted_payload, userKey));
@@ -249,6 +277,16 @@ module.exports = async function(req, res) {
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[update-message] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return sendNodeJson(res, 500, {
+        success: false,
+        error: {
+          code: 'DATABASE_URL_MISSING',
+          message: '缺少 DATABASE_URL 环境变量'
+        }
+      });
+    }
+
     return sendNodeJson(res, 500, {
       success: false,
       error: {
@@ -279,6 +317,20 @@ exports.handler = async function(event) {
     };
   } catch (error) {
     console.error('[update-message] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return {
+        statusCode: 500,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          success: false,
+          error: {
+            code: 'DATABASE_URL_MISSING',
+            message: '缺少 DATABASE_URL 环境变量'
+          }
+        })
+      };
+    }
+
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },

@@ -12,10 +12,10 @@
  *
  *   const client = new ReiClient({
  *     baseUrl: 'https://example.com/api/v1',
- *     userId: 'user-123',
+ *     userId: '550e8400-e29b-41d4-a716-446655440000',
  *   });
  *
- *   // Fetch master key and initialise encryption
+ *   // Fetch user key and initialise encryption
  *   await client.init();
  *
  *   // Schedule a message (payload is auto-encrypted)
@@ -41,28 +41,30 @@ export class ReiClient {
     /** @private */
     this._userId = config.userId;
     /** @private */
-    this._masterKey = null;
-    /** @private */
     this._userKey = null;
   }
 
   // ─── Initialisation ─────────────────────────────────────────────
 
   /**
-   * Fetch the master key and derive the user-specific encryption key.
+   * Fetch the user-specific encryption key.
    * Must be called before any encrypted request.
    */
   async init() {
-    const res = await fetch(`${this._baseUrl}/get-master-key`, {
+    const res = await fetch(`${this._baseUrl}/get-user-key`, {
       method: 'GET',
       headers: { 'X-User-Id': this._userId }
     });
 
     const json = await res.json();
-    if (!json.success) throw new Error(json.error?.message || 'Failed to fetch master key');
+    if (!json.success) throw new Error(json.error?.message || 'Failed to fetch user key');
 
-    this._masterKey = json.data.masterKey;
-    this._userKey = await this._deriveKey(this._masterKey, this._userId);
+    const userKey = json?.data?.userKey;
+    if (typeof userKey !== 'string' || !/^[0-9a-f]{64}$/i.test(userKey)) {
+      throw new Error('[rei-standard-amsg-client] Invalid user key format');
+    }
+
+    this._userKey = this._hexToUint8Array(userKey);
   }
 
   // ─── Public API ─────────────────────────────────────────────────
@@ -189,17 +191,6 @@ export class ReiClient {
   // ─── Crypto helpers (Web Crypto API) ────────────────────────────
 
   /**
-   * Derive a user-specific AES-256-GCM key from the master key and userId.
-   * @private
-   */
-  async _deriveKey(masterKey, userId) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(masterKey + userId);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    return new Uint8Array(hashBuffer);
-  }
-
-  /**
    * Encrypt plaintext with AES-256-GCM.
    * @private
    * @param {string} plaintext
@@ -262,6 +253,15 @@ export class ReiClient {
     const raw = atob(base64);
     const arr = new Uint8Array(raw.length);
     for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+    return arr;
+  }
+
+  /** @private */
+  _hexToUint8Array(hex) {
+    const arr = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      arr[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+    }
     return arr;
   }
 

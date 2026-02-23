@@ -4,6 +4,8 @@
  * ReiStandard v1.1.0
  */
 
+const { isValidUUIDv4 } = require('../../lib/validation');
+
 function normalizeHeaders(h) {
   const out = {};
   for (const k in h || {}) out[k.toLowerCase()] = h[k];
@@ -26,6 +28,9 @@ async function core(url, headers) {
   const userId = h['x-user-id'];
   if (!userId) {
     return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
+  }
+  if (!isValidUUIDv4(userId)) {
+    return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
   }
 
   // TODO: 删除数据库中的任务（按 uuid + userId）

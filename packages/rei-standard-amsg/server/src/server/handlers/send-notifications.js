@@ -40,6 +40,20 @@ export function createSendNotificationsHandler(ctx) {
       return { status: 401, body: { success: false, error: { code: 'UNAUTHORIZED', message: 'Cron Secret 验证失败' } } };
     }
 
+    const masterKey = await ctx.db.getMasterKey();
+    if (!masterKey) {
+      return {
+        status: 503,
+        body: {
+          success: false,
+          error: {
+            code: 'MASTER_KEY_NOT_INITIALIZED',
+            message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+          }
+        }
+      };
+    }
+
     const startTime = Date.now();
     const tasks = await ctx.db.getPendingTasks(50);
 
@@ -109,7 +123,7 @@ export function createSendNotificationsHandler(ctx) {
       }
 
       try {
-        const userKey = deriveUserEncryptionKey(task.user_id, ctx.encryptionKey);
+        const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
         const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
         if (decryptedPayload.recurrenceType === 'none') {

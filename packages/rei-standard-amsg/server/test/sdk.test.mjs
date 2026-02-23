@@ -12,10 +12,13 @@ import {
   validateScheduleMessagePayload,
   isValidISO8601,
   isValidUrl,
-  isValidUUID
+  isValidUUID,
+  isValidUUIDv4
 } from '../src/server/index.js';
 import { processMessagesByUuid } from '../src/server/lib/message-processor.js';
 import { createSendNotificationsHandler } from '../src/server/handlers/send-notifications.js';
+
+const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 
 function encryptClientPayload(payload, userId, masterKey) {
   const userKey = deriveUserEncryptionKey(userId, masterKey);
@@ -84,6 +87,11 @@ describe('validation utilities', () => {
     assert.equal(isValidUUID('not-a-uuid'), false);
   });
 
+  it('isValidUUIDv4', () => {
+    assert.equal(isValidUUIDv4(TEST_USER_ID), true);
+    assert.equal(isValidUUIDv4('550e8400-e29b-11d4-a716-446655440000'), false);
+  });
+
   it('validateScheduleMessagePayload rejects missing contactName', () => {
     const result = validateScheduleMessagePayload({});
     assert.equal(result.valid, false);
@@ -135,24 +143,16 @@ describe('createReiServer', () => {
     await assert.rejects(() => createReiServer(), /config is required/i);
   });
 
-  it('throws without encryptionKey', async () => {
-    await assert.rejects(
-      () => createReiServer({ db: { driver: 'neon', connectionString: 'postgres://x' } }),
-      /encryptionKey.*required/i
-    );
-  });
-
   it('returns handlers and adapter when configured with neon', async () => {
     const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
 
     assert.ok(server.handlers);
     assert.ok(server.adapter);
     assert.equal(typeof server.handlers.initDatabase.GET, 'function');
-    assert.equal(typeof server.handlers.initDatabase.POST, 'function');
-    assert.equal(typeof server.handlers.getMasterKey.GET, 'function');
+    assert.equal(typeof server.handlers.initMasterKey.POST, 'function');
+    assert.equal(typeof server.handlers.getUserKey.GET, 'function');
     assert.equal(typeof server.handlers.scheduleMessage.POST, 'function');
     assert.equal(typeof server.handlers.sendNotifications.POST, 'function');
     assert.equal(typeof server.handlers.updateMessage.PUT, 'function');
@@ -172,7 +172,6 @@ describe('createReiServer', () => {
     try {
       await createReiServer({
         db: { driver: 'neon', connectionString: 'postgres://x' },
-        encryptionKey: 'a'.repeat(64),
         vapid: {
           email: 'mailto:test@example.com',
           publicKey: vapidKeys.publicKey,
@@ -198,7 +197,6 @@ describe('createReiServer', () => {
     try {
       await createReiServer({
         db: { driver: 'neon', connectionString: 'postgres://x' },
-        encryptionKey: 'a'.repeat(64),
         vapid: {
           email: 'test@example.com',
           publicKey: vapidKeys.publicKey,
@@ -215,93 +213,79 @@ describe('createReiServer', () => {
 
 // ─── Handler unit tests (no real DB) ───────────────────────────
 
-describe('getMasterKey handler', () => {
+describe('key handlers', () => {
   let server;
+  const masterKey = 'b'.repeat(64);
 
   beforeEach(async () => {
     server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'b'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
   });
 
   it('returns 400 when X-User-Id is missing', async () => {
-    const result = await server.handlers.getMasterKey.GET({});
+    const result = await server.handlers.getUserKey.GET({});
     assert.equal(result.status, 400);
     assert.equal(result.body.error.code, 'USER_ID_REQUIRED');
   });
 
-  it('returns masterKey when userId is present', async () => {
-    const result = await server.handlers.getMasterKey.GET({ 'x-user-id': 'u1' });
+  it('returns 400 when X-User-Id is not UUID v4', async () => {
+    const result = await server.handlers.getUserKey.GET({ 'x-user-id': 'u1' });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, 'INVALID_USER_ID_FORMAT');
+  });
+
+  it('returns 503 when master key is not initialized', async () => {
+    server.adapter.getMasterKey = async () => null;
+    const result = await server.handlers.getUserKey.GET({ 'x-user-id': TEST_USER_ID });
+    assert.equal(result.status, 503);
+    assert.equal(result.body.error.code, 'MASTER_KEY_NOT_INITIALIZED');
+  });
+
+  it('returns userKey when userId and master key are present', async () => {
+    server.adapter.getMasterKey = async () => masterKey;
+    const result = await server.handlers.getUserKey.GET({ 'x-user-id': TEST_USER_ID });
     assert.equal(result.status, 200);
-    assert.equal(result.body.data.masterKey, 'b'.repeat(64));
+    assert.equal(result.body.data.userKey, deriveUserEncryptionKey(TEST_USER_ID, masterKey));
     assert.equal(result.body.data.version, 1);
+  });
+
+  it('initMasterKey returns 409 when already initialized', async () => {
+    server.adapter.setMasterKeyOnce = async () => false;
+    const result = await server.handlers.initMasterKey.POST();
+    assert.equal(result.status, 409);
+    assert.equal(result.body.error.code, 'MASTER_KEY_ALREADY_INITIALIZED');
+  });
+
+  it('initMasterKey returns 201 with master key payload', async () => {
+    server.adapter.setMasterKeyOnce = async () => true;
+    const result = await server.handlers.initMasterKey.POST();
+    assert.equal(result.status, 201);
+    assert.equal(result.body.success, true);
+    assert.match(result.body.data.masterKey, /^[0-9a-f]{64}$/);
+    assert.equal(result.body.data.version, 1);
+    assert.equal(result.body.data.fingerprint.length, 16);
   });
 });
 
 describe('initDatabase handler', () => {
-  it('returns 500 when initSecret is not configured', async () => {
+  it('returns 200 and schema summary without auth header', async () => {
     const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
 
-    const result = await server.handlers.initDatabase.GET({});
-    assert.equal(result.status, 500);
-    assert.equal(result.body.error.code, 'INIT_SECRET_MISSING');
-  });
-
-  it('returns 500 on POST when initSecret is not configured', async () => {
-    const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+    server.adapter.initSchema = async () => ({
+      columnsCreated: 2,
+      indexesCreated: 1,
+      indexesFailed: 0,
+      columns: [{ name: 'id' }, { name: 'user_id' }],
+      indexes: [{ name: 'idx_user_id', status: 'success' }]
     });
 
-    const result = await server.handlers.initDatabase.POST({}, '{}');
-    assert.equal(result.status, 500);
-    assert.equal(result.body.error.code, 'INIT_SECRET_MISSING');
-  });
-
-  it('returns 401 when authorization header is wrong', async () => {
-    const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64),
-      initSecret: 'my-secret'
-    });
-
-    const result = await server.handlers.initDatabase.GET({ authorization: 'Bearer wrong' });
-    assert.equal(result.status, 401);
-    assert.equal(result.body.error.code, 'UNAUTHORIZED');
-  });
-
-  it('returns 400 on POST when body is malformed JSON', async () => {
-    const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64),
-      initSecret: 'my-secret'
-    });
-
-    const result = await server.handlers.initDatabase.POST(
-      { authorization: 'Bearer my-secret' },
-      '{not valid json}'
-    );
-    assert.equal(result.status, 400);
-    assert.equal(result.body.error.code, 'INVALID_JSON');
-  });
-
-  it('returns 400 on POST when body is not an object', async () => {
-    const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64),
-      initSecret: 'my-secret'
-    });
-
-    const result = await server.handlers.initDatabase.POST(
-      { authorization: 'Bearer my-secret' },
-      null
-    );
-    assert.equal(result.status, 400);
-    assert.equal(result.body.error.code, 'INVALID_REQUEST_BODY');
+    const result = await server.handlers.initDatabase.GET();
+    assert.equal(result.status, 200);
+    assert.equal(result.body.success, true);
+    assert.equal(Array.isArray(result.body.data.tables), true);
   });
 });
 
@@ -310,15 +294,14 @@ describe('messages handler validation', () => {
 
   beforeEach(async () => {
     server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
   });
 
   it('returns 400 for invalid limit', async () => {
     const result = await server.handlers.messages.GET(
       '/messages?limit=abc',
-      { 'x-user-id': 'u1' }
+      { 'x-user-id': TEST_USER_ID }
     );
     assert.equal(result.status, 400);
     assert.equal(result.body.error.code, 'INVALID_PARAMETERS');
@@ -327,7 +310,7 @@ describe('messages handler validation', () => {
   it('returns 400 for negative offset', async () => {
     const result = await server.handlers.messages.GET(
       '/messages?offset=-5',
-      { 'x-user-id': 'u1' }
+      { 'x-user-id': TEST_USER_ID }
     );
     assert.equal(result.status, 400);
     assert.equal(result.body.error.code, 'INVALID_PARAMETERS');
@@ -336,14 +319,14 @@ describe('messages handler validation', () => {
   it('returns 400 for zero limit', async () => {
     const result = await server.handlers.messages.GET(
       '/messages?limit=0',
-      { 'x-user-id': 'u1' }
+      { 'x-user-id': TEST_USER_ID }
     );
     assert.equal(result.status, 400);
     assert.equal(result.body.error.code, 'INVALID_PARAMETERS');
   });
 
   it('returns encrypted payload for successful list query', async () => {
-    const userKey = deriveUserEncryptionKey('u1', 'a'.repeat(64));
+    const userKey = deriveUserEncryptionKey(TEST_USER_ID, 'a'.repeat(64));
     const encryptedPayload = encryptForStorage(
       JSON.stringify({
         contactName: 'Alice',
@@ -370,7 +353,8 @@ describe('messages handler validation', () => {
       total: 1
     });
 
-    const result = await server.handlers.messages.GET('/messages', { 'x-user-id': 'u1' });
+    server.adapter.getMasterKey = async () => 'a'.repeat(64);
+    const result = await server.handlers.messages.GET('/messages', { 'x-user-id': TEST_USER_ID });
     assert.equal(result.status, 200);
     assert.equal(result.body.success, true);
     assert.equal(result.body.encrypted, true);
@@ -389,13 +373,13 @@ describe('scheduleMessage handler', () => {
 
   it('returns 400 when encrypted body is missing', async () => {
     const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: masterKey
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
+    server.adapter.getMasterKey = async () => masterKey;
 
     const result = await server.handlers.scheduleMessage.POST(
       {
-        'x-user-id': 'u1',
+        'x-user-id': TEST_USER_ID,
         'x-payload-encrypted': 'true',
         'x-encryption-version': '1'
       },
@@ -408,10 +392,10 @@ describe('scheduleMessage handler', () => {
 
   it('returns 409 when uuid already exists', async () => {
     const server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: masterKey
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
 
+    server.adapter.getMasterKey = async () => masterKey;
     server.adapter.createTask = async () => {
       const duplicateError = new Error('duplicate key value violates unique constraint "uidx_uuid"');
       duplicateError.code = '23505';
@@ -427,13 +411,13 @@ describe('scheduleMessage handler', () => {
         pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hello'
       },
-      'u1',
+      TEST_USER_ID,
       masterKey
     );
 
     const result = await server.handlers.scheduleMessage.POST(
       {
-        'x-user-id': 'u1',
+        'x-user-id': TEST_USER_ID,
         'x-payload-encrypted': 'true',
         'x-encryption-version': '1'
       },
@@ -450,15 +434,14 @@ describe('updateMessage handler', () => {
 
   beforeEach(async () => {
     server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
   });
 
   it('returns 400 when encryption header is missing', async () => {
     const result = await server.handlers.updateMessage.PUT(
       '/update-message?id=550e8400-e29b-41d4-a716-446655440000',
-      { 'x-user-id': 'u1' },
+      { 'x-user-id': TEST_USER_ID },
       '{}'
     );
     assert.equal(result.status, 400);
@@ -466,10 +449,11 @@ describe('updateMessage handler', () => {
   });
 
   it('returns 400 for malformed encrypted payload JSON', async () => {
+    server.adapter.getMasterKey = async () => 'a'.repeat(64);
     const result = await server.handlers.updateMessage.PUT(
       '/update-message?id=550e8400-e29b-41d4-a716-446655440000',
       {
-        'x-user-id': 'u1',
+        'x-user-id': TEST_USER_ID,
         'x-payload-encrypted': 'true',
         'x-encryption-version': '1'
       },
@@ -480,10 +464,11 @@ describe('updateMessage handler', () => {
   });
 
   it('returns 400 for missing request body', async () => {
+    server.adapter.getMasterKey = async () => 'a'.repeat(64);
     const result = await server.handlers.updateMessage.PUT(
       '/update-message?id=550e8400-e29b-41d4-a716-446655440000',
       {
-        'x-user-id': 'u1',
+        'x-user-id': TEST_USER_ID,
         'x-payload-encrypted': 'true',
         'x-encryption-version': '1'
       },
@@ -499,8 +484,7 @@ describe('cancelMessage handler', () => {
 
   beforeEach(async () => {
     server = await createReiServer({
-      db: { driver: 'neon', connectionString: 'postgres://x' },
-      encryptionKey: 'a'.repeat(64)
+      db: { driver: 'neon', connectionString: 'postgres://x' }
     });
   });
 
@@ -509,7 +493,7 @@ describe('cancelMessage handler', () => {
 
     const result = await server.handlers.cancelMessage.DELETE(
       '/cancel-message?id=550e8400-e29b-41d4-a716-446655440000',
-      { 'x-user-id': 'u1' }
+      { 'x-user-id': TEST_USER_ID }
     );
 
     assert.equal(result.status, 404);
@@ -521,7 +505,7 @@ describe('cancelMessage handler', () => {
 
     const result = await server.handlers.cancelMessage.DELETE(
       '/cancel-message?id=550e8400-e29b-41d4-a716-446655440000',
-      { 'x-user-id': 'u1' }
+      { 'x-user-id': TEST_USER_ID }
     );
 
     assert.equal(result.status, 200);
@@ -532,7 +516,7 @@ describe('cancelMessage handler', () => {
 describe('processMessagesByUuid delivery safety', () => {
   it('does not retry delivery when cleanup fails after successful send', async () => {
     const masterKey = 'd'.repeat(64);
-    const userId = 'u1';
+    const userId = TEST_USER_ID;
     const task = {
       id: 1,
       user_id: userId,
@@ -561,7 +545,6 @@ describe('processMessagesByUuid delivery safety', () => {
     const updateCalls = [];
 
     const ctx = {
-      encryptionKey: masterKey,
       vapid: {
         email: 'vapid@example.com',
         publicKey: 'public-key',
@@ -573,6 +556,7 @@ describe('processMessagesByUuid delivery safety', () => {
         }
       },
       db: {
+        getMasterKey: async () => masterKey,
         getTaskByUuid: async () => task,
         getTaskByUuidOnly: async () => task,
         deleteTaskById: async () => {
@@ -598,7 +582,7 @@ describe('processMessagesByUuid delivery safety', () => {
 describe('sendNotifications post-send persistence safety', () => {
   it('marks sent and avoids retry scheduling when cleanup fails', async () => {
     const masterKey = 'e'.repeat(64);
-    const userId = 'u1';
+    const userId = TEST_USER_ID;
     const userKey = deriveUserEncryptionKey(userId, masterKey);
     const task = {
       id: 42,
@@ -625,7 +609,6 @@ describe('sendNotifications post-send persistence safety', () => {
     let sendCount = 0;
     const updateCalls = [];
     const handler = createSendNotificationsHandler({
-      encryptionKey: masterKey,
       cronSecret: 'cron-secret',
       vapid: {
         email: 'vapid@example.com',
@@ -638,6 +621,7 @@ describe('sendNotifications post-send persistence safety', () => {
         }
       },
       db: {
+        getMasterKey: async () => masterKey,
         getPendingTasks: async () => [task],
         deleteTaskById: async () => {
           throw new Error('delete failed');

@@ -7,6 +7,7 @@
  */
 
 import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../lib/encryption.js';
+import { isValidUUIDv4 } from '../lib/validation.js';
 
 export function createMessagesHandler(ctx) {
   async function GET(url, headers) {
@@ -16,6 +17,12 @@ export function createMessagesHandler(ctx) {
       return {
         status: 400,
         body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '必须提供 X-User-Id 请求头' } }
+      };
+    }
+    if (!isValidUUIDv4(userId)) {
+      return {
+        status: 400,
+        body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } }
       };
     }
 
@@ -34,7 +41,15 @@ export function createMessagesHandler(ctx) {
 
     const { tasks, total } = await ctx.db.listTasks(userId, { status, limit, offset });
 
-    const userKey = deriveUserEncryptionKey(userId, ctx.encryptionKey);
+    const masterKey = await ctx.db.getMasterKey();
+    if (!masterKey) {
+      return {
+        status: 503,
+        body: { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } }
+      };
+    }
+
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
 
     const decryptedTasks = tasks.map(task => {
       const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));

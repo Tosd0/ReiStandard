@@ -33,6 +33,14 @@ function isValidUUID(uuid) {
 }
 
 /**
+ * 验证 UUID v4 格式
+ */
+function isValidUUIDv4(uuid) {
+  const uuidV4Regex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidV4Regex.test(uuid);
+}
+
+/**
  * 验证请求体参数
  * 返回格式：{ valid: boolean, errorCode?: string, errorMessage?: string, details?: object }
  */
@@ -184,5 +192,6 @@ module.exports = {
   isValidISO8601,
   isValidUrl,
   isValidUUID,
+  isValidUUIDv4,
   validateScheduleMessagePayload
 };

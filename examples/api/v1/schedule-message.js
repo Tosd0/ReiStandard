@@ -6,7 +6,8 @@
 
 const webpush = require('web-push');
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
-const { validateScheduleMessagePayload } = require('../../lib/validation');
+const { validateScheduleMessagePayload, isValidUUIDv4 } = require('../../lib/validation');
+const { getMasterKeyFromDb } = require('../../lib/master-key-store');
 const { randomUUID } = require('crypto');
 // const { sql } = require('@vercel/postgres');
 
@@ -76,6 +77,19 @@ async function core(headers, body) {
     };
   }
 
+  if (!isValidUUIDv4(userId)) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: 'INVALID_USER_ID_FORMAT',
+          message: 'X-User-Id 必须是 UUID v4 格式'
+        }
+      }
+    };
+  }
+
   if (encryptionVersion !== '1') {
     return {
       status: 400,
@@ -89,7 +103,22 @@ async function core(headers, body) {
     };
   }
 
-  // 2. 解密请求体
+  // 2. 读取主密钥
+  const masterKey = await getMasterKeyFromDb();
+  if (!masterKey) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        error: {
+          code: 'MASTER_KEY_NOT_INITIALIZED',
+          message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
+        }
+      }
+    };
+  }
+
+  // 3. 解密请求体
   let payload;
   try {
     const encryptedBody = typeof body === 'string' ? JSON.parse(body) : body;
@@ -109,7 +138,7 @@ async function core(headers, body) {
     }
 
     // 派生用户专属密钥并解密
-    const userKey = deriveUserEncryptionKey(userId);
+    const userKey = deriveUserEncryptionKey(userId, masterKey);
     payload = decryptPayload(encryptedBody, userKey);
 
   } catch (error) {
@@ -142,7 +171,7 @@ async function core(headers, body) {
     throw error;
   }
 
-  // 3. 验证业务参数
+  // 4. 验证业务参数
   const validationResult = validateScheduleMessagePayload(payload);
   if (!validationResult.valid) {
     return {
@@ -158,11 +187,11 @@ async function core(headers, body) {
     };
   }
 
-  // 4. 生成 UUID（如果未提供）
+  // 5. 生成 UUID（如果未提供）
   const taskUuid = payload.uuid || randomUUID();
   
-  // 5. 加密整个 payload 用于数据库存储（全字段加密）
-  const userKey = deriveUserEncryptionKey(userId);
+  // 6. 加密整个 payload 用于数据库存储（全字段加密）
+  const userKey = deriveUserEncryptionKey(userId, masterKey);
   
   // 创建要存储的完整数据对象
   const fullTaskData = {
@@ -184,7 +213,7 @@ async function core(headers, body) {
   // 将整个数据对象加密成一个字符串
   const encryptedPayload = encryptForStorage(JSON.stringify(fullTaskData), userKey);
 
-  // 6. 插入数据库（全字段加密存储）
+  // 7. 插入数据库（全字段加密存储）
   /*
   const result = await sql`
     INSERT INTO scheduled_messages (
@@ -229,7 +258,7 @@ async function core(headers, body) {
     messageType: payload.messageType
   });
 
-  // 7. instant 类型：立即触发 send-notifications 处理
+  // 8. instant 类型：立即触发 send-notifications 处理
   if (payload.messageType === 'instant') {
     // 验证 VAPID 配置（instant 消息需要立即发送）
     if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
@@ -257,7 +286,7 @@ async function core(headers, body) {
 
     try {
       // 立即处理这条消息（带重试机制）
-      const sendResult = await processMessagesByUuid(taskUuid, 2); // 最多重试2次
+      const sendResult = await processMessagesByUuid(taskUuid, 2, masterKey); // 最多重试2次
       
       if (!sendResult.success) {
         // 发送失败，更新数据库任务状态为失败（如果数据库可用）
@@ -328,7 +357,7 @@ async function core(headers, body) {
     }
   }
 
-  // 8. 返回普通类型的成功响应（敏感信息已加密存储）
+  // 9. 返回普通类型的成功响应（敏感信息已加密存储）
   return {
     status: 201,
     body: {
@@ -359,6 +388,15 @@ module.exports = async function(req, res) {
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[schedule-message] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return sendNodeJson(res, 500, {
+        success: false,
+        error: {
+          code: 'DATABASE_URL_MISSING',
+          message: '缺少 DATABASE_URL 环境变量'
+        }
+      });
+    }
     return sendNodeJson(res, 500, {
       success: false,
       error: {
@@ -388,6 +426,19 @@ exports.handler = async function(event) {
     };
   } catch (error) {
     console.error('[schedule-message] Error:', error);
+    if (error.code === 'DATABASE_URL_MISSING') {
+      return {
+        statusCode: 500,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          success: false,
+          error: {
+            code: 'DATABASE_URL_MISSING',
+            message: '缺少 DATABASE_URL 环境变量'
+          }
+        })
+      };
+    }
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },

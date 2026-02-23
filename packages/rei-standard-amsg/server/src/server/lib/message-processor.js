@@ -12,7 +12,6 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 
 /**
  * @typedef {Object} ProcessorContext
- * @property {string}  encryptionKey     - 64-char hex master key.
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
  * @property {Object}  vapid             - { email, publicKey, privateKey }
  * @property {import('../adapters/interface.js').DbAdapter} db
@@ -23,11 +22,17 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
  *
  * @param {import('../adapters/interface.js').TaskRow} task
  * @param {ProcessorContext} ctx
+ * @param {string} [providedMasterKey]
  * @returns {Promise<{ success: boolean, messagesSent: number, error?: string }>}
  */
-export async function processSingleMessage(task, ctx) {
+export async function processSingleMessage(task, ctx, providedMasterKey) {
   try {
-    const userKey = deriveUserEncryptionKey(task.user_id, ctx.encryptionKey);
+    const masterKey = providedMasterKey || await ctx.db.getMasterKey();
+    if (!masterKey) {
+      return { success: false, messagesSent: 0, error: 'MASTER_KEY_NOT_INITIALIZED' };
+    }
+
+    const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
     const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
     let messageContent;
@@ -108,10 +113,19 @@ export async function processSingleMessage(task, ctx) {
  * @param {ProcessorContext} ctx
  * @param {number} [maxRetries=2]
  * @param {string} [userId]
+ * @param {string} [providedMasterKey]
  * @returns {Promise<{ success: boolean, messagesSent?: number, retriesUsed?: number, error?: Object }>}
  */
-export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId) {
+export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, providedMasterKey) {
   let retryCount = 0;
+  const masterKey = providedMasterKey || await ctx.db.getMasterKey();
+
+  if (!masterKey) {
+    return {
+      success: false,
+      error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化' }
+    };
+  }
 
   while (retryCount <= maxRetries) {
     let task;
@@ -136,7 +150,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId) {
       return { success: false, error: { code: 'TASK_NOT_FOUND', message: '任务不存在或已处理' } };
     }
 
-    const result = await processSingleMessage(task, ctx);
+    const result = await processSingleMessage(task, ctx, masterKey);
 
     if (!result.success) {
       if (retryCount < maxRetries) {

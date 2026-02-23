@@ -12,7 +12,7 @@
 
 按功能拆分后，主应用直接按包引用：
 
-- `@rei-standard/amsg-server`：`createReiServer`，用于创建 7 个标准 API 处理器
+- `@rei-standard/amsg-server`：`createReiServer`，用于创建标准 API 处理器
 - `@rei-standard/amsg-client`：`ReiClient`，用于前端加密和 API 调用
 - `@rei-standard/amsg-sw`：`installReiSW`，用于 SW 推送展示和离线请求队列
 
@@ -57,7 +57,7 @@ import { installReiSW } from '@rei-standard/amsg-sw';
 
 #### 1. [API 技术规范](./standards/active-messaging-api.md) - 后端 API 标准
 完整的后端 API 技术规范，包括：
-- 7 个 API 端点的详细定义（请求/响应格式、错误代码）
+- API 端点的详细定义（请求/响应格式、错误代码）
 - 端到端加密架构（AES-256-GCM）
 - 四种消息类型（fixed、prompted、auto、instant）
 - 认证与授权体系
@@ -85,7 +85,7 @@ import { installReiSW } from '@rei-standard/amsg-sw';
 
 #### 3. [本地测试](./docs/TEST_README.md) - 开发环境测试
 本地测试脚本使用指南：
-- 完整的端点测试（7 个 API 端点）
+- 完整的端点测试（全部标准 API 端点）
 - 加密/解密验证
 - 参数验证测试
 - 自动清理测试数据
@@ -121,13 +121,14 @@ VAPID_EMAIL=your@email.com
 NEXT_PUBLIC_VAPID_PUBLIC_KEY=...
 VAPID_PRIVATE_KEY=...
 CRON_SECRET=$(openssl rand -base64 32)
-ENCRYPTION_KEY=$(openssl rand -hex 32)
 
 # 4. 初始化数据库
-curl -X GET "http://localhost:3000/api/v1/init-database" \
-  -H "Authorization: Bearer YOUR_INIT_SECRET"
+curl -X GET "http://localhost:3000/api/v1/init-database"
 
-# 5. 部署到 Vercel
+# 5. 一次性初始化主密钥（仅首次可见，请离线保存）
+curl -X POST "http://localhost:3000/api/v1/init-master-key"
+
+# 6. 部署到 Vercel
 vercel --prod
 ```
 
@@ -159,7 +160,8 @@ ReiStandard/
 ├── examples/
 │   ├── api/v1/                          # API 实现示例代码
 │   │   ├── init-database.js             # 数据库初始化
-│   │   ├── get-master-key.js            # 主密钥分发
+│   │   ├── init-master-key.js           # 主密钥一次性初始化
+│   │   ├── get-user-key.js              # 用户密钥分发
 │   │   ├── schedule-message.js          # 创建定时任务
 │   │   ├── send-notifications.js        # Cron 触发处理
 │   │   ├── update-message.js            # 更新任务

@@ -29,9 +29,7 @@ const rei = await createReiServer({
     driver: 'neon',
     connectionString: process.env.DATABASE_URL
   },
-  encryptionKey: process.env.ENCRYPTION_KEY,
   cronSecret: process.env.CRON_SECRET,
-  initSecret: process.env.INIT_SECRET,
   vapid: {
     email: process.env.VAPID_EMAIL,
     publicKey: process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY,
@@ -43,12 +41,19 @@ const rei = await createReiServer({
 导出的标准 handler：
 
 - `rei.handlers.initDatabase`
-- `rei.handlers.getMasterKey`
+- `rei.handlers.initMasterKey`
+- `rei.handlers.getUserKey`
 - `rei.handlers.scheduleMessage`
 - `rei.handlers.sendNotifications`
 - `rei.handlers.updateMessage`
 - `rei.handlers.cancelMessage`
 - `rei.handlers.messages`
+
+推荐初始化顺序：
+
+1. 调用 `initDatabase.GET`（幂等创建表）
+2. 调用 `initMasterKey.POST`（仅首次返回 `masterKey`）
+3. 客户端携带 UUID v4 `X-User-Id` 调用 `getUserKey.GET`
 
 ## 相关包
 

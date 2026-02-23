@@ -8,10 +8,14 @@ const { createCipheriv, createDecipheriv, createHash, randomBytes } = require('c
 /**
  * 派生用户专属加密密钥
  * @param {string} userId - 用户唯一标识符
+ * @param {string} masterKey - 64字符十六进制主密钥
  * @returns {string} 64字符十六进制密钥
  */
-function deriveUserEncryptionKey(userId) {
-  const masterKey = process.env.ENCRYPTION_KEY;
+function deriveUserEncryptionKey(userId, masterKey) {
+  if (typeof masterKey !== 'string' || !/^[0-9a-f]{64}$/i.test(masterKey)) {
+    throw new Error('Invalid master key format');
+  }
+
   return createHash('sha256')
     .update(masterKey + userId)
     .digest('hex')
