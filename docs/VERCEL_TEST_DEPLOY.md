@@ -1,26 +1,22 @@
-# 生产环境测试端点部署指南
+# 生产环境测试端点部署指南（v2.0.0）
 
-将 `tests/test-vercel-function.js` 部署为 Serverless 测试端点，用于持续健康检查。
+将 `tests/test-vercel-function.js` 部署为 Serverless 健康检查端点。
 
 ## 相关文档
 
-- 本地测试主指南：https://github.com/Tosd0/ReiStandard/blob/main/docs/TEST_README.md
-- 手动接入部署：https://github.com/Tosd0/ReiStandard/blob/main/examples/README.md
+- 本地测试：https://github.com/Tosd0/ReiStandard/blob/main/docs/TEST_README.md
+- 手动接入：https://github.com/Tosd0/ReiStandard/blob/main/examples/README.md
 
 ## 环境变量
 
-本文件不重复定义语义，直接复用：
+- 必需：`TENANT_DATABASE_URL`
+- 可选：`INIT_SECRET`（服务端启用初始化鉴权时再配置）
 
-- `API_BASE_URL`
-- `CRON_SECRET`
+可选：
+
 - `TEST_USER_ID`
 
-说明见：
-https://github.com/Tosd0/ReiStandard/blob/main/docs/TEST_README.md
-
-额外可选：
-
-- `INIT_SECRET`（如果你希望初始化接口有额外保护）
+说明：测试端点会先调用 `init-tenant`，然后自动完成 `get-user-key`、`schedule-message`、`send-notifications` 验证。
 
 ## 部署方式一：集成到现有项目
 
@@ -67,8 +63,7 @@ active-messaging-test/
 {
   "version": 2,
   "env": {
-    "API_BASE_URL": "https://your-actual-api-domain.vercel.app",
-    "CRON_SECRET": "@cron-secret"
+    "TENANT_DATABASE_URL": "@rei-tenant-database-url"
   }
 }
 ```
@@ -76,7 +71,13 @@ active-messaging-test/
 ### 4. 设置 Secret
 
 ```bash
-vercel secrets add cron-secret "your_cron_secret"
+vercel secrets add rei-tenant-database-url "postgres://..."
+```
+
+如果服务端启用了初始化鉴权，再额外配置：
+
+```bash
+vercel secrets add rei-init-secret "your_init_secret"
 ```
 
 ## CI/CD 集成（示例）
@@ -102,11 +103,11 @@ jobs:
 ## 告警建议
 
 1. 监控 URL：`/api/test-active-messaging`
-2. 轮询间隔：5 分钟
+2. 轮询间隔：5~10 分钟
 3. 告警条件：`summary.failed > 0`
 
 ## 故障排查
 
-1. `500 Configuration error`：环境变量缺失。
-2. `401`：`CRON_SECRET` 与 API 端不一致。
-3. 测试通过率波动：优先检查数据库连通与 VAPID 配置。
+1. `500`：缺失 `TENANT_DATABASE_URL`。
+2. `401 INVALID_INIT_AUTH`：服务端启用了 `INIT_SECRET` 且当前值不一致。
+3. `401 INVALID_TENANT_AUTH`：token 签发/验签配置异常。

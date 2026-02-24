@@ -1,36 +1,19 @@
 /**
- * Vercel Function 版本的主动消息 API 测试
- *
- * 部署方式：
- * 1. 将此文件放到 /api/test-active-messaging.js
- * 2. 在 Vercel Dashboard 配置环境变量
- * 3. 访问 https://your-domain.vercel.app/api/test-active-messaging
- *
- * 或者本地运行：
- * vercel dev
- * curl http://localhost:3000/api/test-active-messaging
+ * Vercel Function 版本的主动消息 API v2.0.0 测试
  */
 
 const crypto = require('crypto');
 
-// ============ 配置 ============
-function getEnv(key, defaultValue = null) {
-  return process.env[key] || defaultValue;
-}
-
-// ============ 加密工具 ============
 function encryptPayload(plainPayload, encryptionKey) {
   const plaintext = JSON.stringify(plainPayload);
-  const iv = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(
     'aes-256-gcm',
     Buffer.from(encryptionKey, 'hex'),
     iv
   );
-  const encrypted = Buffer.concat([
-    cipher.update(plaintext, 'utf8'),
-    cipher.final()
-  ]);
+
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
   return {
@@ -40,7 +23,6 @@ function encryptPayload(plainPayload, encryptionKey) {
   };
 }
 
-// ============ HTTP 请求 ============
 async function makeRequest(method, url, options = {}) {
   try {
     const response = await fetch(url, {
@@ -62,41 +44,37 @@ async function makeRequest(method, url, options = {}) {
     return {
       ok: false,
       status: 0,
-      error: error.message
+      error: error.message,
+      data: {}
     };
   }
 }
 
-// ============ 测试函数 ============
 async function runTests(baseUrl, config) {
   const results = [];
-  const createdTasks = [];
-  let userKey = null;
 
-  // 测试 1: 获取用户密钥
-  try {
-    const res = await makeRequest('GET', `${baseUrl}/api/v1/get-user-key`, {
-      headers: { 'X-User-Id': config.userId }
-    });
-    const fetchedUserKey = res.data?.data?.userKey;
-    if (res.ok && res.data.success && typeof fetchedUserKey === 'string' && /^[0-9a-f]{64}$/i.test(fetchedUserKey)) {
-      userKey = fetchedUserKey;
-    }
-    results.push({
-      test: 'GET /api/v1/get-user-key',
-      passed: Boolean(userKey),
-      status: res.status,
-      message: userKey ? '成功' : res.data.error?.message || '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'GET /api/v1/get-user-key',
-      passed: false,
-      error: error.message
-    });
+  const initHeaders = {};
+  if (config.initSecret) {
+    initHeaders['X-Init-Secret'] = config.initSecret;
   }
 
-  if (!userKey) {
+  const initRes = await makeRequest('POST', `${baseUrl}/api/v1/init-tenant`, {
+    headers: initHeaders,
+    body: {
+      driver: 'neon',
+      databaseUrl: config.tenantDatabaseUrl
+    }
+  });
+
+  const initPassed = initRes.ok && initRes.data.success;
+  results.push({
+    test: 'POST /api/v1/init-tenant',
+    passed: initPassed,
+    status: initRes.status,
+    message: initPassed ? '成功' : (initRes.data.error && initRes.data.error.message) || initRes.error || '失败'
+  });
+
+  if (!initPassed) {
     return {
       summary: {
         total: results.length,
@@ -105,389 +83,109 @@ async function runTests(baseUrl, config) {
         successRate: '0.0%'
       },
       results,
-      cleanup: {
-        attempted: 0,
-        successful: 0,
-        details: []
-      },
       timestamp: new Date().toISOString()
     };
   }
 
-  // 测试 2: 创建 fixed 消息
-  try {
-    const payload = {
-      contactName: 'ReiTest',
-      messageType: 'fixed',
-      userMessage: '测试消息',
-      firstSendTime: new Date(Date.now() + 60000).toISOString(),
-      recurrenceType: 'none',
-      pushSubscription: {
-        endpoint: 'https://fcm.googleapis.com/test',
-        keys: { p256dh: 'test', auth: 'test' }
-      }
-    };
+  const tenantToken = initRes.data.data.tenantToken;
+  const cronToken = initRes.data.data.cronToken;
 
-    const encrypted = encryptPayload(payload, userKey);
-    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
-      headers: {
-        'X-Payload-Encrypted': 'true',
-        'X-Encryption-Version': '1',
-        'X-User-Id': config.userId
-      },
-      body: encrypted
-    });
-
-    if (res.ok && res.data.success) {
-      createdTasks.push(res.data.data.uuid);
+  const userKeyRes = await makeRequest('GET', `${baseUrl}/api/v1/get-user-key`, {
+    headers: {
+      Authorization: `Bearer ${tenantToken}`,
+      'X-User-Id': config.userId
     }
+  });
 
-    results.push({
-      test: 'POST /api/v1/schedule-message (fixed)',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      taskId: res.data.data?.id,
-      message: res.ok ? '成功' : res.data.error?.message || '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'POST /api/v1/schedule-message (fixed)',
-      passed: false,
-      error: error.message
-    });
-  }
+  const keyPassed = userKeyRes.ok && userKeyRes.data.success;
+  results.push({
+    test: 'GET /api/v1/get-user-key',
+    passed: keyPassed,
+    status: userKeyRes.status,
+    message: keyPassed ? '成功' : (userKeyRes.data.error && userKeyRes.data.error.message) || userKeyRes.error || '失败'
+  });
 
-  // 测试 3: 创建 prompted 消息（使用占位符 API key）
-  try {
-    const payload = {
-      contactName: 'ReiTest',
-      messageType: 'prompted',
-      firstSendTime: new Date(Date.now() + 120000).toISOString(),
-      recurrenceType: 'none',
-      pushSubscription: {
-        endpoint: 'https://fcm.googleapis.com/test',
-        keys: { p256dh: 'test', auth: 'test' }
+  if (!keyPassed) {
+    return {
+      summary: {
+        total: results.length,
+        passed: results.filter(r => r.passed).length,
+        failed: results.filter(r => !r.passed).length,
+        successRate: `${((results.filter(r => r.passed).length / results.length) * 100).toFixed(1)}%`
       },
-      apiUrl: 'https://api.openai.com/v1/chat/completions',
-      apiKey: 'sk-test-placeholder',
-      primaryModel: 'gpt-5',
-      completePrompt: '测试 prompt'
+      results,
+      timestamp: new Date().toISOString()
     };
+  }
 
-    const encrypted = encryptPayload(payload, userKey);
-    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
-      headers: {
-        'X-Payload-Encrypted': 'true',
-        'X-Encryption-Version': '1',
-        'X-User-Id': config.userId
-      },
-      body: encrypted
-    });
-
-    if (res.ok && res.data.success) {
-      createdTasks.push(res.data.data.uuid);
+  const payload = {
+    contactName: 'ReiTest',
+    messageType: 'fixed',
+    userMessage: '测试消息',
+    firstSendTime: new Date(Date.now() + 60 * 1000).toISOString(),
+    recurrenceType: 'none',
+    pushSubscription: {
+      endpoint: 'https://fcm.googleapis.com/test',
+      keys: { p256dh: 'test', auth: 'test' }
     }
+  };
 
-    results.push({
-      test: 'POST /api/v1/schedule-message (prompted)',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      taskId: res.data.data?.id,
-      message: res.ok ? '成功' : res.data.error?.message || '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'POST /api/v1/schedule-message (prompted)',
-      passed: false,
-      error: error.message
-    });
-  }
+  const encrypted = encryptPayload(payload, userKeyRes.data.data.userKey);
+  const scheduleRes = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
+    headers: {
+      Authorization: `Bearer ${tenantToken}`,
+      'X-Payload-Encrypted': 'true',
+      'X-Encryption-Version': '1',
+      'X-User-Id': config.userId
+    },
+    body: encrypted
+  });
 
-  // 测试 3.5: 创建 instant 固定消息
-  try {
-    const payload = {
-      contactName: 'InstantRei',
-      messageType: 'instant',
-      userMessage: '即时测试消息',
-      firstSendTime: new Date().toISOString(),
-      recurrenceType: 'none',
-      pushSubscription: {
-        endpoint: 'https://fcm.googleapis.com/test',
-        keys: { p256dh: 'test', auth: 'test' }
-      }
-    };
+  results.push({
+    test: 'POST /api/v1/schedule-message',
+    passed: scheduleRes.ok && scheduleRes.data.success,
+    status: scheduleRes.status,
+    message: scheduleRes.ok ? '成功' : (scheduleRes.data.error && scheduleRes.data.error.message) || scheduleRes.error || '失败'
+  });
 
-    const encrypted = encryptPayload(payload, userKey);
-    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
-      headers: {
-        'X-Payload-Encrypted': 'true',
-        'X-Encryption-Version': '1',
-        'X-User-Id': config.userId
-      },
-      body: encrypted
-    });
-
-    results.push({
-      test: 'POST /api/v1/schedule-message (instant fixed)',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      messagesSent: res.data.data?.messagesSent,
-      message: res.ok ? `发送 ${res.data.data?.messagesSent || 0} 条消息` : res.data.error?.message || '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'POST /api/v1/schedule-message (instant fixed)',
-      passed: false,
-      error: error.message
-    });
-  }
-
-  // 测试 3.6: 创建 instant AI 消息
-  try {
-    const payload = {
-      contactName: 'InstantRei',
-      messageType: 'instant',
-      firstSendTime: new Date().toISOString(),
-      recurrenceType: 'none',
-      pushSubscription: {
-        endpoint: 'https://fcm.googleapis.com/test',
-        keys: { p256dh: 'test', auth: 'test' }
-      },
-      apiUrl: 'https://api.openai.com/v1/chat/completions',
-      apiKey: 'sk-test-placeholder',
-      primaryModel: 'gpt-5',
-      completePrompt: '立即发送一条简短测试消息'
-    };
-
-    const encrypted = encryptPayload(payload, userKey);
-    const res = await makeRequest('POST', `${baseUrl}/api/v1/schedule-message`, {
-      headers: {
-        'X-Payload-Encrypted': 'true',
-        'X-Encryption-Version': '1',
-        'X-User-Id': config.userId
-      },
-      body: encrypted
-    });
-
-    results.push({
-      test: 'POST /api/v1/schedule-message (instant AI)',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      messagesSent: res.data.data?.messagesSent,
-      message: res.ok ? `发送 ${res.data.data?.messagesSent || 0} 条消息` : res.data.error?.message || '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'POST /api/v1/schedule-message (instant AI)',
-      passed: false,
-      error: error.message
-    });
-  }
-
-  // 测试 4: 查询任务列表
-  try {
-    const res = await makeRequest('GET', `${baseUrl}/api/v1/messages?status=pending&limit=100`, {
-      headers: { 'X-User-Id': config.userId }
-    });
-
-    results.push({
-      test: 'GET /api/v1/messages',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      taskCount: res.data.data?.tasks?.length || 0,
-      message: res.ok ? `查询到 ${res.data.data?.tasks?.length || 0} 个任务` : '失败'
-    });
-  } catch (error) {
-    results.push({
-      test: 'GET /api/v1/messages',
-      passed: false,
-      error: error.message
-    });
-  }
-
-  // 测试 5: 更新任务
-  if (createdTasks.length > 0) {
-    try {
-      const updatePayload = {
-        nextSendAt: new Date(Date.now() + 300000).toISOString()
-      };
-
-      const encrypted = encryptPayload(updatePayload, userKey);
-      const res = await makeRequest('PUT', `${baseUrl}/api/v1/update-message?id=${createdTasks[0]}`, {
-        headers: {
-          'X-Payload-Encrypted': 'true',
-          'X-Encryption-Version': '1',
-          'X-User-Id': config.userId
-        },
-        body: encrypted
-      });
-
-      results.push({
-        test: 'PUT /api/v1/update-message/:id',
-        passed: res.ok && res.data.success,
-        status: res.status,
-        message: res.ok ? '成功' : res.data.error?.message || '失败'
-      });
-    } catch (error) {
-      results.push({
-        test: 'PUT /api/v1/update-message/:id',
-        passed: false,
-        error: error.message
-      });
+  const sendRes = await makeRequest('POST', `${baseUrl}/api/v1/send-notifications`, {
+    headers: {
+      Authorization: `Bearer ${cronToken}`
     }
-  }
+  });
 
-  // 测试 6: 触发通知（仅测试认证，不实际执行）
-  try {
-    const headers = {
-      'Authorization': `Bearer ${config.cronSecret}`
-    };
-    if (config.vercelBypassKey) {
-      headers['x-vercel-protection-bypass'] = config.vercelBypassKey;
-    }
+  results.push({
+    test: 'POST /api/v1/send-notifications',
+    passed: sendRes.ok && sendRes.data.success,
+    status: sendRes.status,
+    message: sendRes.ok ? '成功' : (sendRes.data.error && sendRes.data.error.message) || sendRes.error || '失败'
+  });
 
-    const res = await makeRequest('POST', `${baseUrl}/api/v1/send-notifications`, {
-      headers
-    });
-
-    results.push({
-      test: 'POST /api/v1/send-notifications',
-      passed: res.ok && res.data.success,
-      status: res.status,
-      message: res.ok
-        ? `处理了 ${res.data.data?.totalTasks || 0} 个任务`
-        : res.data.error?.message || '失败',
-      errorCode: res.data.error?.code,
-      errorDetails: res.data.error?.details
-    });
-  } catch (error) {
-    results.push({
-      test: 'POST /api/v1/send-notifications',
-      passed: false,
-      error: error.message
-    });
-  }
-
-  // 清理: 删除创建的任务
-  const cleanupResults = [];
-  for (const taskUuid of createdTasks) {
-    try {
-      const res = await makeRequest('DELETE', `${baseUrl}/api/v1/cancel-message?id=${taskUuid}`, {
-        headers: { 'X-User-Id': config.userId }
-      });
-      cleanupResults.push({
-        uuid: taskUuid,
-        success: res.ok && res.data.success
-      });
-    } catch (error) {
-      cleanupResults.push({
-        uuid: taskUuid,
-        success: false,
-        error: error.message
-      });
-    }
-  }
-
-  // 统计结果
-  const passedCount = results.filter(r => r.passed).length;
-  const totalCount = results.length;
+  const passed = results.filter(r => r.passed).length;
+  const total = results.length;
 
   return {
     summary: {
-      total: totalCount,
-      passed: passedCount,
-      failed: totalCount - passedCount,
-      successRate: ((passedCount / totalCount) * 100).toFixed(1) + '%'
+      total,
+      passed,
+      failed: total - passed,
+      successRate: `${((passed / total) * 100).toFixed(1)}%`
     },
     results,
-    cleanup: {
-      attempted: createdTasks.length,
-      successful: cleanupResults.filter(r => r.success).length,
-      details: cleanupResults
-    },
     timestamp: new Date().toISOString()
   };
 }
 
-// ============ Vercel Function Handler ============
-export default async function handler(req, res) {
-  // CORS 处理
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'GET') {
-    return res.status(405).json({
-      error: 'Method not allowed',
-      message: '只支持 GET 请求'
-    });
-  }
-
-  // 读取配置
+module.exports = async function handler(req, res) {
+  const baseUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
   const config = {
-    userId: getEnv('TEST_USER_ID', crypto.randomUUID()),
-    cronSecret: getEnv('CRON_SECRET'),
-    vercelBypassKey: getEnv('VERCEL_PROTECTION_BYPASS', '')
+    initSecret: process.env.INIT_SECRET || '',
+    tenantDatabaseUrl: process.env.TENANT_DATABASE_URL,
+    userId: process.env.TEST_USER_ID || crypto.randomUUID()
   };
 
-  // 验证必需配置
-  if (!config.cronSecret) {
-    return res.status(500).json({
-      error: 'Configuration error',
-      message: '缺少 CRON_SECRET 环境变量'
-    });
-  }
-
-  // 获取 API 基础 URL
-  const baseUrl = getEnv('API_BASE_URL') || `https://${req.headers.host}`;
-
-  try {
-    const testResults = await runTests(baseUrl, config);
-    return res.status(200).json(testResults);
-  } catch (error) {
-    return res.status(500).json({
-      error: 'Test execution failed',
-      message: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-}
-
-// ============ 本地运行支持 ============
-if (require.main === module) {
-  // 本地运行测试
-  const config = {
-    userId: getEnv('TEST_USER_ID', crypto.randomUUID()),
-    cronSecret: getEnv('CRON_SECRET'),
-    vercelBypassKey: getEnv('VERCEL_PROTECTION_BYPASS', '')
-  };
-
-  if (!config.cronSecret) {
-    console.error('❌ 错误: 缺少必需的环境变量');
-    console.error('请设置: CRON_SECRET, API_BASE_URL');
-    process.exit(1);
-  }
-
-  const baseUrl = getEnv('API_BASE_URL', 'http://localhost:3000');
-
-  console.log('============================');
-  console.log('主动消息 API 测试');
-  console.log('============================');
-  console.log(`API 地址: ${baseUrl}`);
-  console.log(`测试用户: ${config.userId}`);
-  console.log('');
-
-  runTests(baseUrl, config)
-    .then(results => {
-      console.log(JSON.stringify(results, null, 2));
-      process.exit(results.summary.failed === 0 ? 0 : 1);
-    })
-    .catch(error => {
-      console.error('测试失败:', error);
-      process.exit(1);
-    });
-}
+  const result = await runTests(baseUrl, config);
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(result, null, 2));
+};

@@ -1,15 +1,22 @@
 /**
  * Handler: cancel-message
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0
  *
  * @param {Object} ctx - Server context.
  * @returns {{ DELETE: function }}
  */
 
 import { isValidUUIDv4 } from '../lib/validation.js';
+import { getHeader } from '../lib/request.js';
 
 export function createCancelMessageHandler(ctx) {
   async function DELETE(url, headers) {
+    const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
+    if (!tenantResult.ok) {
+      return tenantResult.error;
+    }
+
+    const db = tenantResult.context.db;
     const u = new URL(url, 'https://dummy');
     const taskUuid = u.searchParams.get('id');
 
@@ -17,7 +24,7 @@ export function createCancelMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'TASK_ID_REQUIRED', message: '缺少任务ID' } } };
     }
 
-    const userId = headers['x-user-id'];
+    const userId = getHeader(headers, 'x-user-id');
     if (!userId) {
       return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
     }
@@ -25,7 +32,7 @@ export function createCancelMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
     }
 
-    const deleted = await ctx.db.deleteTaskByUuid(taskUuid, userId);
+    const deleted = await db.deleteTaskByUuid(taskUuid, userId);
 
     if (!deleted) {
       return {

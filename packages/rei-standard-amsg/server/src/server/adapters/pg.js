@@ -10,12 +10,9 @@
 import { Pool } from 'pg';
 import {
   TABLE_SQL,
-  SYSTEM_CONFIG_SQL,
   INDEXES,
   VERIFY_TABLE_SQL,
-  VERIFY_SYSTEM_CONFIG_SQL,
-  COLUMNS_SQL,
-  SYSTEM_CONFIG_COLUMNS_SQL
+  COLUMNS_SQL
 } from './schema.js';
 
 export class PgAdapter {
@@ -44,8 +41,6 @@ export class PgAdapter {
 
   async initSchema() {
     await this._query(TABLE_SQL);
-    await this._query(SYSTEM_CONFIG_SQL);
-
     const indexResults = [];
     for (const index of INDEXES) {
       try {
@@ -80,21 +75,13 @@ export class PgAdapter {
     if (tableCheck.length === 0) {
       throw new Error('Table creation verification failed');
     }
-    const systemConfigCheck = await this._query(VERIFY_SYSTEM_CONFIG_SQL);
-    if (systemConfigCheck.length === 0) {
-      throw new Error('system_config table creation verification failed');
-    }
-
     const columns = await this._query(COLUMNS_SQL);
-    const systemConfigColumns = await this._query(SYSTEM_CONFIG_COLUMNS_SQL);
-
     return {
-      columnsCreated: columns.length + systemConfigColumns.length,
+      columnsCreated: columns.length,
       indexesCreated: indexResults.filter(r => r.status === 'success').length,
       indexesFailed: indexResults.filter(r => r.status === 'failed').length,
       columns: [
-        ...columns.map(c => ({ table: 'scheduled_messages', name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' })),
-        ...systemConfigColumns.map(c => ({ table: 'system_config', name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' }))
+        ...columns.map(c => ({ table: 'scheduled_messages', name: c.column_name, type: c.data_type, nullable: c.is_nullable === 'YES' }))
       ],
       indexes: indexResults
     };
@@ -257,26 +244,5 @@ export class PgAdapter {
       [uuid, userId]
     );
     return rows.length > 0 ? rows[0].status : null;
-  }
-
-  async getMasterKey() {
-    const rows = await this._query(
-      `SELECT value
-       FROM system_config
-       WHERE key = 'master_key'
-       LIMIT 1`
-    );
-    return rows.length > 0 ? rows[0].value : null;
-  }
-
-  async setMasterKeyOnce(masterKey) {
-    const rows = await this._query(
-      `INSERT INTO system_config (key, value, created_at, updated_at)
-       VALUES ('master_key', $1, NOW(), NOW())
-       ON CONFLICT (key) DO NOTHING
-       RETURNING key`,
-      [masterKey]
-    );
-    return rows.length > 0;
   }
 }

@@ -18,15 +18,6 @@ export const TABLE_SQL = `
   )
 `;
 
-export const SYSTEM_CONFIG_SQL = `
-  CREATE TABLE IF NOT EXISTS system_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-  )
-`;
-
 export const INDEXES = [
   {
     name: 'idx_pending_tasks_optimized',
@@ -72,26 +63,11 @@ export const VERIFY_TABLE_SQL = `
     AND table_name = 'scheduled_messages'
 `;
 
-export const VERIFY_SYSTEM_CONFIG_SQL = `
-  SELECT table_name
-  FROM information_schema.tables
-  WHERE table_schema = 'public'
-    AND table_name = 'system_config'
-`;
-
 export const COLUMNS_SQL = `
   SELECT column_name, data_type, is_nullable
   FROM information_schema.columns
   WHERE table_schema = 'public'
     AND table_name = 'scheduled_messages'
-  ORDER BY ordinal_position
-`;
-
-export const SYSTEM_CONFIG_COLUMNS_SQL = `
-  SELECT column_name, data_type, is_nullable
-  FROM information_schema.columns
-  WHERE table_schema = 'public'
-    AND table_name = 'system_config'
   ORDER BY ordinal_position
 `;
 

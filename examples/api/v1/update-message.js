@@ -1,12 +1,12 @@
 /**
  * PUT /api/v1/update-message?id={uuid}
  * 功能：更新已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0
  */
 
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
 const { isValidISO8601, isValidUUIDv4 } = require('../../lib/validation');
-const { getMasterKeyFromDb } = require('../../lib/master-key-store');
+const { resolveTenantFromRequest } = require('../../lib/tenant-context');
 // const { sql } = require('@vercel/postgres');
 
 function normalizeHeaders(h) {
@@ -22,6 +22,12 @@ function sendNodeJson(res, status, body) {
 }
 
 async function core(url, headers, body) {
+  const tenantResult = await resolveTenantFromRequest(headers, url);
+  if (!tenantResult.ok) {
+    return tenantResult.response;
+  }
+
+  const masterKey = tenantResult.tenant.masterKey;
   const h = normalizeHeaders(headers);
   const u = new URL(url, 'https://dummy');
   const taskUuid = u.searchParams.get('id');
@@ -62,20 +68,6 @@ async function core(url, headers, body) {
         error: {
           code: 'INVALID_USER_ID_FORMAT',
           message: 'X-User-Id 必须是 UUID v4 格式'
-        }
-      }
-    };
-  }
-
-  const masterKey = await getMasterKeyFromDb();
-  if (!masterKey) {
-    return {
-      status: 503,
-      body: {
-        success: false,
-        error: {
-          code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
         }
       }
     };
@@ -277,15 +269,6 @@ module.exports = async function(req, res) {
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[update-message] Error:', error);
-    if (error.code === 'DATABASE_URL_MISSING') {
-      return sendNodeJson(res, 500, {
-        success: false,
-        error: {
-          code: 'DATABASE_URL_MISSING',
-          message: '缺少 DATABASE_URL 环境变量'
-        }
-      });
-    }
 
     return sendNodeJson(res, 500, {
       success: false,
@@ -317,20 +300,6 @@ exports.handler = async function(event) {
     };
   } catch (error) {
     console.error('[update-message] Error:', error);
-    if (error.code === 'DATABASE_URL_MISSING') {
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          success: false,
-          error: {
-            code: 'DATABASE_URL_MISSING',
-            message: '缺少 DATABASE_URL 环境变量'
-          }
-        })
-      };
-    }
-
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },

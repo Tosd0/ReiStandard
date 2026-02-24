@@ -1,22 +1,24 @@
 /**
  * 消息处理工具函数库
  * 用于处理单个消息任务的生成和发送
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0
  */
 
 const webpush = require('web-push');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('./encryption');
-const { getMasterKeyFromDb } = require('./master-key-store');
+const { getVapidConfig, getMissingVapidKeys, normalizeVapidSubject } = require('./runtime-config');
 // const { sql } = require('@vercel/postgres');
 
 // 初始化 VAPID，确保在所有调用路径都可用
-const VAPID_EMAIL = process.env.VAPID_EMAIL;
-const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const vapidConfig = getVapidConfig();
+const VAPID_EMAIL = vapidConfig.email;
+const VAPID_PUBLIC_KEY = vapidConfig.publicKey;
+const VAPID_PRIVATE_KEY = vapidConfig.privateKey;
+const vapidMissingKeys = getMissingVapidKeys(vapidConfig);
 
-if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+if (vapidMissingKeys.length === 0) {
   webpush.setVapidDetails(
-    `mailto:${VAPID_EMAIL}`,
+    normalizeVapidSubject(VAPID_EMAIL),
     VAPID_PUBLIC_KEY,
     VAPID_PRIVATE_KEY
   );
@@ -42,12 +44,12 @@ if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
  */
 async function processSingleMessage(task, providedMasterKey = null) {
   try {
-    const masterKey = providedMasterKey || await getMasterKeyFromDb();
+    const masterKey = providedMasterKey;
     if (!masterKey) {
       return {
         success: false,
         messagesSent: 0,
-        error: 'MASTER_KEY_NOT_INITIALIZED'
+        error: 'TENANT_MASTER_KEY_MISSING'
       };
     }
 
@@ -164,7 +166,7 @@ async function processSingleMessage(task, providedMasterKey = null) {
     const messages = sentences.length > 0 ? sentences : [messageContent];
 
     // 验证 VAPID 配置
-    if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    if (vapidMissingKeys.length > 0) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
     }
 
@@ -233,14 +235,14 @@ async function processSingleMessage(task, providedMasterKey = null) {
  */
 async function processMessagesByUuid(uuid, maxRetries = 2, providedMasterKey = null) {
   let retryCount = 0;
-  const masterKey = providedMasterKey || await getMasterKeyFromDb();
+  const masterKey = providedMasterKey;
 
   if (!masterKey) {
     return {
       success: false,
       error: {
-        code: 'MASTER_KEY_NOT_INITIALIZED',
-        message: '系统密钥尚未初始化'
+        code: 'TENANT_MASTER_KEY_MISSING',
+        message: '租户主密钥不存在或配置异常'
       }
     };
   }

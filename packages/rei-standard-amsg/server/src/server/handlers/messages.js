@@ -1,17 +1,26 @@
 /**
  * Handler: messages
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0
  *
  * @param {Object} ctx - Server context.
  * @returns {{ GET: function }}
  */
 
 import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../lib/encryption.js';
+import { getHeader } from '../lib/request.js';
 import { isValidUUIDv4 } from '../lib/validation.js';
 
 export function createMessagesHandler(ctx) {
   async function GET(url, headers) {
-    const userId = headers['x-user-id'];
+    const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
+    if (!tenantResult.ok) {
+      return tenantResult.error;
+    }
+
+    const tenantCtx = tenantResult.context;
+    const db = tenantCtx.db;
+    const masterKey = tenantCtx.masterKey;
+    const userId = getHeader(headers, 'x-user-id');
 
     if (!userId) {
       return {
@@ -39,15 +48,7 @@ export function createMessagesHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_PARAMETERS', message: 'offset 参数无效，必须为非负整数' } } };
     }
 
-    const { tasks, total } = await ctx.db.listTasks(userId, { status, limit, offset });
-
-    const masterKey = await ctx.db.getMasterKey();
-    if (!masterKey) {
-      return {
-        status: 503,
-        body: { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } }
-      };
-    }
+    const { tasks, total } = await db.listTasks(userId, { status, limit, offset });
 
     const userKey = deriveUserEncryptionKey(userId, masterKey);
 

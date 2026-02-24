@@ -118,3 +118,27 @@ export function parseEncryptedBody(body) {
 
   return parsedBody;
 }
+
+/**
+ * Read a header value case-insensitively.
+ *
+ * @param {Record<string, any>} headers
+ * @param {string} name
+ * @returns {string}
+ */
+export function getHeader(headers = {}, name) {
+  if (!headers || typeof headers !== 'object') {
+    return '';
+  }
+
+  const lowerName = String(name || '').toLowerCase();
+  if (!lowerName) return '';
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === lowerName) {
+      return String(value || '').trim();
+    }
+  }
+
+  return '';
+}

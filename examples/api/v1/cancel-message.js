@@ -1,10 +1,11 @@
 /**
  * DELETE /api/v1/cancel-message?id={uuid}
  * 功能：取消/删除已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0
  */
 
 const { isValidUUIDv4 } = require('../../lib/validation');
+const { resolveTenantFromRequest } = require('../../lib/tenant-context');
 
 function normalizeHeaders(h) {
   const out = {};
@@ -19,6 +20,11 @@ function sendNodeJson(res, status, body) {
 }
 
 async function core(url, headers) {
+  const tenantResult = await resolveTenantFromRequest(headers, url);
+  if (!tenantResult.ok) {
+    return tenantResult.response;
+  }
+
   const h = normalizeHeaders(headers);
   const u = new URL(url, 'https://dummy');
   const taskUuid = u.searchParams.get('id');
