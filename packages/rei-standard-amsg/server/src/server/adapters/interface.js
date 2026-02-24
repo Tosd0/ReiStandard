@@ -41,11 +41,7 @@
 /**
  * @typedef {Object} DbAdapter
  * @property {() => Promise<InitSchemaResult>} initSchema
- *   Create the scheduled_messages/system_config tables and all indexes.
- * @property {() => Promise<string|null>} getMasterKey
- *   Read master key from system_config (key = 'master_key').
- * @property {(masterKey: string) => Promise<boolean>} setMasterKeyOnce
- *   Insert master key once. Returns false if already initialized.
+ *   Create the scheduled_messages table and all indexes.
  * @property {() => Promise<void>} dropSchema
  *   Drop the scheduled_messages table (CASCADE).
  * @property {(params: InsertTaskParams) => Promise<TaskRow>} createTask

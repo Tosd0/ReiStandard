@@ -1,6 +1,6 @@
 /**
  * Handler: send-notifications
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0
  *
  * @param {Object} ctx - Server context.
  * @returns {{ POST: function }}
@@ -11,7 +11,22 @@ import { decryptFromStorage } from '../lib/encryption.js';
 import { processSingleMessage } from '../lib/message-processor.js';
 
 export function createSendNotificationsHandler(ctx) {
-  async function POST(headers) {
+  async function POST(urlOrHeaders, maybeHeaders) {
+    const url = typeof urlOrHeaders === 'string' ? urlOrHeaders : '';
+    const headers = maybeHeaders || (typeof urlOrHeaders === 'object' ? urlOrHeaders : {});
+
+    const tenantResult = await ctx.tenantManager.resolveTenant(headers, {
+      allowCronToken: true,
+      url
+    });
+    if (!tenantResult.ok) {
+      return tenantResult.error;
+    }
+
+    const tenantCtx = tenantResult.context;
+    const db = tenantCtx.db;
+    const masterKey = tenantCtx.masterKey;
+
     if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       return {
         status: 500,
@@ -32,30 +47,8 @@ export function createSendNotificationsHandler(ctx) {
       };
     }
 
-    // Verify Cron Secret
-    const authHeader = (headers['authorization'] || '').trim();
-    const expectedAuth = `Bearer ${ctx.cronSecret}`;
-
-    if (authHeader !== expectedAuth) {
-      return { status: 401, body: { success: false, error: { code: 'UNAUTHORIZED', message: 'Cron Secret 验证失败' } } };
-    }
-
-    const masterKey = await ctx.db.getMasterKey();
-    if (!masterKey) {
-      return {
-        status: 503,
-        body: {
-          success: false,
-          error: {
-            code: 'MASTER_KEY_NOT_INITIALIZED',
-            message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key'
-          }
-        }
-      };
-    }
-
     const startTime = Date.now();
-    const tasks = await ctx.db.getPendingTasks(50);
+    const tasks = await db.getPendingTasks(50);
 
     const MAX_CONCURRENT = 8;
     const results = {
@@ -72,11 +65,11 @@ export function createSendNotificationsHandler(ctx) {
 
       try {
         if (task.retry_count >= 3) {
-          await ctx.db.updateTaskById(task.id, { status: 'failed' });
+          await db.updateTaskById(task.id, { status: 'failed' });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed' });
         } else {
           const nextRetryTime = new Date(Date.now() + (task.retry_count + 1) * 2 * 60 * 1000);
-          await ctx.db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
+          await db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count + 1, nextRetryAt: nextRetryTime.toISOString() });
         }
       } catch (updateError) {
@@ -94,7 +87,7 @@ export function createSendNotificationsHandler(ctx) {
 
       let markedSent = false;
       try {
-        await ctx.db.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
+        await db.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
         markedSent = true;
       } catch (_markSentError) {
         markedSent = false;
@@ -111,7 +104,11 @@ export function createSendNotificationsHandler(ctx) {
     async function processTask(task) {
       let sendResult;
       try {
-        sendResult = await processSingleMessage(task, ctx);
+        sendResult = await processSingleMessage(task, {
+          ...ctx,
+          db,
+          masterKey
+        }, masterKey);
       } catch (error) {
         await handleDeliveryFailure(task, error.message || '消息发送失败');
         return;
@@ -127,7 +124,7 @@ export function createSendNotificationsHandler(ctx) {
         const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
         if (decryptedPayload.recurrenceType === 'none') {
-          await ctx.db.deleteTaskById(task.id);
+          await db.deleteTaskById(task.id);
           results.deletedOnceOffTasks++;
         } else {
           let nextSendAt;
@@ -137,7 +134,7 @@ export function createSendNotificationsHandler(ctx) {
           } else if (decryptedPayload.recurrenceType === 'weekly') {
             nextSendAt = new Date(currentSendAt.getTime() + 7 * 24 * 60 * 60 * 1000);
           }
-          await ctx.db.updateTaskById(task.id, { next_send_at: nextSendAt.toISOString(), retry_count: 0 });
+          await db.updateTaskById(task.id, { next_send_at: nextSendAt.toISOString(), retry_count: 0 });
           results.updatedRecurringTasks++;
         }
 
@@ -167,7 +164,7 @@ export function createSendNotificationsHandler(ctx) {
     }
 
     // Cleanup old tasks
-    await ctx.db.cleanupOldTasks(7);
+    await db.cleanupOldTasks(7);
 
     const executionTime = Date.now() - startTime;
 

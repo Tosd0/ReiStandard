@@ -1,27 +1,26 @@
-# ReiStandard 手动接入部署指南（备用）
+# ReiStandard 手动接入部署指南（v2.0.0 Blob 一体化初始化）
 
-> 这份文档仅用于 **不使用 SDK 包** 的手动接入。优先推荐 Package-First：
-> - https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md
-> - https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md
-> - https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md
+> 本文档用于不使用 SDK 包时的手动接入。优先推荐 Package-First。
 
 ## 目录结构
 
 ```text
 examples/
-├── api/v1/                          # API 手动实现文件
-│   ├── init-database.js             # 数据库初始化（建议首次后删除）
-│   ├── init-master-key.js           # 系统主密钥一次性初始化
-│   ├── get-user-key.js              # 用户密钥分发
-│   ├── schedule-message.js          # 创建任务 / 即时消息
-│   ├── send-notifications.js        # Cron 触发处理
-│   ├── update-message.js            # 更新任务
-│   ├── cancel-message.js            # 取消任务
-│   └── messages.js                  # 查询任务列表
-└── README.md
+├── api/v1/
+│   ├── init-tenant.js               # 一体化租户初始化
+│   ├── get-user-key.js              # 用户密钥分发（需 tenantToken）
+│   ├── schedule-message.js          # 创建任务 / 即时消息（需 tenantToken）
+│   ├── send-notifications.js        # Cron 触发处理（需 cronToken）
+│   ├── update-message.js            # 更新任务（需 tenantToken）
+│   ├── cancel-message.js            # 取消任务（需 tenantToken）
+│   └── messages.js                  # 查询任务列表（需 tenantToken）
+└── lib/
+    ├── blob-tenant-store.js         # Blob 租户配置存储
+    ├── tenant-token.js              # tenant/cron token 签发与校验
+    └── tenant-context.js            # 租户初始化与请求解析
 ```
 
-## 手动接入步骤
+## 管理员一次性步骤（每个部署一次）
 
 ### 1. 复制示例代码
 
@@ -33,49 +32,90 @@ cp -r examples/lib ./
 ### 2. 安装依赖
 
 ```bash
-npm install web-push @neondatabase/serverless
-# 或使用 pg
-# npm install web-push pg
+npm install web-push @netlify/blobs @neondatabase/serverless
+# 如需 pg
+# npm install pg
 ```
 
 ### 3. 配置环境变量
 
 ```dotenv
-DATABASE_URL=postgresql://[user]:[password]@[host]:[port]/[database]
 VAPID_EMAIL=youremail@example.com
 NEXT_PUBLIC_VAPID_PUBLIC_KEY=YOUR-PUBLIC-KEY
 VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
-CRON_SECRET=YOUR-SECRET
+TENANT_CONFIG_KEK=YOUR-KEK-SECRET
+TENANT_TOKEN_SIGNING_KEY=YOUR-TOKEN-SIGNING-KEY
+# 可选：配置后 init-tenant 必须带 X-Init-Secret
+INIT_SECRET=YOUR-INIT-SECRET
+PUBLIC_BASE_URL=https://your-domain.com
 VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 ```
 
-`CRON_SECRET` 生成：
+建议生成方式：
 
 ```bash
 openssl rand -base64 32
 ```
 
-### 4. 初始化数据库与主密钥
+可分别用于：`TENANT_CONFIG_KEK`、`TENANT_TOKEN_SIGNING_KEY`，`INIT_SECRET` 为可选增强项。
+
+## 租户一次性步骤（每个租户一次）
+
+租户提交自己的数据库连接串到 `init-tenant`：
 
 ```bash
-curl -X GET "http://localhost:3000/api/v1/init-database"
-curl -X POST "http://localhost:3000/api/v1/init-master-key"
+curl -X POST "https://your-domain.com/api/v1/init-tenant" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "driver": "neon",
+    "databaseUrl": "postgresql://user:pass@host/db"
+  }'
 ```
 
-### 5. 配置 Cron 调度
+如果你配置了 `INIT_SECRET`，再加上：
 
 ```bash
-* * * * * curl -X POST "https://your-domain.com/api/v1/send-notifications" \
-  -H "Authorization: Bearer YOUR_CRON_SECRET" \
-  -H "x-vercel-protection-bypass: YOUR_BYPASS_KEY"
+-H "X-Init-Secret: YOUR-INIT-SECRET"
+```
+
+成功响应包含：
+
+- `tenantId`
+- `tenantToken`
+- `cronToken`
+- `cronWebhookUrl`
+- `masterKeyFingerprint`
+
+## 日常调用
+
+### 前端业务请求（tenantToken）
+
+- `get-user-key`
+- `schedule-message`
+- `update-message`
+- `cancel-message`
+- `messages`
+
+统一携带：
+
+```http
+Authorization: Bearer <tenantToken>
+```
+
+### Cron 调度（cronToken）
+
+可直接使用初始化返回的 `cronWebhookUrl`，或手动调用：
+
+```bash
+curl -X POST "https://your-domain.com/api/v1/send-notifications" \
+  -H "Authorization: Bearer YOUR_CRON_TOKEN"
 ```
 
 ## 端点清单
 
 | 端点 | 方法 | 功能 |
 |------|------|------|
-| `/api/v1/init-database` | GET | 幂等初始化数据库 |
-| `/api/v1/init-master-key` | POST | 初始化系统主密钥 |
+| `/api/v1/init-tenant` | POST | 一体化初始化租户 |
 | `/api/v1/get-user-key` | GET | 获取用户密钥 |
 | `/api/v1/schedule-message` | POST | 创建任务/即时消息 |
 | `/api/v1/send-notifications` | POST | Cron 触发发送 |

@@ -1,24 +1,27 @@
 /**
  * POST /api/v1/schedule-message
  * 功能：创建定时消息任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0
  */
 
 const webpush = require('web-push');
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');
 const { validateScheduleMessagePayload, isValidUUIDv4 } = require('../../lib/validation');
-const { getMasterKeyFromDb } = require('../../lib/master-key-store');
+const { resolveTenantFromRequest } = require('../../lib/tenant-context');
+const { getVapidConfig, getMissingVapidKeys, normalizeVapidSubject } = require('../../lib/runtime-config');
 const { randomUUID } = require('crypto');
 // const { sql } = require('@vercel/postgres');
 
 // 🔧 初始化 VAPID（instant 消息路径需要）
-const VAPID_EMAIL = process.env.VAPID_EMAIL;
-const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const vapidConfig = getVapidConfig();
+const VAPID_EMAIL = vapidConfig.email;
+const VAPID_PUBLIC_KEY = vapidConfig.publicKey;
+const VAPID_PRIVATE_KEY = vapidConfig.privateKey;
+const vapidMissingKeys = getMissingVapidKeys(vapidConfig);
 
-if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+if (vapidMissingKeys.length === 0) {
   webpush.setVapidDetails(
-    `mailto:${VAPID_EMAIL}`,
+    normalizeVapidSubject(VAPID_EMAIL),
     VAPID_PUBLIC_KEY,
     VAPID_PRIVATE_KEY
   );
@@ -44,6 +47,12 @@ function sendNodeJson(res, status, body) {
 }
 
 async function core(headers, body) {
+  const tenantResult = await resolveTenantFromRequest(headers);
+  if (!tenantResult.ok) {
+    return tenantResult.response;
+  }
+
+  const masterKey = tenantResult.tenant.masterKey;
   const h = normalizeHeaders(headers);
 
   // 1. 验证加密头部
@@ -103,22 +112,7 @@ async function core(headers, body) {
     };
   }
 
-  // 2. 读取系统密钥
-  const masterKey = await getMasterKeyFromDb();
-  if (!masterKey) {
-    return {
-      status: 503,
-      body: {
-        success: false,
-        error: {
-          code: 'MASTER_KEY_NOT_INITIALIZED',
-          message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
-        }
-      }
-    };
-  }
-
-  // 3. 解密请求体
+  // 2. 解密请求体
   let payload;
   try {
     const encryptedBody = typeof body === 'string' ? JSON.parse(body) : body;
@@ -261,7 +255,7 @@ async function core(headers, body) {
   // 8. instant 类型：立即触发 send-notifications 处理
   if (payload.messageType === 'instant') {
     // 验证 VAPID 配置（instant 消息需要立即发送）
-    if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    if (vapidMissingKeys.length > 0) {
       return {
         status: 500,
         body: {
@@ -270,11 +264,7 @@ async function core(headers, body) {
             code: 'VAPID_CONFIG_ERROR',
             message: 'VAPID 配置缺失，无法发送即时消息',
             details: {
-              missingKeys: [
-                !VAPID_EMAIL && 'VAPID_EMAIL',
-                !VAPID_PUBLIC_KEY && 'NEXT_PUBLIC_VAPID_PUBLIC_KEY',
-                !VAPID_PRIVATE_KEY && 'VAPID_PRIVATE_KEY'
-              ].filter(Boolean)
+              missingKeys: vapidMissingKeys
             }
           }
         }
@@ -388,15 +378,6 @@ module.exports = async function(req, res) {
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[schedule-message] Error:', error);
-    if (error.code === 'DATABASE_URL_MISSING') {
-      return sendNodeJson(res, 500, {
-        success: false,
-        error: {
-          code: 'DATABASE_URL_MISSING',
-          message: '缺少 DATABASE_URL 环境变量'
-        }
-      });
-    }
     return sendNodeJson(res, 500, {
       success: false,
       error: {
@@ -426,19 +407,6 @@ exports.handler = async function(event) {
     };
   } catch (error) {
     console.error('[schedule-message] Error:', error);
-    if (error.code === 'DATABASE_URL_MISSING') {
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          success: false,
-          error: {
-            code: 'DATABASE_URL_MISSING',
-            message: '缺少 DATABASE_URL 环境变量'
-          }
-        })
-      };
-    }
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },

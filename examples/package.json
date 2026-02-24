@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@neondatabase/serverless": ">=0.9.0",
-    "web-push": ">=3.6.0"
+    "web-push": ">=3.6.0",
+    "@netlify/blobs": "^8.1.0",
+    "pg": ">=8.0.0"
   }
 }

@@ -5,7 +5,7 @@
 set -e  # 遇到错误立即退出
 
 echo "=============================="
-echo "主动消息 API 测试启动脚本"
+echo "主动消息 API v2.0.0 测试启动脚本"
 echo "=============================="
 echo ""
 
@@ -29,7 +29,7 @@ if [ ! -f .env.test ]; then
     echo "  2. 编辑配置文件: nano .env.test"
     echo "  3. 填写必需配置项:"
     echo "     - API_BASE_URL"
-    echo "     - CRON_SECRET"
+    echo "     - TENANT_DATABASE_URL"
     echo ""
     exit 1
 fi
@@ -47,8 +47,8 @@ if [ -z "$API_BASE_URL" ]; then
     MISSING_VARS="$MISSING_VARS API_BASE_URL"
 fi
 
-if [ -z "$CRON_SECRET" ]; then
-    MISSING_VARS="$MISSING_VARS CRON_SECRET"
+if [ -z "$TENANT_DATABASE_URL" ]; then
+    MISSING_VARS="$MISSING_VARS TENANT_DATABASE_URL"
 fi
 
 if [ -n "$MISSING_VARS" ]; then

@@ -1,33 +1,36 @@
 /**
  * ReiStandard Server SDK Entry Point
- * v1.2.2
+ * v2.0.0
  *
  * Usage:
  *   import { createReiServer } from '@rei-standard/amsg-server';
  *
- *   const rei = createReiServer({
- *     db: { driver: 'neon', connectionString: process.env.DATABASE_URL },
- *     cronSecret: process.env.CRON_SECRET,
+ *   const rei = await createReiServer({
  *     vapid: {
  *       email: process.env.VAPID_EMAIL,
  *       publicKey: process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY,
  *       privateKey: process.env.VAPID_PRIVATE_KEY,
  *     },
+ *     tenant: {
+ *       blobNamespace: 'rei-tenants',
+ *       kek: process.env.TENANT_CONFIG_KEK,
+ *       tokenSigningKey: process.env.TENANT_TOKEN_SIGNING_KEY,
+ *       initSecret: process.env.INIT_SECRET,
+ *       publicBaseUrl: process.env.PUBLIC_BASE_URL
+ *     }
  *   });
- *
- *   // rei.handlers  – object with standard route handler factories
- *   // rei.adapter   – the underlying database adapter
  */
 
 import { createAdapter } from './adapters/factory.js';
-import { createInitDatabaseHandler } from './handlers/init-database.js';
-import { createInitMasterKeyHandler } from './handlers/init-master-key.js';
+import { createInitTenantHandler } from './handlers/init-tenant.js';
 import { createGetUserKeyHandler } from './handlers/get-user-key.js';
 import { createScheduleMessageHandler } from './handlers/schedule-message.js';
 import { createSendNotificationsHandler } from './handlers/send-notifications.js';
 import { createUpdateMessageHandler } from './handlers/update-message.js';
 import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
+import { createTenantBlobStore } from './tenant/blob-store.js';
+import { createTenantContextManager } from './tenant/context.js';
 
 function normalizeVapidSubject(email) {
   const trimmedEmail = String(email || '').trim();
@@ -43,26 +46,25 @@ function normalizeVapidSubject(email) {
  */
 
 /**
- * @typedef {'neon'|'pg'} DriverName
- */
-
-/**
- * @typedef {Object} DbConfig
- * @property {DriverName} driver           - Database driver name.
- * @property {string}     connectionString - Database connection URL.
+ * @typedef {Object} TenantServerConfig
+ * @property {string} [blobNamespace]  - Netlify Blob namespace.
+ * @property {string} kek              - KEK used to encrypt tenant config in blobs.
+ * @property {string} tokenSigningKey  - HMAC key used to sign tenant/cron tokens.
+ * @property {string} [initSecret]     - Optional secret for /init-tenant bootstrap endpoint.
+ * @property {string} [publicBaseUrl]  - Optional base URL for generated cron webhook.
+ * @property {(db: {driver:'neon'|'pg', connectionString:string}) => Promise<any>} [adapterFactory]
+ *   Optional adapter factory override (mainly for tests).
  */
 
 /**
  * @typedef {Object} ReiServerConfig
- * @property {DbConfig}    db            - Database configuration.
- * @property {string}      [cronSecret]  - Bearer token for cron-triggered endpoints.
- * @property {VapidConfig} [vapid]       - VAPID keys for Web Push.
+ * @property {VapidConfig} [vapid]   - VAPID keys for Web Push.
+ * @property {TenantServerConfig} tenant - Tenant config & auth settings.
  */
 
 /**
  * @typedef {Object} ReiHandlers
- * @property {{ GET: function }} initDatabase
- * @property {{ POST: function }} initMasterKey
+ * @property {{ POST: function }} initTenant
  * @property {{ GET: function }} getUserKey
  * @property {{ POST: function }} scheduleMessage
  * @property {{ POST: function }} sendNotifications
@@ -73,8 +75,7 @@ function normalizeVapidSubject(email) {
 
 /**
  * @typedef {Object} ReiServer
- * @property {ReiHandlers} handlers - The 7 standard API route handler objects.
- * @property {import('./adapters/interface.js').DbAdapter} adapter - The database adapter instance.
+ * @property {ReiHandlers} handlers - Standard API route handler objects.
  */
 
 /**
@@ -85,8 +86,7 @@ function normalizeVapidSubject(email) {
  */
 export async function createReiServer(config) {
   if (!config) throw new Error('[rei-standard-amsg-server] config is required');
-
-  const adapter = await createAdapter(config.db);
+  if (!config.tenant) throw new Error('[rei-standard-amsg-server] tenant config is required');
 
   // web-push is a hard dependency for ReiStandard server features
   let webpushModule;
@@ -109,30 +109,43 @@ export async function createReiServer(config) {
     );
   }
 
-  /** @type {Object} Shared context injected into every handler */
+  const tenantStore = createTenantBlobStore({
+    namespace: config.tenant.blobNamespace || 'rei-tenants',
+    kek: config.tenant.kek
+  });
+
+  const tenantManager = createTenantContextManager({
+    tenantStore,
+    tokenSigningKey: config.tenant.tokenSigningKey,
+    publicBaseUrl: config.tenant.publicBaseUrl,
+    adapterFactory: config.tenant.adapterFactory
+  });
+
+  const initSecret = String(config.tenant.initSecret || '').trim();
+
   const ctx = {
-    db: adapter,
-    cronSecret: config.cronSecret || '',
     vapid: {
       email: vapid.email || '',
       publicKey: vapid.publicKey || '',
       privateKey: vapid.privateKey || ''
     },
-    webpush: webpushModule
+    webpush: webpushModule,
+    tenant: {
+      initSecret
+    },
+    tenantManager
   };
 
   return {
     handlers: {
-      initDatabase: createInitDatabaseHandler(ctx),
-      initMasterKey: createInitMasterKeyHandler(ctx),
+      initTenant: createInitTenantHandler(ctx),
       getUserKey: createGetUserKeyHandler(ctx),
       scheduleMessage: createScheduleMessageHandler(ctx),
       sendNotifications: createSendNotificationsHandler(ctx),
       updateMessage: createUpdateMessageHandler(ctx),
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx)
-    },
-    adapter
+    }
   };
 }
 
@@ -140,3 +153,4 @@ export async function createReiServer(config) {
 export { createAdapter } from './adapters/factory.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
+export { createTenantToken, verifyTenantToken } from './tenant/token.js';

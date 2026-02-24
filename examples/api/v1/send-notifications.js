@@ -1,21 +1,24 @@
 /**
  * POST /api/v1/send-notifications
  * 功能：Cron Job 触发，处理到期的定时消息任务
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0
  */
 
 const webpush = require('web-push');
 const { processSingleMessage } = require('../../lib/message-processor');
 const { deriveUserEncryptionKey, decryptFromStorage } = require('../../lib/encryption');
-const { getMasterKeyFromDb } = require('../../lib/master-key-store');
+const { resolveTenantFromRequest } = require('../../lib/tenant-context');
+const { getVapidConfig, getMissingVapidKeys, normalizeVapidSubject } = require('../../lib/runtime-config');
 // const { sql } = require('@vercel/postgres');
 
 // VAPID 配置验证
-const VAPID_EMAIL = process.env.VAPID_EMAIL;
-const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const vapidConfig = getVapidConfig();
+const VAPID_EMAIL = vapidConfig.email;
+const VAPID_PUBLIC_KEY = vapidConfig.publicKey;
+const VAPID_PRIVATE_KEY = vapidConfig.privateKey;
+const vapidMissingKeys = getMissingVapidKeys(vapidConfig);
 
-if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+if (vapidMissingKeys.length > 0) {
   console.error('[send-notifications] VAPID configuration error:', {
     hasEmail: !!VAPID_EMAIL,
     hasPublicKey: !!VAPID_PUBLIC_KEY,
@@ -24,18 +27,12 @@ if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
 }
 
 // 仅在配置完整时设置 VAPID
-if (VAPID_EMAIL && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+if (vapidMissingKeys.length === 0) {
   webpush.setVapidDetails(
-    `mailto:${VAPID_EMAIL}`,
+    normalizeVapidSubject(VAPID_EMAIL),
     VAPID_PUBLIC_KEY,
     VAPID_PRIVATE_KEY
   );
-}
-
-function normalizeHeaders(h) {
-  const out = {};
-  for (const k in h || {}) out[k.toLowerCase()] = h[k];
-  return out;
 }
 
 function sendNodeJson(res, status, body) {
@@ -44,12 +41,16 @@ function sendNodeJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function core(headers) {
+async function core(url, headers) {
   try {
-    const h = normalizeHeaders(headers);
+    const tenantResult = await resolveTenantFromRequest(headers, url, { allowCronToken: true });
+    if (!tenantResult.ok) {
+      return tenantResult.response;
+    }
 
+    const masterKey = tenantResult.tenant.masterKey;
     // 0. 验证 VAPID 配置
-    if (!VAPID_EMAIL || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    if (vapidMissingKeys.length > 0) {
       return {
         status: 500,
         body: {
@@ -58,50 +59,15 @@ async function core(headers) {
             code: 'VAPID_CONFIG_ERROR',
             message: 'VAPID 配置缺失，无法发送推送通知',
             details: {
-              missingKeys: [
-                !VAPID_EMAIL && 'VAPID_EMAIL',
-                !VAPID_PUBLIC_KEY && 'NEXT_PUBLIC_VAPID_PUBLIC_KEY',
-                !VAPID_PRIVATE_KEY && 'VAPID_PRIVATE_KEY'
-              ].filter(Boolean)
+              missingKeys: vapidMissingKeys
             }
           }
         }
       };
     }
 
-    // 1. 验证 Cron Secret
-    const authHeader = h['authorization'] || '';
-    const expectedAuth = `Bearer ${process.env.CRON_SECRET}`;
-
-    if (authHeader.trim() !== expectedAuth) {
-      return {
-        status: 401,
-        body: {
-          success: false,
-          error: {
-            code: 'UNAUTHORIZED',
-            message: 'Cron Secret 验证失败'
-          }
-        }
-      };
-    }
-
     const startTime = Date.now();
-    const masterKey = await getMasterKeyFromDb();
-    if (!masterKey) {
-      return {
-        status: 503,
-        body: {
-          success: false,
-          error: {
-            code: 'MASTER_KEY_NOT_INITIALIZED',
-            message: '系统密钥尚未初始化，请先调用 /api/v1/init-master-key'
-          }
-        }
-      };
-    }
-
-    // 2. 查询待处理任务（全字段加密版本）
+    // 1. 查询待处理任务（全字段加密版本）
     /*
     const tasks = await sql`
       SELECT
@@ -330,7 +296,7 @@ async function core(headers) {
 module.exports = async function(req, res) {
   try {
     if (req.method !== 'POST') return sendNodeJson(res, 405, { error: 'Method not allowed' });
-    const result = await core(req.headers);
+    const result = await core(req.url, req.headers);
     return sendNodeJson(res, result.status, result.body);
   } catch (error) {
     console.error('[send-notifications] Error:', error);
@@ -341,7 +307,8 @@ module.exports = async function(req, res) {
 exports.handler = async function(event) {
   try {
     if (event.httpMethod !== 'POST') return { statusCode: 405, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'Method not allowed' }) };
-    const result = await core(event.headers || {});
+    const url = event.rawUrl || `https://dummy${event.path}${event.rawQuery ? '?' + event.rawQuery : ''}`;
+    const result = await core(url, event.headers || {});
     return { statusCode: result.status, headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(result.body) };
   } catch (error) {
     console.error('[send-notifications] Error:', error);

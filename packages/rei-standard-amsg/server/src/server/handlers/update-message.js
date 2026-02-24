@@ -1,17 +1,25 @@
 /**
  * Handler: update-message
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0
  *
  * @param {Object} ctx - Server context.
  * @returns {{ PUT: function }}
  */
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
-import { parseEncryptedBody, isPlainObject } from '../lib/request.js';
+import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
 import { isValidISO8601, isValidUUIDv4 } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
+    const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
+    if (!tenantResult.ok) {
+      return tenantResult.error;
+    }
+
+    const tenantCtx = tenantResult.context;
+    const db = tenantCtx.db;
+    const masterKey = tenantCtx.masterKey;
     const u = new URL(url, 'https://dummy');
     const taskUuid = u.searchParams.get('id');
 
@@ -19,7 +27,7 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'TASK_ID_REQUIRED', message: '缺少任务ID' } } };
     }
 
-    const userId = headers['x-user-id'];
+    const userId = getHeader(headers, 'x-user-id');
     if (!userId) {
       return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
     }
@@ -27,8 +35,8 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
     }
 
-    const isEncrypted = headers['x-payload-encrypted'] === 'true';
-    const encryptionVersion = headers['x-encryption-version'];
+    const isEncrypted = getHeader(headers, 'x-payload-encrypted') === 'true';
+    const encryptionVersion = getHeader(headers, 'x-encryption-version');
 
     if (!isEncrypted) {
       return { status: 400, body: { success: false, error: { code: 'ENCRYPTION_REQUIRED', message: '请求体必须加密' } } };
@@ -36,11 +44,6 @@ export function createUpdateMessageHandler(ctx) {
 
     if (encryptionVersion !== '1') {
       return { status: 400, body: { success: false, error: { code: 'UNSUPPORTED_ENCRYPTION_VERSION', message: '加密版本不支持' } } };
-    }
-
-    const masterKey = await ctx.db.getMasterKey();
-    if (!masterKey) {
-      return { status: 503, body: { success: false, error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化，请先调用 /api/v1/init-master-key' } } };
     }
 
     const parsedBody = parseEncryptedBody(body);
@@ -71,10 +74,10 @@ export function createUpdateMessageHandler(ctx) {
     }
 
     // Fetch existing task
-    const existingTask = await ctx.db.getTaskByUuid(taskUuid, userId);
+    const existingTask = await db.getTaskByUuid(taskUuid, userId);
 
     if (!existingTask) {
-      const taskStatus = await ctx.db.getTaskStatus(taskUuid, userId);
+      const taskStatus = await db.getTaskStatus(taskUuid, userId);
       if (!taskStatus) {
         return { status: 404, body: { success: false, error: { code: 'TASK_NOT_FOUND', message: '指定的任务不存在或已被删除' } } };
       }
@@ -95,7 +98,7 @@ export function createUpdateMessageHandler(ctx) {
     const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);
     const extraFields = updates.nextSendAt ? { next_send_at: updates.nextSendAt } : undefined;
 
-    const result = await ctx.db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
+    const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
 
     if (!result) {
       return { status: 409, body: { success: false, error: { code: 'UPDATE_CONFLICT', message: '任务更新失败，任务可能已被修改或删除' } } };

@@ -1,6 +1,6 @@
 /**
  * Message Processor (SDK version)
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0
  *
  * Handles single message content generation and Web Push delivery.
  * Receives its dependencies (encryption helpers, webpush, VAPID config)
@@ -27,9 +27,9 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
  */
 export async function processSingleMessage(task, ctx, providedMasterKey) {
   try {
-    const masterKey = providedMasterKey || await ctx.db.getMasterKey();
+    const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
-      return { success: false, messagesSent: 0, error: 'MASTER_KEY_NOT_INITIALIZED' };
+      return { success: false, messagesSent: 0, error: 'TENANT_MASTER_KEY_MISSING' };
     }
 
     const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
@@ -118,12 +118,12 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
  */
 export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, providedMasterKey) {
   let retryCount = 0;
-  const masterKey = providedMasterKey || await ctx.db.getMasterKey();
+  const masterKey = providedMasterKey || ctx.masterKey;
 
   if (!masterKey) {
     return {
       success: false,
-      error: { code: 'MASTER_KEY_NOT_INITIALIZED', message: '主密钥尚未初始化' }
+      error: { code: 'TENANT_MASTER_KEY_MISSING', message: '租户主密钥不存在或配置异常' }
     };
   }
 
