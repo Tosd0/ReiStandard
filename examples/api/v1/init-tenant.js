@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/init-tenant
  * 功能：一体化初始化租户（建表 + 生成密钥 + 写入 Blob + 发放 token）
- * ReiStandard v2.0.0
+ * ReiStandard v2.0.0-pre1
  */
 
 const { isValidUUIDv4 } = require('../../lib/validation');

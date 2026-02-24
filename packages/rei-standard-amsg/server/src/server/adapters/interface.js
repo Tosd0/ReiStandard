@@ -1,6 +1,6 @@
 /**
  * Database Adapter Interface
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0-pre1
  *
  * Defines the contract that every database adapter must fulfil.
  * Implementations live in ./neon.js, ./pg.js, etc.

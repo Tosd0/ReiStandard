@@ -1,7 +1,7 @@
 /**
  * GET /api/v1/get-user-key
  * 功能：根据用户 ID 派生用户专属密钥
- * ReiStandard v2.0.0
+ * ReiStandard v2.0.0-pre1
  */
 
 const { deriveUserEncryptionKey } = require('../../lib/encryption');

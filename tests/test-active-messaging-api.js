@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * 主动消息 API v2.0.0 综合测试脚本（Blob 一体化初始化版）
+ * 主动消息 API v2.0.0-pre1 综合测试脚本（Blob 一体化初始化版）
  */
 
 const crypto = require('crypto');
@@ -84,7 +84,7 @@ async function makeRequest(method, endpoint, options = {}) {
 }
 
 async function run() {
-  console.log('=== ReiStandard API v2.0.0 测试开始 ===');
+  console.log('=== ReiStandard API v2.0.0-pre1 测试开始 ===');
 
   const initHeaders = {};
   if (CONFIG.initSecret) {
@@ -130,7 +130,7 @@ async function run() {
   const schedulePayload = {
     contactName: 'TestContact',
     messageType: 'fixed',
-    userMessage: 'hello from v2.0.0',
+    userMessage: 'hello from v2.0.0-pre1',
     firstSendTime: new Date(Date.now() + 60 * 1000).toISOString(),
     recurrenceType: 'none',
     pushSubscription: {
@@ -187,7 +187,7 @@ async function run() {
   }
 
   console.log('send-notifications 成功');
-  console.log('=== ReiStandard API v2.0.0 测试通过 ===');
+  console.log('=== ReiStandard API v2.0.0-pre1 测试通过 ===');
 }
 
 run().catch((error) => {

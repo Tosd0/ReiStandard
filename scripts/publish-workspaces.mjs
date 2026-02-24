@@ -5,6 +5,17 @@ import { spawnSync } from 'node:child_process';
 const rootDir = process.cwd();
 const dryRun = process.argv.includes('--dry-run');
 const useProvenance = process.env.NPM_PUBLISH_PROVENANCE !== 'false';
+const publishTagFromEnv = (process.env.NPM_PUBLISH_TAG || '').trim();
+
+function isPrereleaseVersion(version) {
+  return /-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(version);
+}
+
+function resolvePublishTag(version) {
+  if (publishTagFromEnv) return publishTagFromEnv;
+  if (isPrereleaseVersion(version)) return 'next';
+  return '';
+}
 
 function readJson(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8');
@@ -122,6 +133,11 @@ function isVersionPublished(name, version) {
 
 function publishWorkspace(pkgDir, pkg) {
   const npmArgs = ['publish', '--access', 'public'];
+  const publishTag = resolvePublishTag(pkg.version);
+
+  if (publishTag) {
+    npmArgs.push('--tag', publishTag);
+  }
 
   if (useProvenance) {
     npmArgs.push('--provenance');
@@ -131,7 +147,8 @@ function publishWorkspace(pkgDir, pkg) {
     npmArgs.push('--dry-run');
   }
 
-  console.log(`[publish] Publishing ${pkg.name}@${pkg.version} from ${path.relative(rootDir, pkgDir)}`);
+  const tagLabel = publishTag ? ` (tag: ${publishTag})` : '';
+  console.log(`[publish] Publishing ${pkg.name}@${pkg.version} from ${path.relative(rootDir, pkgDir)}${tagLabel}`);
   run('npm', npmArgs, { cwd: pkgDir, stdio: 'inherit' });
 }
 

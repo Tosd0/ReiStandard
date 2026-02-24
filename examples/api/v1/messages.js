@@ -1,7 +1,7 @@
 /**
  * GET /api/v1/messages
  * 功能：查询用户的定时任务列表
- * ReiStandard v2.0.0
+ * ReiStandard v2.0.0-pre1
  */
 
 // const { sql } = require('@vercel/postgres');

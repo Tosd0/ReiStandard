@@ -1,6 +1,6 @@
 {
   "name": "rei-standard-examples",
-  "version": "1.2.2",
+  "version": "2.0.0-pre1",
   "private": true,
   "description": "ReiStandard reference implementation examples",
   "engines": {

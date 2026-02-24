@@ -1,5 +1,5 @@
 /**
- * Vercel Function 版本的主动消息 API v2.0.0 测试
+ * Vercel Function 版本的主动消息 API v2.0.0-pre1 测试
  */
 
 const crypto = require('crypto');

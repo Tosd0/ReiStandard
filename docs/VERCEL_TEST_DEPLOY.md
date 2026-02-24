@@ -1,4 +1,4 @@
-# 生产环境测试端点部署指南（v2.0.0）
+# 生产环境测试端点部署指南（v2.0.0-pre1）
 
 将 `tests/test-vercel-function.js` 部署为 Serverless 健康检查端点。
 
