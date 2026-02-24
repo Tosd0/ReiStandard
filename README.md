@@ -32,6 +32,28 @@ import { installReiSW } from '@rei-standard/amsg-sw';
    - `TENANT_CONFIG_KEK`
    - `TENANT_TOKEN_SIGNING_KEY`
    - `INIT_SECRET`（可选，配置后 `init-tenant` 需带 `X-Init-Secret`）
+   
+   `.env` 示例：
+   
+   ```dotenv
+   VAPID_EMAIL=youremail@example.com
+   NEXT_PUBLIC_VAPID_PUBLIC_KEY=YOUR-PUBLIC-KEY
+   VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
+   TENANT_CONFIG_KEK=YOUR-KEK-SECRET
+   TENANT_TOKEN_SIGNING_KEY=YOUR-TOKEN-SIGNING-KEY
+   # 可选：配置后 init-tenant 必须带 X-Init-Secret
+   INIT_SECRET=YOUR-INIT-SECRET
+   PUBLIC_BASE_URL=https://your-domain.com
+   VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
+   ```
+
+   建议生成方式（用于 `TENANT_CONFIG_KEK` / `TENANT_TOKEN_SIGNING_KEY`，以及可选的 `INIT_SECRET`）：
+
+   ```bash
+   openssl rand -base64 32
+   ```
+
+   部署配置示例可参考：`examples/vercel.json.example`
 3. 发布后即可接收租户初始化请求。
 
 ### 租户一次性步骤（每个租户一次）

@@ -26,6 +26,7 @@
    - `tenantToken`：业务端点
    - `cronToken`：仅 cron 发送端点
 5. 租户敏感配置（数据库连接、masterKey）加密后存入 Blob。
+6. 推荐在 Netlify 使用 Scheduled Function 触发调度聚合端点，再按租户触发后台发送；同时保留外部 cron 兼容模式。
 
 ## 3. 角色与职责
 
@@ -44,6 +45,9 @@
 ### 3.2 租户（每个租户一次）
 
 租户只需提交自己的数据库连接串到 `init-tenant`。
+
+> 规范强制要求：**每个 tenant 必须使用独立的 `databaseUrl`（独立数据库 URL）**。  
+> 不允许多个 tenant 共享同一个数据库 URL，否则会导致租户数据串扰、任务误处理等不可预料错误。
 
 系统自动完成：
 
@@ -76,14 +80,49 @@
 Authorization: Bearer <tenantToken>
 ```
 
-### 5.2 Cron 调用
+### 5.2 Cron 调用（兼容模式）
 
 `POST /api/v1/send-notifications` 支持两种方式：
 
 1. Header：`Authorization: Bearer <cronToken>`
 2. Query：`/api/v1/send-notifications?token=<cronToken>`
 
-### 5.3 失败响应
+### 5.3 Netlify Scheduled Function（推荐模式）
+
+在 Netlify 平台，推荐使用 Scheduled Function 每分钟触发一次聚合调度，再按租户触发后台发送。
+
+Scheduled Function 示例：
+
+```ts
+export const config = {
+  schedule: '* * * * *'
+};
+```
+
+推荐流程：
+
+1. Scheduled Function 触发 `/api/v1/send-notifications-scheduled`。
+2. `send-notifications-scheduled` 读取 Blob 租户索引（见 8.2）。
+3. 循环触发后台发送端点（推荐复用 `/api/v1/send-notifications?token=...`，也可实现为 `background` 别名端点）。
+
+说明：
+
+- 该模式是推荐实现，不替代第 5.2 节 cron 兼容模式。
+- 若同时启用两种模式，必须确保不会重复发送（例如仅保留一个入口，或做幂等保护）。
+
+### 5.4 双轨兼容策略（可同时启用）
+
+兼容模式（外部 cron）与推荐模式（Netlify Scheduled）允许同时存在，推荐按“主备”设计：
+
+1. 主路径：`send-notifications-scheduled`。
+2. 备路径：外部 cron 直接调用 `send-notifications`（仅故障切换时启用）。
+
+若同时常态启用两条路径，必须满足至少一项：
+
+- 调度入口互斥（分布式锁或单实例保证）。
+- 数据库侧领取任务时使用原子“claim”语义，避免同一任务被并发处理。
+
+### 5.5 失败响应
 
 无 token、token 过期、签名错误、token 类型不匹配，均返回：
 
@@ -101,6 +140,7 @@ Authorization: Bearer <tenantToken>
 | `DELETE` | `/api/v1/cancel-message?id={uuid}` | 取消任务 | `tenantToken` |
 | `GET` | `/api/v1/messages` | 查询任务列表 | `tenantToken` |
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
+| `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
 ## 7. 一体化初始化接口
 
@@ -160,12 +200,29 @@ Body:
 - 入 Blob 前必须使用 `TENANT_CONFIG_KEK` 进行加密。
 - 运行时解密失败应视为租户配置失效。
 
-### 8.2 数据库（业务任务）
+### 8.2 Blob（租户调度索引，推荐）
+
+当实现第 5.3 节推荐模式时，`init-tenant` 完成后应同步写入租户调度索引。
+
+索引最小字段：
+
+- `tenantId`
+- `cronToken`
+- `updatedAt`
+
+要求：
+
+- `cronToken` 在索引中不得明文存储，必须与租户配置相同级别加密后再入 Blob。
+- `tenantId` 与 `cronToken` 必须同源（同一次租户初始化签发），避免索引错配。
+- `send-notifications-scheduled` 读取索引后，应按 `tenantId` 循环触发后台发送，并记录失败租户用于重试。
+
+### 8.3 数据库（业务任务）
 
 数据库仅存业务任务表（如 `scheduled_messages`）。
 
 - 不再保存 `system_config`。
 - 不再在数据库持久化 masterKey。
+- 每个 tenant 必须绑定独立数据库 URL，禁止复用同一连接串。
 
 ## 9. 错误码（v2.0.0-pre1）
 
@@ -197,14 +254,20 @@ Body:
 
 ### 10.2 租户一次性流程
 
-1. 调用 `POST /api/v1/init-tenant` 提交 `databaseUrl`。
+1. 调用 `POST /api/v1/init-tenant` 提交 `databaseUrl`（必须是该 tenant 独占的数据库 URL）。
 2. 保存返回的 `tenantToken`、`cronWebhookUrl`。
-3. 将 `cronWebhookUrl` 粘贴到 cron 平台。
+3. 支持三种接入方式：
+   - 仅兼容模式：将 `cronWebhookUrl` 粘贴到外部 cron 平台。
+   - 仅推荐模式：由 `init-tenant` 同步写入 Blob 租户调度索引。
+   - 双轨兼容（主备）：两者同时配置，但需满足第 5.4 节防重入要求。
 
 ### 10.3 日常调用流程
 
 1. 前端调用业务端点时自动携带 `tenantToken`。
-2. cron 周期调用 `send-notifications`。
+2. 调度触发可单轨或双轨：
+   - 兼容模式：外部 cron 周期调用 `send-notifications`。
+   - 推荐模式：Netlify Scheduled Function 每分钟调用 `send-notifications-scheduled`，后者循环触发后台发送。
+   - 双轨兼容：两条路径同时保留，按第 5.4 节做互斥/幂等。
 
 ## 11. 向后兼容声明
 
@@ -213,6 +276,7 @@ v2.0.0-pre1 为破坏性升级：
 - 旧初始化端点已移除。
 - 旧 `CRON_SECRET` 方案不再作为标准鉴权方案。
 - 旧文档中关于 `system_config` 的描述全部失效。
+- 调度层新增“推荐模式”不影响旧 cron 兼容模式，旧 cron 接入仍可继续使用。
 
 ## 12. 实现一致性要求（DoD）
 
@@ -223,3 +287,5 @@ v2.0.0-pre1 为破坏性升级：
 3. `tenantToken` 与 `cronToken` 权限分离。
 4. `packages` 与 `examples` 的接口行为一致。
 5. 文档明确管理员一次性与租户一次性职责。
+6. 若实现推荐调度模式，必须实现 Blob 租户调度索引，并对索引中的 `cronToken` 加密存储。
+7. 若同时启用兼容模式与推荐模式，必须实现调度防重入机制（入口互斥或任务原子领取）。
