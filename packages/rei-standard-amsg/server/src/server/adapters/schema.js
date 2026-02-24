@@ -1,6 +1,6 @@
 /**
  * Shared SQL schema constants
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0-pre1
  */
 
 export const TABLE_SQL = `

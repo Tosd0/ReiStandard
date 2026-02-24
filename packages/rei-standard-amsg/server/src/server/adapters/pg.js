@@ -1,6 +1,6 @@
 /**
  * PostgreSQL (pg) Database Adapter
- * ReiStandard SDK v1.2.2
+ * ReiStandard SDK v2.0.0-pre1
  *
  * Uses the standard 'pg' npm package.
  *

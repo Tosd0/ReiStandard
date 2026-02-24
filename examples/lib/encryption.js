@@ -1,6 +1,6 @@
 /**
  * 加密工具函数库
- * ReiStandard v1.2.2
+ * ReiStandard v2.0.0-pre1
  */
 
 const { createCipheriv, createDecipheriv, createHash, randomBytes } = require('crypto');

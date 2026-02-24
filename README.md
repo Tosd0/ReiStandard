@@ -2,15 +2,15 @@
 
 **主动消息 API 标准**：本仓库含纯前端项目（小手机）统一的定时/即时消息推送接口与实现规范，支持端到端加密、Serverless 部署与三包接入。最小只需要一个数据库就能持续跑，全程免费！
 
-> **v2.0.0 初始化变更（重要）**：初始化已从 `init-database + init-master-key` 合并为 `POST /api/v1/init-tenant` 一步完成。业务端点统一使用 `tenantToken` / `cronToken` 鉴权。
+> **v2.0.0-pre1 初始化变更（重要）**：初始化已从 `init-database + init-master-key` 合并为 `POST /api/v1/init-tenant` 一步完成。业务端点统一使用 `tenantToken` / `cronToken` 鉴权。
 
 ## 📦 Package-First（推荐）
 
 | Package | 版本 | 说明 | 文档 |
 |---------|------|------|------|
-| `@rei-standard/amsg-server` | `2.0.0` | 服务端 SDK（Blob 租户化 + 标准 handlers） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
-| `@rei-standard/amsg-client` | `1.2.2` | 浏览器 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
-| `@rei-standard/amsg-sw` | `1.2.2` | Service Worker SDK（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
+| `@rei-standard/amsg-server` | `2.0.0-pre1` | 服务端 SDK（Blob 租户化 + 标准 handlers） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `2.0.0-pre1` | 浏览器 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `2.0.0-pre1` | Service Worker SDK（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
 
 快速引用：
 
@@ -20,7 +20,7 @@ import { ReiClient } from '@rei-standard/amsg-client';
 import { installReiSW } from '@rei-standard/amsg-sw';
 ```
 
-## 🚩 一体化初始化（v2.0.0）
+## 🚩 一体化初始化（v2.0.0-pre1）
 
 ### 管理员一次性步骤（每个部署一次）
 

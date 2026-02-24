@@ -1,5 +1,5 @@
 /**
- * v2.0.0 master key helper（来源：tenant context / blob）
+ * v2.0.0-pre1 master key helper（来源：tenant context / blob）
  * 不再从数据库 system_config 读取或写入。
  */
 

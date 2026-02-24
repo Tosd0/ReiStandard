@@ -6,9 +6,9 @@
 
 | Package | 版本 | 用途 | 文档 |
 |---------|------|------|------|
-| `@rei-standard/amsg-server` | `2.0.0` | 服务端标准 handlers、Blob 租户配置与 token 鉴权 | [server README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md) |
-| `@rei-standard/amsg-client` | `1.2.2` | 浏览器端加密、请求封装、Push 订阅 | [client README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) |
-| `@rei-standard/amsg-sw` | `1.2.2` | SW 推送展示、离线队列、后台重试 | [sw README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md) |
+| `@rei-standard/amsg-server` | `2.0.0-pre1` | 服务端标准 handlers、Blob 租户配置与 token 鉴权 | [server README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-client` | `2.0.0-pre1` | 浏览器端加密、请求封装、Push 订阅 | [client README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) |
+| `@rei-standard/amsg-sw` | `2.0.0-pre1` | SW 推送展示、离线队列、后台重试 | [sw README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md) |
 
 ## 推荐接入顺序
 

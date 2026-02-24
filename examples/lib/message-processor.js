@@ -1,7 +1,7 @@
 /**
  * 消息处理工具函数库
  * 用于处理单个消息任务的生成和发送
- * ReiStandard v2.0.0
+ * ReiStandard v2.0.0-pre1
  */
 
 const webpush = require('web-push');

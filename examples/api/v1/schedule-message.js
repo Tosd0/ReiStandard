@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/schedule-message
  * 功能：创建定时消息任务（CommonJS，兼容 Vercel 与 Netlify）
- * ReiStandard v2.0.0
+ * ReiStandard v2.0.0-pre1
  */
 
 const webpush = require('web-push');

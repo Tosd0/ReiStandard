@@ -1,6 +1,6 @@
 /**
  * ReiStandard Server SDK Entry Point
- * v2.0.0
+ * v2.0.0-pre1
  *
  * Usage:
  *   import { createReiServer } from '@rei-standard/amsg-server';

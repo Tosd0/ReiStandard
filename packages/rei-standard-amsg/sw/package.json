@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-sw",
-  "version": "1.2.2",
+  "version": "2.0.0-pre1",
   "description": "ReiStandard Active Messaging service worker SDK",
   "repository": {
     "type": "git",
