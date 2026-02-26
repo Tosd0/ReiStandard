@@ -199,7 +199,9 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
  * @private
  */
 async function _callAI(payload) {
-  const aiResponse = await fetch(payload.apiUrl, {
+  const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
+
+  const aiResponse = await fetch(normalizedApiUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -215,9 +217,60 @@ async function _callAI(payload) {
   });
 
   if (!aiResponse.ok) {
-    throw new Error(`AI API error: ${aiResponse.status} ${aiResponse.statusText}`);
+    if (aiResponse.status === 405) {
+      throw new Error(
+        `AI API error: 405 Method Not Allowed. ` +
+        `apiUrl must point to a full chat endpoint (for example: /chat/completions). ` +
+        `Received: ${normalizedApiUrl}`
+      );
+    }
+
+    throw new Error(
+      `AI API error: ${aiResponse.status} ${aiResponse.statusText || 'Unknown Error'}. ` +
+      `Request URL: ${normalizedApiUrl}`
+    );
   }
 
   const aiData = await aiResponse.json();
-  return aiData.choices[0].message.content.trim();
+  const content = aiData?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('AI API error: response missing choices[0].message.content');
+  }
+
+  return content.trim();
+}
+
+/**
+ * Normalize AI API URL with minimal, non-breaking rules:
+ * - trim whitespace
+ * - remove redundant trailing slashes from pathname
+ * - keep query string untouched
+ *
+ * Note: This function does NOT auto-append /v1 or /chat/completions.
+ *
+ * @param {string} apiUrl
+ * @returns {string}
+ */
+function normalizeAiApiUrl(apiUrl) {
+  if (typeof apiUrl !== 'string' || !apiUrl.trim()) {
+    throw new Error(
+      'Invalid apiUrl: apiUrl is required. ' +
+      'Please provide a full chat endpoint URL (for example: https://api.openai.com/v1/chat/completions).'
+    );
+  }
+
+  const trimmedApiUrl = apiUrl.trim();
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(trimmedApiUrl);
+  } catch {
+    throw new Error(
+      `Invalid apiUrl: "${apiUrl}". ` +
+      'Please provide a valid absolute URL that points to a full chat endpoint.'
+    );
+  }
+
+  parsedUrl.pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
+  return parsedUrl.toString();
 }

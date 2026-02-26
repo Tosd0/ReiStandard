@@ -50,6 +50,16 @@ const rei = await createReiServer({
 // GET  /api/v1/messages             -> rei.handlers.messages.GET
 ```
 
+## AI 接口 `apiUrl` 约束
+
+当 `messageType` 为 `prompted` / `auto`，或 `instant` 使用 AI 配置时：
+
+- `apiUrl` 必须是完整聊天端点（例如：`https://api.openai.com/v1/chat/completions`）。
+- SDK 会自动做最小规范化：去首尾空白、去路径尾部多余 `/`。
+- SDK **不会**自动补全 `/v1`、`/chat/completions` 等路径。
+
+如果上游返回 `405 Method Not Allowed`，通常表示 `apiUrl` 指向了基础域名而非聊天端点，请优先检查配置值。
+
 ## 一体化初始化流程
 
 1. 管理员配置环境变量（VAPID + tenant secrets）

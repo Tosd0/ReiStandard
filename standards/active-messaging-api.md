@@ -142,6 +142,16 @@ export const config = {
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
+### 6.1 AI 消息的 `apiUrl` 约束（`schedule-message`）
+
+当消息配置使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时：
+
+- `apiUrl` 必须是完整聊天端点 URL（例如：`https://api.openai.com/v1/chat/completions`）。
+- 实现方可对 URL 做最小规范化（如去首尾空白、去路径尾部多余 `/`）。
+- 实现方不应自动补全版本路径（如 `/v1`）或聊天路径（如 `/chat/completions`）。
+
+若上游返回 `405 Method Not Allowed`，应优先判定为 `apiUrl` 指向错误端点，并返回明确错误提示。
+
 ## 7. 一体化初始化接口
 
 ### 7.1 请求

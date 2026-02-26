@@ -76,36 +76,7 @@ async function processSingleMessage(task, providedMasterKey = null) {
       // instant 类型：优先使用 AI，否则使用固定消息
       if (decryptedPayload.completePrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
         // AI 生成
-        const apiUrl = decryptedPayload.apiUrl;
-        const apiKey = decryptedPayload.apiKey;
-        const completePrompt = decryptedPayload.completePrompt;
-
-        const aiResponse = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: decryptedPayload.primaryModel,
-            messages: [
-              {
-                role: 'user',
-                content: completePrompt
-              }
-            ],
-            max_tokens: 500,
-            temperature: 0.8
-          }),
-          signal: AbortSignal.timeout(300000) // 300秒超时
-        });
-
-        if (!aiResponse.ok) {
-          throw new Error(`AI API error: ${aiResponse.status} ${aiResponse.statusText}`);
-        }
-
-        const aiData = await aiResponse.json();
-        messageContent = aiData.choices[0].message.content.trim();
+        messageContent = await callAiWithPayload(decryptedPayload);
       } else if (decryptedPayload.userMessage) {
         // 固定消息
         messageContent = decryptedPayload.userMessage;
@@ -115,37 +86,7 @@ async function processSingleMessage(task, providedMasterKey = null) {
 
     } else if (decryptedPayload.messageType === 'prompted' || decryptedPayload.messageType === 'auto') {
       // AI 消息：调用 AI API
-      const apiUrl = decryptedPayload.apiUrl;
-      const apiKey = decryptedPayload.apiKey;
-      const completePrompt = decryptedPayload.completePrompt;
-
-      // 调用 AI API（OpenAI 兼容接口）
-      const aiResponse = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: decryptedPayload.primaryModel,
-          messages: [
-            {
-              role: 'user',
-              content: completePrompt
-            }
-          ],
-          max_tokens: 500,
-          temperature: 0.8
-        }),
-        signal: AbortSignal.timeout(300000) // 300秒超时
-      });
-
-      if (!aiResponse.ok) {
-        throw new Error(`AI API error: ${aiResponse.status} ${aiResponse.statusText}`);
-      }
-
-      const aiData = await aiResponse.json();
-      messageContent = aiData.choices[0].message.content.trim();
+      messageContent = await callAiWithPayload(decryptedPayload);
     } else {
       throw new Error('Invalid message configuration: no content source available');
     }
@@ -225,6 +166,93 @@ async function processSingleMessage(task, providedMasterKey = null) {
       error: error.message
     };
   }
+}
+
+/**
+ * 调用 OpenAI 兼容接口（带 apiUrl 规范化）
+ * @param {object} payload
+ * @returns {Promise<string>}
+ */
+async function callAiWithPayload(payload) {
+  const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
+
+  const aiResponse = await fetch(normalizedApiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${payload.apiKey}`
+    },
+    body: JSON.stringify({
+      model: payload.primaryModel,
+      messages: [
+        {
+          role: 'user',
+          content: payload.completePrompt
+        }
+      ],
+      max_tokens: 500,
+      temperature: 0.8
+    }),
+    signal: AbortSignal.timeout(300000) // 300秒超时
+  });
+
+  if (!aiResponse.ok) {
+    if (aiResponse.status === 405) {
+      throw new Error(
+        `AI API error: 405 Method Not Allowed. ` +
+        `apiUrl must point to a full chat endpoint (for example: /chat/completions). ` +
+        `Received: ${normalizedApiUrl}`
+      );
+    }
+
+    throw new Error(
+      `AI API error: ${aiResponse.status} ${aiResponse.statusText || 'Unknown Error'}. ` +
+      `Request URL: ${normalizedApiUrl}`
+    );
+  }
+
+  const aiData = await aiResponse.json();
+  const content = aiData?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('AI API error: response missing choices[0].message.content');
+  }
+
+  return content.trim();
+}
+
+/**
+ * 规范化 AI API URL（只做安全、保守的规范化）
+ * - 去除首尾空白
+ * - 去除路径尾部多余斜杠
+ * - 保留 query 参数
+ *
+ * 不自动补全 /v1 或 /chat/completions。
+ *
+ * @param {string} apiUrl
+ * @returns {string}
+ */
+function normalizeAiApiUrl(apiUrl) {
+  if (typeof apiUrl !== 'string' || !apiUrl.trim()) {
+    throw new Error(
+      'Invalid apiUrl: apiUrl is required. ' +
+      'Please provide a full chat endpoint URL (for example: https://api.openai.com/v1/chat/completions).'
+    );
+  }
+
+  const trimmedApiUrl = apiUrl.trim();
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(trimmedApiUrl);
+  } catch {
+    throw new Error(
+      `Invalid apiUrl: "${apiUrl}". ` +
+      'Please provide a valid absolute URL that points to a full chat endpoint.'
+    );
+  }
+
+  parsedUrl.pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
+  return parsedUrl.toString();
 }
 
 /**
