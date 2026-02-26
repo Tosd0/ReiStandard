@@ -1,4 +1,4 @@
-# ReiStandard 手动接入部署指南（v2.0.0-pre1 Blob 一体化初始化）
+# ReiStandard 手动接入部署指南（v2.0.1 Blob 一体化初始化）
 
 > 本文档用于不使用 SDK 包时的手动接入。优先推荐 Package-First。
 

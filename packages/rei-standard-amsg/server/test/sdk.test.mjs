@@ -270,7 +270,7 @@ describe('validation utilities', () => {
 
 // ─── Server tests ──────────────────────────────────────────────
 
-describe('createReiServer v2.0.0-pre1 flow', () => {
+describe('createReiServer v2.0.1 flow', () => {
   let server;
 
   beforeEach(async () => {
@@ -278,7 +278,7 @@ describe('createReiServer v2.0.0-pre1 flow', () => {
     server = await buildServer();
   });
 
-  it('returns v2.0.0-pre1 handlers', async () => {
+  it('returns v2.0.1 handlers', async () => {
     assert.equal(typeof server.handlers.initTenant.POST, 'function');
     assert.equal(typeof server.handlers.getUserKey.GET, 'function');
     assert.equal(typeof server.handlers.scheduleMessage.POST, 'function');

@@ -1,6 +1,6 @@
 /**
  * ReiStandard Client SDK
- * v2.0.0-pre1
+ * v2.0.1
  *
  * Lightweight browser client that handles:
  *  - AES-256-GCM encryption using the Web Crypto API

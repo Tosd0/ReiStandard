@@ -5,7 +5,7 @@
 
 ## 版本信息
 
-- **版本号**: v2.0.0-pre1
+- **版本号**: v2.0.1
 - **最后更新**: 2026-02-23
 - **状态**: Stable
 - **关联标准**: [主动消息API端点标准](./active-messaging-api.md)
@@ -1335,12 +1335,12 @@ self.addEventListener('notificationclick', (event) => {
 
 ## 15. 变更日志
 
-### v2.0.0-pre1 (2026-02-23)
+### v2.0.1 (2026-02-23)
 
 #### 🔧 改进优化
 
 **1. instant 消息类型支持**
-- 配合后端 API v2.0.0-pre1，支持接收和显示 `instant` 类型的推送通知
+- 配合后端 API v2.0.1，支持接收和显示 `instant` 类型的推送通知
 - instant 消息特性：
   - 立即发送，无需等待 cronjob 触发
   - 用于后台正常收消息
@@ -1361,7 +1361,7 @@ self.addEventListener('notificationclick', (event) => {
 #### 📝 兼容性说明
 
 - Service Worker 实现保持向后兼容
-- 支持处理 v1.0.0、v1.1.0 和 v2.0.0-pre1 的通知数据结构
+- 支持处理 v1.0.0、v1.1.0 和 v2.0.1 的通知数据结构
 - 无破坏性变更
 
 ---

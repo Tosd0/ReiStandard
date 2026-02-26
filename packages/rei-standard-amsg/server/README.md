@@ -1,8 +1,8 @@
 # @rei-standard/amsg-server
 
-`@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK（v2.0.0-pre1），提供 Blob 租户配置、租户 token 鉴权和标准路由处理器。
+`@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK（v2.0.1），提供 Blob 租户配置、租户 token 鉴权和标准路由处理器。
 
-## v2.0.0-pre1 变更摘要
+## v2.0.1 变更摘要
 
 - 初始化流程合并为 `POST /api/v1/init-tenant`
 - 移除旧端点：`init-database`、`init-master-key`

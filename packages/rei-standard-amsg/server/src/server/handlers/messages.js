@@ -1,6 +1,6 @@
 /**
  * Handler: messages
- * ReiStandard SDK v2.0.0-pre1
+ * ReiStandard SDK v2.0.1
  *
  * @param {Object} ctx - Server context.
  * @returns {{ GET: function }}

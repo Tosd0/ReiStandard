@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-client",
-  "version": "2.0.0-pre1",
+  "version": "2.0.1",
   "description": "ReiStandard Active Messaging browser client SDK",
   "repository": {
     "type": "git",
