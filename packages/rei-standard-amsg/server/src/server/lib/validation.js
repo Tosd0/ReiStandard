@@ -78,6 +78,14 @@ export function validateScheduleMessagePayload(payload) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['recurrenceType'] } };
   }
 
+  if (
+    payload.maxTokens !== undefined &&
+    payload.maxTokens !== null &&
+    (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0)
+  ) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['maxTokens'] } };
+  }
+
   if (payload.messageType === 'fixed') {
     if (!payload.userMessage) {
       return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { missingFields: ['userMessage (required for fixed type)'] } };

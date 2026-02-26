@@ -73,6 +73,14 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['recurrenceType'] } } } };
     }
 
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'maxTokens') &&
+      updates.maxTokens !== null &&
+      (!Number.isInteger(updates.maxTokens) || updates.maxTokens <= 0)
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['maxTokens'] } } } };
+    }
+
     // Fetch existing task
     const existingTask = await db.getTaskByUuid(taskUuid, userId);
 
@@ -92,7 +100,8 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.userMessage && { userMessage: updates.userMessage }),
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
-      ...(updates.metadata && { metadata: updates.metadata })
+      ...(updates.metadata && { metadata: updates.metadata }),
+      ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null })
     };
 
     const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);

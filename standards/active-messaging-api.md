@@ -149,6 +149,7 @@ export const config = {
 - `apiUrl` 必须是完整聊天端点 URL（例如：`https://api.openai.com/v1/chat/completions`）。
 - 实现方可对 URL 做最小规范化（如去首尾空白、去路径尾部多余 `/`）。
 - 实现方不应自动补全版本路径（如 `/v1`）或聊天路径（如 `/chat/completions`）。
+- `maxTokens` 为可选整数字段（> 0）：传入则映射到上游 AI 请求的 `max_tokens`；不传则不指定该参数。
 
 若上游返回 `405 Method Not Allowed`，应优先判定为 `apiUrl` 指向错误端点，并返回明确错误提示。
 

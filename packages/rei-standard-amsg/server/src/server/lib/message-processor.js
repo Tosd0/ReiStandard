@@ -200,6 +200,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
  */
 async function _callAI(payload) {
   const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
+  const requestBody = buildAiRequestBody(payload);
 
   const aiResponse = await fetch(normalizedApiUrl, {
     method: 'POST',
@@ -207,12 +208,7 @@ async function _callAI(payload) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${payload.apiKey}`
     },
-    body: JSON.stringify({
-      model: payload.primaryModel,
-      messages: [{ role: 'user', content: payload.completePrompt }],
-      max_tokens: 500,
-      temperature: 0.8
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(300000)
   });
 
@@ -238,6 +234,35 @@ async function _callAI(payload) {
   }
 
   return content.trim();
+}
+
+/**
+ * Build OpenAI-compatible request body.
+ *
+ * `max_tokens` is optional:
+ * - include it only when payload.maxTokens is provided
+ * - omit it when payload.maxTokens is undefined / null
+ *
+ * @param {Object} payload
+ * @returns {Object}
+ */
+function buildAiRequestBody(payload) {
+  const requestBody = {
+    model: payload.primaryModel,
+    messages: [{ role: 'user', content: payload.completePrompt }],
+    temperature: 0.8
+  };
+
+  if (payload.maxTokens === undefined || payload.maxTokens === null) {
+    return requestBody;
+  }
+
+  if (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0) {
+    throw new Error('Invalid maxTokens: maxTokens must be a positive integer when provided.');
+  }
+
+  requestBody.max_tokens = payload.maxTokens;
+  return requestBody;
 }
 
 /**

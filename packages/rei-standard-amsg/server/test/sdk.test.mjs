@@ -234,6 +234,38 @@ describe('validation utilities', () => {
     });
     assert.equal(result.valid, true);
   });
+
+  it('validateScheduleMessagePayload accepts optional maxTokens', () => {
+    const result = validateScheduleMessagePayload({
+      contactName: 'Alice',
+      messageType: 'prompted',
+      firstSendTime: new Date(Date.now() + 60000).toISOString(),
+      pushSubscription: { endpoint: 'https://push.example.com' },
+      completePrompt: 'Say hello',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      maxTokens: 128
+    });
+    assert.equal(result.valid, true);
+  });
+
+  it('validateScheduleMessagePayload rejects invalid maxTokens', () => {
+    const result = validateScheduleMessagePayload({
+      contactName: 'Alice',
+      messageType: 'prompted',
+      firstSendTime: new Date(Date.now() + 60000).toISOString(),
+      pushSubscription: { endpoint: 'https://push.example.com' },
+      completePrompt: 'Say hello',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      maxTokens: 0
+    });
+    assert.equal(result.valid, false);
+    assert.equal(result.errorCode, 'INVALID_PARAMETERS');
+    assert.deepEqual(result.details?.invalidFields, ['maxTokens']);
+  });
 });
 
 // ─── Server tests ──────────────────────────────────────────────

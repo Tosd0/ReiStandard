@@ -127,6 +127,24 @@ async function core(url, headers, body) {
     };
   }
 
+  if (
+    Object.prototype.hasOwnProperty.call(updates, 'maxTokens') &&
+    updates.maxTokens !== null &&
+    (!Number.isInteger(updates.maxTokens) || updates.maxTokens <= 0)
+  ) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: 'INVALID_UPDATE_DATA',
+          message: '更新数据格式错误',
+          details: { invalidFields: ['maxTokens'] }
+        }
+      }
+    };
+  }
+
   // 查询现有任务并解密（全字段加密版本）
   /*
   const existingTask = await sql`
@@ -199,6 +217,7 @@ async function core(url, headers, body) {
     apiKey: null,
     primaryModel: null,
     completePrompt: null,
+    maxTokens: null,
     pushSubscription: {},
     metadata: {}
   };
@@ -210,7 +229,8 @@ async function core(url, headers, body) {
     ...(updates.userMessage && { userMessage: updates.userMessage }),
     ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
     ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
-    ...(updates.metadata && { metadata: updates.metadata })
+    ...(updates.metadata && { metadata: updates.metadata }),
+    ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null })
   };
   
   // 重新加密整个payload

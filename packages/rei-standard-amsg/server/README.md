@@ -57,6 +57,7 @@ const rei = await createReiServer({
 - `apiUrl` 必须是完整聊天端点（例如：`https://api.openai.com/v1/chat/completions`）。
 - SDK 会自动做最小规范化：去首尾空白、去路径尾部多余 `/`。
 - SDK **不会**自动补全 `/v1`、`/chat/completions` 等路径。
+- `maxTokens` 为可选字段：传了就映射为 `max_tokens`；不传则不指定（由上游模型默认策略决定）。
 
 如果上游返回 `405 Method Not Allowed`，通常表示 `apiUrl` 指向了基础域名而非聊天端点，请优先检查配置值。
 

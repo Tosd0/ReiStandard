@@ -200,6 +200,7 @@ async function core(headers, body) {
     apiKey: payload.apiKey || null,
     primaryModel: payload.primaryModel || null,
     completePrompt: payload.completePrompt || null,
+    maxTokens: payload.maxTokens ?? null,
     pushSubscription: payload.pushSubscription,
     metadata: payload.metadata || {}
   };

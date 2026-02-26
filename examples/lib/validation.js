@@ -104,6 +104,19 @@ function validateScheduleMessagePayload(payload) {
     };
   }
 
+  if (
+    payload.maxTokens !== undefined &&
+    payload.maxTokens !== null &&
+    (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0)
+  ) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PARAMETERS',
+      errorMessage: '缺少必需参数或参数格式错误',
+      details: { invalidFields: ['maxTokens'] }
+    };
+  }
+
   // 消息类型特定验证
   if (payload.messageType === 'fixed') {
     if (!payload.userMessage) {

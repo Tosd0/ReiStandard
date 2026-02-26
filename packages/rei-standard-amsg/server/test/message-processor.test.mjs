@@ -46,10 +46,12 @@ describe('message processor AI apiUrl handling', () => {
     });
 
     const calledUrls = [];
+    const requestBodies = [];
     const originalFetch = globalThis.fetch;
 
-    globalThis.fetch = async (url) => {
+    globalThis.fetch = async (url, options) => {
       calledUrls.push(url);
+      requestBodies.push(JSON.parse(options.body));
       return {
         ok: true,
         async json() {
@@ -68,7 +70,45 @@ describe('message processor AI apiUrl handling', () => {
       assert.equal(result.success, true);
       assert.equal(calledUrls.length, 1);
       assert.equal(calledUrls[0], 'https://api.example.com/v1/chat/completions');
+      assert.equal(Object.hasOwn(requestBodies[0], 'max_tokens'), false);
       assert.equal(typeof pushedPayload, 'string');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('passes max_tokens only when maxTokens is provided', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'say hi',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      maxTokens: 256,
+      pushSubscription: { endpoint: 'https://push.example.com/sub' }
+    });
+
+    const requestBodies = [];
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async (_url, options) => {
+      requestBodies.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: 'hello world' } }] };
+        }
+      };
+    };
+
+    const ctx = createContext();
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(requestBodies.length, 1);
+      assert.equal(requestBodies[0].max_tokens, 256);
     } finally {
       globalThis.fetch = originalFetch;
     }

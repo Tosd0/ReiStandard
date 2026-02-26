@@ -175,6 +175,7 @@ async function processSingleMessage(task, providedMasterKey = null) {
  */
 async function callAiWithPayload(payload) {
   const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
+  const requestBody = buildAiRequestBody(payload);
 
   const aiResponse = await fetch(normalizedApiUrl, {
     method: 'POST',
@@ -182,17 +183,7 @@ async function callAiWithPayload(payload) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${payload.apiKey}`
     },
-    body: JSON.stringify({
-      model: payload.primaryModel,
-      messages: [
-        {
-          role: 'user',
-          content: payload.completePrompt
-        }
-      ],
-      max_tokens: 500,
-      temperature: 0.8
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(300000) // 300秒超时
   });
 
@@ -218,6 +209,37 @@ async function callAiWithPayload(payload) {
   }
 
   return content.trim();
+}
+
+/**
+ * 构建 OpenAI 兼容请求体。
+ * max_tokens 为可选项：仅在提供 maxTokens 时才透传。
+ *
+ * @param {object} payload
+ * @returns {object}
+ */
+function buildAiRequestBody(payload) {
+  const requestBody = {
+    model: payload.primaryModel,
+    messages: [
+      {
+        role: 'user',
+        content: payload.completePrompt
+      }
+    ],
+    temperature: 0.8
+  };
+
+  if (payload.maxTokens === undefined || payload.maxTokens === null) {
+    return requestBody;
+  }
+
+  if (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0) {
+    throw new Error('Invalid maxTokens: maxTokens must be a positive integer when provided.');
+  }
+
+  requestBody.max_tokens = payload.maxTokens;
+  return requestBody;
 }
 
 /**
