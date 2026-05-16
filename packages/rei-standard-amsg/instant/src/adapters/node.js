@@ -48,7 +48,13 @@ export function toNodeHandler(fetchHandler) {
 async function nodeRequestToFetchRequest(req) {
   const host = req.headers.host || 'localhost';
   const protocol = req.socket && req.socket.encrypted ? 'https' : 'http';
-  const url = `${protocol}://${host}${req.url || '/'}`;
+  // req.url is usually a path (origin-form), but some proxy / sub-router setups
+  // can hand back an absolute URL. Detect that case and use it verbatim
+  // instead of double-prefixing the scheme+host.
+  const rawUrl = req.url || '/';
+  const url = /^https?:\/\//i.test(rawUrl)
+    ? rawUrl
+    : `${protocol}://${host}${rawUrl}`;
 
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {

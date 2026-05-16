@@ -263,8 +263,21 @@ function verifyBearerToken(request, signingKey) {
     createHmac('sha256', signingKey).update(signingInput).digest()
   );
 
-  const received = Buffer.from(receivedSig);
-  const expected = Buffer.from(expectedSig);
+  // Compare raw HMAC bytes (32 B after base64url decode) rather than the
+  // UTF-8 bytes of the encoded characters — semantically clearer and avoids
+  // Buffer.from(string)'s implicit-encoding default. Kept in lockstep with
+  // amsg-server's tenant/token.js to preserve the protocol contract.
+  let received;
+  let expected;
+  try {
+    received = base64UrlDecode(receivedSig);
+    expected = base64UrlDecode(expectedSig);
+  } catch {
+    return jsonResponse(401, {
+      success: false,
+      error: { code: 'UNAUTHORIZED', message: 'token 签名格式无效' }
+    });
+  }
   if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
     return jsonResponse(401, {
       success: false,
