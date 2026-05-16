@@ -120,7 +120,14 @@ export function validateScheduleMessagePayload(payload) {
   if (payload.uuid && !isValidUUID(payload.uuid)) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['uuid (invalid UUID format)'] } };
   }
-  if (payload.messageSubtype && !['chat', 'forum', 'moment'].includes(payload.messageSubtype)) {
+  // messageSubtype is a free-form string tag forwarded to SW-side push payload
+  // for classification. Only the type is enforced; the taxonomy is the
+  // consumer's call (previously the enum was chat/forum/moment).
+  if (
+    payload.messageSubtype !== undefined &&
+    payload.messageSubtype !== null &&
+    typeof payload.messageSubtype !== 'string'
+  ) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['messageSubtype'] } };
   }
 
