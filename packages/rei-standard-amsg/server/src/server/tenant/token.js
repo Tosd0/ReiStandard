@@ -70,8 +70,17 @@ export function verifyTenantToken(token, secret, options = {}) {
   const signingInput = `${encodedHeader}.${encodedPayload}`;
   const expectedSignature = sign(signingInput, secret);
 
-  const receivedBuffer = Buffer.from(receivedSignature);
-  const expectedBuffer = Buffer.from(expectedSignature);
+  // Compare raw HMAC bytes (decoded from base64url) rather than the
+  // encoded character bytes — semantically clearer and avoids the
+  // implicit-UTF-8 default of Buffer.from(string).
+  let receivedBuffer;
+  let expectedBuffer;
+  try {
+    receivedBuffer = base64UrlDecode(receivedSignature);
+    expectedBuffer = base64UrlDecode(expectedSignature);
+  } catch {
+    throw new Error('INVALID_TENANT_AUTH');
+  }
   if (
     receivedBuffer.length !== expectedBuffer.length ||
     !timingSafeEqual(receivedBuffer, expectedBuffer)
