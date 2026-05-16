@@ -22,11 +22,26 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Pin to 22.22.3 to dodge the broken bundled npm in the runner image's
+          # toolcache. Background:
+          #   - Node 22.22.2 (which the toolcache still ships) bundles a broken
+          #     npm 10.9.7 missing the `promise-retry` module — any attempt to
+          #     self-upgrade npm via `npm install -g npm@<x>` fails with
+          #     MODULE_NOT_FOUND from @npmcli/arborist/lib/arborist/rebuild.js.
+          #   - The fix landed upstream in Node 22.22.3 (nodejs/node#62463,
+          #     npm/cli#9152), but actions/runner-images#13883 is still open
+          #     so the GitHub-hosted runner toolcache hasn't been refreshed.
+          #   - Asking setup-node for a specific patch the cache doesn't have
+          #     forces a fresh download from nodejs.org — giving us the fixed
+          #     bundled npm without the self-upgrade dance.
+          # Remove this pin (revert to `node-version: 22`) once #13883 is closed.
+          node-version: '22.22.3'
           cache: npm
           registry-url: 'https://registry.npmjs.org'
 
       - name: Upgrade npm for trusted publishing
+        # OIDC trusted publishing needs npm >= 11.5.1. With the 22.22.3 pin
+        # above the bundled npm 10.9.8 self-upgrades cleanly.
         run: npm install -g npm@^11.5.1
 
       - name: Remove deprecated npm config
