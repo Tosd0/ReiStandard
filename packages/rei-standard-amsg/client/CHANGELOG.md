@@ -1,5 +1,20 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.2.0 — 2026-05-16
+
+### Added
+
+- 构造选项 `instantEncryption` (boolean, default `true`) 与 `instantClientToken` (string, optional)。
+- `instantEncryption: false` 时 `sendInstant()` 直接 POST 明文 JSON，配套 `@rei-standard/amsg-instant@0.2.0`。`init()` 在该模式下变 no-op。
+- 明文模式下构造时可省略 `userId`（默认加密模式仍强制要求）。
+- 明文模式下若配 `instantClientToken`，请求会带 `X-Client-Token` 头（弱鉴权 —— token 随 bundle 走前端，devtools 一开就能看到，只防 URL 直怼）。
+
+### Unchanged
+
+- 默认 `instantEncryption: true`，行为与 2.1.0 完全一致（兼容 amsg-instant 0.1.x 与 amsg-server `schedule-message` 路径）。
+- `scheduleMessage` / `listMessages` / `updateMessage` / `cancelMessage` / `subscribePush` 仍走加密路径，不受新选项影响。
+- 加密模式下 `init()` 行为完全不变。
+
 ## 2.1.0 — 2026-05-16
 
 ### Added

@@ -1,11 +1,11 @@
 /**
  * ReiStandard Client SDK
- * v2.0.1
  *
  * Lightweight browser client that handles:
- *  - AES-256-GCM encryption using the Web Crypto API
+ *  - AES-256-GCM encryption using the Web Crypto API (for amsg-server's
+ *    schedule path and amsg-instant 0.1.x)
+ *  - Optional plaintext mode for amsg-instant 0.2.x (instantEncryption: false)
  *  - Push subscription management via the Push API
- *  - Convenient request helpers for amsg-server endpoints + amsg-instant
  *
  * Usage:
  *   import { ReiClient } from '@rei-standard/amsg-client';
@@ -25,6 +25,8 @@
 /**
  * @typedef {Object} ReiClientConfig
  * @property {string} baseUrl                            - Default base URL of the API (e.g. https://host/api/v1).
+ *                                                         In plaintext-instant mode (`instantEncryption: false`)
+ *                                                         this can be the amsg-instant Worker URL directly.
  * @property {Record<string, string>} [customBaseUrls]   - Optional per-endpoint base URL overrides.
  *                                                         Key is the endpoint name (e.g. `instant`); value is
  *                                                         the base URL to use for that endpoint instead of
@@ -33,7 +35,21 @@
  *                                                         Workers while the rest run on Netlify). Future
  *                                                         endpoints (e.g. `schedule`, `messages`) can be
  *                                                         overridden the same way without an API change.
- * @property {string} userId                             - Current user identifier (UUID v4).
+ * @property {string} [userId]                           - Current user identifier (UUID v4). Required for the
+ *                                                         encrypted path (default `instantEncryption: true`,
+ *                                                         and for `scheduleMessage` / `listMessages` /
+ *                                                         `updateMessage` always). Can be omitted only when
+ *                                                         `instantEncryption: false` AND you do not call any
+ *                                                         encrypted method.
+ * @property {boolean} [instantEncryption=true]          - When `false`, `sendInstant()` posts plaintext JSON
+ *                                                         to amsg-instant 0.2.x. `init()` becomes a no-op.
+ *                                                         All other methods (`scheduleMessage` etc.) keep
+ *                                                         using AES-256-GCM regardless of this flag.
+ * @property {string} [instantClientToken]               - When set, sent as the `X-Client-Token` header by
+ *                                                         `sendInstant()` in plaintext mode. Note: this is
+ *                                                         a *weak* shared secret — it ships inside any
+ *                                                         frontend bundle that uses it, so devtools can
+ *                                                         read it. Use for casual URL-direct abuse only.
  */
 
 export class ReiClient {
@@ -42,7 +58,13 @@ export class ReiClient {
    */
   constructor(config) {
     if (!config || !config.baseUrl) throw new Error('[rei-standard-amsg-client] baseUrl is required');
-    if (!config.userId) throw new Error('[rei-standard-amsg-client] userId is required');
+
+    const instantEncryption = config.instantEncryption !== false;
+    if (!config.userId && instantEncryption) {
+      throw new Error(
+        '[rei-standard-amsg-client] userId is required (omit only when instantEncryption: false)'
+      );
+    }
 
     /** @private */
     this._baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -56,9 +78,15 @@ export class ReiClient {
       }
     }
     /** @private */
-    this._userId = config.userId;
+    this._userId = config.userId || '';
     /** @private */
     this._userKey = null;
+    /** @private */
+    this._instantEncryption = instantEncryption;
+    /** @private */
+    this._instantClientToken = typeof config.instantClientToken === 'string' && config.instantClientToken
+      ? config.instantClientToken
+      : '';
   }
 
   /**
@@ -77,8 +105,18 @@ export class ReiClient {
   /**
    * Fetch the user-specific encryption key.
    * Must be called before any encrypted request.
+   *
+   * In plaintext-instant mode (`instantEncryption: false`) this is a no-op:
+   * `sendInstant()` does not need a userKey. Note that if you also intend to
+   * call `scheduleMessage` / `listMessages` / `updateMessage` (which always
+   * use AES-256-GCM), you must construct with `instantEncryption: true`
+   * (the default) — those methods will throw "Not initialised" otherwise.
    */
   async init() {
+    if (this._instantEncryption === false) {
+      return;
+    }
+
     const res = await fetch(`${this._baseUrl}/get-user-key`, {
       method: 'GET',
       headers: { 'X-User-Id': this._userId }
@@ -136,11 +174,16 @@ export class ReiClient {
    *   - Deployable to Cloudflare Workers / Deno Deploy / Vercel Edge
    *   - Rejects scheduled-only fields (`firstSendTime`, `recurrenceType`)
    *
-   * The payload uses the same field names as `scheduleMessage`, minus
-   * `firstSendTime` and `recurrenceType`. It is auto-encrypted with the
-   * same `userKey` fetched by `init()`, so the upstream deployment of
-   * amsg-instant must share the same `masterKey` as the amsg-server
-   * tenant.
+   * Two transport modes (chosen by constructor `instantEncryption`):
+   *
+   * - **Encrypted (default)** — payload is AES-256-GCM encrypted with the
+   *   `userKey` fetched by `init()`. Compatible with amsg-instant 0.1.x and
+   *   with amsg-server's `schedule-message` instant path. Sends
+   *   `X-User-Id` + `X-Payload-Encrypted: true` + `X-Encryption-Version: 1`.
+   *
+   * - **Plaintext** (`instantEncryption: false`) — payload is sent as raw
+   *   JSON. Targets amsg-instant 0.2.x. Sends `X-Client-Token` if
+   *   `instantClientToken` was configured.
    *
    * Routes to `customBaseUrls.instant` if configured, otherwise `baseUrl`.
    *
@@ -150,14 +193,22 @@ export class ReiClient {
    * @returns {Promise<Object>} `{ success, data?: { messagesSent, sentAt }, error? }`
    */
   async sendInstant(payload, endpointPath = '/instant', opts = {}) {
-    const encrypted = await this._encrypt(JSON.stringify(payload));
+    const headers = { 'Content-Type': 'application/json' };
+    let body;
 
-    const headers = {
-      'Content-Type': 'application/json',
-      'X-User-Id': this._userId,
-      'X-Payload-Encrypted': 'true',
-      'X-Encryption-Version': '1'
-    };
+    if (this._instantEncryption === false) {
+      body = JSON.stringify(payload);
+      if (this._instantClientToken) {
+        headers['X-Client-Token'] = this._instantClientToken;
+      }
+    } else {
+      const encrypted = await this._encrypt(JSON.stringify(payload));
+      headers['X-User-Id'] = this._userId;
+      headers['X-Payload-Encrypted'] = 'true';
+      headers['X-Encryption-Version'] = '1';
+      body = JSON.stringify(encrypted);
+    }
+
     if (opts.authorization) {
       headers['Authorization'] = opts.authorization;
     }
@@ -166,7 +217,7 @@ export class ReiClient {
     const res = await fetch(`${this._resolveBaseUrl('instant')}${path}`, {
       method: 'POST',
       headers,
-      body: JSON.stringify(encrypted)
+      body
     });
 
     return res.json();
