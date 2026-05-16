@@ -8,6 +8,9 @@ ref
 # Node.js
 node_modules/
 
+# Editor / tooling
+.serena/
+
 # Build output
 packages/*/dist/
 packages/*/*/dist/

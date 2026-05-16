@@ -1,0 +1,63 @@
+{
+  "name": "@rei-standard/amsg-instant",
+  "version": "0.1.0",
+  "description": "ReiStandard Active Messaging — stateless one-shot instant push handler. No DB, no cron, deployable to Cloudflare Workers / Node / Netlify / Vercel.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tosd0/ReiStandard",
+    "directory": "packages/rei-standard-amsg/instant"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./adapters/cloudflare": {
+      "types": "./dist/adapters/cloudflare.d.ts",
+      "import": "./dist/adapters/cloudflare.mjs",
+      "require": "./dist/adapters/cloudflare.cjs"
+    },
+    "./adapters/node": {
+      "types": "./dist/adapters/node.d.ts",
+      "import": "./dist/adapters/node.mjs",
+      "require": "./dist/adapters/node.cjs"
+    },
+    "./adapters/netlify": {
+      "types": "./dist/adapters/netlify.d.ts",
+      "import": "./dist/adapters/netlify.mjs",
+      "require": "./dist/adapters/netlify.cjs"
+    },
+    "./adapters/vercel": {
+      "types": "./dist/adapters/vercel.d.ts",
+      "import": "./dist/adapters/vercel.mjs",
+      "require": "./dist/adapters/vercel.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

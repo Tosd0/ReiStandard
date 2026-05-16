@@ -50,6 +50,10 @@ const rei = await createReiServer({
 // GET  /api/v1/messages             -> rei.handlers.messages.GET
 ```
 
+## 关于 `messageType: 'instant'`
+
+> **Note**：新代码的 instant 消息请用 [@rei-standard/amsg-instant](../instant/README.md)，跳过本端点的"建任务 → 处理 → 删任务" DB 来回。本端点的 `instant` 分支为兼容保留，行为不变、不会有运行时警告。
+
 ## AI 接口 `apiUrl` 约束
 
 当 `messageType` 为 `prompted` / `auto`，或 `instant` 使用 AI 配置时：

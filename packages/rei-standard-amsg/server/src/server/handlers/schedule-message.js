@@ -97,6 +97,14 @@ export function createScheduleMessageHandler(ctx) {
 
     const encryptedPayload = encryptForStorage(JSON.stringify(fullTaskData), userKey);
 
+    /**
+     * @deprecated Soft-deprecated. For new code, use @rei-standard/amsg-instant.
+     *   This branch is kept for backward compatibility and the existing behavior
+     *   (create task → process → delete) is unchanged. The dedicated amsg-instant
+     *   package is stateless (no DB roundtrip), deployable to Cloudflare Workers,
+     *   and locks the encryption + push-payload contract behind a single version.
+     *   See packages/rei-standard-amsg/instant/README.md.
+     */
     // Instant type: check VAPID before creating the task to avoid orphaned rows
     if (payload.messageType === 'instant') {
       if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
@@ -150,6 +158,13 @@ export function createScheduleMessageHandler(ctx) {
       return { status: 500, body: { success: false, error: { code: 'TASK_CREATE_FAILED', message: '创建任务失败' } } };
     }
 
+    /**
+     * @deprecated Soft-deprecated. For new code, use @rei-standard/amsg-instant.
+     *   The "create-task → process-by-uuid → delete-task" sequence below is
+     *   preserved verbatim so existing clients keep working. New integrations
+     *   should call the dedicated amsg-instant endpoint instead — it skips this
+     *   DB round-trip entirely. See packages/rei-standard-amsg/instant/README.md.
+     */
     // Instant type: send immediately
     if (payload.messageType === 'instant') {
       try {

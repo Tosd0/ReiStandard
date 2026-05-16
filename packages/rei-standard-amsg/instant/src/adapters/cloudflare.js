@@ -1,0 +1,69 @@
+/**
+ * Cloudflare Workers adapter for @rei-standard/amsg-instant.
+ *
+ * Cloudflare Workers is the primary deployment target for amsg-instant:
+ *   - No DB needed
+ *   - Subrequest time waiting for the LLM does not count against CPU quota
+ *   - Wall-time is uncapped (within reason)
+ *   - The free tier easily covers most one-shot instant push workloads
+ *
+ * Usage (option 1 — env at module-init time, simplest):
+ *   import { createInstantHandler } from '@rei-standard/amsg-instant';
+ *
+ *   export default {
+ *     fetch: createInstantHandler({
+ *       vapid: {
+ *         email: 'mailto:you@example.com',
+ *         publicKey: globalThis.VAPID_PUBLIC_KEY,
+ *         privateKey: globalThis.VAPID_PRIVATE_KEY,
+ *       },
+ *       masterKey: globalThis.AMSG_MASTER_KEY,
+ *     }),
+ *   };
+ *
+ * Usage (option 2 — read env from per-request bindings, recommended):
+ *   import { createCloudflareWorker } from '@rei-standard/amsg-instant/adapters/cloudflare';
+ *
+ *   export default createCloudflareWorker((env) => ({
+ *     vapid: {
+ *       email: 'mailto:you@example.com',
+ *       publicKey: env.VAPID_PUBLIC_KEY,
+ *       privateKey: env.VAPID_PRIVATE_KEY,
+ *     },
+ *     masterKey: env.AMSG_MASTER_KEY,
+ *   }));
+ *
+ * wrangler.toml (excerpt):
+ *   compatibility_flags = ["nodejs_compat"]
+ *   # Secrets — set via `wrangler secret put NAME`
+ *   #   VAPID_PUBLIC_KEY
+ *   #   VAPID_PRIVATE_KEY
+ *   #   AMSG_MASTER_KEY
+ */
+
+import { createInstantHandler } from '../index.js';
+
+/**
+ * Build a Cloudflare Workers module export that lazily constructs the
+ * handler the first time a request arrives. The factory receives the
+ * Workers `env` binding so secrets can be read at request time rather
+ * than at module-init time (which is required by Workers when secrets
+ * are scoped per environment).
+ *
+ * @param {(env: Record<string, string>) => import('../index.js').InstantHandlerOptions} optionsBuilder
+ * @returns {{ fetch: (request: Request, env: Record<string, string>) => Promise<Response> }}
+ */
+export function createCloudflareWorker(optionsBuilder) {
+  let handler = null;
+  return {
+    async fetch(request, env) {
+      if (!handler) {
+        handler = createInstantHandler(optionsBuilder(env || {}));
+      }
+      return handler(request);
+    }
+  };
+}
+
+export { createInstantHandler };
+export default { createCloudflareWorker };

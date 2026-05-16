@@ -38,6 +38,35 @@ await client.scheduleMessage({
 });
 ```
 
+## 发送即时消息
+
+新代码用 `client.sendInstant(payload)`，走 [`@rei-standard/amsg-instant`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)。
+
+```js
+const client = new ReiClient({
+  baseUrl: '/api/v1',
+  customBaseUrls: {
+    instant: 'https://instant.example.com',              // 不传则用 baseUrl
+  },
+  userId: '550e8400-e29b-41d4-a716-446655440000',
+});
+
+await client.init();
+
+await client.sendInstant({
+  contactName: 'Rei',
+  completePrompt: '你是 Rei，用一句话提醒用户带伞',
+  apiUrl: 'https://api.openai.com/v1/chat/completions',
+  apiKey: '...',
+  primaryModel: 'gpt-4o-mini',
+  pushSubscription: subscription.toJSON(),
+});
+```
+
+> `customBaseUrls` 是按端点名（如 `instant`）覆盖 `baseUrl` 的通用机制；后续其他端点也可以用同一字段独立指定 base URL，不会再加新的命名字段。
+
+旧路径 `scheduleMessage({ ...payload, messageType: 'instant' })` 仍然可用（兼容保留，多一次 DB 来回）。
+
 ## 导出 API（Exports）
 
 - `ReiClient`
@@ -46,6 +75,7 @@ await client.scheduleMessage({
 
 - `init()`
 - `scheduleMessage(payload)`
+- `sendInstant(payload)`
 - `updateMessage(uuid, updates)`
 - `cancelMessage(uuid)`
 - `listMessages(opts)`
