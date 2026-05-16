@@ -5,7 +5,7 @@
  * Lightweight browser client that handles:
  *  - AES-256-GCM encryption using the Web Crypto API
  *  - Push subscription management via the Push API
- *  - Convenient request helpers for all 7 endpoints
+ *  - Convenient request helpers for amsg-server endpoints + amsg-instant
  *
  * Usage:
  *   import { ReiClient } from '@rei-standard/amsg-client';
@@ -24,8 +24,16 @@
 
 /**
  * @typedef {Object} ReiClientConfig
- * @property {string} baseUrl  - Base URL of the API (e.g. https://host/api/v1).
- * @property {string} userId   - Current user identifier.
+ * @property {string} baseUrl                            - Default base URL of the API (e.g. https://host/api/v1).
+ * @property {Record<string, string>} [customBaseUrls]   - Optional per-endpoint base URL overrides.
+ *                                                         Key is the endpoint name (e.g. `instant`); value is
+ *                                                         the base URL to use for that endpoint instead of
+ *                                                         `baseUrl`. Useful when different endpoints live on
+ *                                                         different deployments (e.g. `instant` on Cloudflare
+ *                                                         Workers while the rest run on Netlify). Future
+ *                                                         endpoints (e.g. `schedule`, `messages`) can be
+ *                                                         overridden the same way without an API change.
+ * @property {string} userId                             - Current user identifier (UUID v4).
  */
 
 export class ReiClient {
@@ -39,9 +47,29 @@ export class ReiClient {
     /** @private */
     this._baseUrl = config.baseUrl.replace(/\/+$/, '');
     /** @private */
+    this._customBaseUrls = {};
+    if (config.customBaseUrls && typeof config.customBaseUrls === 'object') {
+      for (const [name, url] of Object.entries(config.customBaseUrls)) {
+        if (typeof url === 'string' && url) {
+          this._customBaseUrls[name] = url.replace(/\/+$/, '');
+        }
+      }
+    }
+    /** @private */
     this._userId = config.userId;
     /** @private */
     this._userKey = null;
+  }
+
+  /**
+   * Resolve the base URL for a given endpoint, falling back to `baseUrl`.
+   *
+   * @private
+   * @param {string} endpointName
+   * @returns {string}
+   */
+  _resolveBaseUrl(endpointName) {
+    return this._customBaseUrls[endpointName] || this._baseUrl;
   }
 
   // ─── Initialisation ─────────────────────────────────────────────
@@ -70,7 +98,14 @@ export class ReiClient {
   // ─── Public API ─────────────────────────────────────────────────
 
   /**
-   * Schedule (or instantly send) a message.
+   * Schedule a message.
+   *
+   * Note: For `messageType: 'instant'`, prefer `sendInstant()` instead.
+   * That routes through `@rei-standard/amsg-instant` (stateless, no DB
+   * round-trip) rather than `amsg-server`'s schedule-message endpoint.
+   * This method still works for instant via amsg-server for backward
+   * compatibility — see CHANGELOG / README for details.
+   *
    * The payload is automatically encrypted before transmission.
    *
    * @param {Object} payload - Schedule message payload.
@@ -87,6 +122,50 @@ export class ReiClient {
         'X-Payload-Encrypted': 'true',
         'X-Encryption-Version': '1'
       },
+      body: JSON.stringify(encrypted)
+    });
+
+    return res.json();
+  }
+
+  /**
+   * Send a one-shot instant message via `@rei-standard/amsg-instant`.
+   *
+   * Compared to `scheduleMessage({ messageType: 'instant', ... })`:
+   *   - No DB round-trip on the server side (stateless)
+   *   - Deployable to Cloudflare Workers / Deno Deploy / Vercel Edge
+   *   - Rejects scheduled-only fields (`firstSendTime`, `recurrenceType`)
+   *
+   * The payload uses the same field names as `scheduleMessage`, minus
+   * `firstSendTime` and `recurrenceType`. It is auto-encrypted with the
+   * same `userKey` fetched by `init()`, so the upstream deployment of
+   * amsg-instant must share the same `masterKey` as the amsg-server
+   * tenant.
+   *
+   * Routes to `customBaseUrls.instant` if configured, otherwise `baseUrl`.
+   *
+   * @param {Object} payload - Instant message payload.
+   * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
+   * @param {{ authorization?: string }} [opts] - Optional auth header to forward.
+   * @returns {Promise<Object>} `{ success, data?: { messagesSent, sentAt }, error? }`
+   */
+  async sendInstant(payload, endpointPath = '/instant', opts = {}) {
+    const encrypted = await this._encrypt(JSON.stringify(payload));
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-User-Id': this._userId,
+      'X-Payload-Encrypted': 'true',
+      'X-Encryption-Version': '1'
+    };
+    if (opts.authorization) {
+      headers['Authorization'] = opts.authorization;
+    }
+
+    const path = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+    const res = await fetch(`${this._resolveBaseUrl('instant')}${path}`, {
+      method: 'POST',
+      headers,
       body: JSON.stringify(encrypted)
     });
 

@@ -9,13 +9,17 @@
 | Package | 版本 | 说明 | 文档 |
 |---------|------|------|------|
 | `@rei-standard/amsg-server` | `2.0.1` | 服务端 SDK（Blob 租户化 + 标准 handlers） | [packages/rei-standard-amsg/server/README.md](./packages/rei-standard-amsg/server/README.md) |
+| `@rei-standard/amsg-instant` | `0.1.0` | 一次性即时推送 handler | [packages/rei-standard-amsg/instant/README.md](./packages/rei-standard-amsg/instant/README.md) |
 | `@rei-standard/amsg-client` | `2.0.1` | 浏览器 SDK（加密、请求封装、Push 订阅） | [packages/rei-standard-amsg/client/README.md](./packages/rei-standard-amsg/client/README.md) |
 | `@rei-standard/amsg-sw` | `2.0.1` | Service Worker SDK（推送展示、离线队列） | [packages/rei-standard-amsg/sw/README.md](./packages/rei-standard-amsg/sw/README.md) |
+
+服务端选哪个：一次性消息用 `amsg-instant`，定时 / 周期消息用 `amsg-server`，两个都装也行（共用 VAPID + masterKey）。详见 [SDK 总览](./packages/rei-standard-amsg/README.md)。
 
 快速引用：
 
 ```js
 import { createReiServer } from '@rei-standard/amsg-server';
+import { createInstantHandler } from '@rei-standard/amsg-instant';
 import { ReiClient } from '@rei-standard/amsg-client';
 import { installReiSW } from '@rei-standard/amsg-sw';
 ```
