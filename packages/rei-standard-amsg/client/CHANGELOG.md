@@ -1,6 +1,6 @@
 # Changelog — @rei-standard/amsg-client
 
-## Unreleased
+## 2.1.0 — 2026-05-16
 
 ### Added
 
