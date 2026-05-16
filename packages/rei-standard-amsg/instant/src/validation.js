@@ -9,12 +9,6 @@
  * scheduled-only fields here.
  */
 
-const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-export function isValidUUIDv4(uuid) {
-  return typeof uuid === 'string' && UUID_V4_RE.test(uuid);
-}
-
 function isValidUrl(s) {
   if (typeof s !== 'string') return false;
   try { new URL(s); return true; } catch { return false; }

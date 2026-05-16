@@ -3,7 +3,7 @@
  *
  * Stateless one-shot instant push handler. The entire lifecycle of an
  * instant request lives inside a single function invocation:
- *   decrypt → call LLM → split sentences → deliver Web Push → 200 OK.
+ *   parse → call LLM → split sentences → deliver Web Push → 200 OK.
  * No DB, no cron, no tenant init. Deploy to Cloudflare Workers, Node,
  * Netlify, or Vercel.
  *
@@ -13,19 +13,16 @@
  *   export default {
  *     fetch: createInstantHandler({
  *       vapid: { email, publicKey, privateKey },
- *       masterKey: env.AMSG_MASTER_KEY,
+ *       clientToken: env.AMSG_CLIENT_TOKEN,   // optional
  *     })
  *   };
  */
 
 import { createHmac, timingSafeEqual } from 'crypto';
 
-import { deriveUserEncryptionKey, decryptPayload } from './crypto.js';
 import { loadWebpush, applyVapid } from './webpush.js';
-import { isValidUUIDv4, validateInstantPayload } from './validation.js';
+import { validateInstantPayload } from './validation.js';
 import { processInstantMessage } from './message-processor.js';
-
-const ENCRYPTION_VERSION = '1';
 
 /**
  * @typedef {Object} VapidConfig
@@ -37,8 +34,8 @@ const ENCRYPTION_VERSION = '1';
 /**
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
- * @property {string} masterKey               - 64-char hex master key shared with amsg-server tenant (32 bytes entropy).
- * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, Authorization: Bearer <token> is verified.
+ * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Note: this is a *weak* check — the token will be visible in any frontend bundle that uses it, so it stops casual URL-direct abuse, not a determined attacker. Use `tokenSigningKey` for real auth.
+ * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
  * @property {Object} [webpush]               - Optional preloaded web-push module (mainly for tests).
  * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy).
  * @property {(e: { type: string }) => void} [onEvent]
@@ -57,13 +54,11 @@ const ENCRYPTION_VERSION = '1';
 export function createInstantHandler(options) {
   if (!options) throw new Error('[amsg-instant] options is required');
   if (!options.vapid) throw new Error('[amsg-instant] options.vapid is required');
-  if (!options.masterKey || typeof options.masterKey !== 'string') {
-    throw new Error('[amsg-instant] options.masterKey is required (64-char hex)');
-  }
 
   const onEvent = typeof options.onEvent === 'function' ? options.onEvent : () => {};
   const tokenSigningKey = options.tokenSigningKey ? String(options.tokenSigningKey) : '';
-  const masterKey = options.masterKey;
+  const clientToken = options.clientToken ? String(options.clientToken) : '';
+  const expectedClientTokenBytes = clientToken ? Buffer.from(clientToken, 'utf8') : null;
 
   let vapidApplied = false;
   let cachedWebpush = null;
@@ -94,34 +89,9 @@ export function createInstantHandler(options) {
       if (tokenError) return tokenError;
     }
 
-    const isEncrypted = getHeader(request, 'x-payload-encrypted') === 'true';
-    if (!isEncrypted) {
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'ENCRYPTION_REQUIRED', message: '请求体必须加密（X-Payload-Encrypted: true）' }
-      });
-    }
-
-    const userId = getHeader(request, 'x-user-id');
-    if (!userId) {
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符（X-User-Id）' }
-      });
-    }
-    if (!isValidUUIDv4(userId)) {
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' }
-      });
-    }
-
-    const encryptionVersion = getHeader(request, 'x-encryption-version');
-    if (encryptionVersion !== ENCRYPTION_VERSION) {
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'UNSUPPORTED_ENCRYPTION_VERSION', message: '加密版本不支持' }
-      });
+    if (expectedClientTokenBytes) {
+      const tokenError = verifyClientToken(request, expectedClientTokenBytes);
+      if (tokenError) return tokenError;
     }
 
     let rawBody;
@@ -134,43 +104,13 @@ export function createInstantHandler(options) {
       });
     }
 
-    let envelope;
+    let payload;
     try {
-      envelope = JSON.parse(rawBody);
+      payload = JSON.parse(rawBody);
     } catch {
       return jsonResponse(400, {
         success: false,
         error: { code: 'INVALID_PAYLOAD_FORMAT', message: '请求体不是合法 JSON' }
-      });
-    }
-
-    if (
-      !envelope ||
-      typeof envelope.iv !== 'string' ||
-      typeof envelope.authTag !== 'string' ||
-      typeof envelope.encryptedData !== 'string'
-    ) {
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'INVALID_PAYLOAD_FORMAT', message: '加密信封字段缺失或类型错误' }
-      });
-    }
-
-    let payload;
-    try {
-      const userKey = deriveUserEncryptionKey(userId, masterKey);
-      payload = decryptPayload(envelope, userKey);
-    } catch (err) {
-      if (err instanceof SyntaxError) {
-        return jsonResponse(400, {
-          success: false,
-          error: { code: 'INVALID_PAYLOAD_FORMAT', message: '解密后数据不是合法 JSON' }
-        });
-      }
-      const msg = String(err?.message || '');
-      return jsonResponse(400, {
-        success: false,
-        error: { code: 'DECRYPTION_FAILED', message: msg.includes('auth') ? '请求体解密失败（auth tag）' : '请求体解密失败' }
       });
     }
 
@@ -230,6 +170,24 @@ function jsonResponse(status, body) {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' }
   });
+}
+
+function verifyClientToken(request, expectedBytes) {
+  const received = getHeader(request, 'x-client-token');
+  if (!received) {
+    return jsonResponse(401, {
+      success: false,
+      error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' }
+    });
+  }
+  const receivedBytes = Buffer.from(received, 'utf8');
+  if (receivedBytes.length !== expectedBytes.length || !timingSafeEqual(receivedBytes, expectedBytes)) {
+    return jsonResponse(401, {
+      success: false,
+      error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' }
+    });
+  }
+  return null;
 }
 
 function verifyBearerToken(request, signingKey) {
@@ -321,6 +279,5 @@ function base64UrlDecode(input) {
 
 // ─── Public re-exports (for advanced users / SSR / tests) ──────────────
 
-export { deriveUserEncryptionKey, decryptPayload } from './crypto.js';
-export { isValidUUIDv4, validateInstantPayload } from './validation.js';
+export { validateInstantPayload } from './validation.js';
 export { splitMessageIntoSentences, processInstantMessage } from './message-processor.js';

@@ -1,38 +1,20 @@
 /**
  * E2E test for amsg-instant.
  *
- * Verifies that the push payload field shape produced by amsg-instant is
- * byte-identical to what amsg-server's scheduled path produces, using the
- * same encryption helpers, the same VAPID values, and the same input
- * shape. This is the test that guards the "single protocol contract"
- * promise of the package.
+ * Verifies the push payload field shape produced by amsg-instant remains
+ * byte-identical to amsg-server's scheduled path, so the shared SW
+ * (`@rei-standard/amsg-sw`) keeps working unchanged. Body is now plain JSON
+ * (amsg-instant 0.2.0 dropped the envelope encryption).
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCipheriv, randomBytes } from 'crypto';
 
-import { createInstantHandler, deriveUserEncryptionKey } from '../src/index.js';
-
-const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
-const TEST_MASTER_KEY = 'b'.repeat(64);
-
-function encryptForTransport(obj, userKeyHex) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', Buffer.from(userKeyHex, 'hex'), iv);
-  const encrypted = Buffer.concat([cipher.update(JSON.stringify(obj), 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return {
-    iv: iv.toString('base64'),
-    authTag: authTag.toString('base64'),
-    encryptedData: encrypted.toString('base64')
-  };
-}
+import { createInstantHandler } from '../src/index.js';
 
 describe('e2e: push payload contract parity with amsg-server', () => {
   it('produces a payload with every field defined in message-processor.js:78-93', async () => {
-    const userKey = deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
-    const envelope = encryptForTransport({
+    const payload = {
       contactName: '小手机',
       avatarUrl: 'https://example.com/avatar.png',
       completePrompt: 'reply with two sentences in Chinese',
@@ -45,7 +27,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
         keys: { p256dh: 'aaa', auth: 'bbb' }
       },
       metadata: { foo: 'bar', n: 42 }
-    }, userKey);
+    };
 
     const captured = [];
     const handler = createInstantHandler({
@@ -54,11 +36,10 @@ describe('e2e: push payload contract parity with amsg-server', () => {
         publicKey: 'pub',
         privateKey: 'priv'
       },
-      masterKey: TEST_MASTER_KEY,
       webpush: {
         setVapidDetails() {},
-        async sendNotification(_sub, payload) {
-          captured.push(JSON.parse(payload));
+        async sendNotification(_sub, body) {
+          captured.push(JSON.parse(body));
         }
       },
       fetch: async () => ({
@@ -71,12 +52,8 @@ describe('e2e: push payload contract parity with amsg-server', () => {
 
     const req = new Request('http://localhost/instant', {
       method: 'POST',
-      headers: {
-        'x-user-id': TEST_USER_ID,
-        'x-payload-encrypted': 'true',
-        'x-encryption-version': '1'
-      },
-      body: JSON.stringify(envelope)
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
     });
     const res = await handler(req);
     assert.equal(res.status, 200);

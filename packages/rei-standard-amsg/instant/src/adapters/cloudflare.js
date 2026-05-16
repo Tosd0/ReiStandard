@@ -17,7 +17,7 @@
  *         publicKey: globalThis.VAPID_PUBLIC_KEY,
  *         privateKey: globalThis.VAPID_PRIVATE_KEY,
  *       },
- *       masterKey: globalThis.AMSG_MASTER_KEY,
+ *       clientToken: globalThis.AMSG_CLIENT_TOKEN,   // optional weak auth
  *     }),
  *   };
  *
@@ -30,7 +30,7 @@
  *       publicKey: env.VAPID_PUBLIC_KEY,
  *       privateKey: env.VAPID_PRIVATE_KEY,
  *     },
- *     masterKey: env.AMSG_MASTER_KEY,
+ *     clientToken: env.AMSG_CLIENT_TOKEN,            // optional
  *   }));
  *
  * wrangler.toml (excerpt):
@@ -38,7 +38,7 @@
  *   # Secrets — set via `wrangler secret put NAME`
  *   #   VAPID_PUBLIC_KEY
  *   #   VAPID_PRIVATE_KEY
- *   #   AMSG_MASTER_KEY
+ *   #   AMSG_CLIENT_TOKEN   # optional
  */
 
 import { createInstantHandler } from '../index.js';

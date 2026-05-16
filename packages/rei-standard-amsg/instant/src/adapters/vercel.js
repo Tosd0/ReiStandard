@@ -19,7 +19,7 @@
  *       publicKey: process.env.VAPID_PUBLIC_KEY,
  *       privateKey: process.env.VAPID_PRIVATE_KEY,
  *     },
- *     masterKey: process.env.AMSG_MASTER_KEY,
+ *     clientToken: process.env.AMSG_CLIENT_TOKEN,   // optional weak auth
  *   });
  *   export default toVercelEdgeHandler(handler);
  */

@@ -1,8 +1,10 @@
 # @rei-standard/amsg-instant
 
-一次性即时消息的无状态处理器：整个生命周期 = 一次 HTTP 函数调用（解密 → 调 LLM → 分句 → 发 Web Push → 返回 200）。无数据库、无 cron、无租户初始化，唯一依赖是 `web-push`。
+无状态明文一次性即时推送处理器：整个生命周期 = 一次 HTTP 函数调用（解析 → 调 LLM → 分句 → 发 Web Push → 返回 200）。无数据库、无 cron、无租户初始化，唯一依赖是 `web-push`。
 
-存在意义是把 amsg-client / amsg-server / amsg-sw 三端的加密协议与 push payload 契约锁在同一个版本号下：升级一个 `amsg-instant` 等于三端同步升级，下游不必自己复刻协议细节。
+定位是**单租户自部署**场景下的极简 instant 推送：前端、Worker、LLM key 都在你自己手里，链路只剩浏览器 → Worker 的 HTTPS。应用层加密在该场景下没有实际收益（HTTPS 已加密传输；apiKey 由前端塞进 payload 必然要让 Worker 见到；攻击者拿 Worker URL 也榨不出 apiKey、推不动别人订阅），所以从 0.2.0 起协议改为**纯明文**。
+
+> 多租户 SaaS 场景请用 `@rei-standard/amsg-server` 的 `schedule-message` 路径（仍保留 AES-256-GCM 加密 + 租户隔离）。
 
 ## 选哪个包？
 
@@ -11,9 +13,7 @@
 | 一次性即时推送（按钮触发 → 通知）    | **amsg-instant**    |
 | 指定时间的定时消息                   | amsg-server         |
 | 周期性消息（每日/每周）              | amsg-server         |
-| 全都要                               | 两个都装，共用 VAPID + masterKey |
-
-`amsg-server` 的 `instant` 分支保留兼容、行为不变；新代码请用本包。
+| 多租户 SaaS（要应用层加密 + 租户隔离）| amsg-server         |
 
 ## 安装
 
@@ -28,19 +28,21 @@ npm install @rei-standard/amsg-instant web-push
 | `vapid.email`       | string    | ✅   | VAPID 联系邮箱，自动补 `mailto:` 前缀 |
 | `vapid.publicKey`   | string    | ✅   | VAPID 公钥 |
 | `vapid.privateKey`  | string    | ✅   | VAPID 私钥 |
-| `masterKey`         | string    | ✅   | 64 字符 hex（32 字节熵），用于派生用户加密密钥 |
-| `tokenSigningKey`   | string    | ❌   | 提供则校验 `Authorization: Bearer <jwt>`；省略则放行 |
+| `clientToken`       | string    | ❌   | 弱共享密钥；配了则校验 `X-Client-Token` 头。**只防 URL 直怼/脚本小子**，不防有心人（前端 bundle 必然带着 token） |
+| `tokenSigningKey`   | string    | ❌   | 强鉴权 HMAC 密钥；配了则校验 `Authorization: Bearer <jwt>` |
 | `webpush`           | object    | ❌   | 注入 web-push 模块（测试用） |
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用） |
-| `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error` |
+| `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
 
-生成 masterKey：
+### 鉴权策略
 
-```bash
-openssl rand -hex 32
-```
+三档独立可选：
 
-> **⚠️ 兼容性提醒**：如果你同时部署 `amsg-server`，`amsg-instant` 的 `masterKey` 必须和 `amsg-server` **同一租户**的 masterKey 一致（amsg-server 的 masterKey 在 Blob 里，初始化时由 `init-tenant` 返回；自部署单租户时把它原样喂给 amsg-instant 即可）。这样 `@rei-standard/amsg-client` 用同一个 `userKey` 加密一次，就能同时发到两个 endpoint。
+- **裸跑**（`clientToken` 和 `tokenSigningKey` 都不配）：任意请求直通。HTTPS 已加密传输，单租户自部署不需要应用层身份校验。适合个人 demo / 本地测试。
+- **弱鉴权**（配 `clientToken`）：客户端固定带 `X-Client-Token: <token>` 头，比对失败返回 `401 INVALID_CLIENT_TOKEN`。token 会随前端 bundle 发出去，devtools 一开就能拿到 —— 只防 URL 直接被脚本小子打。
+- **强鉴权**（配 `tokenSigningKey`）：客户端带 `Authorization: Bearer <JWT>`，HMAC-SHA256 签名校验 + 过期时间检查。生产部署推荐。
+
+两个可以同时配（先校验 Bearer，再校验 X-Client-Token）。
 
 ## API
 
@@ -57,7 +59,7 @@ const handler = createInstantHandler({
     publicKey: process.env.VAPID_PUBLIC_KEY,
     privateKey: process.env.VAPID_PRIVATE_KEY,
   },
-  masterKey: process.env.AMSG_MASTER_KEY,
+  clientToken: process.env.AMSG_CLIENT_TOKEN,   // 可选
 });
 ```
 
@@ -67,16 +69,18 @@ const handler = createInstantHandler({
 
 ```http
 POST /instant
-Authorization: Bearer <tenantToken>     ← 仅当 tokenSigningKey 配置时检查
+Authorization: Bearer <jwt>     ← 仅当 tokenSigningKey 配置时检查
+X-Client-Token: <token>         ← 仅当 clientToken 配置时检查
 Content-Type: application/json
-X-User-Id: <uuid v4>
-X-Payload-Encrypted: true
-X-Encryption-Version: 1
 
-{ "iv": "...", "authTag": "...", "encryptedData": "..." }
+{
+  "contactName": "...",
+  "completePrompt": "...",
+  ...
+}
 ```
 
-**解密后的 payload（与 `amsg-server` instant 分支字段命名一致）**：
+**payload 字段**：
 
 ```ts
 {
@@ -122,12 +126,8 @@ X-Encryption-Version: 1
 |-----------------------------------|------|------|
 | `METHOD_NOT_ALLOWED`              | 405  | 非 POST |
 | `UNAUTHORIZED`                    | 401  | tokenSigningKey 校验失败 |
-| `ENCRYPTION_REQUIRED`             | 400  | 缺 `X-Payload-Encrypted: true` |
-| `USER_ID_REQUIRED`                | 400  | 缺 `X-User-Id` |
-| `INVALID_USER_ID_FORMAT`          | 400  | `X-User-Id` 不是 UUID v4 |
-| `UNSUPPORTED_ENCRYPTION_VERSION`  | 400  | `X-Encryption-Version` ≠ `1` |
-| `INVALID_PAYLOAD_FORMAT`          | 400  | envelope / payload 字段缺失或非法 |
-| `DECRYPTION_FAILED`               | 400  | AES auth tag 校验失败等 |
+| `INVALID_CLIENT_TOKEN`            | 401  | clientToken 校验失败（缺头或不匹配） |
+| `INVALID_PAYLOAD_FORMAT`          | 400  | body 不是合法 JSON 或字段缺失/非法 |
 | `VAPID_CONFIG_ERROR`              | 500  | VAPID 配置缺失 |
 | `LLM_CALL_FAILED`                 | 502  | 上游 LLM 请求失败 |
 | `PUSH_SEND_FAILED`                | 502  | Web Push 派送失败 |
@@ -170,7 +170,7 @@ export default createCloudflareWorker((env) => ({
     publicKey: env.VAPID_PUBLIC_KEY,
     privateKey: env.VAPID_PRIVATE_KEY,
   },
-  masterKey: env.AMSG_MASTER_KEY,
+  clientToken: env.AMSG_CLIENT_TOKEN,   // 可选
 }));
 ```
 
@@ -184,7 +184,7 @@ compatibility_flags = ["nodejs_compat"]
 # Secrets — set via:
 #   wrangler secret put VAPID_PUBLIC_KEY
 #   wrangler secret put VAPID_PRIVATE_KEY
-#   wrangler secret put AMSG_MASTER_KEY
+#   wrangler secret put AMSG_CLIENT_TOKEN   # 可选
 ```
 
 ### Node / Express
@@ -202,7 +202,7 @@ const instantHandler = createInstantHandler({
     publicKey: process.env.VAPID_PUBLIC_KEY,
     privateKey: process.env.VAPID_PRIVATE_KEY,
   },
-  masterKey: process.env.AMSG_MASTER_KEY,
+  clientToken: process.env.AMSG_CLIENT_TOKEN,
 });
 
 // 注意：这条路由不要挂 express.json()，处理器自己读 raw body
@@ -223,7 +223,7 @@ const handler = createInstantHandler({
     publicKey: Netlify.env.get('VAPID_PUBLIC_KEY'),
     privateKey: Netlify.env.get('VAPID_PRIVATE_KEY'),
   },
-  masterKey: Netlify.env.get('AMSG_MASTER_KEY'),
+  clientToken: Netlify.env.get('AMSG_CLIENT_TOKEN'),
 });
 
 export default toNetlifyHandler(handler);
@@ -245,7 +245,7 @@ const handler = createInstantHandler({
     publicKey: process.env.VAPID_PUBLIC_KEY,
     privateKey: process.env.VAPID_PRIVATE_KEY,
   },
-  masterKey: process.env.AMSG_MASTER_KEY,
+  clientToken: process.env.AMSG_CLIENT_TOKEN,
 });
 
 export default toVercelEdgeHandler(handler);
@@ -253,22 +253,19 @@ export default toVercelEdgeHandler(handler);
 
 ## 浏览器端调用
 
-使用 `@rei-standard/amsg-client` 的 `sendInstant()`：
+使用 `@rei-standard/amsg-client` 的 `sendInstant()`，并把 `instantEncryption: false` 打开：
 
 ```js
 import { ReiClient } from '@rei-standard/amsg-client';
 
 const client = new ReiClient({
-  baseUrl: '/api/v1',                              // amsg-server 部署（取 userKey）
-  customBaseUrls: {
-    instant: 'https://instant.example.com',        // amsg-instant 部署
-  },
-  userId: '550e8400-e29b-41d4-a716-446655440000',
+  baseUrl: 'https://instant.example.com',   // amsg-instant Worker URL
+  instantEncryption: false,
+  instantClientToken: 'shared-secret-xyz',  // 可选；Worker 端配了再填
 });
 
-await client.init();
-
-const result = await client.sendInstant({
+// init() 在明文模式下是 no-op，调用与否都可
+await client.sendInstant({
   contactName: 'Rei',
   completePrompt: '你是 Rei，用一句话提醒用户带伞',
   apiUrl: 'https://api.openai.com/v1/chat/completions',
@@ -276,8 +273,6 @@ const result = await client.sendInstant({
   primaryModel: 'gpt-4o-mini',
   pushSubscription: subscription.toJSON(),
 });
-
-console.log(result); // { messagesSent: 3, sentAt: '...' }
 ```
 
 ## 导出
@@ -285,9 +280,6 @@ console.log(result); // { messagesSent: 3, sentAt: '...' }
 主入口：
 
 - `createInstantHandler(options)`
-- `deriveUserEncryptionKey(userId, masterKey)`
-- `decryptPayload(envelope, userKey)`
-- `isValidUUIDv4(s)`
 - `validateInstantPayload(payload)`
 - `splitMessageIntoSentences(text)`
 - `processInstantMessage(payload, ctx)`
