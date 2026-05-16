@@ -1,4 +1,5 @@
 ref
+.DS_Store
 
 # 测试配置文件
 .env.test
