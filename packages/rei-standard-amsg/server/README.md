@@ -65,6 +65,21 @@ const rei = await createReiServer({
 
 如果上游返回 `405 Method Not Allowed`，通常表示 `apiUrl` 指向了基础域名而非聊天端点，请优先检查配置值。
 
+## 提示词字段（`completePrompt` vs `messages`，2.2.0+）
+
+AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
+
+- `completePrompt: string` —— 简单场景：内部包成单条 `{role:'user', content}` 后发给 LLM。
+- `messages: Array<{ role: 'system'|'user'|'assistant'|'tool', content: string | unknown[] }>` —— 多轮 / 带 system role：**原样**转发给 LLM，不做任何 role 注入或重排。和上游主聊天路径调用 LLM 的 body 字节级一致。
+
+两个字段同时给 → `400 INVALID_PARAMETERS`；都不给且没 `userMessage`（仅 instant 类型允许 fallback）也是 400。`messages` 数组必须非空，role 必须是上面四种之一。
+
+可选 `temperature?: number` 透传给 LLM：`completePrompt` 路径未传时默认 0.8（保持旧行为）；`messages` 路径未传时**不发**，让上游主路径自己决定。
+
+## 导出（新增）
+
+- `validateLlmMessagesArray(messages)` — 同步预校验 messages 数组，返回 `string | null`（错误信息 / 通过）。和 `@rei-standard/amsg-instant` 的校验规则字节级一致。
+
 ## 一体化初始化流程
 
 1. 管理员配置环境变量（VAPID + tenant secrets）

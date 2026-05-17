@@ -47,6 +47,40 @@ export function isValidUUIDv4(uuid) {
   return uuidV4Regex.test(uuid);
 }
 
+const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
+
+/**
+ * Validate an OpenAI-style messages array. Same shape contract as
+ * `@rei-standard/amsg-instant` (kept in lockstep on purpose — both packages
+ * end up forwarding this to the same LLM body).
+ *
+ * @param {unknown} messages
+ * @returns {string | null}   Error message, or null if valid.
+ */
+export function validateLlmMessagesArray(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return 'messages must be a non-empty array';
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      return `messages[${i}] must be an object`;
+    }
+    if (!VALID_LLM_MESSAGE_ROLES.has(m.role)) {
+      return `messages[${i}].role must be one of system / user / assistant / tool`;
+    }
+    if (typeof m.content === 'string') {
+      if (!m.content) return `messages[${i}].content must be a non-empty string`;
+    } else if (Array.isArray(m.content)) {
+      if (m.content.length === 0) return `messages[${i}].content array must be non-empty`;
+      // Element schema is intentionally not enforced — passed through to LLM as-is.
+    } else {
+      return `messages[${i}].content must be a non-empty string or a non-empty array`;
+    }
+  }
+  return null;
+}
+
 /**
  * Validate the schedule-message request payload.
  *
@@ -92,9 +126,40 @@ export function validateScheduleMessagePayload(payload) {
     }
   }
 
+  // ─── Prompt schema (shared by prompted / auto / instant AI configs) ──
+  //
+  // Callers provide *exactly one of* `completePrompt` (string) or `messages`
+  // (OpenAI-style array). Same contract as @rei-standard/amsg-instant; the
+  // server's LLM path forwards either verbatim.
+  const promptCheck = (() => {
+    const hasCompletePrompt = payload.completePrompt !== undefined && payload.completePrompt !== null && payload.completePrompt !== '';
+    const hasMessages = payload.messages !== undefined && payload.messages !== null;
+    if (hasCompletePrompt && hasMessages) {
+      return {
+        error: { code: 'INVALID_PARAMETERS', message: 'exactly one of `completePrompt` or `messages` must be provided（两者不能同时出现）', details: { invalidFields: ['completePrompt', 'messages'] } },
+        hasCompletePrompt: true, hasMessages: true,
+      };
+    }
+    if (hasMessages) {
+      const err = validateLlmMessagesArray(payload.messages);
+      if (err) {
+        return {
+          error: { code: 'INVALID_PARAMETERS', message: err, details: { invalidFields: ['messages'] } },
+          hasCompletePrompt: false, hasMessages: true,
+        };
+      }
+    }
+    return { error: null, hasCompletePrompt, hasMessages };
+  })();
+
+  if (promptCheck.error) {
+    return { valid: false, errorCode: promptCheck.error.code, errorMessage: promptCheck.error.message, details: promptCheck.error.details };
+  }
+  const hasPrompt = promptCheck.hasCompletePrompt || promptCheck.hasMessages;
+
   if (payload.messageType === 'prompted' || payload.messageType === 'auto') {
     const missingAiFields = [];
-    if (!payload.completePrompt) missingAiFields.push('completePrompt');
+    if (!hasPrompt) missingAiFields.push('completePrompt or messages');
     if (!payload.apiUrl) missingAiFields.push('apiUrl');
     if (!payload.apiKey) missingAiFields.push('apiKey');
     if (!payload.primaryModel) missingAiFields.push('primaryModel');
@@ -107,11 +172,19 @@ export function validateScheduleMessagePayload(payload) {
     if (payload.recurrenceType && payload.recurrenceType !== 'none') {
       return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型的 recurrenceType 必须为 none', details: { invalidFields: ['recurrenceType (must be "none" for instant type)'] } };
     }
-    const hasAiConfig = payload.completePrompt && payload.apiUrl && payload.apiKey && payload.primaryModel;
+    const hasAiConfig = hasPrompt && payload.apiUrl && payload.apiKey && payload.primaryModel;
     const hasUserMessage = payload.userMessage;
     if (!hasAiConfig && !hasUserMessage) {
-      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型必须提供 userMessage 或完整的 AI 配置', details: { missingFields: ['userMessage or (completePrompt + apiUrl + apiKey + primaryModel)'] } };
+      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型必须提供 userMessage 或完整的 AI 配置', details: { missingFields: ['userMessage or ((completePrompt | messages) + apiUrl + apiKey + primaryModel)'] } };
     }
+  }
+
+  if (
+    payload.temperature !== undefined &&
+    payload.temperature !== null &&
+    (typeof payload.temperature !== 'number' || !Number.isFinite(payload.temperature))
+  ) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['temperature (must be a finite number)'] } };
   }
 
   if (payload.avatarUrl && !isValidUrl(payload.avatarUrl)) {

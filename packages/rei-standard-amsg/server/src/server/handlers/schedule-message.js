@@ -89,8 +89,13 @@ export function createScheduleMessageHandler(ctx) {
       apiUrl: payload.apiUrl || null,
       apiKey: payload.apiKey || null,
       primaryModel: payload.primaryModel || null,
+      // Prompt is one-of: legacy completePrompt (string) OR messages (OpenAI-
+      // style array). Validation has already enforced exactly-one-of, so
+      // exactly one of these will be non-null when an AI config is provided.
       completePrompt: payload.completePrompt || null,
+      messages: Array.isArray(payload.messages) ? payload.messages : null,
       maxTokens: payload.maxTokens ?? null,
+      temperature: payload.temperature ?? null,
       pushSubscription: payload.pushSubscription,
       metadata: payload.metadata || {}
     };

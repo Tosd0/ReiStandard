@@ -93,6 +93,29 @@ await client.sendInstant({
 
 旧路径 `scheduleMessage({ ...payload, messageType: 'instant' })` 仍然可用（兼容保留，多一次 DB 来回）。
 
+### `messages` 模式（多轮上下文 / 带 system role，对接 amsg-instant 0.5.0+ / amsg-server 2.2.0+）
+
+需要 system role、保留多轮历史、tool role 这些场景时，把 `completePrompt` 换成标准 OpenAI 格式的 `messages` 数组。client 本身**完全透传**，所以 SDK 端零额外配置：
+
+```js
+await client.sendInstant({
+  contactName: 'Rei',
+  messages: [
+    { role: 'system', content: '你是 Rei，回复要简短自然。' },
+    { role: 'user', content: '今天会下雨吗？' },
+    { role: 'assistant', content: '看了下，下午有阵雨。' },
+    { role: 'user', content: '那提醒我一下带伞' },
+  ],
+  apiUrl: 'https://api.openai.com/v1/chat/completions',
+  apiKey: '...',
+  primaryModel: 'gpt-4o-mini',
+  temperature: 0.7,                                  // 可选
+  pushSubscription: subscription.toJSON(),
+});
+```
+
+注意 `completePrompt` 和 `messages` **必须恰好二选一**——两者同时给会被 Worker / Server 端返回 `400 INVALID_PAYLOAD_FORMAT` / `INVALID_PARAMETERS`。`scheduleMessage` 也接受同样的 `messages` 字段（amsg-server 2.2.0+ 起持久化层一并支持），用法相同。
+
 ## 导出 API（Exports）
 
 - `ReiClient`

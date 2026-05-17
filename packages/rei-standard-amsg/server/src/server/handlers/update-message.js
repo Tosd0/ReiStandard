@@ -8,7 +8,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidISO8601, isValidUUIDv4 } from '../lib/validation.js';
+import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -81,6 +81,30 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['maxTokens'] } } } };
     }
 
+    // Reject updates that try to set both completePrompt and messages at
+    // once. We don't enforce one-of-required here (callers may patch other
+    // fields), but the two prompt sources are mutually exclusive and must
+    // stay that way in storage too.
+    if (
+      updates.completePrompt &&
+      updates.messages !== undefined && updates.messages !== null
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'completePrompt 与 messages 不能同时更新（二选一）', details: { invalidFields: ['completePrompt', 'messages'] } } } };
+    }
+    if (updates.messages !== undefined && updates.messages !== null) {
+      const msgErr = validateLlmMessagesArray(updates.messages);
+      if (msgErr) {
+        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: msgErr, details: { invalidFields: ['messages'] } } } };
+      }
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'temperature') &&
+      updates.temperature !== null &&
+      (typeof updates.temperature !== 'number' || !Number.isFinite(updates.temperature))
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['temperature'] } } } };
+    }
+
     // Fetch existing task
     const existingTask = await db.getTaskByUuid(taskUuid, userId);
 
@@ -94,14 +118,27 @@ export function createUpdateMessageHandler(ctx) {
 
     const existingData = JSON.parse(decryptFromStorage(existingTask.encrypted_payload, userKey));
 
+    // When the caller switches prompt source (completePrompt ↔ messages),
+    // null out the other so storage stays one-of (matches schedule-message
+    // shape and prevents buildAiRequestBody from accidentally seeing both).
+    const promptUpdates = {};
+    if (updates.completePrompt) {
+      promptUpdates.completePrompt = updates.completePrompt;
+      promptUpdates.messages = null;
+    } else if (updates.messages !== undefined && updates.messages !== null) {
+      promptUpdates.messages = updates.messages;
+      promptUpdates.completePrompt = null;
+    }
+
     const updatedData = {
       ...existingData,
-      ...(updates.completePrompt && { completePrompt: updates.completePrompt }),
+      ...promptUpdates,
       ...(updates.userMessage && { userMessage: updates.userMessage }),
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
       ...(updates.metadata && { metadata: updates.metadata }),
-      ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null })
+      ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null }),
+      ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null })
     };
 
     const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);

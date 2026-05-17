@@ -1,5 +1,23 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.2.0 — 2026-05-17
+
+### New
+
+- **`messages` 数组转发**（与 [`@rei-standard/amsg-instant` 0.5.0](../instant/CHANGELOG.md#050--2026-05-17) 同步）：`schedule-message` / `update-message` payload 新增可选 `messages` 字段，与 `completePrompt` **互斥二选一**。`prompted` / `auto` / `instant` 三种 AI 配置消息全部支持。
+  - 上游应用直接把标准 OpenAI 格式的 `[{role:'system',...}, {role:'user',...}, {role:'assistant',...}, ...]` 透传过来，`buildAiRequestBody` **原样**转给 LLM —— 不再被强行压成单个 user 消息。让定时消息 / 即时消息 / Worker instant 三条路径的 LLM 调用完全等价（system role、多轮历史、tool role 全保留）。
+  - `content` 支持 `string` 或非空数组（多模态留口子，元素 schema 不深挖）。
+  - role 限定 `system | user | assistant | tool`，违规 → `400 INVALID_PARAMETERS`。
+  - 两者同时给、`messages` 为空数组、role 非法 → 全部 `400`。
+  - 持久化层（加密 task data）同时存 `completePrompt` 和 `messages` 字段；`update-message` 切换 prompt source 时自动 null 掉另一个，保证存储一致性。
+- **`temperature` 字段**：可选 number，会透传给 LLM。legacy `completePrompt` 路径无 temperature 时仍默认 0.8（保持旧行为）；`messages` 路径无 temperature 时**不发**，跟上游主路径完全一致。
+- 顶层 export `validateLlmMessagesArray(messages)`：业务可在 SDK 之外做同步预校验。
+
+### Compatibility
+
+- 旧 `completePrompt` 调用者**零修改**继续工作。DB schema、加密格式、推送 payload 字段全部不动。2.1.x 直接升级即可。
+- 与 `@rei-standard/amsg-instant` 0.5.0 共享语义；两端独立实现但行为字节级一致。
+
 ## 2.1.1 — 2026-05-17
 
 ### Improvements

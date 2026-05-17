@@ -41,7 +41,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       messageContent = decryptedPayload.userMessage;
 
     } else if (decryptedPayload.messageType === 'instant') {
-      if (decryptedPayload.completePrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
+      const hasPrompt = !!decryptedPayload.completePrompt || (Array.isArray(decryptedPayload.messages) && decryptedPayload.messages.length > 0);
+      if (hasPrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
         messageContent = await _callAI(decryptedPayload);
       } else if (decryptedPayload.userMessage) {
         messageContent = decryptedPayload.userMessage;
@@ -247,11 +248,28 @@ async function _callAI(payload) {
  * @returns {Object}
  */
 function buildAiRequestBody(payload) {
+  // messages mode (added in v2.2.0): forward the caller's OpenAI-style array
+  // verbatim — same contract as @rei-standard/amsg-instant 0.5.0+. No auto
+  // role injection, no concatenation back to a single user message. Lets
+  // the upstream app preserve system / multi-turn context byte-for-byte
+  // across the schedule-message path.
+  const llmMessages = Array.isArray(payload.messages) && payload.messages.length > 0
+    ? payload.messages
+    : [{ role: 'user', content: payload.completePrompt }];
+
   const requestBody = {
     model: payload.primaryModel,
-    messages: [{ role: 'user', content: payload.completePrompt }],
-    temperature: 0.8
+    messages: llmMessages,
   };
+
+  // Match the instant package's behavior: only inject default temperature
+  // for the legacy completePrompt path; messages mode forwards whatever the
+  // upstream app set (or nothing) so behavior matches their main chat path.
+  if (payload.temperature !== undefined && payload.temperature !== null) {
+    requestBody.temperature = payload.temperature;
+  } else if (!Array.isArray(payload.messages)) {
+    requestBody.temperature = 0.8;
+  }
 
   if (payload.maxTokens === undefined || payload.maxTokens === null) {
     return requestBody;

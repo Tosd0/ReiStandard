@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage, normalizeAiApiUrl } from '../src/server/lib/message-processor.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
+import { validateScheduleMessagePayload, validateLlmMessagesArray } from '../src/server/lib/validation.js';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
@@ -272,5 +273,190 @@ describe('normalizeAiApiUrl', () => {
   it('rejects empty or invalid input', () => {
     assert.throws(() => normalizeAiApiUrl(''), /required/);
     assert.throws(() => normalizeAiApiUrl('not-a-url'), /Invalid apiUrl/);
+  });
+});
+
+// ─── messages array (v2.2.0) — parity with @rei-standard/amsg-instant ──
+describe('messages array support', () => {
+  function basePromptedPayload(overrides = {}) {
+    return {
+      contactName: 'Rei',
+      messageType: 'prompted',
+      firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
+      ...overrides,
+    };
+  }
+
+  it('validation: accepts completePrompt only', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload({ completePrompt: 'say hi' }));
+    assert.equal(result.valid, true);
+  });
+
+  it('validation: accepts messages only', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload({
+      messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }],
+    }));
+    assert.equal(result.valid, true);
+  });
+
+  it('validation: rejects when both completePrompt and messages are provided', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload({
+      completePrompt: 'hi',
+      messages: [{ role: 'user', content: 'hi' }],
+    }));
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /exactly one|两者不能同时/);
+  });
+
+  it('validation: rejects when neither prompt source is provided for prompted type', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload());
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /缺少必需参数/);
+  });
+
+  it('validation: rejects messages with invalid role', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload({
+      messages: [{ role: 'robot', content: 'hi' }],
+    }));
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /role/);
+  });
+
+  it('validation: rejects empty messages array', () => {
+    const result = validateScheduleMessagePayload(basePromptedPayload({ messages: [] }));
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /non-empty/);
+  });
+
+  it('validation: accepts optional temperature, rejects non-number', () => {
+    const ok = validateScheduleMessagePayload(basePromptedPayload({
+      completePrompt: 'hi', temperature: 0.3,
+    }));
+    assert.equal(ok.valid, true);
+
+    const bad = validateScheduleMessagePayload(basePromptedPayload({
+      completePrompt: 'hi', temperature: 'hot',
+    }));
+    assert.equal(bad.valid, false);
+  });
+
+  it('validateLlmMessagesArray: accepts string and non-empty array content', () => {
+    assert.equal(validateLlmMessagesArray([{ role: 'user', content: 'hi' }]), null);
+    assert.equal(validateLlmMessagesArray([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]), null);
+  });
+
+  it('validateLlmMessagesArray: rejects empty string / empty array / wrong type', () => {
+    assert.match(validateLlmMessagesArray([{ role: 'user', content: '' }]), /non-empty string/);
+    assert.match(validateLlmMessagesArray([{ role: 'user', content: [] }]), /non-empty/);
+    assert.match(validateLlmMessagesArray([{ role: 'user', content: 42 }]), /non-empty/);
+  });
+
+  it('LLM call: forwards messages array verbatim (no role injection)', async () => {
+    const messages = [
+      { role: 'system', content: 'you are Rei' },
+      { role: 'user', content: 'multi-turn' },
+      { role: 'assistant', content: 'sure' },
+      { role: 'user', content: 'continue' },
+    ];
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      messages,
+      temperature: 0.42,
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const requestBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options) => {
+      requestBodies.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: 'ok' } }] };
+        },
+      };
+    };
+
+    try {
+      const result = await processSingleMessage(task, createContext());
+      assert.equal(result.success, true);
+      assert.deepEqual(requestBodies[0].messages, messages);
+      assert.equal(requestBodies[0].temperature, 0.42);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('LLM call: legacy completePrompt path still wraps and defaults temperature 0.8', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'legacy hi',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const requestBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options) => {
+      requestBodies.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: 'ok' } }] };
+        },
+      };
+    };
+
+    try {
+      const result = await processSingleMessage(task, createContext());
+      assert.equal(result.success, true);
+      assert.deepEqual(requestBodies[0].messages, [{ role: 'user', content: 'legacy hi' }]);
+      assert.equal(requestBodies[0].temperature, 0.8);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('LLM call: messages mode does NOT inject default temperature when caller omits it', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      messages: [{ role: 'user', content: 'hi' }],
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const requestBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options) => {
+      requestBodies.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: 'ok' } }] };
+        },
+      };
+    };
+
+    try {
+      const result = await processSingleMessage(task, createContext());
+      assert.equal(result.success, true);
+      assert.equal(Object.hasOwn(requestBodies[0], 'temperature'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

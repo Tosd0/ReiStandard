@@ -152,5 +152,5 @@ export async function createReiServer(config) {
 // Re-export utilities that consumers may need
 export { createAdapter } from './adapters/factory.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
-export { validateScheduleMessagePayload, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
+export { validateScheduleMessagePayload, validateLlmMessagesArray, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
 export { createTenantToken, verifyTenantToken } from './tenant/token.js';
