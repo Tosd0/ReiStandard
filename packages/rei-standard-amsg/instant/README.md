@@ -125,6 +125,10 @@ Content-Type: application/json
   maxTokens?: number;
   temperature?: number;            // 0.5.0+：透传给 LLM；completePrompt 路径未传默认 0.8
   messageSubtype?: string;         // SW 端分类标签，取值由业务决定
+
+  // === 分句正则（0.6.0+），可选 ===
+  splitPattern?: string | string[]; // 自定义把 LLM 输出切成多条推送的正则；不传走默认 /([。！？!?]+)/
+
   pushSubscription: {              // Web Push 标准订阅
     endpoint: string;
     keys: { p256dh: string; auth: string };
@@ -172,6 +176,26 @@ curl -X POST https://instant.example.com/instant \
     "pushSubscription": { "endpoint": "...", "keys": { "p256dh": "...", "auth": "..." } }
   }'
 ```
+
+#### `splitPattern`：自定义分句正则（0.6.0+）
+
+LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每条之间间隔 1.5s，看起来像真人一句句打字）。`splitPattern` 让调用方覆盖这个正则：
+
+```jsonc
+// 单正则：按换行切
+{ "splitPattern": "([\\n]+)" }
+
+// 数组：级联——先按段落切，每段再按句号切
+{ "splitPattern": ["(\\n\\n+)", "([。！？!?]+)"] }
+```
+
+**约定**：
+
+- 传**正则 source**，不要带两边的 `/.../` 也不要带尾部 flag（`/foo/i` 会被当字面量斜杠 + 字面量 `i` 匹配）。需要大小写不敏感请用 `[Aa]` 这种字符类替代。
+- 想保留分隔符（默认就是把句号回贴到前一段），把分隔符包进 `(...)` 捕获组。库不会自动包——传 `"\\n+"` 而不是 `"(\\n+)"` 会得到首尾相连、分隔符丢失的奇怪结果。
+- 数组语义是**级联**（split → split → split），不是"任一匹配就切"。需要后者请用 `|` 自己合一条正则。
+- 上限：每项 ≤ 200 字符，数组 ≤ 10 项；非法或无法 `new RegExp(...)` 通过 → `400 INVALID_PAYLOAD_FORMAT`。
+- 不传 / `null` / `[]` → 走默认正则，行为字节级与 0.5.x 一致。
 
 #### `apiUrl` 规范化（0.4.0+）
 

@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-instant",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "ReiStandard Active Messaging — stateless one-shot instant push handler. Zero runtime deps, pure Web Crypto. Deployable to Cloudflare Workers / Vercel Edge / Netlify / Node with no flags.",
   "repository": {
     "type": "git",

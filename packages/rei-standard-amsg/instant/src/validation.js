@@ -16,6 +16,40 @@ function isValidUrl(s) {
 
 const VALID_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
+const SPLIT_PATTERN_MAX_LENGTH = 200;
+const SPLIT_PATTERN_MAX_ITEMS = 10;
+
+/**
+ * Validate the optional `splitPattern` field. Mirrors amsg-server's
+ * `validateSplitPattern` (kept in lockstep). Accepts string, string[], or
+ * absent/null. Returns an error message string, or null when valid.
+ *
+ * The size caps are an input-size guard, NOT a ReDoS defense — a 6-char
+ * pattern like `(a+)+$` is enough to trigger catastrophic backtracking.
+ * Worker / runtime CPU limits are the real backstop; the blast radius is
+ * self-inflicted only (caller's regex on caller's own LLM output).
+ */
+function validateSplitPattern(value) {
+  if (value === undefined || value === null) return null;
+  const isArray = Array.isArray(value);
+  const items = isArray ? value : [value];
+  if (isArray && items.length === 0) return null;          // empty array = use default
+  if (items.length > SPLIT_PATTERN_MAX_ITEMS) {
+    return `splitPattern 数组最多 ${SPLIT_PATTERN_MAX_ITEMS} 项`;
+  }
+  for (let i = 0; i < items.length; i++) {
+    const s = items[i];
+    const label = isArray ? `splitPattern[${i}]` : 'splitPattern';
+    if (typeof s !== 'string') return `${label} 必须是字符串`;
+    if (s.length > SPLIT_PATTERN_MAX_LENGTH) {
+      return `${label} 不能超过 ${SPLIT_PATTERN_MAX_LENGTH} 字符`;
+    }
+    try { new RegExp(s); }
+    catch (_) { return `${label} 不是有效正则表达式`; }
+  }
+  return null;
+}
+
 function validateMessagesArray(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return 'messages 必须是长度 ≥ 1 的数组';
@@ -224,6 +258,16 @@ export function validateInstantPayload(payload) {
       errorCode: 'INVALID_PAYLOAD_FORMAT',
       errorMessage: 'messageSubtype 必须是字符串',
       details: { invalidFields: ['messageSubtype'] }
+    };
+  }
+
+  const splitErr = validateSplitPattern(payload.splitPattern);
+  if (splitErr) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: splitErr,
+      details: { invalidFields: ['splitPattern'] }
     };
   }
 

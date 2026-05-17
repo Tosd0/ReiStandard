@@ -1,5 +1,21 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.6.0 — 2026-05-18
+
+**New**
+
+- **`splitPattern` 自定义分句正则**：payload 新增可选 `splitPattern` 字段，类型 `string | string[]`。LLM 返回的整段文本将按此正则切成多条 Web Push 推送（默认 `/([。！？!?]+)/`）。
+  - `string` → 单个正则 source（不带 flags），用 `new RegExp(splitPattern)` 编译后替代默认正则。
+  - `string[]` → **级联**应用：第一个正则切完，每段再用第二个切，以此类推。适合分层切分（先按段落 `(\n\n+)`、再按句号 `([。！？!?]+)`）。需要 "任一匹配就切" 的语义，调用方自己用 `|` 合成一条正则即可。
+  - 不传 / `null` / `undefined` / `[]` → 走默认正则，行为字节级不变。
+  - **捕获组约定**：想让分隔符回贴到前一段（与默认行为一致），把分隔符放进 `(...)` 捕获组。库不自动包裹。
+  - **限制**：每项 ≤ 200 字符，数组 ≤ 10 项，每项必须能 `new RegExp(...)` 通过。违规 → `400 INVALID_PAYLOAD_FORMAT`。
+  - 校验失败的错误信息会精确到出错的索引（如 `splitPattern[2] 不是有效正则表达式`）。
+
+**Compatibility**
+
+- 0.5.x 调用者**零修改**继续工作。push payload、subscription、VAPID、错误码全部不动。0.5.x 直接升级即可。
+
 ## 0.5.0 — 2026-05-17
 
 **New**

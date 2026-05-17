@@ -18,16 +18,11 @@ import { randomUUID } from './utils.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 
-/**
- * Split a message into individual sentences for sequential delivery.
- * Mirrors amsg-server message-processor.js:59-70 (do not drift).
- *
- * @param {string} messageContent
- * @returns {string[]}
- */
-export function splitMessageIntoSentences(messageContent) {
-  const sentences = messageContent
-    .split(/([。！？!?]+)/)
+const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
+
+function splitOnceByRegex(chunk, regex) {
+  const out = chunk
+    .split(regex)
     .reduce((acc, part, i, arr) => {
       if (i % 2 === 0 && part.trim()) {
         const punctuation = arr[i + 1] || '';
@@ -36,8 +31,49 @@ export function splitMessageIntoSentences(messageContent) {
       return acc;
     }, [])
     .filter(s => s.length > 0);
+  // No-match fallback: pass the chunk through untouched so a later regex in
+  // a cascade can still take a swing at it.
+  return out.length > 0 ? out : [chunk];
+}
 
-  return sentences.length > 0 ? sentences : [messageContent];
+/**
+ * Split a message into individual sentences for sequential delivery.
+ * Mirrors amsg-server message-processor.js:59-70 (do not drift).
+ *
+ * `splitPattern` is an optional caller-provided override:
+ *   - `string`              → single regex source, used in place of the default
+ *   - `string[]`            → applied as a cascade: split by patterns[0], then
+ *                             split each resulting chunk by patterns[1], etc.
+ *   - omitted / null / [] / undefined → default /([。！？!?]+)/
+ *
+ * Capture-group convention: if you want the delimiter re-attached to the
+ * preceding chunk (matches default behavior), wrap your delimiter in `(...)`
+ * — e.g. `"([\\n]+)"` not `"[\\n]+"`. We don't auto-wrap; that would require
+ * parsing escaped/character-class/non-capturing groups.
+ *
+ * Validation (length cap, regex compilability, array size) is enforced by
+ * `validateSplitPattern` upstream — this function trusts its inputs.
+ *
+ * @param {string} messageContent
+ * @param {string | string[] | null} [splitPattern=null]
+ * @returns {string[]}
+ */
+export function splitMessageIntoSentences(messageContent, splitPattern = null) {
+  const sources =
+    splitPattern == null ? null :
+    Array.isArray(splitPattern) ? splitPattern :
+    [splitPattern];
+
+  const regexes = (sources && sources.length > 0)
+    ? sources.map(s => new RegExp(s))
+    : [DEFAULT_SPLIT_REGEX];
+
+  let chunks = [messageContent];
+  for (const regex of regexes) {
+    chunks = chunks.flatMap(c => splitOnceByRegex(c, regex));
+  }
+
+  return chunks.length > 0 ? chunks : [messageContent];
 }
 
 /**
@@ -237,7 +273,7 @@ export async function processInstantMessage(payload, ctx) {
     throw error;
   }
 
-  const messages = splitMessageIntoSentences(messageContent);
+  const messages = splitMessageIntoSentences(messageContent, payload.splitPattern ?? null);
   const pushSubscription = payload.pushSubscription;
   const contactName = payload.contactName;
   const avatarUrl = payload.avatarUrl || null;
