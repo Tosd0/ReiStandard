@@ -2,6 +2,12 @@
  * PUT /api/v1/update-message?id={uuid}
  * 功能：更新已存在的定时任务（CommonJS，兼容 Vercel 与 Netlify）
  * ReiStandard v2.0.1
+ *
+ * ⚠️ OUTDATED — predates messages array support.
+ *
+ * 这份示例**不允许**通过 `messages` 字段切换 prompt source，也不会
+ * 在切换时自动 null 掉旧字段以保持存储一致性。新接入请直接用
+ * `@rei-standard/amsg-server@2.2.0+` 的 `updateMessage` handler。
  */
 
 const { deriveUserEncryptionKey, decryptPayload, encryptForStorage } = require('../../lib/encryption');

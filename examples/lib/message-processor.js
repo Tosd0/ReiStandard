@@ -2,6 +2,13 @@
  * 消息处理工具函数库
  * 用于处理单个消息任务的生成和发送
  * ReiStandard v2.0.1
+ *
+ * ⚠️ OUTDATED — predates messages array support.
+ *
+ * 这份示例的 `buildAiRequestBody` 还把 `completePrompt` 硬包成单条
+ * `{role:'user', content}` 后发给 LLM，**没有** v2.2.0+ 的 messages
+ * 数组分支、`temperature` 透传。新接入请直接用
+ * `@rei-standard/amsg-server@2.2.0+` 的内置 `processSingleMessage`。
  */
 
 const webpush = require('web-push');

@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.2.1 — 2026-05-17
+
+### Docs
+
+- README 加 `messages` 模式示例，配合 `@rei-standard/amsg-instant@0.5.0+` / `@rei-standard/amsg-server@2.2.0+` 的 OpenAI 格式 messages 数组转发。client 是 payload-agnostic 透传（`JSON.stringify(payload)`），所以**无代码改动**，只更新文档说明。
+
 ## 2.2.0 — 2026-05-16
 
 ### Added

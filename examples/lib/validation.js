@@ -1,6 +1,16 @@
 /**
  * 参数验证工具函数库
  * ReiStandard v2.0.1
+ *
+ * ⚠️ OUTDATED — predates messages array support.
+ *
+ * 这份示例只校验旧 `completePrompt` 字段，**未实现** v2.2.0+ 的
+ * OpenAI 格式 `messages` 数组互斥校验、`temperature` 校验，以及
+ * `validateLlmMessagesArray` 辅助函数。新接入请直接用包：
+ *   - `@rei-standard/amsg-server@2.2.0+`（schedule/update-message 路径）
+ *   - `@rei-standard/amsg-instant@0.5.0+`（无状态 Worker 路径）
+ *
+ * 这份手动接入示例后续会同步，目前**保持 v2.0.1 行为**便于老部署对照。
  */
 
 /**

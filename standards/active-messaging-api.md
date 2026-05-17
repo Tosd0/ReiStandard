@@ -153,6 +153,21 @@ export const config = {
 
 若上游返回 `405 Method Not Allowed`，应优先判定为 `apiUrl` 指向错误端点，并返回明确错误提示。
 
+> ⚠️ **OUTDATED — predates messages array support (2026-05-17)**
+>
+> 本节描述的提示词契约（仅 `completePrompt: string`）已被 `@rei-standard/amsg-server@2.2.0+`
+> 和 `@rei-standard/amsg-instant@0.5.0+` 扩展为「`completePrompt` 与 `messages`
+> 互斥二选一」：
+>
+> - `completePrompt?: string` — 简单场景，handler 内部包成单条 `{role:'user', content}`。
+> - `messages?: Array<{ role: 'system'|'user'|'assistant'|'tool', content: string | unknown[] }>`
+>   — 多轮 / 带 system role / tool role，handler **原样**转发给 LLM，不做注入或重排。
+> - 两者必须**恰好提供一个**，同时给或都不给均返回 `400 INVALID_PARAMETERS` / `INVALID_PAYLOAD_FORMAT`。
+> - 可选 `temperature?: number` 透传给 LLM；legacy `completePrompt` 路径未传时默认 `0.8`，
+>   `messages` 路径未传时**不发**。
+>
+> 实现侧请直接参考两个包的源码与 CHANGELOG；本规范文档将在后续 minor 修订中正式纳入。
+
 ## 7. 一体化初始化接口
 
 ### 7.1 请求

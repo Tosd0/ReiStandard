@@ -2,6 +2,22 @@
 
 > 本文档用于不使用 SDK 包时的手动接入。优先推荐 Package-First。
 
+> ⚠️ **OUTDATED — predates messages array support (2026-05-17)**
+>
+> 这份手动接入示例停留在 v2.0.1 字段：`schedule-message` / `update-message`
+> 仅接受 `completePrompt: string`，**没有**对接 v2.2.0+ 的 OpenAI 格式
+> `messages` 数组（含 system role / 多轮上下文 / tool role）和
+> `temperature` 透传。`lib/message-processor.js` 的 `buildAiRequestBody`
+> 也还把 prompt 硬包成单条 user 消息。
+>
+> 新接入请直接用 SDK 包（行为已对齐、字节级一致）：
+>
+> - `@rei-standard/amsg-server@2.2.0+` — schedule/update-message 路径
+> - `@rei-standard/amsg-instant@0.5.0+` — 无状态 Worker 路径
+> - `@rei-standard/amsg-client@2.2.1+` — 浏览器 SDK（透传 messages）
+>
+> 这份示例文档与代码后续会同步更新。
+
 ## 目录结构
 
 ```text

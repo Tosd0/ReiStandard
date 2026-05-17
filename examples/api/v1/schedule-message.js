@@ -2,6 +2,14 @@
  * POST /api/v1/schedule-message
  * 功能：创建定时消息任务（CommonJS，兼容 Vercel 与 Netlify）
  * ReiStandard v2.0.1
+ *
+ * ⚠️ OUTDATED — predates messages array support.
+ *
+ * 这份手动接入示例**不接受** v2.2.0+ 的 `messages` 字段（OpenAI 格式
+ * 数组），也不会把它写进加密 payload。新接入请直接用
+ * `@rei-standard/amsg-server@2.2.0+` 的 `createReiServer().handlers
+ * .scheduleMessage`，那里完整实现了 messages 数组互斥校验、
+ * `temperature` 透传与持久化。
  */
 
 const webpush = require('web-push');
