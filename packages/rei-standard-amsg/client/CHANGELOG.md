@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.2.2 — 2026-05-18
+
+### Docs
+
+- README 加 `splitPattern` 字段说明，配合 `@rei-standard/amsg-instant@0.6.0+` / `@rei-standard/amsg-server@2.3.0+` 自定义分句正则。client 是 payload-agnostic 透传（`JSON.stringify(payload)`），所以**无代码改动**——业务直接把 `splitPattern: string | string[]` 放进 `sendInstant` / `scheduleMessage` 的 payload，Worker / Server 端会自己校验和应用。
+
 ## 2.2.1 — 2026-05-17
 
 ### Docs

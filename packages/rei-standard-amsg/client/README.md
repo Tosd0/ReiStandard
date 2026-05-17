@@ -116,6 +116,34 @@ await client.sendInstant({
 
 注意 `completePrompt` 和 `messages` **必须恰好二选一**——两者同时给会被 Worker / Server 端返回 `400 INVALID_PAYLOAD_FORMAT` / `INVALID_PARAMETERS`。`scheduleMessage` 也接受同样的 `messages` 字段（amsg-server 2.2.0+ 起持久化层一并支持），用法相同。
 
+### `splitPattern` 自定义分句正则（对接 amsg-instant 0.6.0+ / amsg-server 2.3.0+）
+
+LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送。要换成别的正则（按换行、按段落、自定义符号……）就在 payload 里加 `splitPattern`：
+
+```js
+// 单正则：按换行切
+await client.sendInstant({
+  contactName: 'Rei',
+  completePrompt: '...',
+  splitPattern: '([\\n]+)',
+  // 其余字段同上
+});
+
+// 数组级联：先按段落，每段再按句号
+await client.sendInstant({
+  contactName: 'Rei',
+  completePrompt: '...',
+  splitPattern: ['(\\n\\n+)', '([。！？!?]+)'],
+});
+```
+
+`splitPattern` 类型是 `string | string[]`。`scheduleMessage` 也支持，`updateMessage` 可显式传 `splitPattern: null` 重置回默认。client SDK 完全透传不校验，所有错误在 Worker / Server 端返回（每项 ≤ 200 字符、数组 ≤ 10 项、必须能 `new RegExp()` 通过）。
+
+**两个常见 footgun**：
+
+- 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
+- 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
+
 ## 导出 API（Exports）
 
 - `ReiClient`
