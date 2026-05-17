@@ -21,12 +21,37 @@
  */
 
 /**
+ * Lazy Web Crypto polyfill for Node 18.
+ *
+ * Node 19+ exposes `globalThis.crypto` natively, but Node 18 (the current
+ * LTS at time of writing, and the default Netlify Functions runtime) does
+ * not. The dynamic import path keeps Node out of the bundle on every other
+ * platform — Workers / Edge / Deno never executes this branch, and tsup
+ * leaves the specifier untouched because `node:crypto` is externalized.
+ */
+let _polyfillApplied = false;
+async function ensureWebCryptoPolyfill() {
+  if (_polyfillApplied || globalThis.crypto) return;
+  const { webcrypto } = await import('node:crypto');
+  if (!globalThis.crypto) {
+    Object.defineProperty(globalThis, 'crypto', {
+      value: webcrypto,
+      writable: false,
+      configurable: true,
+      enumerable: false,
+    });
+  }
+  _polyfillApplied = true;
+}
+
+/**
  * @param {(request: Request) => Promise<Response>} fetchHandler
  * @returns {(req: import('http').IncomingMessage, res: import('http').ServerResponse) => Promise<void>}
  */
 export function toNodeHandler(fetchHandler) {
   return async function nodeHandler(req, res) {
     try {
+      await ensureWebCryptoPolyfill();
       const fetchRequest = await nodeRequestToFetchRequest(req);
       const fetchResponse = await fetchHandler(fetchRequest);
       await writeFetchResponseToNode(fetchResponse, res);

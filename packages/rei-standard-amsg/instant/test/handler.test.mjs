@@ -1,18 +1,34 @@
-import { describe, it } from 'node:test';
+import { describe, it, before } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
   createInstantHandler,
   splitMessageIntoSentences,
-  validateInstantPayload
+  validateInstantPayload,
 } from '../src/index.js';
+import {
+  generateTestVapid,
+  generateTestSubscription,
+  createFetchRouter,
+  makeLlmResponse,
+} from './helpers.mjs';
+
+const LLM_URL = 'https://api.example.com/v1/chat/completions';
+
+let vapid;
+let subKit;
+
+before(async () => {
+  vapid = await generateTestVapid();
+  subKit = await generateTestSubscription();
+});
 
 function makeRequest({ body, headers = {}, method = 'POST' } = {}) {
   const defaultHeaders = { 'content-type': 'application/json' };
   return new Request('http://localhost/instant', {
     method,
     headers: { ...defaultHeaders, ...headers },
-    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body))
+    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
   });
 }
 
@@ -20,50 +36,20 @@ function makeValidPayload(overrides = {}) {
   return {
     contactName: 'Rei',
     completePrompt: 'say hi briefly',
-    apiUrl: 'https://api.example.com/v1/chat/completions',
+    apiUrl: LLM_URL,
     apiKey: 'sk-test',
     primaryModel: 'model-x',
-    pushSubscription: {
-      endpoint: 'https://push.example.com/sub',
-      keys: { p256dh: 'aaa', auth: 'bbb' }
-    },
-    ...overrides
+    pushSubscription: subKit.subscription,
+    ...overrides,
   };
 }
 
-function makeMockWebpush(sendNotificationImpl) {
-  const calls = [];
-  return {
-    calls,
-    mod: {
-      setVapidDetails() {},
-      async sendNotification(sub, payload) {
-        calls.push({ sub, payload: JSON.parse(payload) });
-        if (sendNotificationImpl) return sendNotificationImpl(sub, payload);
-      }
-    }
-  };
+function llmRouter(content) {
+  return createFetchRouter({
+    pushEndpoint: subKit.subscription.endpoint,
+    llm: async () => makeLlmResponse(content),
+  });
 }
-
-function makeMockFetch(handler) {
-  return async (url, options) => handler(url, options);
-}
-
-function llmReply(content) {
-  return makeMockFetch(async () => ({
-    ok: true,
-    status: 200,
-    async json() {
-      return { choices: [{ message: { content } }] };
-    }
-  }));
-}
-
-const validVapid = {
-  email: 'vapid@example.com',
-  publicKey: 'public-key',
-  privateKey: 'private-key'
-};
 
 // ─── Unit: validation ──────────────────────────────────────────────────
 
@@ -135,10 +121,7 @@ describe('splitMessageIntoSentences', () => {
 
 describe('createInstantHandler — request validation', () => {
   it('rejects non-POST methods', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod
-    });
+    const handler = createInstantHandler({ vapid });
     const res = await handler(new Request('http://localhost/instant', { method: 'GET' }));
     assert.equal(res.status, 405);
     const body = await res.json();
@@ -146,10 +129,7 @@ describe('createInstantHandler — request validation', () => {
   });
 
   it('rejects non-JSON body', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod
-    });
+    const handler = createInstantHandler({ vapid });
     const req = makeRequest({ body: 'not json {' });
     const res = await handler(req);
     assert.equal(res.status, 400);
@@ -158,10 +138,7 @@ describe('createInstantHandler — request validation', () => {
   });
 
   it('rejects payload missing required fields', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod
-    });
+    const handler = createInstantHandler({ vapid });
     const req = makeRequest({ body: { contactName: 'only this' } });
     const res = await handler(req);
     assert.equal(res.status, 400);
@@ -174,22 +151,15 @@ describe('createInstantHandler — request validation', () => {
 
 describe('createInstantHandler — clientToken', () => {
   it('passes through when clientToken is not configured (open mode)', async () => {
-    const webpush = makeMockWebpush();
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: webpush.mod,
-      fetch: llmReply('hi.')
-    });
+    const router = llmRouter('hi.');
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 200);
+    assert.equal(router.pushCalls.length, 1);
   });
 
   it('returns 401 INVALID_CLIENT_TOKEN when header missing', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod,
-      clientToken: 'shared-secret-xyz'
-    });
+    const handler = createInstantHandler({ vapid, clientToken: 'shared-secret-xyz' });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 401);
     const body = await res.json();
@@ -197,14 +167,10 @@ describe('createInstantHandler — clientToken', () => {
   });
 
   it('returns 401 INVALID_CLIENT_TOKEN when header mismatches', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod,
-      clientToken: 'shared-secret-xyz'
-    });
+    const handler = createInstantHandler({ vapid, clientToken: 'shared-secret-xyz' });
     const res = await handler(makeRequest({
       body: makeValidPayload(),
-      headers: { 'x-client-token': 'wrong-token' }
+      headers: { 'x-client-token': 'wrong-token' },
     }));
     assert.equal(res.status, 401);
     const body = await res.json();
@@ -212,32 +178,27 @@ describe('createInstantHandler — clientToken', () => {
   });
 
   it('returns 200 when header matches clientToken', async () => {
-    const webpush = makeMockWebpush();
+    const router = llmRouter('matched.');
     const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: webpush.mod,
+      vapid,
       clientToken: 'shared-secret-xyz',
-      fetch: llmReply('matched.')
+      fetch: router.fetch,
     });
     const res = await handler(makeRequest({
       body: makeValidPayload(),
-      headers: { 'x-client-token': 'shared-secret-xyz' }
+      headers: { 'x-client-token': 'shared-secret-xyz' },
     }));
     assert.equal(res.status, 200);
-    assert.equal(webpush.calls.length, 1);
+    assert.equal(router.pushCalls.length, 1);
   });
 });
 
-// ─── Handler: happy path & push payload contract ──────────────────────
+// ─── Handler: happy path & push delivery ──────────────────────────────
 
-describe('createInstantHandler — happy path & push payload contract', () => {
-  it('parses plaintext, calls LLM, splits, pushes, and returns 200', async () => {
-    const webpush = makeMockWebpush();
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: webpush.mod,
-      fetch: llmReply('你好。今天好天气！')
-    });
+describe('createInstantHandler — happy path', () => {
+  it('parses plaintext, calls LLM, splits, pushes each sentence, returns 200', async () => {
+    const router = llmRouter('你好。今天好天气！');
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
 
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 200);
@@ -245,53 +206,36 @@ describe('createInstantHandler — happy path & push payload contract', () => {
     assert.equal(body.success, true);
     assert.equal(body.data.messagesSent, 2);
     assert.match(body.data.sentAt, /^\d{4}-\d{2}-\d{2}T/);
-    assert.equal(webpush.calls.length, 2);
 
-    const first = webpush.calls[0].payload;
-    assert.equal(first.title, '来自 Rei');
-    assert.equal(first.message, '你好。');
-    assert.equal(first.contactName, 'Rei');
-    assert.match(first.messageId, /^msg_[0-9a-f-]+_instant_0$/);
-    assert.equal(first.messageIndex, 1);
-    assert.equal(first.totalMessages, 2);
-    assert.equal(first.messageType, 'instant');
-    assert.equal(first.messageSubtype, 'chat');
-    assert.equal(first.taskId, null);
-    assert.equal(first.source, 'instant');
-    assert.equal(first.avatarUrl, null);
-    assert.deepEqual(first.metadata, {});
-    assert.match(first.timestamp, /^\d{4}-\d{2}-\d{2}T/);
-
-    const second = webpush.calls[1].payload;
-    assert.equal(second.messageIndex, 2);
-    assert.match(second.messageId, /^msg_[0-9a-f-]+_instant_1$/);
+    assert.equal(router.pushCalls.length, 2);
+    for (const call of router.pushCalls) {
+      assert.equal(call.headers['content-encoding'], 'aes128gcm');
+      assert.equal(call.headers['content-type'], 'application/octet-stream');
+      assert.match(call.headers['authorization'], /^vapid t=/);
+      assert.match(call.headers['authorization'], new RegExp(`k=${vapid.publicKey}`));
+    }
   });
 
   it('returns LLM_CALL_FAILED on upstream error', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: makeMockWebpush().mod,
-      fetch: makeMockFetch(async () => ({ ok: false, status: 500, statusText: 'oops' }))
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => ({ ok: false, status: 500, statusText: 'oops' }),
     });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.equal(body.error.code, 'LLM_CALL_FAILED');
+    assert.equal(router.pushCalls.length, 0);
   });
 
-  it('returns PUSH_SEND_FAILED on web-push error', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      webpush: {
-        setVapidDetails() {},
-        async sendNotification() {
-          const err = new Error('push gateway 410');
-          err.statusCode = 410;
-          throw err;
-        }
-      },
-      fetch: llmReply('one sentence')
+  it('returns PUSH_SEND_FAILED when push gateway returns non-2xx', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => makeLlmResponse('one sentence'),
+      onPush: () => new Response('gone', { status: 410, statusText: 'Gone' }),
     });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 502);
     const body = await res.json();
@@ -299,11 +243,7 @@ describe('createInstantHandler — happy path & push payload contract', () => {
   });
 
   it('rejects request when tokenSigningKey is set but Authorization missing', async () => {
-    const handler = createInstantHandler({
-      vapid: validVapid,
-      tokenSigningKey: 'signing-secret',
-      webpush: makeMockWebpush().mod
-    });
+    const handler = createInstantHandler({ vapid, tokenSigningKey: 'signing-secret' });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 401);
     const body = await res.json();
@@ -315,11 +255,29 @@ describe('createInstantHandler — VAPID config', () => {
   it('returns VAPID_CONFIG_ERROR when vapid keys are missing', async () => {
     const handler = createInstantHandler({
       vapid: { email: '', publicKey: '', privateKey: '' },
-      webpush: makeMockWebpush().mod
     });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 500);
     const body = await res.json();
     assert.equal(body.error.code, 'VAPID_CONFIG_ERROR');
+  });
+
+  it('ignores deprecated options.webpush silently', async () => {
+    const router = llmRouter('ok.');
+    // Stub console.warn so the deprecation message doesn't litter test output
+    // while still letting the handler run.
+    const originalWarn = globalThis.console.warn;
+    globalThis.console.warn = () => {};
+    try {
+      const handler = createInstantHandler({
+        vapid,
+        webpush: { iAm: 'ignored' },
+        fetch: router.fetch,
+      });
+      const res = await handler(makeRequest({ body: makeValidPayload() }));
+      assert.equal(res.status, 200);
+    } finally {
+      globalThis.console.warn = originalWarn;
+    }
   });
 });

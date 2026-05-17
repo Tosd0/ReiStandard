@@ -1,6 +1,6 @@
 # @rei-standard/amsg-instant
 
-无状态明文一次性即时推送处理器：整个生命周期 = 一次 HTTP 函数调用（解析 → 调 LLM → 分句 → 发 Web Push → 返回 200）。无数据库、无 cron、无租户初始化，唯一依赖是 `web-push`。
+**零运行时依赖**的无状态明文一次性即时推送处理器：整个生命周期 = 一次 HTTP 函数调用（解析 → 调 LLM → 分句 → 发 Web Push → 返回 200）。无数据库、无 cron、无租户初始化。从 0.3.0 起 RFC 8291 (`aes128gcm`) payload 加密和 RFC 8292 VAPID JWT 由内置实现完成，不再需要 `web-push` / Node `crypto`。
 
 定位是**单租户自部署**场景下的极简 instant 推送：前端、Worker、LLM key 都在你自己手里，链路只剩浏览器 → Worker 的 HTTPS。应用层加密在该场景下没有实际收益（HTTPS 已加密传输；apiKey 由前端塞进 payload 必然要让 Worker 见到；攻击者拿 Worker URL 也榨不出 apiKey、推不动别人订阅），所以从 0.2.0 起协议改为**纯明文**。
 
@@ -18,8 +18,10 @@
 ## 安装
 
 ```bash
-npm install @rei-standard/amsg-instant web-push
+npm install @rei-standard/amsg-instant
 ```
+
+> 0.3.0 起不再需要 `web-push` 依赖。所有 Web Push 加密/签名都用 `globalThis.crypto.subtle` 完成。
 
 ## 配置项
 
@@ -30,8 +32,8 @@ npm install @rei-standard/amsg-instant web-push
 | `vapid.privateKey`  | string    | ✅   | VAPID 私钥 |
 | `clientToken`       | string    | ❌   | 弱共享密钥；配了则校验 `X-Client-Token` 头。**只防 URL 直怼/脚本小子**，不防有心人（前端 bundle 必然带着 token） |
 | `tokenSigningKey`   | string    | ❌   | 强鉴权 HMAC 密钥；配了则校验 `Authorization: Bearer <jwt>` |
-| `webpush`           | object    | ❌   | 注入 web-push 模块（测试用） |
-| `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用） |
+| `webpush`           | object    | ❌   | **0.3.0 起废弃**。保留参数兼容旧代码但被忽略；测试改用 `fetch` 拦截 push endpoint 的 POST。 |
+| `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
 | `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
 
 ### 鉴权策略
@@ -178,8 +180,9 @@ export default createCloudflareWorker((env) => ({
 # wrangler.toml
 name = "amsg-instant"
 main = "worker.js"
-compatibility_date = "2026-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2024-01-01"
+# 0.3.0 起不再需要 compatibility_flags = ["nodejs_compat"]
+# 所有 crypto 都走 globalThis.crypto.subtle（Workers 原生支持）
 
 # Secrets — set via:
 #   wrangler secret put VAPID_PUBLIC_KEY
@@ -211,6 +214,8 @@ app.listen(3000);
 ```
 
 ### Netlify Functions
+
+> Netlify Functions 默认仍是 Node 18，0.3.0 起 `adapters/node` 在请求入口处自动检测并 polyfill `globalThis.crypto`，无需 caller 做任何事。如果想原生 Web Crypto，把 Function 切到 Netlify Edge 即可。
 
 ```js
 // netlify/functions/instant.js
@@ -283,6 +288,8 @@ await client.sendInstant({
 - `validateInstantPayload(payload)`
 - `splitMessageIntoSentences(text)`
 - `processInstantMessage(payload, ctx)`
+- `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现
+- `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
 
 子路径：
 

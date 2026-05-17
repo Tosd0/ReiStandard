@@ -3,7 +3,7 @@
  * ReiStandard amsg-instant
  *
  * Lifecycle of a single instant request:
- *   decrypt → call LLM (OpenAI-compatible) → split into sentences →
+ *   call LLM (OpenAI-compatible) → split into sentences →
  *   send each sentence as its own Web Push notification (1500ms spacing) →
  *   return success.
  *
@@ -13,7 +13,8 @@
  * uniformly via the `source` discriminator.
  */
 
-import { randomUUID } from 'crypto';
+import { sendWebPush } from './webpush.js';
+import { randomUUID } from './utils.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 
@@ -37,6 +38,50 @@ export function splitMessageIntoSentences(messageContent) {
     .filter(s => s.length > 0);
 
   return sentences.length > 0 ? sentences : [messageContent];
+}
+
+/**
+ * Build the SW-facing JSON payload for a single sentence in an instant
+ * burst. Exported so test suites can verify the wire shape without having
+ * to decrypt RFC 8291 ciphertext.
+ *
+ * Field-for-field parity with `amsg-server/src/server/lib/message-processor.js:78-93`
+ * is the contract — drift here will break the shared SW.
+ *
+ * @param {Object} args
+ * @param {string} args.message
+ * @param {number} args.index           - 0-based.
+ * @param {number} args.total
+ * @param {string} args.contactName
+ * @param {string|null} [args.avatarUrl]
+ * @param {string} [args.messageSubtype='chat']
+ * @param {Object} [args.metadata={}]
+ * @returns {Object}
+ */
+export function buildInstantPushPayload({
+  message,
+  index,
+  total,
+  contactName,
+  avatarUrl = null,
+  messageSubtype = 'chat',
+  metadata = {},
+}) {
+  return {
+    title: `来自 ${contactName}`,
+    message,
+    contactName,
+    messageId: `msg_${randomUUID()}_instant_${index}`,
+    messageIndex: index + 1,
+    totalMessages: total,
+    messageType: 'instant',
+    messageSubtype,
+    taskId: null,
+    timestamp: new Date().toISOString(),
+    source: 'instant',
+    avatarUrl,
+    metadata,
+  };
 }
 
 /**
@@ -120,10 +165,10 @@ async function callLlm(payload, fetchImpl) {
 /**
  * Process one instant message: LLM → split → push each sentence.
  *
- * @param {Object} payload - Decrypted instant payload (already validated).
+ * @param {Object} payload - Validated instant payload.
  * @param {Object} ctx
- * @param {Object} ctx.webpush         - web-push module (VAPID already applied).
- * @param {Function} [ctx.fetch]       - fetch impl (globalThis.fetch by default).
+ * @param {{ email: string, publicKey: string, privateKey: string }} ctx.vapid
+ * @param {Function} [ctx.fetch]       - fetch impl (globalThis.fetch by default). Used for BOTH LLM and Web Push.
  * @param {Function} [ctx.sleep]       - sleep impl (testability).
  * @param {(e: { type: string }) => void} [ctx.onEvent]
  * @returns {Promise<{ messagesSent: number, sentAt: string }>}
@@ -151,24 +196,23 @@ export async function processInstantMessage(payload, ctx) {
   const metadata = payload.metadata || {};
 
   for (let i = 0; i < messages.length; i++) {
-    const notificationPayload = {
-      title: `来自 ${contactName}`,
+    const notificationPayload = buildInstantPushPayload({
       message: messages[i],
+      index: i,
+      total: messages.length,
       contactName,
-      messageId: `msg_${randomUUID()}_instant_${i}`,
-      messageIndex: i + 1,
-      totalMessages: messages.length,
-      messageType: 'instant',
-      messageSubtype,
-      taskId: null,
-      timestamp: new Date().toISOString(),
-      source: 'instant',
       avatarUrl,
-      metadata
-    };
+      messageSubtype,
+      metadata,
+    });
 
     try {
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(notificationPayload));
+      await sendWebPush({
+        subscription: pushSubscription,
+        payload: JSON.stringify(notificationPayload),
+        vapid: ctx.vapid,
+        fetch: fetchImpl,
+      });
       onEvent({ type: 'push_sent', messageIndex: i + 1, totalMessages: messages.length });
     } catch (err) {
       const error = new Error(err?.message || 'Web Push delivery failed');

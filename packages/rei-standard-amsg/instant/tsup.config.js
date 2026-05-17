@@ -18,5 +18,8 @@ export default defineConfig({
   target: 'node20',
   splitting: false,
   clean: true,
-  external: ['web-push', 'node:crypto', 'crypto']
+  // Only the Node adapter touches `node:crypto` (lazily, for the Node 18
+  // WebCrypto polyfill). Keep it externalized so the bundler doesn't try
+  // to inline a non-existent module on Workers / Edge.
+  external: ['node:crypto']
 });

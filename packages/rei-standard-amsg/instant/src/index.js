@@ -4,8 +4,10 @@
  * Stateless one-shot instant push handler. The entire lifecycle of an
  * instant request lives inside a single function invocation:
  *   parse → call LLM → split sentences → deliver Web Push → 200 OK.
- * No DB, no cron, no tenant init. Deploy to Cloudflare Workers, Node,
- * Netlify, or Vercel.
+ * No DB, no cron, no tenant init. Zero runtime dependencies. Pure Web
+ * Crypto under the hood, so the same handler runs unchanged on Cloudflare
+ * Workers (no `nodejs_compat` flag), Vercel Edge, Netlify Edge, Deno,
+ * Bun, and Node.
  *
  * Usage:
  *   import { createInstantHandler } from '@rei-standard/amsg-instant';
@@ -18,26 +20,30 @@
  *   };
  */
 
-import { createHmac, timingSafeEqual } from 'crypto';
-
-import { loadWebpush, applyVapid } from './webpush.js';
 import { validateInstantPayload } from './validation.js';
 import { processInstantMessage } from './message-processor.js';
+import {
+  utf8,
+  utf8Decode,
+  base64UrlToBytes,
+  hmacSha256,
+  timingSafeEqualBytes,
+} from './utils.js';
 
 /**
  * @typedef {Object} VapidConfig
  * @property {string} email
- * @property {string} publicKey
- * @property {string} privateKey
+ * @property {string} publicKey   - base64url, 65 B uncompressed P-256 point.
+ * @property {string} privateKey  - base64url, 32 B scalar.
  */
 
 /**
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
- * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Note: this is a *weak* check — the token will be visible in any frontend bundle that uses it, so it stops casual URL-direct abuse, not a determined attacker. Use `tokenSigningKey` for real auth.
+ * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Weak by design: the token is visible in any frontend bundle that uses it. Use `tokenSigningKey` for real auth.
  * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
- * @property {Object} [webpush]               - Optional preloaded web-push module (mainly for tests).
- * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy).
+ * @property {Object} [webpush]               - **Deprecated since 0.3.0.** Ignored. amsg-instant now implements RFC 8291 + RFC 8292 natively on Web Crypto. Tests should intercept the push HTTP request via `options.fetch` instead.
+ * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy). Used for BOTH the LLM call and the outgoing Web Push POST.
  * @property {(e: { type: string }) => void} [onEvent]
  */
 
@@ -55,24 +61,23 @@ export function createInstantHandler(options) {
   if (!options) throw new Error('[amsg-instant] options is required');
   if (!options.vapid) throw new Error('[amsg-instant] options.vapid is required');
 
+  if (options.webpush !== undefined) {
+    // Loud-but-survivable deprecation: keep accepting the option so 0.2.x
+    // callers don't crash, but make it obvious in any non-silent runtime.
+    const warn = globalThis.console && globalThis.console.warn;
+    if (typeof warn === 'function') {
+      warn('[amsg-instant] options.webpush is deprecated and ignored since 0.3.0. Intercept push delivery via options.fetch in tests.');
+    }
+  }
+
   const onEvent = typeof options.onEvent === 'function' ? options.onEvent : () => {};
   const tokenSigningKey = options.tokenSigningKey ? String(options.tokenSigningKey) : '';
   const clientToken = options.clientToken ? String(options.clientToken) : '';
-  const expectedClientTokenBytes = clientToken ? Buffer.from(clientToken, 'utf8') : null;
+  const expectedClientTokenBytes = clientToken ? utf8(clientToken) : null;
 
-  let vapidApplied = false;
-  let cachedWebpush = null;
-
-  async function ensureWebpush() {
-    if (cachedWebpush && vapidApplied) return cachedWebpush;
-    const mod = await loadWebpush(options.webpush);
-    if (!vapidApplied) {
-      applyVapid(mod, options.vapid);
-      vapidApplied = true;
-    }
-    cachedWebpush = mod;
-    return mod;
-  }
+  // Validate VAPID shape eagerly so misconfiguration surfaces on the very
+  // first request rather than the first Web Push attempt.
+  const vapidValid = isVapidConfigValid(options.vapid);
 
   return async function handler(request) {
     onEvent({ type: 'request' });
@@ -85,7 +90,7 @@ export function createInstantHandler(options) {
     }
 
     if (tokenSigningKey) {
-      const tokenError = verifyBearerToken(request, tokenSigningKey);
+      const tokenError = await verifyBearerToken(request, tokenSigningKey);
       if (tokenError) return tokenError;
     }
 
@@ -126,10 +131,7 @@ export function createInstantHandler(options) {
       });
     }
 
-    let webpush;
-    try {
-      webpush = await ensureWebpush();
-    } catch (_err) {
+    if (!vapidValid) {
       return jsonResponse(500, {
         success: false,
         error: { code: 'VAPID_CONFIG_ERROR', message: 'VAPID 配置缺失或无效' }
@@ -138,7 +140,7 @@ export function createInstantHandler(options) {
 
     try {
       const result = await processInstantMessage(payload, {
-        webpush,
+        vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
         onEvent
       });
@@ -146,7 +148,7 @@ export function createInstantHandler(options) {
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
-      const status = code === 'PUSH_SEND_FAILED' ? 502 : code === 'LLM_CALL_FAILED' ? 502 : 500;
+      const status = code === 'PUSH_SEND_FAILED' || code === 'LLM_CALL_FAILED' ? 502 : 500;
       return jsonResponse(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' }
@@ -172,6 +174,13 @@ function jsonResponse(status, body) {
   });
 }
 
+function isVapidConfigValid(vapid) {
+  if (!vapid || !vapid.email || !vapid.publicKey || !vapid.privateKey) return false;
+  // Don't fully parse here — sendWebPush will throw a precise error on bad
+  // key shape. Just ensure none of the three fields are blank.
+  return true;
+}
+
 function verifyClientToken(request, expectedBytes) {
   const received = getHeader(request, 'x-client-token');
   if (!received) {
@@ -180,8 +189,8 @@ function verifyClientToken(request, expectedBytes) {
       error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' }
     });
   }
-  const receivedBytes = Buffer.from(received, 'utf8');
-  if (receivedBytes.length !== expectedBytes.length || !timingSafeEqual(receivedBytes, expectedBytes)) {
+  const receivedBytes = utf8(received);
+  if (!timingSafeEqualBytes(receivedBytes, expectedBytes)) {
     return jsonResponse(401, {
       success: false,
       error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' }
@@ -190,7 +199,7 @@ function verifyClientToken(request, expectedBytes) {
   return null;
 }
 
-function verifyBearerToken(request, signingKey) {
+async function verifyBearerToken(request, signingKey) {
   const authHeader = getHeader(request, 'authorization');
   if (!authHeader.toLowerCase().startsWith('bearer ')) {
     return jsonResponse(401, {
@@ -217,26 +226,18 @@ function verifyBearerToken(request, signingKey) {
 
   const [encodedHeader, encodedPayload, receivedSig] = parts;
   const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const expectedSig = base64UrlEncode(
-    createHmac('sha256', signingKey).update(signingInput).digest()
-  );
+  const expectedSigBytes = await hmacSha256(utf8(signingKey), utf8(signingInput));
 
-  // Compare raw HMAC bytes (32 B after base64url decode) rather than the
-  // UTF-8 bytes of the encoded characters — semantically clearer and avoids
-  // Buffer.from(string)'s implicit-encoding default. Kept in lockstep with
-  // amsg-server's tenant/token.js to preserve the protocol contract.
-  let received;
-  let expected;
+  let receivedBytes;
   try {
-    received = base64UrlDecode(receivedSig);
-    expected = base64UrlDecode(expectedSig);
+    receivedBytes = base64UrlToBytes(receivedSig);
   } catch {
     return jsonResponse(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 签名格式无效' }
     });
   }
-  if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+  if (!timingSafeEqualBytes(receivedBytes, expectedSigBytes)) {
     return jsonResponse(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 签名无效' }
@@ -245,7 +246,7 @@ function verifyBearerToken(request, signingKey) {
 
   let payload;
   try {
-    payload = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8'));
+    payload = JSON.parse(utf8Decode(base64UrlToBytes(encodedPayload)));
   } catch {
     return jsonResponse(401, {
       success: false,
@@ -263,21 +264,8 @@ function verifyBearerToken(request, signingKey) {
   return null;
 }
 
-function base64UrlEncode(buf) {
-  return Buffer.from(buf)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function base64UrlDecode(input) {
-  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
-  const padLength = (4 - (normalized.length % 4)) % 4;
-  return Buffer.from(normalized + '='.repeat(padLength), 'base64');
-}
-
 // ─── Public re-exports (for advanced users / SSR / tests) ──────────────
 
 export { validateInstantPayload } from './validation.js';
 export { splitMessageIntoSentences, processInstantMessage } from './message-processor.js';
+export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
