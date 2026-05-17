@@ -1,5 +1,20 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.5.0 — 2026-05-17
+
+**New**
+
+- **`messages` 数组转发**：payload 新增可选 `messages` 字段，与 `completePrompt` 二选一互斥。上游应用直接把标准 OpenAI 格式的 `[{role:'system',...}, {role:'user',...}, {role:'assistant',...}, ...]` 透传过来，handler **原样**转给 LLM —— 不再被强行压成单个 user 消息。让 instant-push 路径和主聊天路径的 LLM 调用完全等价（system role、多轮历史、tool role 全保留）。
+  - `content` 支持 `string` 或非空数组（多模态留口子，元素 schema 不深挖）。
+  - role 限定 `system | user | assistant | tool`，违规 → `400 INVALID_PAYLOAD_FORMAT`。
+  - 两者同时给、两者都不给、`messages` 为空数组、role 非法 → 全部 `400`，错误信息明示 "exactly one of `completePrompt` or `messages` must be provided"。
+- **`temperature` 字段**：可选 number，会透传给 LLM。legacy `completePrompt` 路径无 temperature 时仍默认 0.8（保持旧行为）；`messages` 路径无 temperature 时**不发**，跟上游主路径完全一致。
+- LLM 请求 body 现在恒含 `stream: false`（instant 路径按契约非流式）。
+
+**Compatibility**
+
+- 旧 `completePrompt` 调用者**零修改**继续工作。push payload、subscription、VAPID key、错误码全部不动。0.4.x 直接升级即可。
+
 ## 0.4.0 — 2026-05-17
 
 **New**

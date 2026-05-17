@@ -111,11 +111,19 @@ Content-Type: application/json
 {
   contactName: string;
   avatarUrl?: string | null;
-  completePrompt: string;          // 必填（amsg-instant 不支持 fixed/auto）
+
+  // === 提示词，二选一恰好一个（0.5.0+）===
+  completePrompt?: string;         // 简单推送场景：单 user 消息
+  messages?: Array<{               // 多轮 / 带 system role：原样转发给 LLM
+    role: 'system' | 'user' | 'assistant' | 'tool';
+    content: string | unknown[];   // 数组形态留给多模态，元素不强校验
+  }>;
+
   apiUrl: string;                  // OpenAI 兼容端点；详见下方"apiUrl 规范化"
   apiKey: string;
   primaryModel: string;
   maxTokens?: number;
+  temperature?: number;            // 0.5.0+：透传给 LLM；completePrompt 路径未传默认 0.8
   messageSubtype?: string;         // SW 端分类标签，取值由业务决定
   pushSubscription: {              // Web Push 标准订阅
     endpoint: string;
@@ -125,7 +133,45 @@ Content-Type: application/json
 }
 ```
 
+`completePrompt` 和 `messages` 必须**恰好提供一个**；同时给或都不给都会返回 `400 INVALID_PAYLOAD_FORMAT`。`messages` 数组不能为空，每条 `role` 必须是 `system / user / assistant / tool`。handler **不会**对 `messages` 做任何自动注入或重排——上游传什么就发什么。
+
 `firstSendTime` 和 `recurrenceType` 在 `amsg-instant` 上是**非法字段**，会直接返回 `INVALID_PAYLOAD_FORMAT`。
+
+#### `messages` 模式 curl 示例
+
+```bash
+curl -X POST https://instant.example.com/instant \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contactName": "Rei",
+    "messages": [
+      { "role": "system", "content": "你是 Rei，回复要简短自然。" },
+      { "role": "user", "content": "今天会下雨吗？" },
+      { "role": "assistant", "content": "看了下，下午有阵雨。" },
+      { "role": "user", "content": "那提醒我一下带伞" }
+    ],
+    "apiUrl": "https://api.openai.com/v1/chat/completions",
+    "apiKey": "sk-...",
+    "primaryModel": "gpt-4o-mini",
+    "temperature": 0.7,
+    "pushSubscription": { "endpoint": "...", "keys": { "p256dh": "...", "auth": "..." } }
+  }'
+```
+
+对比 `completePrompt` 模式（简单推送，handler 内部包成单条 `{role:'user', content}`）：
+
+```bash
+curl -X POST https://instant.example.com/instant \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contactName": "Rei",
+    "completePrompt": "你是 Rei，用一句话提醒用户带伞",
+    "apiUrl": "https://api.openai.com/v1/chat/completions",
+    "apiKey": "sk-...",
+    "primaryModel": "gpt-4o-mini",
+    "pushSubscription": { "endpoint": "...", "keys": { "p256dh": "...", "auth": "..." } }
+  }'
+```
 
 #### `apiUrl` 规范化（0.4.0+）
 

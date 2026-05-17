@@ -79,12 +79,12 @@ describe('validateInstantPayload', () => {
     assert.equal(result.valid, false);
   });
 
-  it('rejects missing completePrompt', () => {
+  it('rejects when both completePrompt and messages are missing', () => {
     const p = makeValidPayload();
     delete p.completePrompt;
     const result = validateInstantPayload(p);
     assert.equal(result.valid, false);
-    assert.match(result.errorMessage, /completePrompt/);
+    assert.match(result.errorMessage, /completePrompt.*messages|messages.*completePrompt/);
   });
 
   it('rejects invalid maxTokens', () => {
@@ -95,6 +95,78 @@ describe('validateInstantPayload', () => {
   it('accepts maxTokens null/undefined', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ maxTokens: null })).valid, true);
     assert.equal(validateInstantPayload(makeValidPayload({ maxTokens: undefined })).valid, true);
+  });
+
+  // ── messages array support (0.5.0) ─────────────────────────────────
+  it('accepts messages array (without completePrompt)', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'system', content: 'you are Rei' },
+      { role: 'user', content: 'say hi' },
+    ];
+    const result = validateInstantPayload(p);
+    assert.equal(result.valid, true);
+  });
+
+  it('rejects when both completePrompt and messages are present', () => {
+    const p = makeValidPayload({
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const result = validateInstantPayload(p);
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /completePrompt.*messages|exactly one/);
+  });
+
+  it('rejects empty messages array', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [];
+    const result = validateInstantPayload(p);
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /messages/);
+  });
+
+  it('rejects messages with invalid role', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [{ role: 'human', content: 'hi' }];
+    const result = validateInstantPayload(p);
+    assert.equal(result.valid, false);
+    assert.match(result.errorMessage, /role/);
+  });
+
+  it('rejects messages with empty string content', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [{ role: 'user', content: '' }];
+    const result = validateInstantPayload(p);
+    assert.equal(result.valid, false);
+  });
+
+  it('accepts messages with array content (multimodal future-proofing)', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('rejects messages content that is neither string nor array', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [{ role: 'user', content: 123 }];
+    assert.equal(validateInstantPayload(p).valid, false);
+  });
+
+  it('accepts optional temperature', () => {
+    assert.equal(validateInstantPayload(makeValidPayload({ temperature: 0.3 })).valid, true);
+    assert.equal(validateInstantPayload(makeValidPayload({ temperature: null })).valid, true);
+  });
+
+  it('rejects non-numeric temperature', () => {
+    assert.equal(validateInstantPayload(makeValidPayload({ temperature: 'hot' })).valid, false);
   });
 });
 
@@ -248,6 +320,65 @@ describe('createInstantHandler — happy path', () => {
     assert.equal(res.status, 401);
     const body = await res.json();
     assert.equal(body.error.code, 'UNAUTHORIZED');
+  });
+});
+
+describe('createInstantHandler — messages array forwarding (0.5.0)', () => {
+  function captureLlmBody() {
+    const captured = {};
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async (_url, init) => {
+        captured.body = JSON.parse(init.body);
+        return makeLlmResponse('ok.');
+      },
+    });
+    return { router, captured };
+  }
+
+  it('forwards messages array verbatim to LLM (no auto role injection)', async () => {
+    const { router, captured } = captureLlmBody();
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const messages = [
+      { role: 'system', content: 'you are Rei' },
+      { role: 'user', content: 'first user msg' },
+      { role: 'assistant', content: 'first assistant reply' },
+      { role: 'user', content: 'follow up' },
+    ];
+    const payload = makeValidPayload();
+    delete payload.completePrompt;
+    payload.messages = messages;
+    payload.temperature = 0.42;
+
+    const res = await handler(makeRequest({ body: payload }));
+    assert.equal(res.status, 200);
+
+    assert.deepEqual(captured.body.messages, messages);
+    assert.equal(captured.body.model, 'model-x');
+    assert.equal(captured.body.stream, false);
+    assert.equal(captured.body.temperature, 0.42);
+  });
+
+  it('legacy completePrompt path still wraps into single user message', async () => {
+    const { router, captured } = captureLlmBody();
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(makeRequest({ body: makeValidPayload({ completePrompt: 'legacy hi' }) }));
+    assert.equal(res.status, 200);
+
+    assert.deepEqual(captured.body.messages, [{ role: 'user', content: 'legacy hi' }]);
+    assert.equal(captured.body.stream, false);
+  });
+
+  it('handler rejects when both completePrompt and messages are present', async () => {
+    const handler = createInstantHandler({ vapid });
+    const res = await handler(makeRequest({
+      body: makeValidPayload({ messages: [{ role: 'user', content: 'hi' }] }),
+    }));
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.code, 'INVALID_PAYLOAD_FORMAT');
   });
 });
 

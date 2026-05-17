@@ -14,6 +14,36 @@ function isValidUrl(s) {
   try { new URL(s); return true; } catch { return false; }
 }
 
+const VALID_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
+
+function validateMessagesArray(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return 'messages 必须是长度 ≥ 1 的数组';
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      return `messages[${i}] 必须是对象`;
+    }
+    if (!VALID_MESSAGE_ROLES.has(m.role)) {
+      return `messages[${i}].role 必须是 system / user / assistant / tool 之一`;
+    }
+    if (typeof m.content === 'string') {
+      if (!m.content) {
+        return `messages[${i}].content 不能是空字符串`;
+      }
+    } else if (Array.isArray(m.content)) {
+      if (m.content.length === 0) {
+        return `messages[${i}].content 数组不能为空`;
+      }
+      // Element schema is intentionally not validated — passed through to LLM as-is.
+    } else {
+      return `messages[${i}].content 必须是非空字符串或长度 ≥ 1 的数组`;
+    }
+  }
+  return null;
+}
+
 /**
  * Validate an instant payload.
  *
@@ -65,12 +95,57 @@ export function validateInstantPayload(payload) {
     };
   }
 
-  if (typeof payload.completePrompt !== 'string' || !payload.completePrompt.trim()) {
+  const hasCompletePrompt = payload.completePrompt !== undefined;
+  const hasMessages = payload.messages !== undefined;
+
+  if (hasCompletePrompt && hasMessages) {
     return {
       valid: false,
       errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: 'completePrompt 必填（amsg-instant 不支持 fixed/auto 模式）',
-      details: { missingFields: ['completePrompt'] }
+      errorMessage: 'exactly one of `completePrompt` or `messages` must be provided（两者不能同时出现）',
+      details: { invalidFields: ['completePrompt', 'messages'] }
+    };
+  }
+  if (!hasCompletePrompt && !hasMessages) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'exactly one of `completePrompt` or `messages` must be provided',
+      details: { missingFields: ['completePrompt', 'messages'] }
+    };
+  }
+
+  if (hasCompletePrompt) {
+    if (typeof payload.completePrompt !== 'string' || !payload.completePrompt.trim()) {
+      return {
+        valid: false,
+        errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: 'completePrompt 必须是非空字符串',
+        details: { invalidFields: ['completePrompt'] }
+      };
+    }
+  } else {
+    const messagesError = validateMessagesArray(payload.messages);
+    if (messagesError) {
+      return {
+        valid: false,
+        errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: messagesError,
+        details: { invalidFields: ['messages'] }
+      };
+    }
+  }
+
+  if (
+    payload.temperature !== undefined &&
+    payload.temperature !== null &&
+    (typeof payload.temperature !== 'number' || !Number.isFinite(payload.temperature))
+  ) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'temperature 必须是有限数字',
+      details: { invalidFields: ['temperature'] }
     };
   }
 

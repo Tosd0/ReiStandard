@@ -141,11 +141,30 @@ export function normalizeAiApiUrl(apiUrl) {
 }
 
 function buildAiRequestBody(payload) {
+  // messages mode: forward the caller's OpenAI-style array verbatim. No auto
+  // role injection, no concatenation back to a single user message — the
+  // point of this branch is to let the upstream app preserve system / multi-
+  // turn context across the instant-push path.
+  const llmMessages = payload.messages
+    ? payload.messages
+    : [{ role: 'user', content: payload.completePrompt }];
+
   const body = {
     model: payload.primaryModel,
-    messages: [{ role: 'user', content: payload.completePrompt }],
-    temperature: 0.8
+    messages: llmMessages,
+    // Instant path is one-shot, non-streaming by contract.
+    stream: false,
   };
+
+  // Default temperature only when caller didn't pick one AND we're in the
+  // legacy completePrompt path. In messages mode we forward whatever the
+  // upstream app set (or nothing) so behavior matches their main chat path
+  // byte-for-byte.
+  if (payload.temperature !== undefined && payload.temperature !== null) {
+    body.temperature = payload.temperature;
+  } else if (!payload.messages) {
+    body.temperature = 0.8;
+  }
 
   if (payload.maxTokens === undefined || payload.maxTokens === null) {
     return body;
