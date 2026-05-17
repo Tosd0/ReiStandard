@@ -7,6 +7,18 @@ on:
       - 'rei-standard-amsg-*@*'
   workflow_dispatch:
 
+# Belt-and-suspenders: even though scripts/publish-workspaces.mjs already
+# filters publishes to the tag-targeted package (so parallel runs cannot
+# step on each other's `npm publish`), a single shared concurrency group
+# serializes Release runs. That keeps logs tidy when several per-package
+# tags are pushed together, and guarantees we never get a `403 You cannot
+# publish over the previously published versions` race if the filter ever
+# regresses. `cancel-in-progress: false` is important — half-finished
+# publishes must never be killed mid-flight.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write

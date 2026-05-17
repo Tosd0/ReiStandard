@@ -7,6 +7,44 @@ const dryRun = process.argv.includes('--dry-run');
 const useProvenance = process.env.NPM_PUBLISH_PROVENANCE !== 'false';
 const publishTagFromEnv = (process.env.NPM_PUBLISH_TAG || '').trim();
 
+/**
+ * Parse the triggering git tag and, if it identifies a single package,
+ * return that package's npm name (e.g. `@rei-standard/amsg-instant`).
+ *
+ * Background — race with parallel tag pushes:
+ *   The Release workflow fires on every `rei-standard-amsg-*@*` tag push.
+ *   If multiple per-package tags are pushed at once (e.g. coordinated
+ *   instant + server + client release), N parallel workflow runs start,
+ *   and each iterates ALL public workspaces. They all see "version not
+ *   yet on npm", all try to publish, and N-1 of them lose a race to
+ *   `403 You cannot publish over the previously published versions`.
+ *
+ *   Filtering by the triggering tag means each run touches exactly one
+ *   package — no overlap, no race. The `v*` and `workflow_dispatch`
+ *   paths still sweep all workspaces (kept for coordinated rolling
+ *   releases and manual recovery).
+ *
+ * Pattern (matches the repo's existing tagging convention):
+ *   `rei-standard-amsg-instant@0.5.0`   → `@rei-standard/amsg-instant`
+ *   `rei-standard-amsg-server@2.2.0`    → `@rei-standard/amsg-server`
+ *   `rei-standard-amsg-client@2.2.1`    → `@rei-standard/amsg-client`
+ *   `v2.1.0` / undefined / manual run   → null (sweep all)
+ *
+ * @param {string} ref   - Typically `process.env.GITHUB_REF` (e.g.
+ *                         `refs/tags/rei-standard-amsg-instant@0.5.0`).
+ *                         Also accepts the bare tag name.
+ * @returns {string | null}
+ */
+function resolveTargetPackageFromTag(ref) {
+  if (!ref) return null;
+  const tagName = ref.startsWith('refs/tags/') ? ref.slice('refs/tags/'.length) : ref;
+  const match = tagName.match(/^rei-standard-amsg-([^@/]+)@/);
+  if (!match) return null;
+  return `@rei-standard/amsg-${match[1]}`;
+}
+
+const targetPackage = resolveTargetPackageFromTag(process.env.GITHUB_REF);
+
 function isPrereleaseVersion(version) {
   return /-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(version);
 }
@@ -178,7 +216,24 @@ function main() {
     return;
   }
 
-  for (const { dir, pkg } of publishable) {
+  let queue = publishable;
+  if (targetPackage) {
+    queue = publishable.filter((entry) => entry.pkg.name === targetPackage);
+    if (queue.length === 0) {
+      // The triggering tag's package name didn't match any workspace —
+      // either the tag was for something that lives outside the workspace
+      // root or a typo. Failing loud beats silently publishing nothing.
+      throw new Error(
+        `[publish] Tag-derived package "${targetPackage}" matches no workspace. ` +
+        `Triggering ref: ${process.env.GITHUB_REF || '(none)'}`
+      );
+    }
+    console.log(`[publish] Tag-scoped run: only publishing ${targetPackage} (from ${process.env.GITHUB_REF}).`);
+  } else {
+    console.log('[publish] Sweep-all run: iterating every public workspace (no per-package tag detected).');
+  }
+
+  for (const { dir, pkg } of queue) {
     ensureBuildArtifacts(dir, pkg);
 
     if (isVersionPublished(pkg.name, pkg.version)) {
