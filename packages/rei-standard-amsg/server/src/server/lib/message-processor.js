@@ -266,21 +266,37 @@ function buildAiRequestBody(payload) {
 }
 
 /**
- * Normalize AI API URL with minimal, non-breaking rules:
- * - trim whitespace
- * - remove redundant trailing slashes from pathname
- * - keep query string untouched
+ * Normalize AI API URL for OpenAI-compatible chat endpoints.
  *
- * Note: This function does NOT auto-append /v1 or /chat/completions.
+ * **Keep in sync** with `@rei-standard/amsg-instant`'s
+ * `src/message-processor.js` `normalizeAiApiUrl` — same rules, same
+ * tests. The two packages share this logic but each carry their own copy
+ * to avoid an architectural dependency (server should not depend on the
+ * stateless worker package).
+ *
+ * Rules (idempotent — running it twice equals running it once):
+ *   - Already ends with `/chat/completions`             → leave as-is.
+ *   - Bare host (no path or just `/`)                   → append `/v1/chat/completions`.
+ *   - Path ends with a version segment like `/v1`,
+ *     `/v2`, … (with or without trailing slash)         → append only
+ *     `/chat/completions`; never doubles `/v1` for
+ *     callers who already include it.
+ *   - Anything else (custom path that doesn't match the
+ *     OpenAI shape, e.g. `/v1/messages` for
+ *     Anthropic-style proxies)                          → leave as-is. The caller
+ *     knows their own routing.
+ *
+ * Query string is preserved verbatim.
  *
  * @param {string} apiUrl
  * @returns {string}
  */
-function normalizeAiApiUrl(apiUrl) {
+export function normalizeAiApiUrl(apiUrl) {
   if (typeof apiUrl !== 'string' || !apiUrl.trim()) {
     throw new Error(
       'Invalid apiUrl: apiUrl is required. ' +
-      'Please provide a full chat endpoint URL (for example: https://api.openai.com/v1/chat/completions).'
+      'Please provide a chat endpoint URL ' +
+      '(for example: https://api.openai.com or https://api.openai.com/v1/chat/completions).'
     );
   }
 
@@ -291,11 +307,24 @@ function normalizeAiApiUrl(apiUrl) {
     parsedUrl = new URL(trimmedApiUrl);
   } catch {
     throw new Error(
-      `Invalid apiUrl: "${apiUrl}". ` +
-      'Please provide a valid absolute URL that points to a full chat endpoint.'
+      `Invalid apiUrl: "${apiUrl}". Please provide a valid absolute URL.`
     );
   }
 
-  parsedUrl.pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
+  let path = parsedUrl.pathname.replace(/\/+$/, '') || '/';
+
+  if (/\/chat\/completions$/.test(path)) {
+    // Already a complete OpenAI-style endpoint. Don't double-suffix.
+  } else if (path === '/') {
+    // Bare host → assume OpenAI shape.
+    path = '/v1/chat/completions';
+  } else if (/\/v\d+$/.test(path)) {
+    // Path ends in `/v1`, `/v2`, … — caller already versioned the URL.
+    // Append only `/chat/completions`; never re-add `/v1`.
+    path = `${path}/chat/completions`;
+  }
+  // Any other custom path is left untouched on purpose.
+
+  parsedUrl.pathname = path;
   return parsedUrl.toString();
 }
