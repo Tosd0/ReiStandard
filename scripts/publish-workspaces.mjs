@@ -20,15 +20,15 @@ const publishTagFromEnv = (process.env.NPM_PUBLISH_TAG || '').trim();
  *   `403 You cannot publish over the previously published versions`.
  *
  *   Filtering by the triggering tag means each run touches exactly one
- *   package — no overlap, no race. The `v*` and `workflow_dispatch`
- *   paths still sweep all workspaces (kept for coordinated rolling
- *   releases and manual recovery).
+ *   package — no overlap, no race. `workflow_dispatch` and local CLI
+ *   invocations fall through to a sweep-all (every workspace that isn't
+ *   yet on npm), useful for manual recovery if a tag run died mid-batch.
  *
- * Pattern (matches the repo's existing tagging convention):
+ * Pattern (matches the repo's tagging convention):
  *   `rei-standard-amsg-instant@0.5.0`   → `@rei-standard/amsg-instant`
  *   `rei-standard-amsg-server@2.2.0`    → `@rei-standard/amsg-server`
  *   `rei-standard-amsg-client@2.2.1`    → `@rei-standard/amsg-client`
- *   `v2.1.0` / undefined / manual run   → null (sweep all)
+ *   undefined / manual / unknown shape  → null (sweep all)
  *
  * @param {string} ref   - Typically `process.env.GITHUB_REF` (e.g.
  *                         `refs/tags/rei-standard-amsg-instant@0.5.0`).

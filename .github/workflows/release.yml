@@ -3,7 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # Per-package release tags only. Historical `v*` tags (v2.1.0, etc.)
+      # were left over from when this repo was a single package — the root
+      # package.json is now `private: true` with no version field, so a
+      # `v*` tag has no semantic meaning here. Manual sweep-all is still
+      # available via `workflow_dispatch`.
       - 'rei-standard-amsg-*@*'
   workflow_dispatch:
 
