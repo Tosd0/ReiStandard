@@ -38,10 +38,16 @@ import {
  */
 
 /**
+ * @typedef {Object} CorsConfig
+ * @property {string} [allowOrigin='*']   - Value for `Access-Control-Allow-Origin`. Set to a specific origin (e.g. `https://app.example.com`) to enable credentialed requests / lock down which sites can call the Worker. `*` is fine for public instant endpoints — pushes are gated by the VAPID subscription key, not by origin.
+ */
+
+/**
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
  * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Weak by design: the token is visible in any frontend bundle that uses it. Use `tokenSigningKey` for real auth.
  * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
+ * @property {CorsConfig} [cors]              - CORS configuration. Defaults to `{ allowOrigin: '*' }`. Every response (including the 204 preflight short-circuit) carries the matching `Access-Control-Allow-*` headers.
  * @property {Object} [webpush]               - **Deprecated since 0.3.0.** Ignored. amsg-instant now implements RFC 8291 + RFC 8292 natively on Web Crypto. Tests should intercept the push HTTP request via `options.fetch` instead.
  * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy). Used for BOTH the LLM call and the outgoing Web Push POST.
  * @property {(e: { type: string }) => void} [onEvent]
@@ -74,28 +80,39 @@ export function createInstantHandler(options) {
   const tokenSigningKey = options.tokenSigningKey ? String(options.tokenSigningKey) : '';
   const clientToken = options.clientToken ? String(options.clientToken) : '';
   const expectedClientTokenBytes = clientToken ? utf8(clientToken) : null;
+  const corsHeaders = buildCorsHeaders(options.cors);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
   const vapidValid = isVapidConfigValid(options.vapid);
 
+  const respond = (status, body) => jsonResponse(status, body, corsHeaders);
+
   return async function handler(request) {
     onEvent({ type: 'request' });
 
+    // CORS preflight short-circuit. Browsers fire OPTIONS before any
+    // cross-origin POST that carries `Authorization` / `Content-Type:
+    // application/json` / a custom `X-Client-Token` header — so this path
+    // hits before we ever try to parse the JSON body.
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
     if (request.method !== 'POST') {
-      return jsonResponse(405, {
+      return respond(405, {
         success: false,
         error: { code: 'METHOD_NOT_ALLOWED', message: 'Only POST is supported' }
       });
     }
 
     if (tokenSigningKey) {
-      const tokenError = await verifyBearerToken(request, tokenSigningKey);
+      const tokenError = await verifyBearerToken(request, tokenSigningKey, respond);
       if (tokenError) return tokenError;
     }
 
     if (expectedClientTokenBytes) {
-      const tokenError = verifyClientToken(request, expectedClientTokenBytes);
+      const tokenError = verifyClientToken(request, expectedClientTokenBytes, respond);
       if (tokenError) return tokenError;
     }
 
@@ -103,7 +120,7 @@ export function createInstantHandler(options) {
     try {
       rawBody = await request.text();
     } catch (_err) {
-      return jsonResponse(400, {
+      return respond(400, {
         success: false,
         error: { code: 'INVALID_PAYLOAD_FORMAT', message: '无法读取请求体' }
       });
@@ -113,7 +130,7 @@ export function createInstantHandler(options) {
     try {
       payload = JSON.parse(rawBody);
     } catch {
-      return jsonResponse(400, {
+      return respond(400, {
         success: false,
         error: { code: 'INVALID_PAYLOAD_FORMAT', message: '请求体不是合法 JSON' }
       });
@@ -121,7 +138,7 @@ export function createInstantHandler(options) {
 
     const validation = validateInstantPayload(payload);
     if (!validation.valid) {
-      return jsonResponse(400, {
+      return respond(400, {
         success: false,
         error: {
           code: validation.errorCode,
@@ -132,7 +149,7 @@ export function createInstantHandler(options) {
     }
 
     if (!vapidValid) {
-      return jsonResponse(500, {
+      return respond(500, {
         success: false,
         error: { code: 'VAPID_CONFIG_ERROR', message: 'VAPID 配置缺失或无效' }
       });
@@ -144,12 +161,12 @@ export function createInstantHandler(options) {
         fetch: options.fetch || globalThis.fetch,
         onEvent
       });
-      return jsonResponse(200, { success: true, data: result });
+      return respond(200, { success: true, data: result });
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
       const status = code === 'PUSH_SEND_FAILED' || code === 'LLM_CALL_FAILED' ? 502 : 500;
-      return jsonResponse(status, {
+      return respond(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' }
       });
@@ -167,10 +184,40 @@ function getHeader(request, name) {
   }
 }
 
-function jsonResponse(status, body) {
+/**
+ * Build the `Access-Control-Allow-*` headers applied to every response.
+ *
+ * `Vary: Origin` is added only when the allowed origin isn't the wildcard
+ * — caching layers in front of the Worker need it so they don't serve a
+ * permissive ACAO header to the wrong site.
+ *
+ * @param {{ allowOrigin?: string } | undefined} cors
+ * @returns {Record<string, string>}
+ */
+function buildCorsHeaders(cors) {
+  const allowOrigin = (cors && typeof cors.allowOrigin === 'string' && cors.allowOrigin.trim())
+    ? cors.allowOrigin.trim()
+    : '*';
+
+  const headers = {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Token',
+    'Access-Control-Max-Age': '86400',
+  };
+  if (allowOrigin !== '*') {
+    headers['Vary'] = 'Origin';
+  }
+  return headers;
+}
+
+function jsonResponse(status, body, extraHeaders) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...(extraHeaders || {}),
+    },
   });
 }
 
@@ -181,17 +228,17 @@ function isVapidConfigValid(vapid) {
   return true;
 }
 
-function verifyClientToken(request, expectedBytes) {
+function verifyClientToken(request, expectedBytes, respond) {
   const received = getHeader(request, 'x-client-token');
   if (!received) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' }
     });
   }
   const receivedBytes = utf8(received);
   if (!timingSafeEqualBytes(receivedBytes, expectedBytes)) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' }
     });
@@ -199,10 +246,10 @@ function verifyClientToken(request, expectedBytes) {
   return null;
 }
 
-async function verifyBearerToken(request, signingKey) {
+async function verifyBearerToken(request, signingKey, respond) {
   const authHeader = getHeader(request, 'authorization');
   if (!authHeader.toLowerCase().startsWith('bearer ')) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: '缺少 Authorization: Bearer <token>' }
     });
@@ -210,7 +257,7 @@ async function verifyBearerToken(request, signingKey) {
 
   const token = authHeader.slice(7).trim();
   if (!token) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: '空 Bearer token' }
     });
@@ -218,7 +265,7 @@ async function verifyBearerToken(request, signingKey) {
 
   const parts = token.split('.');
   if (parts.length !== 3) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 格式无效' }
     });
@@ -232,13 +279,13 @@ async function verifyBearerToken(request, signingKey) {
   try {
     receivedBytes = base64UrlToBytes(receivedSig);
   } catch {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 签名格式无效' }
     });
   }
   if (!timingSafeEqualBytes(receivedBytes, expectedSigBytes)) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 签名无效' }
     });
@@ -248,14 +295,14 @@ async function verifyBearerToken(request, signingKey) {
   try {
     payload = JSON.parse(utf8Decode(base64UrlToBytes(encodedPayload)));
   } catch {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token payload 解析失败' }
     });
   }
 
   if (!payload || payload.v !== 1 || !payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
-    return jsonResponse(401, {
+    return respond(401, {
       success: false,
       error: { code: 'UNAUTHORIZED', message: 'token 已过期或无效' }
     });
@@ -267,5 +314,5 @@ async function verifyBearerToken(request, signingKey) {
 // ─── Public re-exports (for advanced users / SSR / tests) ──────────────
 
 export { validateInstantPayload } from './validation.js';
-export { splitMessageIntoSentences, processInstantMessage } from './message-processor.js';
+export { splitMessageIntoSentences, processInstantMessage, normalizeAiApiUrl } from './message-processor.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';

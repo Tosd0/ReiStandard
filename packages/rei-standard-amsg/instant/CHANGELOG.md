@@ -1,5 +1,27 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.4.0 — 2026-05-17
+
+**New**
+
+- **CORS 内置**：handler 在入口处短路 `OPTIONS` 预检请求 → `204 No Content`，所有响应（含 200 / 4xx / 5xx）自动叠 `Access-Control-Allow-Origin / -Methods / -Headers` + `Access-Control-Max-Age: 86400`。浏览器跨域调用零配置 work。
+- `options.cors?: { allowOrigin?: string }`：自定义允许来源，默认 `'*'`。配成具体来源时自动附 `Vary: Origin`，避免反向代理缓存把 CORS policy 串到错的站点。
+- **`normalizeAiApiUrl(apiUrl)`** 智能补全 OpenAI 兼容路径，**幂等**（跑两次 = 跑一次）：
+  - 裸 host（如 `https://api.openai.com`）→ 补 `/v1/chat/completions`
+  - 末尾是 `/v1` 或 `/v2` 等版本段 → 只补 `/chat/completions`，**不会重复加 v1**
+  - 已含 `/chat/completions` → 原样返回
+  - 其他自定义路径（如 Anthropic 的 `/v1/messages`）→ 不动，尊重 caller 的路由
+
+  老调用者传完整 `…/v1/chat/completions` 仍然工作。函数也作为顶层 export 暴露，方便业务在前端做一致的预校验。
+
+**Improvements**
+
+- 验证函数（Bearer / clientToken）的所有 401/4xx 响应现在也带 CORS headers，让浏览器能正常读到 `body.error.code` 而不是 fail 在 CORS 检查上。
+
+**Compatibility**
+
+- 协议字段零变更；推送 payload、subscription、VAPID key 全部不动。0.3.x 直接升级即可。
+
 ## 0.3.0 — 2026-05-17
 
 **BREAKING**

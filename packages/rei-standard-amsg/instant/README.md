@@ -32,6 +32,7 @@ npm install @rei-standard/amsg-instant
 | `vapid.privateKey`  | string    | ✅   | VAPID 私钥 |
 | `clientToken`       | string    | ❌   | 弱共享密钥；配了则校验 `X-Client-Token` 头。**只防 URL 直怼/脚本小子**，不防有心人（前端 bundle 必然带着 token） |
 | `tokenSigningKey`   | string    | ❌   | 强鉴权 HMAC 密钥；配了则校验 `Authorization: Bearer <jwt>` |
+| `cors.allowOrigin`  | string    | ❌   | `Access-Control-Allow-Origin` 的值，默认 `*`。配成具体来源（如 `https://app.example.com`）会自动加 `Vary: Origin`。0.4.0 起 handler 在入口处短路 `OPTIONS` 预检请求并对所有响应（200/4xx/5xx 都包括）叠 CORS headers。 |
 | `webpush`           | object    | ❌   | **0.3.0 起废弃**。保留参数兼容旧代码但被忽略；测试改用 `fetch` 拦截 push endpoint 的 POST。 |
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
 | `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
@@ -45,6 +46,28 @@ npm install @rei-standard/amsg-instant
 - **强鉴权**（配 `tokenSigningKey`）：客户端带 `Authorization: Bearer <JWT>`，HMAC-SHA256 签名校验 + 过期时间检查。生产部署推荐。
 
 两个可以同时配（先校验 Bearer，再校验 X-Client-Token）。
+
+### CORS
+
+handler 默认就**对所有响应**（包括 200 / 400 / 401 / 500）叠 `Access-Control-Allow-*` 头，并在入口处短路 `OPTIONS` 预检请求 → `204 No Content`。浏览器从任何来源调用 Worker 都直接 work，不用自己写 middleware。
+
+```js
+createInstantHandler({
+  vapid: { ... },
+  // 默认 allowOrigin: '*'，省略这一项即可
+  cors: { allowOrigin: 'https://app.example.com' },  // 锁定来源；自动附 Vary: Origin
+});
+```
+
+固定开放的 headers / methods：
+
+| Header                              | 值                                       |
+|-------------------------------------|------------------------------------------|
+| `Access-Control-Allow-Origin`       | `*`（默认）或 `cors.allowOrigin`         |
+| `Access-Control-Allow-Methods`      | `POST, OPTIONS`                          |
+| `Access-Control-Allow-Headers`      | `Content-Type, Authorization, X-Client-Token` |
+| `Access-Control-Max-Age`            | `86400`                                  |
+| `Vary`                              | `Origin`（仅当 `allowOrigin !== '*'`）   |
 
 ## API
 
@@ -89,7 +112,7 @@ Content-Type: application/json
   contactName: string;
   avatarUrl?: string | null;
   completePrompt: string;          // 必填（amsg-instant 不支持 fixed/auto）
-  apiUrl: string;                  // OpenAI 兼容完整端点
+  apiUrl: string;                  // OpenAI 兼容端点；详见下方"apiUrl 规范化"
   apiKey: string;
   primaryModel: string;
   maxTokens?: number;
@@ -103,6 +126,22 @@ Content-Type: application/json
 ```
 
 `firstSendTime` 和 `recurrenceType` 在 `amsg-instant` 上是**非法字段**，会直接返回 `INVALID_PAYLOAD_FORMAT`。
+
+#### `apiUrl` 规范化（0.4.0+）
+
+为了让用户不必死记 OpenAI 路径全名，Worker 会按下表规则补全 `apiUrl`。规则幂等：跑两次 = 跑一次，所以传完整 URL 也不会被改坏。
+
+| 输入                                                          | 输出                                                           |
+|---------------------------------------------------------------|----------------------------------------------------------------|
+| `https://api.openai.com`                                      | `https://api.openai.com/v1/chat/completions`                   |
+| `https://api.openai.com/`                                     | `https://api.openai.com/v1/chat/completions`                   |
+| `https://api.openai.com/v1`                                   | `https://api.openai.com/v1/chat/completions`（**不会重复加 v1**） |
+| `https://api.openai.com/v1/`                                  | `https://api.openai.com/v1/chat/completions`                   |
+| `https://api.openai.com/v1/chat/completions`                  | 原样返回                                                       |
+| `https://my.proxy.com/openai/v2`                              | `https://my.proxy.com/openai/v2/chat/completions`              |
+| `https://api.anthropic.com/v1/messages`（其他自定义路径）      | 原样返回，不动                                                  |
+
+如果想绕开这个规则（比如代理路径很奇怪），传完整 `…/chat/completions` 即可。
 
 **响应**（成功）：
 
@@ -288,6 +327,7 @@ await client.sendInstant({
 - `validateInstantPayload(payload)`
 - `splitMessageIntoSentences(text)`
 - `processInstantMessage(payload, ctx)`
+- `normalizeAiApiUrl(apiUrl)` — 0.4.0 新增，幂等地补全 `/v1/chat/completions`
 - `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现
 - `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
 

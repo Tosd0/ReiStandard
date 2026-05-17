@@ -85,15 +85,31 @@ export function buildInstantPushPayload({
 }
 
 /**
- * Normalize the AI API URL: trim whitespace, strip trailing slashes,
- * preserve query string. Does NOT auto-append /v1 or /chat/completions.
+ * Normalize the AI API URL for OpenAI-compatible chat endpoints.
+ *
+ * Rules (idempotent — running it twice is the same as running it once):
+ *   - Already ends with `/chat/completions`           → leave as-is.
+ *   - Bare host (no path or just `/`)                  → append `/v1/chat/completions`.
+ *   - Path ends with a version segment like `/v1`,
+ *     `/v2`, … (with or without trailing slash)       → append only `/chat/completions`
+ *     (never doubles `/v1` for callers who already
+ *      include it).
+ *   - Anything else (custom path that doesn't match
+ *     the OpenAI shape, e.g. `/v1/messages` for
+ *     Anthropic-style proxies, or `/openai/api/foo`)   → leave as-is. We don't
+ *     guess — the caller knows their own routing.
+ *
+ * The query string is preserved verbatim.
+ *
+ * @param {string} apiUrl
+ * @returns {string}
  */
-function normalizeAiApiUrl(apiUrl) {
+export function normalizeAiApiUrl(apiUrl) {
   const trimmed = String(apiUrl || '').trim();
   if (!trimmed) {
     throw new Error(
-      'Invalid apiUrl: apiUrl is required. Please provide a full chat endpoint URL ' +
-      '(for example: https://api.openai.com/v1/chat/completions).'
+      'Invalid apiUrl: apiUrl is required. Please provide a chat endpoint URL ' +
+      '(for example: https://api.openai.com or https://api.openai.com/v1/chat/completions).'
     );
   }
 
@@ -102,11 +118,25 @@ function normalizeAiApiUrl(apiUrl) {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(
-      `Invalid apiUrl: "${apiUrl}". Please provide a valid absolute URL that points to a full chat endpoint.`
+      `Invalid apiUrl: "${apiUrl}". Please provide a valid absolute URL.`
     );
   }
 
-  parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+  let path = parsed.pathname.replace(/\/+$/, '') || '/';
+
+  if (/\/chat\/completions$/.test(path)) {
+    // Already a complete OpenAI-style endpoint. Don't double-suffix.
+  } else if (path === '/') {
+    // Bare host → assume OpenAI shape.
+    path = '/v1/chat/completions';
+  } else if (/\/v\d+$/.test(path)) {
+    // Path ends in a version segment (e.g. `/v1`, `/v2`). User already
+    // versioned the URL — just append `/chat/completions`, never re-add `/v1`.
+    path = `${path}/chat/completions`;
+  }
+  // Any other custom path is left untouched on purpose.
+
+  parsed.pathname = path;
   return parsed.toString();
 }
 
