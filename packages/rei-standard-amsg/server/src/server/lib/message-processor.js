@@ -10,6 +10,55 @@
 import { randomUUID } from 'crypto';
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 
+const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
+
+/**
+ * Split a single chunk by one regex; on no-match return [chunk] so a later
+ * regex in a cascade can still take a swing at it.
+ */
+function splitOnceByRegex(chunk, regex) {
+  const out = chunk
+    .split(regex)
+    .reduce((acc, part, i, arr) => {
+      if (i % 2 === 0 && part.trim()) {
+        const punctuation = arr[i + 1] || '';
+        acc.push(part.trim() + punctuation);
+      }
+      return acc;
+    }, [])
+    .filter(s => s.length > 0);
+  return out.length > 0 ? out : [chunk];
+}
+
+/**
+ * Sentence splitter — kept byte-for-byte equivalent to
+ * `@rei-standard/amsg-instant`'s `splitMessageIntoSentences`. Server carries
+ * its own copy to avoid an architectural dependency on the instant package.
+ * Name matches the instant export on purpose so cross-package grep finds
+ * both copies; if you fix a bug here, fix it in the instant copy too.
+ *
+ * @param {string} messageContent
+ * @param {string | string[] | null} [splitPattern=null]
+ * @returns {string[]}
+ */
+function splitMessageIntoSentences(messageContent, splitPattern = null) {
+  const sources =
+    splitPattern == null ? null :
+    Array.isArray(splitPattern) ? splitPattern :
+    [splitPattern];
+
+  const regexes = (sources && sources.length > 0)
+    ? sources.map(s => new RegExp(s))
+    : [DEFAULT_SPLIT_REGEX];
+
+  let chunks = [messageContent];
+  for (const regex of regexes) {
+    chunks = chunks.flatMap(c => splitOnceByRegex(c, regex));
+  }
+
+  return chunks.length > 0 ? chunks : [messageContent];
+}
+
 /**
  * @typedef {Object} ProcessorContext
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
@@ -56,19 +105,12 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       throw new Error('Invalid message configuration: no content source available');
     }
 
-    // Sentence splitting
-    const sentences = messageContent
-      .split(/([。！？!?]+)/)
-      .reduce((acc, part, i, arr) => {
-        if (i % 2 === 0 && part.trim()) {
-          const punctuation = arr[i + 1] || '';
-          acc.push(part.trim() + punctuation);
-        }
-        return acc;
-      }, [])
-      .filter(s => s.length > 0);
-
-    const messages = sentences.length > 0 ? sentences : [messageContent];
+    // Sentence splitting (mirrors @rei-standard/amsg-instant
+    // splitMessageIntoSentences — keep in lockstep; do not drift). Caller may
+    // override the default regex via decryptedPayload.splitPattern (string
+    // for a single regex, string[] for a cascade). Validation already enforces
+    // length cap + RegExp compilability upstream.
+    const messages = splitMessageIntoSentences(messageContent, decryptedPayload.splitPattern ?? null);
 
     if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');

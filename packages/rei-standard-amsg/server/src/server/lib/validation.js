@@ -49,6 +49,47 @@ export function isValidUUIDv4(uuid) {
 
 const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
+const SPLIT_PATTERN_MAX_LENGTH = 200;
+const SPLIT_PATTERN_MAX_ITEMS = 10;
+
+/**
+ * Validate the optional `splitPattern` field. Mirrors
+ * @rei-standard/amsg-instant's `validateSplitPattern` (kept in lockstep).
+ * Accepts `string`, `string[]`, or absent/null. Returns an error message
+ * string, or null when valid.
+ *
+ * Limits (per-item length ≤ 200, array ≤ 10 items, must compile via
+ * `new RegExp(item)`) are an **input-size guard**, NOT a ReDoS defense —
+ * a 6-character pattern like `(a+)+$` is enough to trigger catastrophic
+ * backtracking. The real backstop is Worker / runtime CPU limits + the
+ * fact that splitPattern is stored under the user's own encrypted task
+ * and matched against output from the user's own LLM API key, so the
+ * blast radius is self-inflicted only (no cross-tenant attack surface).
+ *
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function validateSplitPattern(value) {
+  if (value === undefined || value === null) return null;
+  const isArray = Array.isArray(value);
+  const items = isArray ? value : [value];
+  if (isArray && items.length === 0) return null;          // empty array = use default
+  if (items.length > SPLIT_PATTERN_MAX_ITEMS) {
+    return `splitPattern 数组最多 ${SPLIT_PATTERN_MAX_ITEMS} 项`;
+  }
+  for (let i = 0; i < items.length; i++) {
+    const s = items[i];
+    const label = isArray ? `splitPattern[${i}]` : 'splitPattern';
+    if (typeof s !== 'string') return `${label} 必须是字符串`;
+    if (s.length > SPLIT_PATTERN_MAX_LENGTH) {
+      return `${label} 不能超过 ${SPLIT_PATTERN_MAX_LENGTH} 字符`;
+    }
+    try { new RegExp(s); }
+    catch (_) { return `${label} 不是有效正则表达式`; }
+  }
+  return null;
+}
+
 /**
  * Validate an OpenAI-style messages array. Same shape contract as
  * `@rei-standard/amsg-instant` (kept in lockstep on purpose — both packages
@@ -202,6 +243,11 @@ export function validateScheduleMessagePayload(payload) {
     typeof payload.messageSubtype !== 'string'
   ) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['messageSubtype'] } };
+  }
+
+  const splitErr = validateSplitPattern(payload.splitPattern);
+  if (splitErr) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: splitErr, details: { invalidFields: ['splitPattern'] } };
   }
 
   return { valid: true };

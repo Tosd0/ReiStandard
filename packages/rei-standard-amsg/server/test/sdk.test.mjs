@@ -466,3 +466,201 @@ describe('createReiServer v2.0.1 flow', () => {
     assert.equal(result.body.error.code, 'INVALID_TENANT_AUTH');
   });
 });
+
+// ─── update-message splitPattern round-trip (v2.3.0) ──────────────────
+//
+// The update-message handler uses a hasOwnProperty merge so that explicit
+// `splitPattern: null` resets to default instead of being swallowed by a
+// truthy-spread. The mechanism is mechanical but easy to break in a refactor
+// — verify the set / reset / preserve triad end-to-end against an encrypted
+// stored payload.
+describe('update-message splitPattern round-trip', () => {
+  async function buildServerAndAdapter() {
+    const adapter = createFakeAdapter();
+    const server = await createReiServer({
+      vapid: {
+        email: 'vapid@example.com',
+        publicKey: 'BDhAMffLOGHAGMeiU10WAui8vJ75OLtytejvWSTY26CtUd0L4QBlg7zC_EBD-w-xEPSdWxf2WCdBVGySkINp-7c',
+        privateKey: '3Es187YegZBYEbLax2xJsIL_mhIRutxMeRab3OMOHII'
+      },
+      tenant: {
+        blobNamespace: 'test-namespace-splitpattern',
+        kek: 'kek-secret',
+        tokenSigningKey: 'tenant-signing-secret',
+        initSecret: 'init-secret',
+        publicBaseUrl: 'https://example.com',
+        adapterFactory: async () => adapter
+      }
+    });
+    return { server, adapter };
+  }
+
+  async function bootstrapTenant(server) {
+    const initResult = await server.handlers.initTenant.POST(
+      { 'x-init-secret': 'init-secret' },
+      { driver: 'neon', databaseUrl: 'postgres://tenant-db' }
+    );
+    const tenantToken = initResult.body.data.tenantToken;
+    const keyResult = await server.handlers.getUserKey.GET('/api/v1/get-user-key', {
+      authorization: `Bearer ${tenantToken}`,
+      'x-user-id': TEST_USER_ID
+    });
+    return { tenantToken, userKey: keyResult.body.data.userKey };
+  }
+
+  it('PUT splitPattern persists; PUT null resets; omitting preserves', async () => {
+    globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
+    const { server, adapter } = await buildServerAndAdapter();
+
+    const { tenantToken, userKey } = await bootstrapTenant(server);
+
+    // Step 1: schedule a fixed message WITH a splitPattern set up front.
+    const taskUuid = '11111111-2222-4333-8444-555555555555';
+    const firstSendTime = new Date(Date.now() + 60_000).toISOString();
+    const scheduleBody = encryptPayload(
+      {
+        uuid: taskUuid,
+        contactName: 'Alice',
+        messageType: 'fixed',
+        firstSendTime,
+        pushSubscription: { endpoint: 'https://push.example.com' },
+        userMessage: 'hello',
+        splitPattern: '([\\n]+)'
+      },
+      userKey
+    );
+
+    const scheduleResult = await server.handlers.scheduleMessage.POST(
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      scheduleBody
+    );
+    assert.equal(scheduleResult.status, 201);
+
+    // Read the encrypted row back via the adapter (decrypt with userKey).
+    const taskRow = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    assert.ok(taskRow, 'task row should exist after schedule');
+    const initial = JSON.parse(decryptFromStorage(taskRow.encrypted_payload, userKey));
+    assert.equal(initial.splitPattern, '([\\n]+)', 'schedule persists splitPattern');
+
+    // Step 2: PUT splitPattern to a NEW value.
+    const updateBody1 = encryptPayload({ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'] }, userKey);
+    const updateResult1 = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      updateBody1
+    );
+    assert.equal(updateResult1.status, 200);
+    assert.deepEqual(updateResult1.body.data.updatedFields, ['splitPattern']);
+
+    const afterSet = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const afterSetData = JSON.parse(decryptFromStorage(afterSet.encrypted_payload, userKey));
+    assert.deepEqual(afterSetData.splitPattern, ['(\\n\\n+)', '([。！？!?]+)']);
+
+    // Step 3: PUT splitPattern: null → MUST reset to default (the
+    // hasOwnProperty merge is the whole point — a truthy-spread would
+    // silently drop null).
+    const updateBody2 = encryptPayload({ splitPattern: null }, userKey);
+    const updateResult2 = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      updateBody2
+    );
+    assert.equal(updateResult2.status, 200);
+
+    const afterReset = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const afterResetData = JSON.parse(decryptFromStorage(afterReset.encrypted_payload, userKey));
+    assert.equal(afterResetData.splitPattern, null, 'explicit null resets the field');
+
+    // Step 4: PUT with splitPattern omitted entirely → existing value
+    // preserved. First put it back to a concrete value, then patch some
+    // other field and verify splitPattern survives.
+    const updateBody3 = encryptPayload({ splitPattern: '(##+)' }, userKey);
+    await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      updateBody3
+    );
+
+    const unrelatedPatch = encryptPayload({ avatarUrl: 'https://example.com/a.png' }, userKey);
+    await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      unrelatedPatch
+    );
+
+    const preserved = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const preservedData = JSON.parse(decryptFromStorage(preserved.encrypted_payload, userKey));
+    assert.equal(preservedData.splitPattern, '(##+)', 'omitted splitPattern preserves prior value');
+    assert.equal(preservedData.avatarUrl, 'https://example.com/a.png');
+  });
+
+  it('PUT rejects malformed splitPattern with INVALID_UPDATE_DATA', async () => {
+    globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
+    const { server } = await buildServerAndAdapter();
+    const { tenantToken, userKey } = await bootstrapTenant(server);
+
+    // Need an existing task to update.
+    const taskUuid = '22222222-2222-4333-8444-666666666666';
+    const scheduleBody = encryptPayload(
+      {
+        uuid: taskUuid,
+        contactName: 'Bob',
+        messageType: 'fixed',
+        firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+        pushSubscription: { endpoint: 'https://push.example.com' },
+        userMessage: 'hi'
+      },
+      userKey
+    );
+    await server.handlers.scheduleMessage.POST(
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      scheduleBody
+    );
+
+    const badBody = encryptPayload({ splitPattern: '[' }, userKey);
+    const result = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      badBody
+    );
+
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
+    assert.deepEqual(result.body.error.details.invalidFields, ['splitPattern']);
+  });
+});

@@ -96,6 +96,10 @@ export function createScheduleMessageHandler(ctx) {
       messages: Array.isArray(payload.messages) ? payload.messages : null,
       maxTokens: payload.maxTokens ?? null,
       temperature: payload.temperature ?? null,
+      // 0.6.0+: optional caller-provided regex (string or string[]) used by
+      // the message processor to chunk LLM output into individual pushes.
+      // null → processor falls back to the default /([。！？!?]+)/ regex.
+      splitPattern: payload.splitPattern ?? null,
       pushSubscription: payload.pushSubscription,
       metadata: payload.metadata || {}
     };

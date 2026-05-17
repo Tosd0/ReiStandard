@@ -8,7 +8,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray } from '../lib/validation.js';
+import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray, validateSplitPattern } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -104,6 +104,12 @@ export function createUpdateMessageHandler(ctx) {
     ) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['temperature'] } } } };
     }
+    if (Object.prototype.hasOwnProperty.call(updates, 'splitPattern')) {
+      const splitErr = validateSplitPattern(updates.splitPattern);
+      if (splitErr) {
+        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: splitErr, details: { invalidFields: ['splitPattern'] } } } };
+      }
+    }
 
     // Fetch existing task
     const existingTask = await db.getTaskByUuid(taskUuid, userId);
@@ -138,7 +144,11 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
       ...(updates.metadata && { metadata: updates.metadata }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null }),
-      ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null })
+      ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null }),
+      // splitPattern: hasOwnProperty so that explicit `null` (= revert to
+      // default) doesn't get swallowed by truthy-spread the way the optional
+      // string fields above are.
+      ...(Object.prototype.hasOwnProperty.call(updates, 'splitPattern') && { splitPattern: updates.splitPattern ?? null })
     };
 
     const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);

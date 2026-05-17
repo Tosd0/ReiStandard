@@ -1,5 +1,23 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.3.0 — 2026-05-18
+
+### New
+
+- **`splitPattern` 自定义分句正则**（与 [`@rei-standard/amsg-instant` 0.6.0](../instant/CHANGELOG.md#060--2026-05-18) 同步）：`schedule-message` / `update-message` payload 新增可选 `splitPattern: string | string[]` 字段。
+  - `string` → 单个正则 source（不带 flags），用 `new RegExp(splitPattern)` 编译后替代默认 `/([。！？!?]+)/`。
+  - `string[]` → **级联**应用：先按数组首项切，每段再按下一项切，以此类推。适合分层切分（先按段落 `(\n\n+)`、再按句号 `([。！？!?]+)`）。
+  - 不传 / `null` / `[]` → 走默认正则，行为字节级不变；老库存任务（无此字段）行为不变。
+  - **限制**：每项 ≤ 200 字符，数组 ≤ 10 项，每项必须能 `new RegExp(...)` 通过。违规 → `400 INVALID_PARAMETERS`（schedule）/ `400 INVALID_UPDATE_DATA`（update）。
+  - **捕获组约定**：想让分隔符回贴到前一段（与默认行为一致），把分隔符放进 `(...)` 捕获组。库不自动包裹。
+  - 持久化：随 `fullTaskData` 一起加密落盘；`update-message` 用 `hasOwnProperty` 模式合并，显式传 `splitPattern: null` 可重置回默认。
+- 顶层 export `validateSplitPattern(value)`：业务可在 SDK 之外做同步预校验。
+
+### Compatibility
+
+- 2.2.x 调用者**零修改**继续工作。DB schema、加密格式、推送 payload、错误码全部不动。2.2.x 直接升级即可。
+- 与 `@rei-standard/amsg-instant` 0.6.0 共享语义；两端独立实现但行为字节级一致。
+
 ## 2.2.0 — 2026-05-17
 
 ### New

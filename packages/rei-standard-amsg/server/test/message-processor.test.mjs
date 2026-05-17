@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage, normalizeAiApiUrl } from '../src/server/lib/message-processor.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
-import { validateScheduleMessagePayload, validateLlmMessagesArray } from '../src/server/lib/validation.js';
+import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern } from '../src/server/lib/validation.js';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
@@ -455,6 +455,166 @@ describe('messages array support', () => {
       const result = await processSingleMessage(task, createContext());
       assert.equal(result.success, true);
       assert.equal(Object.hasOwn(requestBodies[0], 'temperature'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+// ─── splitPattern (v2.3.0) — parity with @rei-standard/amsg-instant ────
+describe('splitPattern support', () => {
+  function basePayload(overrides = {}) {
+    return {
+      contactName: 'Rei',
+      messageType: 'prompted',
+      firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+      completePrompt: 'say hi',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
+      ...overrides,
+    };
+  }
+
+  it('validateSplitPattern: accepts absent / null / empty array', () => {
+    assert.equal(validateSplitPattern(undefined), null);
+    assert.equal(validateSplitPattern(null), null);
+    assert.equal(validateSplitPattern([]), null);
+  });
+
+  it('validateSplitPattern: accepts string and string[]', () => {
+    assert.equal(validateSplitPattern('([\\n]+)'), null);
+    assert.equal(validateSplitPattern(['(\\n\\n+)', '([。！？!?]+)']), null);
+  });
+
+  it('validateSplitPattern: rejects non-string / array element non-string', () => {
+    assert.match(validateSplitPattern(42), /必须是字符串/);
+    assert.match(validateSplitPattern(['ok', 7]), /splitPattern\[1\]/);
+  });
+
+  it('validateSplitPattern: enforces per-item length and array size caps', () => {
+    const long = 'a'.repeat(201);
+    assert.match(validateSplitPattern(long), /200/);
+    assert.match(
+      validateSplitPattern(Array.from({ length: 11 }, () => '.')),
+      /10/
+    );
+  });
+
+  it('validateSplitPattern: rejects uncompilable regex source', () => {
+    assert.match(validateSplitPattern('['), /正则|RegExp|regex/i);
+    assert.match(validateSplitPattern(['(\\n+)', '[']), /splitPattern\[1\]/);
+  });
+
+  it('validation: accepts splitPattern in schedule payload', () => {
+    const r = validateScheduleMessagePayload(basePayload({ splitPattern: '([\\n]+)' }));
+    assert.equal(r.valid, true);
+  });
+
+  it('validation: rejects malformed splitPattern with INVALID_PARAMETERS', () => {
+    const r = validateScheduleMessagePayload(basePayload({ splitPattern: '[' }));
+    assert.equal(r.valid, false);
+    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
+    assert.deepEqual(r.details.invalidFields, ['splitPattern']);
+  });
+
+  it('processSingleMessage: default regex when splitPattern absent (back-compat)', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+      // splitPattern intentionally omitted to simulate pre-2.3.0 stored task
+    });
+
+    const pushedMessages = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { choices: [{ message: { content: '你好。世界！再见？' } }] }; },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushedMessages.push(JSON.parse(payload).message);
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(result.messagesSent, 3);
+      assert.deepEqual(pushedMessages, ['你好。', '世界！', '再见？']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('processSingleMessage: uses caller-supplied splitPattern (string)', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+      splitPattern: '([\\n]+)',
+    });
+
+    const pushedMessages = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { choices: [{ message: { content: '行一\n行二\n行三' } }] }; },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushedMessages.push(JSON.parse(payload).message);
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(result.messagesSent, 3);
+      assert.deepEqual(pushedMessages, ['行一\n', '行二\n', '行三']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('processSingleMessage: cascades string[] splitPattern in order', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+      splitPattern: ['(\\n\\n+)', '([。！？!?]+)'],
+    });
+
+    const pushedMessages = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return { choices: [{ message: { content: '段一句一。段一句二。\n\n段二句一。' } }] };
+      },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushedMessages.push(JSON.parse(payload).message);
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(result.messagesSent, 3);
+      assert.deepEqual(pushedMessages, ['段一句一。', '段一句二。', '段二句一。']);
     } finally {
       globalThis.fetch = originalFetch;
     }
