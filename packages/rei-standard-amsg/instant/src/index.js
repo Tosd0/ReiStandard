@@ -313,6 +313,6 @@ async function verifyBearerToken(request, signingKey, respond) {
 
 // ─── Public re-exports (for advanced users / SSR / tests) ──────────────
 
-export { validateInstantPayload } from './validation.js';
+export { validateInstantPayload, validateAvatarUrl } from './validation.js';
 export { splitMessageIntoSentences, processInstantMessage, normalizeAiApiUrl } from './message-processor.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';

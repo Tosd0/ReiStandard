@@ -16,6 +16,37 @@ function isValidUrl(s) {
 
 const VALID_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
+const AVATAR_URL_MAX_LENGTH = 2048;
+
+/**
+ * Validate the optional `avatarUrl` field. Rejects `data:` URIs (typically
+ * base64-encoded inline images) and anything longer than 2048 chars, both
+ * of which are the dominant trigger for downstream 413 / Web Push 4 KB
+ * payload errors. Returns an error message string, or null when valid.
+ *
+ * Mirrors amsg-server's `validateAvatarUrl` (kept in lockstep on purpose —
+ * both packages forward `avatarUrl` to the same SW push payload).
+ *
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function validateAvatarUrl(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    return 'avatarUrl 必须是字符串';
+  }
+  if (/^data:/i.test(value)) {
+    return '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
+  }
+  if (value.length > AVATAR_URL_MAX_LENGTH) {
+    return `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
+  }
+  if (!isValidUrl(value)) {
+    return 'avatarUrl 不是合法 URL';
+  }
+  return null;
+}
+
 const SPLIT_PATTERN_MAX_LENGTH = 200;
 const SPLIT_PATTERN_MAX_ITEMS = 10;
 
@@ -234,11 +265,12 @@ export function validateInstantPayload(payload) {
     };
   }
 
-  if (payload.avatarUrl !== undefined && payload.avatarUrl !== null && !isValidUrl(payload.avatarUrl)) {
+  const avatarErr = validateAvatarUrl(payload.avatarUrl);
+  if (avatarErr) {
     return {
       valid: false,
       errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: 'avatarUrl 格式无效',
+      errorMessage: avatarErr,
       details: { invalidFields: ['avatarUrl'] }
     };
   }

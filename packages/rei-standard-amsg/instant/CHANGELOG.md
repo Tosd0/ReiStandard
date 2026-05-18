@@ -1,5 +1,20 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.6.1 — 2026-05-18
+
+**Fix**
+
+- **`avatarUrl` 严格校验**：之前 `avatarUrl` 只检 `new URL(...)` 能不能 parse，导致 `data:image/...;base64,xxx` 这种 base64 内嵌头像也算合法 —— 一旦传进来，整个 push payload 会膨胀到几十 KB，触发下游 Web Push 服务的 4KB 硬上限或网关 `413 Payload Too Large`。现在：
+  - 拒 `data:` 开头的 URI（不区分大小写）→ `400 INVALID_PAYLOAD_FORMAT`，错误信息明示「头像不支持传入 data: URI（base64 内嵌图片会触发 413 / Web Push 4KB 上限），请改为公网可访问的 https:// 图片 URL」。
+  - 拒长度 > 2048 字符的 URL → `400`，错误信息明示实际长度 + 上限 + 建议（CDN 缩略图）。
+  - 仍要求 `new URL(...)` 能 parse。
+  - `undefined` / `null` 仍然视为「未传」，零行为变化。
+- 顶层 export `validateAvatarUrl(value)`：业务可在 SDK 之外做同步预校验，避免一次远端往返。
+
+**Compatibility**
+
+- 0.6.0 调用者**几乎零修改**：除非之前真的在传 `data:` URI 当 avatarUrl（那本来就跑不通推送），否则升级无感。错误码 `INVALID_PAYLOAD_FORMAT` 不变。
+
 ## 0.6.0 — 2026-05-18
 
 **New**

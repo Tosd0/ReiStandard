@@ -110,7 +110,7 @@ Content-Type: application/json
 ```ts
 {
   contactName: string;
-  avatarUrl?: string | null;
+  avatarUrl?: string | null;        // 0.6.1+：拒 data: URI / 长度 > 2KB（base64 头像会触发 413 / Web Push 4KB 上限）
 
   // === 提示词，二选一恰好一个（0.5.0+）===
   completePrompt?: string;         // 简单推送场景：单 user 消息
