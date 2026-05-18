@@ -144,6 +144,33 @@ await client.sendInstant({
 - 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
 - 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
 
+### 本地预校验：`avatarUrl` 与 payload 体积（2.2.3+）
+
+`scheduleMessage` / `sendInstant` / `updateMessage` 在发请求**之前**会在本地做两项预检，避免一次远端往返才拿到 `413` 或 Web Push 4KB 上限报错：
+
+| 触发条件 | 抛出 `Error.code` | 触发原因（背景说明，不在 message 里） |
+| --- | --- | --- |
+| `payload.avatarUrl` 以 `data:` 开头（含 `data:image/...;base64,...`） | `INVALID_AVATAR_URL_LOCAL` | base64 内嵌头像把单个 push payload 撑到几十 KB，远端 Web Push 服务直接返回 4KB 超限 / 网关 `413`。 |
+| `payload.avatarUrl` 长度 > 2048 字符 | `INVALID_AVATAR_URL_LOCAL` | 同上。建议用 CDN 缩略图 URL。 |
+| `payload.avatarUrl` 不是字符串 | `INVALID_AVATAR_URL_LOCAL` | 类型错误。 |
+| `JSON.stringify(payload)` UTF-8 字节数 > 3072 | `PAYLOAD_TOO_LARGE_LOCAL` | 远端网关 / Web Push 4KB 硬上限的本地兜底。错误对象带 `.details = { method, actualBytes, limitBytes }` 方便定位。 |
+
+```js
+try {
+  await client.sendInstant(payload);
+} catch (err) {
+  if (err.code === 'INVALID_AVATAR_URL_LOCAL') {
+    // err.message 形如「头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL」
+  } else if (err.code === 'PAYLOAD_TOO_LARGE_LOCAL') {
+    // err.details = { method: 'sendInstant', actualBytes: 8732, limitBytes: 3072 }
+  } else {
+    throw err;
+  }
+}
+```
+
+服务端（`@rei-standard/amsg-instant` 0.6.1+ / `@rei-standard/amsg-server` 2.3.1+）有等价的二道防线，业务可以放心依赖 client 这一道做 UX 提示。
+
 ## 导出 API（Exports）
 
 - `ReiClient`

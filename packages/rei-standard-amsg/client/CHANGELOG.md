@@ -1,5 +1,21 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.2.3 — 2026-05-18
+
+### Fix
+
+- **本地预校验 `avatarUrl` + payload 体积**（配合 [`@rei-standard/amsg-instant` 0.6.1](../instant/CHANGELOG.md#061--2026-05-18) / [`@rei-standard/amsg-server` 2.3.1](../server/CHANGELOG.md#231--2026-05-18)）：之前 `scheduleMessage` / `sendInstant` / `updateMessage` 是纯 payload-agnostic 透传，业务把 `data:image/...;base64,xxx` 当 `avatarUrl` 传进来，client 会先 AES-GCM 加密、再 POST 出去，绕一圈才在远端拿到 `413` 或 Web Push 4KB 上限报错。现在三个方法在发请求之前做两项本地预检：
+  - **avatarUrl**：拒 `data:` URI、拒长度 > 2048 字符、必须是字符串。违规 → 抛 `Error` with `.code === 'INVALID_AVATAR_URL_LOCAL'`。
+  - **payload 体积**：`JSON.stringify(payload)` 的 UTF-8 字节数 > 3072 → 抛 `Error` with `.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，附 `.details = { actualBytes, limitBytes, method }`。3KB 阈值是 Web Push 4KB 硬上限和典型网关 413 阈值往下留的余量；正常 payload（含多轮 messages、apiKey、push subscription）通常 1–2KB。
+- 两个 code 都带 `LOCAL` 后缀，方便业务和远端返回的 `INVALID_PARAMETERS` / `INVALID_PAYLOAD_FORMAT` 区分（一个不耗远端配额，一个耗）。
+- 错误 message 只写「是什么 + 怎么改」（如「头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL」），不写「为什么」—— 触发原因写在本 CHANGELOG / README，避免错误对话框塞一整段背景说明。
+
+### Compatibility
+
+- 业务**几乎零修改**：除非之前真的在传 `data:` URI 当 avatarUrl 或传 > 3KB 的 payload（那本来就跑不通），否则升级无感。
+- 加密格式、headers、endpoint、响应 schema 全部不动。
+- `scheduleMessage` / `sendInstant` / `updateMessage` 的返回类型不变；新增的两类错误**只在抛出时**才出现。
+
 ## 2.2.2 — 2026-05-18
 
 ### Docs

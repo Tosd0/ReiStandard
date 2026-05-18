@@ -52,6 +52,30 @@
  *                                                         read it. Use for casual URL-direct abuse only.
  */
 
+/**
+ * Max length of `avatarUrl` accepted by local preflight (2 KB). Mirrors
+ * `@rei-standard/amsg-instant` / `@rei-standard/amsg-server` server-side
+ * limits — kept in lockstep on purpose so client-side rejects match what
+ * the server would reject.
+ */
+const AVATAR_URL_MAX_LENGTH = 2048;
+
+/**
+ * Max byte length of a single outgoing payload (3 KB, measured pre-encryption
+ * on the plaintext JSON body). Anything over this is almost certainly a base64
+ * avatar smuggled into `avatarUrl` and will trigger downstream `413 Payload
+ * Too Large` or hit the Web Push 4 KB hard limit at delivery. We bail locally
+ * to save a remote round-trip and give a precise error.
+ */
+const PAYLOAD_LOCAL_MAX_BYTES = 3072;
+
+function makeLocalError(code, message, details) {
+  const err = new Error(`[rei-standard-amsg-client] ${message}`);
+  err.code = code;
+  if (details) err.details = details;
+  return err;
+}
+
 export class ReiClient {
   /**
    * @param {ReiClientConfig} config
@@ -146,11 +170,19 @@ export class ReiClient {
    *
    * The payload is automatically encrypted before transmission.
    *
+   * Throws (without a network round-trip):
+   *   - `INVALID_AVATAR_URL_LOCAL` — `avatarUrl` is a `data:` URI, > 2 KB,
+   *     or otherwise unacceptable.
+   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
    */
   async scheduleMessage(payload) {
-    const encrypted = await this._encrypt(JSON.stringify(payload));
+    this._validateAvatarUrl(payload && payload.avatarUrl);
+    const json = JSON.stringify(payload);
+    this._assertPayloadSize(json, 'scheduleMessage');
+    const encrypted = await this._encrypt(json);
 
     const res = await fetch(`${this._baseUrl}/schedule-message`, {
       method: 'POST',
@@ -187,22 +219,31 @@ export class ReiClient {
    *
    * Routes to `customBaseUrls.instant` if configured, otherwise `baseUrl`.
    *
+   * Throws (without a network round-trip):
+   *   - `INVALID_AVATAR_URL_LOCAL` — `avatarUrl` is a `data:` URI, > 2 KB,
+   *     or otherwise unacceptable.
+   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   *
    * @param {Object} payload - Instant message payload.
    * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
    * @param {{ authorization?: string }} [opts] - Optional auth header to forward.
    * @returns {Promise<Object>} `{ success, data?: { messagesSent, sentAt }, error? }`
    */
   async sendInstant(payload, endpointPath = '/instant', opts = {}) {
+    this._validateAvatarUrl(payload && payload.avatarUrl);
+    const json = JSON.stringify(payload);
+    this._assertPayloadSize(json, 'sendInstant');
+
     const headers = { 'Content-Type': 'application/json' };
     let body;
 
     if (this._instantEncryption === false) {
-      body = JSON.stringify(payload);
+      body = json;
       if (this._instantClientToken) {
         headers['X-Client-Token'] = this._instantClientToken;
       }
     } else {
-      const encrypted = await this._encrypt(JSON.stringify(payload));
+      const encrypted = await this._encrypt(json);
       headers['X-User-Id'] = this._userId;
       headers['X-Payload-Encrypted'] = 'true';
       headers['X-Encryption-Version'] = '1';
@@ -226,12 +267,20 @@ export class ReiClient {
   /**
    * Update an existing scheduled message.
    *
+   * Throws (without a network round-trip):
+   *   - `INVALID_AVATAR_URL_LOCAL` — `updates.avatarUrl` is a `data:` URI,
+   *     > 2 KB, or otherwise unacceptable.
+   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized updates exceed 3 KB.
+   *
    * @param {string} uuid    - Task UUID.
    * @param {Object} updates - Fields to update.
    * @returns {Promise<Object>}
    */
   async updateMessage(uuid, updates) {
-    const encrypted = await this._encrypt(JSON.stringify(updates));
+    this._validateAvatarUrl(updates && updates.avatarUrl);
+    const json = JSON.stringify(updates);
+    this._assertPayloadSize(json, 'updateMessage');
+    const encrypted = await this._encrypt(json);
 
     const res = await fetch(`${this._baseUrl}/update-message?id=${encodeURIComponent(uuid)}`, {
       method: 'PUT',
@@ -316,6 +365,58 @@ export class ReiClient {
       applicationServerKey: this._urlBase64ToUint8Array(vapidPublicKey)
     });
     return subscription;
+  }
+
+  // ─── Local preflight (no network) ────────────────────────────────
+
+  /**
+   * Reject `avatarUrl` values that would 100% fail downstream — `data:`
+   * URIs (base64 inline image) and anything longer than 2 KB. Mirrors the
+   * server-side check in `@rei-standard/amsg-instant` / `@rei-standard/amsg-server`;
+   * intentionally a fast preflight that does not parse the URL (server
+   * still does that, and `URL` is the bigger of the two costs in browsers).
+   *
+   * @private
+   * @param {unknown} value
+   */
+  _validateAvatarUrl(value) {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'string') {
+      throw makeLocalError('INVALID_AVATAR_URL_LOCAL', 'avatarUrl 必须是字符串');
+    }
+    if (/^data:/i.test(value)) {
+      throw makeLocalError(
+        'INVALID_AVATAR_URL_LOCAL',
+        '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL'
+      );
+    }
+    if (value.length > AVATAR_URL_MAX_LENGTH) {
+      throw makeLocalError(
+        'INVALID_AVATAR_URL_LOCAL',
+        `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`,
+        { actualLength: value.length, limit: AVATAR_URL_MAX_LENGTH }
+      );
+    }
+  }
+
+  /**
+   * Reject outgoing payloads larger than 3 KB pre-encryption. Spares the
+   * remote a guaranteed 413 / Web Push 4 KB-limit failure and gives the
+   * caller a precise local error pointing at the size cap.
+   *
+   * @private
+   * @param {string} bodyJson  - `JSON.stringify(payload)`.
+   * @param {string} methodName
+   */
+  _assertPayloadSize(bodyJson, methodName) {
+    const bytes = new TextEncoder().encode(bodyJson).length;
+    if (bytes > PAYLOAD_LOCAL_MAX_BYTES) {
+      throw makeLocalError(
+        'PAYLOAD_TOO_LARGE_LOCAL',
+        `${methodName} payload 体积 ${bytes} 字节超过本地上限 ${PAYLOAD_LOCAL_MAX_BYTES} 字节`,
+        { method: methodName, actualBytes: bytes, limitBytes: PAYLOAD_LOCAL_MAX_BYTES }
+      );
+    }
   }
 
   // ─── Crypto helpers (Web Crypto API) ────────────────────────────
