@@ -8,7 +8,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray, validateSplitPattern } from '../lib/validation.js';
+import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -108,6 +108,12 @@ export function createUpdateMessageHandler(ctx) {
       const splitErr = validateSplitPattern(updates.splitPattern);
       if (splitErr) {
         return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: splitErr, details: { invalidFields: ['splitPattern'] } } } };
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'avatarUrl')) {
+      const avatarErr = validateAvatarUrl(updates.avatarUrl);
+      if (avatarErr) {
+        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: avatarErr, details: { invalidFields: ['avatarUrl'] } } } };
       }
     }
 

@@ -663,4 +663,49 @@ describe('update-message splitPattern round-trip', () => {
     assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
     assert.deepEqual(result.body.error.details.invalidFields, ['splitPattern']);
   });
+
+  it('PUT rejects data: avatarUrl with INVALID_UPDATE_DATA (v2.3.1)', async () => {
+    globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
+    const { server } = await buildServerAndAdapter();
+    const { tenantToken, userKey } = await bootstrapTenant(server);
+
+    const taskUuid = '33333333-2222-4333-8444-777777777777';
+    const scheduleBody = encryptPayload(
+      {
+        uuid: taskUuid,
+        contactName: 'Carol',
+        messageType: 'fixed',
+        firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+        pushSubscription: { endpoint: 'https://push.example.com' },
+        userMessage: 'hi'
+      },
+      userKey
+    );
+    await server.handlers.scheduleMessage.POST(
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      scheduleBody
+    );
+
+    const badBody = encryptPayload({ avatarUrl: 'data:image/png;base64,xxx' }, userKey);
+    const result = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`,
+      {
+        authorization: `Bearer ${tenantToken}`,
+        'x-user-id': TEST_USER_ID,
+        'x-payload-encrypted': 'true',
+        'x-encryption-version': '1'
+      },
+      badBody
+    );
+
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
+    assert.deepEqual(result.body.error.details.invalidFields, ['avatarUrl']);
+    assert.match(result.body.error.message, /data:/);
+  });
 });

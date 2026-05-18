@@ -1,5 +1,21 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.3.1 — 2026-05-18
+
+### Fix
+
+- **`avatarUrl` 严格校验**（与 [`@rei-standard/amsg-instant` 0.6.1](../instant/CHANGELOG.md#061--2026-05-18) 同步）：之前 `avatarUrl` 只检 `new URL(...)` 能不能 parse，导致 `data:image/...;base64,xxx` 这种 base64 内嵌头像也算合法 —— 一旦传进来，存进任务再随推送外发会膨胀几十 KB，触发下游 Web Push 服务的 4KB 硬上限或网关 `413 Payload Too Large`。`schedule-message` 与 `update-message` 现在统一：
+  - 拒 `data:` 开头的 URI（不区分大小写）→ `400 INVALID_PARAMETERS` / `400 INVALID_UPDATE_DATA`，错误信息明示「头像不支持传入 data: URI（base64 内嵌图片会触发 413 / Web Push 4KB 上限），请改为公网可访问的 https:// 图片 URL」。
+  - 拒长度 > 2048 字符的 URL → `400`，错误信息明示实际长度 + 上限 + 建议（CDN 缩略图）。
+  - 仍要求 `new URL(...)` 能 parse。
+  - `undefined` / `null` 仍然视为「未传」，零行为变化。
+- 顶层 export `validateAvatarUrl(value)`：业务可在 SDK 之外做同步预校验，避免一次远端往返。
+
+### Compatibility
+
+- 2.3.0 调用者**几乎零修改**：除非之前真的在传 `data:` URI 当 avatarUrl（那本来就跑不通推送），否则升级无感。错误码 `INVALID_PARAMETERS` / `INVALID_UPDATE_DATA` 不变，加密格式、推送 payload 不动。
+- 与 `@rei-standard/amsg-instant` 0.6.1 共享语义；两端独立实现但行为字节级一致。
+
 ## 2.3.0 — 2026-05-18
 
 ### New

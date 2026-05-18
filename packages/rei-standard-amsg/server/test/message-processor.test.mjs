@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage, normalizeAiApiUrl } from '../src/server/lib/message-processor.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
-import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern } from '../src/server/lib/validation.js';
+import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../src/server/lib/validation.js';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
@@ -618,5 +618,77 @@ describe('splitPattern support', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+// ─── avatarUrl (v2.3.1) — parity with @rei-standard/amsg-instant 0.6.1 ──
+describe('avatarUrl validation', () => {
+  function basePayload(overrides = {}) {
+    return {
+      contactName: 'Rei',
+      messageType: 'prompted',
+      firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+      completePrompt: 'say hi',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
+      ...overrides,
+    };
+  }
+
+  it('validateAvatarUrl: accepts absent / null', () => {
+    assert.equal(validateAvatarUrl(undefined), null);
+    assert.equal(validateAvatarUrl(null), null);
+  });
+
+  it('validateAvatarUrl: accepts a normal https URL', () => {
+    assert.equal(validateAvatarUrl('https://example.com/a.png'), null);
+  });
+
+  it('validateAvatarUrl: rejects data: URI (case-insensitive)', () => {
+    assert.match(validateAvatarUrl('data:image/png;base64,xxx'), /data:/);
+    assert.match(validateAvatarUrl('DATA:image/png;base64,xxx'), /data:/i);
+  });
+
+  it('validateAvatarUrl: rejects strings longer than 2048 chars', () => {
+    const long = 'https://example.com/' + 'a'.repeat(2048);
+    assert.match(validateAvatarUrl(long), /2048/);
+  });
+
+  it('validateAvatarUrl: accepts URL exactly 2048 chars', () => {
+    const url = 'https://x/' + 'a'.repeat(2048 - 'https://x/'.length);
+    assert.equal(url.length, 2048);
+    assert.equal(validateAvatarUrl(url), null);
+  });
+
+  it('validateAvatarUrl: rejects non-string', () => {
+    assert.match(validateAvatarUrl(42), /字符串/);
+  });
+
+  it('validateAvatarUrl: rejects strings that are not valid URLs', () => {
+    assert.match(validateAvatarUrl('not a url'), /URL/);
+  });
+
+  it('schedule payload: rejects data: avatarUrl with INVALID_PARAMETERS', () => {
+    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'data:image/png;base64,xxx' }));
+    assert.equal(r.valid, false);
+    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
+    assert.deepEqual(r.details.invalidFields, ['avatarUrl']);
+    assert.match(r.errorMessage, /data:/);
+  });
+
+  it('schedule payload: rejects oversized avatarUrl', () => {
+    const r = validateScheduleMessagePayload(basePayload({
+      avatarUrl: 'https://example.com/' + 'a'.repeat(2048),
+    }));
+    assert.equal(r.valid, false);
+    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
+    assert.match(r.errorMessage, /2048/);
+  });
+
+  it('schedule payload: accepts a normal https avatarUrl', () => {
+    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'https://example.com/a.png' }));
+    assert.equal(r.valid, true);
   });
 });
