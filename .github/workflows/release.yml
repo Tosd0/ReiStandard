@@ -11,16 +11,24 @@ on:
       - 'rei-standard-amsg-*@*'
   workflow_dispatch:
 
-# Belt-and-suspenders: even though scripts/publish-workspaces.mjs already
-# filters publishes to the tag-targeted package (so parallel runs cannot
-# step on each other's `npm publish`), a single shared concurrency group
-# serializes Release runs. That keeps logs tidy when several per-package
-# tags are pushed together, and guarantees we never get a `403 You cannot
-# publish over the previously published versions` race if the filter ever
-# regresses. `cancel-in-progress: false` is important — half-finished
-# publishes must never be killed mid-flight.
+# Per-ref concurrency group: each tag (or workflow_dispatch ref) gets its
+# own queue, so coordinated multi-package releases (e.g. instant + server
+# + client tags pushed together) all run in parallel without cancelling
+# each other.
+#
+# Earlier this was `group: release` (single global queue). Combined with
+# `cancel-in-progress: false`, GitHub Actions' semantics ("1 running + 1
+# pending max; new arrivals evict the pending one") meant pushing N tags
+# at once kept only the first running + the last pending — middle tags
+# were silently cancelled. Per-ref grouping fixes this; npm-side races
+# are already prevented by scripts/publish-workspaces.mjs filtering on
+# GITHUB_REF (only the triggering tag's package is published), with
+# `isVersionPublished()` as the idempotent backstop.
+#
+# `cancel-in-progress: false` is still important within a single ref:
+# half-finished publishes must never be killed mid-flight.
 concurrency:
-  group: release
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
