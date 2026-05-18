@@ -1,8 +1,10 @@
-# 主动消息 API 技术规范（v2.0.1）
+# 主动消息 API 技术规范（v2.3）
 
 > 状态：当前生效（Active）
-> 
-> 版本日期：2026-02-24
+>
+> 版本日期：2026-05-18
+>
+> 对齐实现：`@rei-standard/amsg-server` 2.3.1、`@rei-standard/amsg-instant` 0.6.1、`@rei-standard/amsg-client` 2.2.3、`@rei-standard/amsg-sw` 2.0.1。
 
 ## 1. 目标与范围
 
@@ -27,6 +29,12 @@
    - `cronToken`：仅 cron 发送端点
 5. 租户敏感配置（数据库连接、masterKey）加密后存入 Blob。
 6. 推荐在 Netlify 使用 Scheduled Function 触发调度聚合端点，再按租户触发后台发送；同时保留外部 cron 兼容模式。
+
+**v2.x 后续增量**（端点与鉴权未变，均为 payload 层向后兼容扩展）：
+
+- `messages` 数组提示词（互斥替代 `completePrompt`），见 §6.1。`amsg-server` 2.2.0+ 与 `amsg-instant` 0.5.0+ 实装。
+- `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 与 `amsg-instant` 0.6.0+ 实装。
+- `avatarUrl` 严格校验（拒 `data:` URI、限长度 ≤ 2048），见 §6.2。`amsg-server` 2.3.1+、`amsg-instant` 0.6.1+、`amsg-client` 2.2.3+ 实装。
 
 ## 3. 角色与职责
 
@@ -142,31 +150,69 @@ export const config = {
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
-### 6.1 AI 消息的 `apiUrl` 约束（`schedule-message`）
+### 6.1 AI 消息字段约束
 
-当消息配置使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时：
+当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束统一适用于 `schedule-message`、`update-message`、`amsg-instant` handler。
 
-- `apiUrl` 必须是完整聊天端点 URL（例如：`https://api.openai.com/v1/chat/completions`）。
-- 实现方可对 URL 做最小规范化（如去首尾空白、去路径尾部多余 `/`）。
-- 实现方不应自动补全版本路径（如 `/v1`）或聊天路径（如 `/chat/completions`）。
-- `maxTokens` 为可选整数字段（> 0）：传入则映射到上游 AI 请求的 `max_tokens`；不传则不指定该参数。
+**`apiUrl`（必填，字符串）** — 完整聊天端点 URL（例：`https://api.openai.com/v1/chat/completions`）。实现方可做最小规范化（去首尾空白、去路径尾部多余 `/`），但**不应**自动补全版本路径（`/v1`）或聊天路径（`/chat/completions`）。若上游返回 `405 Method Not Allowed`，应优先判定为 URL 指向错误端点。
 
-若上游返回 `405 Method Not Allowed`，应优先判定为 `apiUrl` 指向错误端点，并返回明确错误提示。
+**`completePrompt` 与 `messages`（互斥二选一）**
 
-> ⚠️ **OUTDATED — predates messages array support (2026-05-17)**
->
-> 本节描述的提示词契约（仅 `completePrompt: string`）已被 `@rei-standard/amsg-server@2.2.0+`
-> 和 `@rei-standard/amsg-instant@0.5.0+` 扩展为「`completePrompt` 与 `messages`
-> 互斥二选一」：
->
-> - `completePrompt?: string` — 简单场景，handler 内部包成单条 `{role:'user', content}`。
-> - `messages?: Array<{ role: 'system'|'user'|'assistant'|'tool', content: string | unknown[] }>`
->   — 多轮 / 带 system role / tool role，handler **原样**转发给 LLM，不做注入或重排。
-> - 两者必须**恰好提供一个**，同时给或都不给均返回 `400 INVALID_PARAMETERS` / `INVALID_PAYLOAD_FORMAT`。
-> - 可选 `temperature?: number` 透传给 LLM；legacy `completePrompt` 路径未传时默认 `0.8`，
->   `messages` 路径未传时**不发**。
->
-> 实现侧请直接参考两个包的源码与 CHANGELOG；本规范文档将在后续 minor 修订中正式纳入。
+- `completePrompt?: string` — 简单场景。handler 内部包成单条 `{ role: 'user', content }` 再发给 LLM。
+- `messages?: Array<{ role: 'system' | 'user' | 'assistant' | 'tool', content: string | unknown[] }>` — 多轮、带 system role 或 tool role 的场景。handler **原样**转发给 LLM，不做注入或重排；与主聊天路径调用 LLM 的 body 字节级一致。
+
+约束：两者**必须恰好提供一个**。同时提供或都未提供 → `400 INVALID_PARAMETERS`（`amsg-server`）或 `400 INVALID_PAYLOAD_FORMAT`（`amsg-instant`）。`messages` 数组必须非空，role 必须是上述四种之一。
+
+**`temperature`（可选数字）** — 透传给 LLM。`completePrompt` 路径未传时默认 `0.8`（保留旧行为）；`messages` 路径未传时不发，由上游主路径决定。
+
+**`maxTokens`（可选正整数）** — 映射到上游 `max_tokens`；不传则不指定。
+
+**`splitPattern`（可选，`string | string[] | null`）** — 自定义 LLM 返回文本的分句正则；默认 `/([。！？!?]+)/`。
+
+字段写的是**正则 source 字符串**，不带 `/.../` 包裹、不带尾部 flag。库内部 `new RegExp(source)` 编译，**零 flags**。要替代常用 flag 效果请改写 pattern 本身：
+
+| 想要的 flag | 写法 |
+|---|---|
+| `i` 大小写不敏感 | 用字符类，如 `[Aa]` |
+| `s` 点匹配换行 | 用 `[\s\S]` 代替 `.` |
+| `m` 多行 `^` / `$` | 用 `(?:^|\n)` / `(?:$|\n)` |
+| `g` 全局 | 不需要，`String.prototype.split(regex)` 不依赖 `g` |
+
+输入形态：
+
+- `string` → 单条 pattern，替代默认正则。
+- `string[]` → **级联**应用：先按数组首项切，每段再按下一项切，以此类推（适合"先按段落、再按句号"两步切）。要"任一匹配就切"请自行用 `|` 合成一条。
+- 不传 / `null` / `[]` → 走默认，老库存任务无此字段时零迁移。
+- `update-message` 显式传 `splitPattern: null` 可重置回默认；不传则保留原值。
+
+**捕获组约定**：分隔符要不要保留是你定的。把分隔符放进 `(...)` 捕获组 → 回贴到前一段（默认 `/([。！？!?]+)/` 就是这么做的）；不放捕获组 → 分隔符被丢掉。库不会替你自动包。
+
+**级联中的 no-match 兜底**：某一项 pattern 在某段上没匹配 → 该段原样传给下一项，不会被吃掉。
+
+**输入大小限制**：每项 ≤ 200 字符、数组 ≤ 10 项、每项必须能 `new RegExp(...)` 通过。违规 → `400 INVALID_PARAMETERS`（schedule）/ `400 INVALID_UPDATE_DATA`（update）/ `400 INVALID_PAYLOAD_FORMAT`（amsg-instant）。
+
+> 这些上限是**输入大小护栏**，不是 ReDoS 防御——6 字符的 `(a+)+$` 就能触发回溯爆炸。真正兜底的是 Worker / 运行时的 CPU 限额，加上 splitPattern 存在调用方自己的加密任务里、跑在调用方自己 LLM key 的输出上，自爆不跨租户。
+
+`amsg-server` 与 `amsg-instant` 两端独立实现但行为字节级一致；预校验工具：`validateLlmMessagesArray(messages)`、`validateSplitPattern(value)`。
+
+### 6.2 `avatarUrl` 严格校验
+
+`avatarUrl` 字段（`schedule-message` / `update-message` / `amsg-instant` payload，可选）的合法规则：
+
+- 必须是字符串，且 `new URL(...)` 能解析。
+- **拒** `data:` 开头的 URI（不区分大小写）—— base64 内嵌图片会把 push payload 撑到几十 KB，触发下游 Web Push 4KB 硬上限或网关 `413 Payload Too Large`。
+- **拒** 长度 > 2048 字符的 URL。
+- `undefined` / `null` 视为"未传"，零行为变化。
+
+违规返回：
+
+- `amsg-server.schedule-message` → `400 INVALID_PARAMETERS`
+- `amsg-server.update-message` → `400 INVALID_UPDATE_DATA`
+- `amsg-instant` → `400 INVALID_PAYLOAD_FORMAT`
+
+错误信息须明示原因和建议（如"请改为公网可访问的 https:// 图片 URL"或"建议使用 CDN 缩略图"）。客户端 SDK 同时做本地预校验（`amsg-client` 2.2.3+），抛出 `Error` 的 `.code` 为 `INVALID_AVATAR_URL_LOCAL`，避免一次远端往返。
+
+预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）。
 
 ## 7. 一体化初始化接口
 
@@ -250,12 +296,14 @@ Body:
 - 不再在数据库持久化 masterKey。
 - 每个 tenant 必须绑定独立数据库 URL，禁止复用同一连接串。
 
-## 9. 错误码（v2.0.1）
+## 9. 错误码
 
 | HTTP | code | 含义 |
 |---|---|---|
 | 400 | `INVALID_JSON` | 请求体 JSON 不合法 |
-| 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法 |
+| 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法（`schedule-message` 与 `init-tenant` 路径） |
+| 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
+| 400 | `INVALID_PAYLOAD_FORMAT` | `amsg-instant` payload 格式非法（含 §6.1 / §6.2 校验） |
 | 400 | `INVALID_DRIVER` | 不支持的数据库驱动 |
 | 400 | `INVALID_DATABASE_URL` | `databaseUrl` 缺失或为空 |
 | 400 | `INVALID_USER_ID_FORMAT` | `X-User-Id` 非 UUID v4 |
@@ -297,12 +345,18 @@ Body:
 
 ## 11. 向后兼容声明
 
-v2.0.1 为破坏性升级：
+v2.0.1（破坏性）：
 
 - 旧初始化端点已移除。
 - 旧 `CRON_SECRET` 方案不再作为标准鉴权方案。
 - 旧文档中关于 `system_config` 的描述全部失效。
-- 调度层新增“推荐模式”不影响旧 cron 兼容模式，旧 cron 接入仍可继续使用。
+- 调度层新增"推荐模式"不影响旧 cron 兼容模式，旧 cron 接入仍可继续使用。
+
+v2.x 后续增量（向后兼容，无需迁移）：
+
+- `messages` 数组（2.2.0+）：未使用此字段的调用方零修改。
+- `splitPattern`（2.3.0+）：未传时走默认正则，老库存任务字段缺失也按默认处理。
+- `avatarUrl` 严格校验（2.3.1+）：之前传 `data:` URI 当 avatarUrl 实际上一直推不出来（触发下游 4KB / 413），收紧到入口立即报错而已；从未推成功的调用者无感升级。
 
 ## 12. 实现一致性要求（DoD）
 
@@ -311,7 +365,7 @@ v2.0.1 为破坏性升级：
 1. 租户初始化为一步（`init-tenant`）。
 2. 业务端点不可仅依赖 `X-User-Id` 调用成功。
 3. `tenantToken` 与 `cronToken` 权限分离。
-4. `packages` 与 `examples` 的接口行为一致。
+4. `amsg-server` 与 `amsg-instant` 在共有字段（§6.1 / §6.2）上行为字节级一致。`examples/` 是教学示例，可能滞后于最新 SDK 字段，不在一致性约束内。
 5. 文档明确管理员一次性与租户一次性职责。
 6. 若实现推荐调度模式，必须实现 Blob 租户调度索引，并对索引中的 `cronToken` 加密存储。
 7. 若同时启用兼容模式与推荐模式，必须实现调度防重入机制（入口互斥或任务原子领取）。

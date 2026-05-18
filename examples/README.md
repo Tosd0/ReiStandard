@@ -2,21 +2,17 @@
 
 > 本文档用于不使用 SDK 包时的手动接入。优先推荐 Package-First。
 
-> ⚠️ **OUTDATED — predates messages array support (2026-05-17)**
+> ⚠️ **OUTDATED — 停留在 v2.0.1，落后于 SDK 包 v2.3（最后核对 2026-05-18）**
 >
-> 这份手动接入示例停留在 v2.0.1 字段：`schedule-message` / `update-message`
-> 仅接受 `completePrompt: string`，**没有**对接 v2.2.0+ 的 OpenAI 格式
-> `messages` 数组（含 system role / 多轮上下文 / tool role）和
-> `temperature` 透传。`lib/message-processor.js` 的 `buildAiRequestBody`
-> 也还把 prompt 硬包成单条 user 消息。
+> 这份手动接入示例只覆盖 v2.0.1 的核心契约：一体化 `init-tenant`、`tenantToken` / `cronToken` 鉴权、`schedule-message` / `update-message` 接受 `completePrompt: string`。**未对接**以下规范增量（详见 [`standards/active-messaging-api.md`](../standards/active-messaging-api.md) §6.1 / §6.2）：
 >
-> 新接入请直接用 SDK 包（行为已对齐、字节级一致）：
+> | 增量 | SDK 起始版本 | 示例缺什么 |
+> |---|---|---|
+> | OpenAI 格式 `messages` 数组（system / 多轮 / tool role）+ `temperature` 透传 | server 2.2.0 · instant 0.5.0 · client 2.2.1 | `lib/message-processor.js` 的 `buildAiRequestBody` 把 prompt 硬包成单条 user 消息 |
+> | `splitPattern` 自定义分句正则（`string \| string[]`，级联） | server 2.3.0 · instant 0.6.0 | 仍硬编码 `/([。！？!?]+)/` 分句 |
+> | `avatarUrl` 严格校验（拒 `data:` URI、长度 ≤ 2048） | server 2.3.1 · instant 0.6.1 · client 2.2.3（本地预校验） | 只检 `new URL(...)` 能 parse；`data:` base64 头像会进库再触发下游 413 |
 >
-> - `@rei-standard/amsg-server@2.2.0+` — schedule/update-message 路径
-> - `@rei-standard/amsg-instant@0.5.0+` — 无状态 Worker 路径
-> - `@rei-standard/amsg-client@2.2.1+` — 浏览器 SDK（透传 messages）
->
-> 这份示例文档与代码后续会同步更新。
+> 新接入请直接用 SDK 包（`@rei-standard/amsg-server` / `amsg-instant` / `amsg-client`），行为已按规范对齐到字节级。这份示例的文档与代码后续会同步更新。
 
 ## 目录结构
 
