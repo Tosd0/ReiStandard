@@ -7,7 +7,7 @@
 | 包 | 版本 | 用途 |
 |---|---|---|
 | [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | `0.6.1` | 一次性即时推送（无 DB、无 cron、无租户） |
-| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | `2.3.1` | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
+| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | `2.3.2` | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
 | [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | `2.2.3` | 浏览器 SDK：加密、请求封装、Push 订阅 |
 | [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | `2.0.1` | Service Worker：推送展示、离线队列 |
 

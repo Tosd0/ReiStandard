@@ -4,7 +4,7 @@
 >
 > 版本日期：2026-05-18
 >
-> 对齐实现：`@rei-standard/amsg-server` 2.3.1、`@rei-standard/amsg-instant` 0.6.1、`@rei-standard/amsg-client` 2.2.3、`@rei-standard/amsg-sw` 2.0.1。
+> 对齐实现：`@rei-standard/amsg-server` 2.3.2、`@rei-standard/amsg-instant` 0.6.1、`@rei-standard/amsg-client` 2.2.3、`@rei-standard/amsg-sw` 2.0.1。
 
 ## 1. 目标与范围
 

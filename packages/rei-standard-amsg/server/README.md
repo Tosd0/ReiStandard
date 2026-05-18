@@ -1,6 +1,6 @@
 # @rei-standard/amsg-server
 
-`@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK（v2.0.1），提供 Blob 租户配置、租户 token 鉴权和标准路由处理器。
+`@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK：Blob 租户配置、`tenantToken` / `cronToken` 鉴权、标准路由处理器。API 规范见 [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)。
 
 ## v2.0.1 变更摘要
 
@@ -8,6 +8,8 @@
 - 移除旧端点：`init-database`、`init-master-key`
 - 业务端点统一使用 `Authorization: Bearer <tenantToken>`
 - `send-notifications` 支持 `cronToken`（Header 或 query token）
+
+2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 严格校验）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-严格校验)；行为已对齐 `amsg-instant`，向后兼容。
 
 ## 安装
 
@@ -52,7 +54,7 @@ const rei = await createReiServer({
 
 ## 关于 `messageType: 'instant'`
 
-> **Note**：新代码的 instant 消息请用 [@rei-standard/amsg-instant](../instant/README.md)，跳过本端点的"建任务 → 处理 → 删任务" DB 来回。本端点的 `instant` 分支为兼容保留，行为不变、不会有运行时警告。
+> **Note**：新代码的 instant 消息请用 [@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)，跳过本端点的"建任务 → 处理 → 删任务" DB 来回。本端点的 `instant` 分支为兼容保留，行为不变、不会有运行时警告。
 
 ## AI 接口 `apiUrl` 约束
 
@@ -130,17 +132,45 @@ AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
 ## 运行环境与要求
 
 - Node.js `>=20`
-- 必须安装 `web-push`
-- 必须安装 `@netlify/blobs`
-- 必须安装至少一个数据库驱动（`@neondatabase/serverless` 或 `pg`）
-- 必须配置：
-  - `VAPID_EMAIL`
-  - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`
-  - `VAPID_PRIVATE_KEY`
-  - `TENANT_CONFIG_KEK`
-  - `TENANT_TOKEN_SIGNING_KEY`
-- 可选配置：
-  - `INIT_SECRET`（配置后 `init-tenant` 必须带 `X-Init-Secret`）
+- 必须装：`web-push`、`@netlify/blobs`、以及至少一个数据库驱动（`@neondatabase/serverless` 或 `pg`）
+
+### 环境变量
+
+必填：
+
+- `VAPID_EMAIL` — VAPID 联系邮箱
+- `NEXT_PUBLIC_VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` — VAPID 公私钥对，[vapidkeys.com](https://vapidkeys.com) 生成
+- `TENANT_CONFIG_KEK` — 加密 Blob 里租户配置（含 db connection、masterKey）的 KEK
+- `TENANT_TOKEN_SIGNING_KEY` — `tenantToken` / `cronToken` 的 HMAC 签名密钥
+
+可选：
+
+- `INIT_SECRET` — 配了之后 `POST /api/v1/init-tenant` 必须带 `X-Init-Secret` 头才能初始化租户
+- `PUBLIC_BASE_URL` — 生产域名（如 `https://your-domain.com`），用来让 `init-tenant` 返回完整 `cronWebhookUrl`
+- `VERCEL_PROTECTION_BYPASS` — Vercel 部署 + Preview Protection 时给 cron 走的 bypass key
+
+`TENANT_CONFIG_KEK` / `TENANT_TOKEN_SIGNING_KEY` / `INIT_SECRET` 推荐：
+
+```bash
+openssl rand -base64 32
+```
+
+### `.env` 模板
+
+```dotenv
+VAPID_EMAIL=youremail@example.com
+NEXT_PUBLIC_VAPID_PUBLIC_KEY=YOUR-PUBLIC-KEY
+VAPID_PRIVATE_KEY=YOUR-PRIVATE-KEY
+TENANT_CONFIG_KEK=YOUR-KEK-SECRET
+TENANT_TOKEN_SIGNING_KEY=YOUR-TOKEN-SIGNING-KEY
+
+# 可选
+INIT_SECRET=YOUR-INIT-SECRET
+PUBLIC_BASE_URL=https://your-domain.com
+VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
+```
+
+Vercel 部署配置可参考 [`examples/vercel.json.example`](https://github.com/Tosd0/ReiStandard/blob/main/examples/vercel.json.example)。
 
 ## 相关链接（绝对 URL）
 

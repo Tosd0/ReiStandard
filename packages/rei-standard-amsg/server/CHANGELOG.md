@@ -1,5 +1,15 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.3.2 — 2026-05-18
+
+### Docs
+
+- README 不再用 `../../../...` 跳层相对路径（在 npmjs.com 渲染时一律 404）。`standards/active-messaging-api.md`、`examples/vercel.json.example`、sibling `amsg-instant` README 改用绝对 GitHub URL，与原有「## 相关链接（绝对 URL）」小节保持同源。
+- 「环境变量」小节展开：每个变量补一句说明（VAPID 邮箱 / 公私钥用途、`TENANT_CONFIG_KEK` 是用于加密 Blob 里租户配置的 KEK、`TENANT_TOKEN_SIGNING_KEY` 是 token HMAC 签名密钥、`INIT_SECRET` / `PUBLIC_BASE_URL` / `VERCEL_PROTECTION_BYPASS` 的触发条件），附 `openssl rand -base64 32` 生成命令和 `.env` 模板。
+- 「v2.0.1 变更摘要」末尾加 pointer，指向规范 §6.1（`messages` 数组 / `splitPattern`）/ §6.2（`avatarUrl` 严格校验）—— 这些字段从 2.2.0 起陆续加入，未在该小节展开。
+
+无代码变更，仅 README 重写。规范文档在仓库根的 `standards/active-messaging-api.md`（已同步到 v2.3）。
+
 ## 2.3.1 — 2026-05-18
 
 ### Fix
