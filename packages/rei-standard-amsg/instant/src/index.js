@@ -191,6 +191,25 @@ export function createInstantHandler(options) {
 
     const isContinue = pathname === '/continue';
 
+    // `/continue` is a v0.7-only endpoint that exists solely to resume an
+    // agentic-loop turn. A handler created without `onLLMOutput` has no
+    // loop to resume — without this guard the request would pass
+    // validation, enter `runAgenticLoop`, and crash on `ctx.onLLMOutput(
+    // ...)` with `TypeError: ctx.onLLMOutput is not a function`, which
+    // then routes through the HOOK_THREW pipeline and ships the operator
+    // a misleading "hook threw" diagnostic for what is really a deploy
+    // misconfiguration. Reject up-front with a clear 400 so the SW (or
+    // the operator reading logs) knows exactly which knob to turn.
+    if (isContinue && !onLLMOutput) {
+      return respond(400, {
+        success: false,
+        error: {
+          code: 'CONTINUE_NOT_AVAILABLE',
+          message: '/continue 仅在 createInstantHandler 配置了 onLLMOutput 时可用',
+        },
+      });
+    }
+
     // Validator selection — `/continue` uses its own schema, `/instant`
     // (and any other POST path) goes through `validateInstantPayload`
     // with a `hookPath` flag so it can reject `completePrompt` when

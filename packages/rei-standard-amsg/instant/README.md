@@ -250,6 +250,7 @@ LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每
 | `COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH`  | 400  | 0.7 | 配了 `onLLMOutput` 之后 `/instant` 或 `/continue` 还传 `completePrompt`；hook 路径只接受 `messages` 数组 |
 | `HOOK_THREW`                                  | 500  | 0.7 | `onLLMOutput` 抛错或返了非法 decision（`null` / 不识别的 `decision` 值 / `pushPayload` 不可 JSON-serialize）。同时会推一条诊断 push（payload `{type:'error', code:'HOOK_THREW',...}`） |
 | `PAYLOAD_TOO_LARGE`                           | 500  | 0.7 | hook 返的 `pushPayload` UTF-8 字节超 `maxInlineBytes` 且没配 `blobStore`。配上 BlobStore 自动走 envelope 转发 |
+| `CONTINUE_NOT_AVAILABLE`                      | 400  | 0.7 | 往没配 `onLLMOutput` 的 handler POST `/continue`。`/continue` 是 agentic loop 的续跑端点，没钩子就没东西可续，直接拒掉避免误报成 `HOOK_THREW` |
 | `INTERNAL_ERROR`                              | 500  | 0.1 | 其他未分类内部错误 |
 
 **`LOOP_EXCEEDED` 不是错误码** —— hook 反复返 `decision:'continue'` 超 `maxLoopIterations` 时，worker 返 HTTP **200** + body `{ success: true, data: { status: 'loop_exceeded', sessionId, iteration } }`，并向 SW 推一条 `{type:'error', code:'LOOP_EXCEEDED',...}` 诊断 envelope。HTTP 层是正常完成，不会让客户端误重试。

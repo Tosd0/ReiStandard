@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-instant
 
+## Unreleased
+
+**Fix**
+
+- **`/continue` 无 `onLLMOutput` 时给出清晰的 400 `CONTINUE_NOT_AVAILABLE`**：之前往一个没配 hook 的 handler POST `/continue` 会过 validation、进 `runAgenticLoop`、然后在 `ctx.onLLMOutput(...)` 上炸 TypeError、最终被当成 `HOOK_THREW` 报给客户端 + 推一条诊断 envelope。问题是「没钩子」是部署配置问题，不是钩子抛错，HOOK_THREW 把锅甩到了不存在的钩子上。现在在 handler 入口处直接拒，错误码明确指向缺 `onLLMOutput`。
+
 ## 0.7.0 — 2026-05-19 — Agentic Loop Framework
 
 **New**

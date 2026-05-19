@@ -607,6 +607,21 @@ describe('/continue endpoint', () => {
     const json = await res.json();
     assert.equal(json.error.code, 'COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH');
   });
+
+  it('rejects /continue with clear 400 when handler has no onLLMOutput', async () => {
+    // Regression: without this guard the request would pass validation,
+    // crash inside runAgenticLoop on `ctx.onLLMOutput(...)`, and ship the
+    // operator a misleading HOOK_THREW for what is really a deploy
+    // misconfiguration.
+    const handler = createInstantHandler({ vapid, fetch: globalThis.fetch });
+    const res = await handler(makeRequest('http://h/continue', basePayload({
+      iteration: 1,
+      messages: [{ role: 'user', content: 'x' }],
+    })));
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.equal(json.error.code, 'CONTINUE_NOT_AVAILABLE');
+  });
 });
 
 // ─── hook-path rejection of completePrompt on /instant ──────────────────
