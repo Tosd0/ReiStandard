@@ -113,9 +113,12 @@ function validateMessagesArray(messages) {
  * Validate an instant payload.
  *
  * @param {Object} payload
+ * @param {Object} [opts]
+ * @param {boolean} [opts.hookPath=false]            - When the handler was configured with `onLLMOutput`. The hook path rejects `completePrompt` because the hook author cannot predict v0.6's internal prompt-to-messages translation.
+ * @param {number} [opts.maxLoopIterations=10]
  * @returns {{ valid: true } | { valid: false, errorCode: string, errorMessage: string, details?: Object }}
  */
-export function validateInstantPayload(payload) {
+export function validateInstantPayload(payload, opts) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return {
       valid: false,
@@ -162,6 +165,19 @@ export function validateInstantPayload(payload) {
 
   const hasCompletePrompt = payload.completePrompt !== undefined;
   const hasMessages = payload.messages !== undefined;
+  const hookPath = !!(opts && opts.hookPath);
+
+  if (hookPath && hasCompletePrompt) {
+    // The hook path speaks in normalised `messages` arrays — the
+    // hook author has no way to anticipate how v0.6 stitches
+    // `completePrompt` into the LLM request, so we reject early.
+    return {
+      valid: false,
+      errorCode: 'COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH',
+      errorMessage: 'completePrompt is not supported when onLLMOutput is configured; pass a `messages` array directly',
+      details: { invalidFields: ['completePrompt'], hint: 'pass messages array directly' }
+    };
+  }
 
   if (hasCompletePrompt && hasMessages) {
     return {
@@ -303,5 +319,199 @@ export function validateInstantPayload(payload) {
     };
   }
 
+  // Hook-path-only fields are validated regardless of which path
+  // we're on — even legacy callers passing them should get a clean
+  // 400 rather than silent acceptance.
+  const sharedErr = validateHookPathSharedFields(payload, opts);
+  if (sharedErr) return sharedErr;
+
   return { valid: true };
+}
+
+/**
+ * Validate the `/continue` body. Same shape as `/instant`'s hook
+ * path, with two extras:
+ *
+ *   - `sessionId` is required (must match the original turn).
+ *   - `messages` is required (no `completePrompt` accepted on
+ *     `/continue` ever — `/continue` is a v0.7-only endpoint).
+ *
+ * The `iteration` field is **0-indexed** and represents the
+ * **next** round (= the `iteration` the hook saw, plus 1). It must
+ * stay within `[0, maxLoopIterations)` — out-of-range values
+ * indicate a broken client (off-by-one / retry stuck) and we
+ * fail-fast with 400 rather than burning an LLM call.
+ *
+ * @param {Object} payload
+ * @param {{ maxLoopIterations?: number }} [opts]
+ * @returns {{ valid: true } | { valid: false, errorCode: string, errorMessage: string, details?: Object }}
+ */
+export function validateContinuePayload(payload, opts) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'payload 必须是 JSON 对象'
+    };
+  }
+
+  if (typeof payload.sessionId !== 'string' || !payload.sessionId.trim()) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'sessionId 必填且为非空字符串',
+      details: { missingFields: ['sessionId'] }
+    };
+  }
+
+  if (payload.completePrompt !== undefined) {
+    return {
+      valid: false,
+      errorCode: 'COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH',
+      errorMessage: 'completePrompt is not accepted on /continue; pass a `messages` array directly',
+      details: { invalidFields: ['completePrompt'] }
+    };
+  }
+
+  if (payload.messages === undefined) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: '`messages` is required on /continue',
+      details: { missingFields: ['messages'] }
+    };
+  }
+  const messagesError = validateMessagesArray(payload.messages);
+  if (messagesError) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: messagesError,
+      details: { invalidFields: ['messages'] }
+    };
+  }
+
+  if (typeof payload.contactName !== 'string' || !payload.contactName.trim()) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'contactName 必填',
+      details: { missingFields: ['contactName'] }
+    };
+  }
+  if (typeof payload.apiUrl !== 'string' || !payload.apiUrl.trim()) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'apiUrl 必填', details: { missingFields: ['apiUrl'] }
+    };
+  }
+  if (typeof payload.apiKey !== 'string' || !payload.apiKey.trim()) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'apiKey 必填', details: { missingFields: ['apiKey'] }
+    };
+  }
+  if (typeof payload.primaryModel !== 'string' || !payload.primaryModel.trim()) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'primaryModel 必填', details: { missingFields: ['primaryModel'] }
+    };
+  }
+  if (
+    payload.maxTokens !== undefined && payload.maxTokens !== null &&
+    (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0)
+  ) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'maxTokens 必须是正整数', details: { invalidFields: ['maxTokens'] }
+    };
+  }
+  if (
+    payload.temperature !== undefined && payload.temperature !== null &&
+    (typeof payload.temperature !== 'number' || !Number.isFinite(payload.temperature))
+  ) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'temperature 必须是有限数字', details: { invalidFields: ['temperature'] }
+    };
+  }
+  if (
+    !payload.pushSubscription ||
+    typeof payload.pushSubscription !== 'object' ||
+    typeof payload.pushSubscription.endpoint !== 'string'
+  ) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'pushSubscription 必须是合法 Web Push 订阅对象',
+      details: { missingFields: ['pushSubscription.endpoint'] }
+    };
+  }
+  const avatarErr = validateAvatarUrl(payload.avatarUrl);
+  if (avatarErr) {
+    return {
+      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: avatarErr, details: { invalidFields: ['avatarUrl'] }
+    };
+  }
+
+  return validateHookPathSharedFields(payload, opts) || { valid: true };
+}
+
+/**
+ * Validate fields that are only meaningful on the hook path (or
+ * `/continue`). Returns null when everything looks fine so the
+ * caller can keep going.
+ *
+ * @param {Object} payload
+ * @param {{ maxLoopIterations?: number }} [opts]
+ */
+function validateHookPathSharedFields(payload, opts) {
+  if (payload.sessionId !== undefined) {
+    if (typeof payload.sessionId !== 'string' || !payload.sessionId.trim()) {
+      return {
+        valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: 'sessionId 必须是非空字符串',
+        details: { invalidFields: ['sessionId'] }
+      };
+    }
+  }
+  if (payload.charId !== undefined) {
+    if (typeof payload.charId !== 'string' || !payload.charId.trim()) {
+      return {
+        valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: 'charId 必须是非空字符串',
+        details: { invalidFields: ['charId'] }
+      };
+    }
+  }
+  if (payload.iteration !== undefined) {
+    const maxLoop = opts && Number.isInteger(opts.maxLoopIterations) && opts.maxLoopIterations > 0
+      ? opts.maxLoopIterations
+      : 10;
+    if (
+      typeof payload.iteration !== 'number' ||
+      !Number.isInteger(payload.iteration) ||
+      payload.iteration < 0 ||
+      payload.iteration >= maxLoop
+    ) {
+      return {
+        valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: `iteration 必须是 0..${maxLoop - 1} 范围内的整数`,
+        details: { invalidFields: ['iteration'] }
+      };
+    }
+  }
+  if (payload.metadata !== undefined && payload.metadata !== null) {
+    if (
+      typeof payload.metadata !== 'object' ||
+      Array.isArray(payload.metadata)
+    ) {
+      return {
+        valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: 'metadata 必须是普通对象',
+        details: { invalidFields: ['metadata'] }
+      };
+    }
+  }
+  return null;
 }

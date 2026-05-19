@@ -6,7 +6,13 @@ export default defineConfig({
     'adapters/cloudflare': 'src/adapters/cloudflare.js',
     'adapters/node': 'src/adapters/node.js',
     'adapters/netlify': 'src/adapters/netlify.js',
-    'adapters/vercel': 'src/adapters/vercel.js'
+    'adapters/vercel': 'src/adapters/vercel.js',
+    'blob/memory': 'src/blob-store/memory.js',
+    'blob/d1': 'src/blob-store/d1.js',
+    'blob/kv': 'src/blob-store/kv.js',
+    'blob/upstash': 'src/blob-store/upstash.js',
+    'blob/netlify': 'src/blob-store/netlify.js',
+    'blob/postgres': 'src/blob-store/postgres.js'
   },
   format: ['cjs', 'esm'],
   dts: true,

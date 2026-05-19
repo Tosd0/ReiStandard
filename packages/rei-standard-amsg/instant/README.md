@@ -36,6 +36,9 @@ npm install @rei-standard/amsg-instant
 | `webpush`           | object    | ❌   | **0.3.0 起废弃**。保留参数兼容旧代码但被忽略；测试改用 `fetch` 拦截 push endpoint 的 POST。 |
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
 | `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
+| `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
+| `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
+| `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
 
 ### 鉴权策略
 
@@ -233,15 +236,25 @@ LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每
 
 ### 错误码
 
-| Code                              | HTTP | 说明 |
-|-----------------------------------|------|------|
-| `METHOD_NOT_ALLOWED`              | 405  | 非 POST |
-| `UNAUTHORIZED`                    | 401  | tokenSigningKey 校验失败 |
-| `INVALID_CLIENT_TOKEN`            | 401  | clientToken 校验失败（缺头或不匹配） |
-| `INVALID_PAYLOAD_FORMAT`          | 400  | body 不是合法 JSON 或字段缺失/非法 |
-| `VAPID_CONFIG_ERROR`              | 500  | VAPID 配置缺失 |
-| `LLM_CALL_FAILED`                 | 502  | 上游 LLM 请求失败 |
-| `PUSH_SEND_FAILED`                | 502  | Web Push 派送失败 |
+所有错误响应统一走 envelope `{ success: false, error: { code, message } }`，SDK 消费者只需读 `body.error.code` 分支。
+
+| Code                                          | HTTP | 起 | 说明 |
+|-----------------------------------------------|------|----|------|
+| `METHOD_NOT_ALLOWED`                          | 405  | 0.1 | 非 POST（`/blob/:key` GET 例外，见下） |
+| `UNAUTHORIZED`                                | 401  | 0.1 | `tokenSigningKey` 校验失败 |
+| `INVALID_CLIENT_TOKEN`                        | 401  | 0.1 | `clientToken` 校验失败（缺头或不匹配） |
+| `INVALID_PAYLOAD_FORMAT`                      | 400  | 0.1 | body 不是合法 JSON 或字段缺失/非法 |
+| `VAPID_CONFIG_ERROR`                          | 500  | 0.1 | VAPID 配置缺失 |
+| `LLM_CALL_FAILED`                             | 502  | 0.1 | 上游 LLM 请求失败 |
+| `PUSH_SEND_FAILED`                            | 502  | 0.1 | Web Push 派送失败 |
+| `COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH`  | 400  | 0.7 | 配了 `onLLMOutput` 之后 `/instant` 或 `/continue` 还传 `completePrompt`；hook 路径只接受 `messages` 数组 |
+| `HOOK_THREW`                                  | 500  | 0.7 | `onLLMOutput` 抛错或返了非法 decision（`null` / 不识别的 `decision` 值 / `pushPayload` 不可 JSON-serialize）。同时会推一条诊断 push（payload `{type:'error', code:'HOOK_THREW',...}`） |
+| `PAYLOAD_TOO_LARGE`                           | 500  | 0.7 | hook 返的 `pushPayload` UTF-8 字节超 `maxInlineBytes` 且没配 `blobStore`。配上 BlobStore 自动走 envelope 转发 |
+| `INTERNAL_ERROR`                              | 500  | 0.1 | 其他未分类内部错误 |
+
+**`LOOP_EXCEEDED` 不是错误码** —— hook 反复返 `decision:'continue'` 超 `maxLoopIterations` 时，worker 返 HTTP **200** + body `{ success: true, data: { status: 'loop_exceeded', sessionId, iteration } }`，并向 SW 推一条 `{type:'error', code:'LOOP_EXCEEDED',...}` 诊断 envelope。HTTP 层是正常完成，不会让客户端误重试。
+
+**`/blob/:key` 端点的 error envelope 不同** —— 它走 plain `{ error: 'invalid_key' | 'blob_not_found_or_expired' | 'blob_store_not_configured' | 'blob_read_failed' }`，因为这条路径是给 SW 直 fetch 用的、跟主 SDK 的 wrap envelope 不在一条契约上。
 
 ## 推送 payload 字段（SW 端契约）
 
@@ -264,6 +277,374 @@ LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每
   metadata
 }
 ```
+
+---
+
+## Agentic Loop（0.7.0+）
+
+v0.7 在 v0.6 之上**追加**了一个 hook 路径：配置 `onLLMOutput` 后，handler 把"一次请求 = 一次 LLM 调用 + 一条 push"扩展成"一次请求 = 多轮 LLM 调用 + 由 hook 决定如何推送 / 是否续跑 / 是否截断把控制权给客户端"。
+
+**两条路径互不干扰**：
+
+- **不配 `onLLMOutput`** → 原 v0.6 单次 LLM + 分句 + 串行 push（默认 1500 ms 间隔，13 字段 payload）。字节级与 v0.6 一致。
+- **配了 `onLLMOutput`** → 进 agentic loop，每轮 LLM 输出后调 hook 做 decision；hook 返什么就执行什么。`splitPattern` 在这条路径下不会被读，启动期会 `console.warn` 提示。
+
+### hook 签名
+
+```ts
+onLLMOutput(ctx: SessionContext): LLMOutputDecision | Promise<LLMOutputDecision>
+```
+
+`SessionContext` 字段（**不包含**凭据 `apiKey` / `pushSubscription` / `vapid` 等 —— hook 拿不到，也没必要拿）：
+
+| 字段 | 含义 |
+|---|---|
+| `sessionId` | 该会话的稳定 ID。`/instant` 不传时自动生成 UUID v4；`/continue` 必须带回来 |
+| `charId?` | 调用方业务字段，透传 |
+| `messages` | 当前对话 history。已 append 本轮 LLM 整对象 `choices[0].message`（含 `tool_calls` / `reasoning_content` / `refusal`），**不是只塞 `{role, content}`** —— 后者会让下一轮把 tool result 发回 OpenAI 时因为缺 `tool_calls` 被拒 |
+| `llmResponse` | 完整 LLM API response 对象（含 `usage` / `reasoning_content` 等） |
+| `llmOutputText` | `choices[0].message.content`。**可能是空串**（纯 `tool_calls` 响应合法） |
+| `iteration` | 0-indexed 当前轮号 |
+| `metadata` | 调用方传入的 metadata，透传 |
+| `contactName`, `avatarUrl?` | 给想自己构造 default-style payload 的 hook 用 |
+
+### Decision 四选一
+
+```ts
+type LLMOutputDecision =
+  | { decision: 'finish';       pushPayload: unknown }      // 推送 final，结束链路
+  | { decision: 'tool-request'; pushPayload: unknown }      // 推送 tool-request，等 /continue
+  | { decision: 'continue';     nextHistory: ChatMessage[] } // worker 内部再来一轮 LLM，不推送
+  | { decision: 'skip-push' }                                // 直接结束链路、不推送（罕见）
+```
+
+`pushPayload` 必须 **JSON-safe**（无循环引用 / BigInt / function 字段），否则被当作 hook 契约违反走 `HookError` / `HOOK_THREW` 路径。
+
+### `decision: 'continue'` + `nextHistory` 的脚枪
+
+`nextHistory` **完全替换**下一轮的 messages 数组。如果你从零拼 `nextHistory` 而忘了带上刚由 worker append 进 `ctx.messages` 的 assistant 消息，那下一轮 LLM 看到的 history 就是 `user → user`，**OpenAI 会因为 tool result 引用了一个不存在的 assistant 轮直接拒掉请求**。
+
+**默认安全写法**：
+
+```js
+onLLMOutput(ctx) {
+  return {
+    decision: 'continue',
+    nextHistory: [...ctx.messages, toolResultMessage],
+  };
+}
+```
+
+只在你**真的想丢掉 assistant 上下文**时才从零构造。
+
+### `maxLoopIterations`
+
+防的是**单次 worker 调用内 hook 反复返回 `{decision:'continue'}`** 的失控循环。默认 10，超限后 worker 直接：
+
+1. emit `loop_exceeded` 事件
+2. 用 `sendPushWithMaybeBlob` 推一条 `{ type:'error', code:'LOOP_EXCEEDED', sessionId, iteration }` envelope
+3. HTTP **200** + body `{ status: 'loop_exceeded', sessionId, iteration }` —— 注意**不是 5xx**，worker 已经完成了"推一条诊断给 SW"的合约，不该让客户端把它当可重试失败
+
+**保护范围**：仅限单次 worker 调用内的 in-loop counter。跨请求的 `/continue` 洪水攻击（恶意客户端反复打 `/continue` 一直传 `iteration:0`）由部署方的 auth / rate-limit 负责，**不是这个守卫的活**。
+
+### sessionId 重投递 dedup（SW 端必看）
+
+worker **不去重**同一 `sessionId` 的并发 `/continue`。浏览器 push 投递自身就可能给同一条 push 重投（网络重试、focus-change replay、唤醒，**甚至在 SW 上一次 handler 已经跑完之后**），所以两个 `/continue` POST 完全可能背靠背落到 worker，连恶意客户端都不需要。后果是：2× LLM 费用 + UI 上 2× 重复气泡。
+
+**包不管这件事；SW 必须自己 dedup**。Blob 路径是非破坏性多次消费（TTL 默认 60 s），所以 SW 可以**先 fetch 拿真 body、再用 `(sessionId, iteration)` claim** 一个 IndexedDB 记录、写入失败说明已被处理 → 直接吞掉本次投递：
+
+```js
+self.addEventListener('push', (e) => e.waitUntil((async () => {
+  let data = e.data.json();
+  if (data?._blob) {                                          // 1. envelope
+    const res = await fetch(data.url);
+    if (!res.ok) return;                                       // TTL 已过期/失败，不展示
+    data = await res.json();
+  }
+  if (data.type !== 'tool-request') return handle(data);
+
+  // 2. fetch 之后 dedup —— claim 永久保留，靠 sweeper 清旧
+  const claimKey = `${data.sessionId}:${data.iteration}`;
+  const db = await openIdempotencyDB();
+  const claimed = await db.add('claims', { key: claimKey, at: Date.now() }).catch(() => null);
+  if (!claimed) return;                                        // 重复投递 / 重发，吞掉
+
+  const result = await runToolLocally(data);
+  await fetch('/continue', { method: 'POST', body: JSON.stringify({
+    ...data, messages: [...data.messages, result], iteration: data.iteration + 1,
+  }) });
+  // 不删 claim —— 它的存在就是"已消费"的证据
+})()));
+
+async function sweepOldClaims() {                              // SW activate / 周期跑
+  const db = await openIdempotencyDB();
+  const cutoff = Date.now() - 60 * 60 * 1000;                  // 1h 容忍合理重投递窗
+  const tx = db.transaction('claims', 'readwrite');
+  for await (const cursor of tx.store.iterate()) {
+    if (cursor.value.at < cutoff) await cursor.delete();
+  }
+}
+```
+
+⚠️ **`try/finally delete` 是 racey 的**：在 handler 跑完后删 claim，push 重投递时 dedup 失效。必须 claim 永久保留，sweeper 清旧的。IndexedDB `add` 在重复 key 时直接抛错，**天然原子**。
+
+业务能容忍重复 push（纯展示重复气泡也行）就跳过整段。
+
+### `/continue` 端点契约
+
+POST body（结构与 `/instant` 入口相同 + `sessionId` + `iteration`）：
+
+```ts
+{
+  sessionId: string;
+  messages: ChatMessage[];                  // 完整 history（含 tool result 作为最后一条 user/tool 消息）
+  pushSubscription: PushSubscriptionInfo;
+  apiUrl: string; apiKey: string; primaryModel: string;
+  maxTokens?: number; temperature?: number;
+  metadata?: Record<string, unknown>;       // 非 plain object 直接 400
+  charId?: string; avatarUrl?: string; contactName: string;
+  iteration: number;                        // = ctx.iteration + 1，0 ≤ iteration < maxLoopIterations
+}
+```
+
+- 鉴权链：**完整复用** `/instant` 的 Bearer（配了 `tokenSigningKey` 时）+ clientToken（配了 `clientToken` 时），顺序一致。否则在鉴权模式下 `/continue` 留后门。
+- `completePrompt` 永远不接受（`/continue` 是 v0.7 新端点，跟 v0.6 没关系）。
+- 越界 `iteration`（< 0 / 非整数 / ≥ `maxLoopIterations`）**直接 400 fail-fast**：设计前提是客户端是正常实现，传 999 说明 client 状态坏了，少跑一次多余 LLM 比让 in-loop counter 跑满再吐 LOOP_EXCEEDED 友好。不假设防恶意 client（那是 auth / rate-limit 的事）。
+
+### 事件分类（0.7.0+）
+
+事件统一用**直接 type 名**做 discriminator（不再混 `error+code` 二级嵌套）：
+
+- **进度**：`llm_start` / `llm_done` / `final_pushed` / `tool_request_pushed` / `continue_received` / `blob_written`
+- **软失败**（链路可继续 / 自愈）：`blob_put_failed` / `blob_orphaned` / `diagnostic_push_failed` / `payload_too_large`
+- **硬错误**（worker 中止链路）：`hook_threw` / `loop_exceeded` / `llm_call_failed`
+
+**push payload（SW 收到的 wire format）仍用 `{type:'error', code:'...'}`** —— SW 路由按"先看大类、再看 code"更顺手，跟事件分类是独立两层。
+
+---
+
+## BlobStore（0.7.0+）
+
+### 为什么需要它
+
+Web Push（RFC 8030 / 8291）单 record 密文上限 4096 B，扣 header + GCM tag + padding 后明文理论上限约 **3993 B**。各推送服务实际的"安全线"通常更低：
+
+| 通道 | 实测/经验安全线 | 出处 |
+|---|---|---|
+| Mozilla autopush（Firefox desktop） | ~4028 B | 社区实测 |
+| Firefox-on-Android 受限通道 | 3070 B | Firefox 错误信息 |
+| `web-push-php` `MAX_COMPATIBILITY_PAYLOAD_LENGTH` | **2820 B** | web-push-php README |
+| RFC 兼容推荐线 | 3052 B | web-push-libs README |
+| APNs Web Push | ~4096 B | Apple 文档 |
+
+包默认 `maxInlineBytes = 2600`，相对 `web-push-php` 跨服务安全线留 ~220 B margin。**字节比对用 UTF-8 byteLength（`new TextEncoder().encode(s).byteLength`），不是 JS `.length`** —— 后者是 UTF-16 code unit，CJK 字符 `.length = 1` 但 UTF-8 占 3 字节，混用会让中文 payload 误走直传被 413 拒收。
+
+agentic loop 模式下 payload 大小分布（经验值）：
+
+| 场景 | 常态 | p90 | p99 |
+|---|---|---|---|
+| 纯文本 / 副作用 push，无 reasoning | 0.5–1.5 KB | 2 KB | 3 KB |
+| 副作用 push + reasoning chain | 1–2.5 KB | 3 KB | 4–5 KB（撞线） |
+| tool-request push（带本轮 LLM 原文） | 0.8–1.8 KB | 2.5 KB | 3.5 KB |
+| tool-request + reasoning | 1.5–3 KB | 4 KB（临界） | 5–6 KB（超） |
+
+→ **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。`BlobStore` 是**兜底**：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, type? }`，SW 端 `GET ${url}` 拿真 body。
+
+### 何时启用 / 何时跳过
+
+| 场景 | 推荐 |
+|---|---|
+| 不配 `onLLMOutput`（v0.6 legacy 路径） | **不需要配** —— 分句拆出来每段都 < 1 KB |
+| agentic loop，不开 reasoning、不带 replay history | 建议配（保守安全线下 p90 接近撞线） |
+| agentic loop，开 reasoning 显示 | **强烈推荐** —— 必撞 |
+| 任何 tool-request 流程 | 推荐配 |
+| 一次推完整 history | **必须配** —— 必超 |
+
+**不配 + 超限的行为**：抛 `PayloadTooLargeError` + emit `payload_too_large`，不静默截断。调用方据此决定要不要上 BlobStore。
+
+### 包内自带 6 个 adapter
+
+按部署平台分组。把对应的 client 实例传进去就完事，包本身不引任何额外依赖（client SDK 由调用方自己 install）。
+
+**Cloudflare Workers**
+
+```js
+// 推荐 — D1，免费档 10 万 row/day 写入
+import { createD1BlobStore } from '@rei-standard/amsg-instant/blob/d1';
+const adapter = createD1BlobStore(env.DB, { table: 'amsg_transient_blobs' });
+
+// KV — 仅当 D1 不可用时；免费档写入 1k/day，高频会爆
+import { createKVBlobStore } from '@rei-standard/amsg-instant/blob/kv';
+const adapter = createKVBlobStore(env.BLOB_KV);
+```
+
+**Vercel / 任何 serverless（Upstash Redis）**
+
+```js
+// 也覆盖 Vercel KV —— 它就是 Upstash 套壳，client API 一致
+import { Redis } from '@upstash/redis';   // 或 import { kv } from '@vercel/kv';
+import { createUpstashBlobStore } from '@rei-standard/amsg-instant/blob/upstash';
+const adapter = createUpstashBlobStore(Redis.fromEnv());   // 或直接传 kv
+```
+
+**Netlify Functions / Edge**
+
+```js
+import { getStore } from '@netlify/blobs';
+import { createNetlifyBlobStore } from '@rei-standard/amsg-instant/blob/netlify';
+const adapter = createNetlifyBlobStore(getStore('amsg-blobs'));
+// Netlify Blobs 没有原生 TTL — adapter 内部用 {body, expiresAt} 包一层；
+// 生产记得挂个 Netlify Scheduled Function 周期清理过期 row，模板见 src/blob-store/netlify.js
+```
+
+**Postgres（Neon / Supabase / Vercel Postgres / 自建）**
+
+```js
+import { Pool } from 'pg';   // 或 @neondatabase/serverless / @vercel/postgres
+import { createPostgresBlobStore } from '@rei-standard/amsg-instant/blob/postgres';
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = createPostgresBlobStore(pool);
+// 需要自建表 + 挂 cron sweeper，schema/SQL 见下方"SQL schema 模板"小节
+```
+
+**调试 / 单实例长跑（Memory）**
+
+```js
+import { createMemoryBlobStore } from '@rei-standard/amsg-instant/blob/memory';
+const adapter = createMemoryBlobStore({ maxEntries: 100 });
+// ⚠️ DO NOT use 在任何 serverless（CF Workers / Vercel / Netlify / Lambda）
+// —— isolates/instances 之间不共享内存，SW fetch 会命中错 isolate 拿到 404。
+// 满容 fail-fast 不做 LRU，避免静默踢掉还在 in-flight 的 envelope key。
+```
+
+传给 handler：
+
+```js
+createInstantHandler({
+  vapid,
+  onLLMOutput,
+  blobStore: {
+    adapter,
+    maxInlineBytes: 2600,   // 可省，默认 2600
+    ttlSeconds: 60,         // 可省，默认 60
+  },
+});
+```
+
+### 自定义 adapter（任何后端）
+
+实现 `BlobStoreAdapter` 两个方法即可（**`read` 必须是非破坏性 SELECT**，多次读返同样 body —— 让 SW 在 push 重投递时能 fetch 之后再 dedup）：
+
+```ts
+interface BlobStoreAdapter {
+  put(key: string, body: string, ttlSeconds: number): Promise<void>;
+  read(key: string): Promise<string | null>;
+}
+```
+
+模板（Postgres / Redis 各 ~30 行）：
+
+```ts
+function createPostgresBlobStore(pool) {
+  return {
+    async put(key, body, ttl) {
+      await pool.query(
+        'INSERT INTO amsg_transient_blobs(key, body, expires_at) VALUES ($1, $2, $3)',
+        [key, body, Date.now() + ttl * 1000],
+      );
+    },
+    async read(key) {
+      const { rows } = await pool.query(
+        'SELECT body FROM amsg_transient_blobs WHERE key=$1 AND expires_at>$2',
+        [key, Date.now()],
+      );
+      return rows[0]?.body ?? null;
+    },
+  };
+}
+
+function createRedisBlobStore(redis) {
+  return {
+    async put(key, body, ttl) { await redis.set(`amsg:${key}`, body, { EX: ttl }); },
+    async read(key) { return redis.get(`amsg:${key}`); },
+  };
+}
+```
+
+### SQL schema 模板 + 强制 cron sweeper
+
+调用方自建（包不替你建表）：
+
+```sql
+CREATE TABLE IF NOT EXISTS amsg_transient_blobs (
+  key TEXT PRIMARY KEY,
+  body TEXT NOT NULL,
+  expires_at INTEGER NOT NULL  -- ms timestamp
+);
+CREATE INDEX IF NOT EXISTS idx_amsg_blobs_expires ON amsg_transient_blobs(expires_at);
+```
+
+**production 必须挂 cron sweeper** —— 非破坏性 `read` 不删行，过期未消费的 row 会无限堆积：
+
+```ts
+// wrangler.toml
+[triggers]
+crons = ["*/15 * * * *"]
+
+// worker
+export default {
+  async scheduled(_event, env) {
+    await env.DB.prepare('DELETE FROM amsg_transient_blobs WHERE expires_at < ?')
+      .bind(Date.now()).run();
+  },
+};
+```
+
+Redis / Upstash 等带原生 TTL 的后端不用挂；KV 同理。
+
+### Node 反代部署注意
+
+`request.url` 在 nginx / Caddy 反代下默认是内网 host，envelope blobUrl 会推导错。outer router 里用 `X-Forwarded-Proto` / `X-Forwarded-Host` 重建公网 URL 后再传 Request 进来。
+
+---
+
+## Migrating from v0.6
+
+**绝大多数 v0.6 用户什么都不用改**。包升到 0.7.0 后：
+
+- 不配 `onLLMOutput` → 跑 legacy 路径，字节级与 v0.6 一致（同 13 字段 payload、同 1500 ms 间隔、同 `splitPattern`、同 `onEvent` 事件）
+- `splitPattern` 数组、`messageSubtype`、`metadata` 等所有 v0.6 字段保持原样
+- `buildInstantPushPayload` 现在是 public helper —— 你的 v0.6 测试如果之前 monkey-patch 过它，现在可以直接 import
+
+只在你**想用 agentic loop** 的时候才动配置：把 `onLLMOutput` 加进 `createInstantHandler` 入参，里头自己决定 finish / tool-request / continue / skip-push。其他都不需要碰。
+
+---
+
+## Subpath mount
+
+handler 假设独占 URL 根空间。`/continue` 是精确路径匹配，`/blob/${key}` envelope 是 root-anchored（从入站 `request.url` 推导成 `https://host/blob/...`）。如果你想把 amsg 挂到 `/amsg/*` 子前缀下，outer router 必须**同时**做两件事：
+
+```js
+if (url.pathname.startsWith('/amsg/')) {
+  // /amsg/instant, /amsg/continue: 剥前缀
+  const inner = new Request(
+    url.origin + url.pathname.slice('/amsg'.length) + url.search,
+    request,
+  );
+  return amsgHandler(inner, env, ctx);
+}
+if (url.pathname.startsWith('/blob/')) {
+  // envelope blobUrl 是 https://host/blob/${key} —— SW fetch 时回到 root，
+  // 没法被前缀隔离。outer router 直接路由到 amsg handler，不重写 URL。
+  return amsgHandler(request, env, ctx);
+}
+```
+
+**代价**：`/blob/*` 在 root 被 amsg 永久占用，部署方想给别的服务用这个 path 会冲突。不配 `blobStore` 则只需要 `/amsg/*` 这一条。
+
+不引入 `blobUrlBuilder` 这种回调是有意为之 —— 它只能修 envelope URL 一边，不修路由（`url.pathname === '/continue'` 仍是精确匹配），不如承认双前缀这条限制，配置项越少出错面越小。
+
+---
 
 ## 部署示例
 

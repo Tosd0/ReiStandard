@@ -20,8 +20,9 @@
  *   };
  */
 
-import { validateInstantPayload } from './validation.js';
+import { validateInstantPayload, validateContinuePayload } from './validation.js';
 import { processInstantMessage } from './message-processor.js';
+import { HookError, PayloadTooLargeError, LlmCallError } from './errors.js';
 import {
   utf8,
   utf8Decode,
@@ -29,6 +30,8 @@ import {
   hmacSha256,
   timingSafeEqualBytes,
 } from './utils.js';
+
+const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * @typedef {Object} VapidConfig
@@ -51,6 +54,23 @@ import {
  * @property {Object} [webpush]               - **Deprecated since 0.3.0.** Ignored. amsg-instant now implements RFC 8291 + RFC 8292 natively on Web Crypto. Tests should intercept the push HTTP request via `options.fetch` instead.
  * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy). Used for BOTH the LLM call and the outgoing Web Push POST.
  * @property {(e: { type: string }) => void} [onEvent]
+ * @property {(ctx: import('./session-context.js').SessionContext) => Promise<object> | object} [onLLMOutput]
+ *           - **v0.7 hook.** When provided, the handler switches from
+ *             the legacy one-shot path to a per-turn agentic loop.
+ *             The hook returns one of:
+ *               `{ decision: 'finish',       pushPayload }`
+ *               `{ decision: 'tool-request', pushPayload }`
+ *               `{ decision: 'continue',     nextHistory }`
+ *               `{ decision: 'skip-push' }`
+ *             See README §Agentic Loop.
+ * @property {import('./blob-store/interface.js').BlobStoreConfig} [blobStore]
+ *           - Optional. When the hook returns a pushPayload whose
+ *             UTF-8 byte length exceeds `maxInlineBytes` (default
+ *             2600), the body is written to the adapter and the SW
+ *             receives a small `{ _blob, key, url, type? }` envelope
+ *             instead. Without `blobStore` the over-sized payload
+ *             throws `PayloadTooLargeError`.
+ * @property {number} [maxLoopIterations=10]  - Hard ceiling on in-loop `decision:'continue'` rounds within a single worker invocation. Cross-invocation `/continue` floods are the deployer's auth/rate-limit concern.
  */
 
 /**
@@ -81,6 +101,23 @@ export function createInstantHandler(options) {
   const clientToken = options.clientToken ? String(options.clientToken) : '';
   const expectedClientTokenBytes = clientToken ? utf8(clientToken) : null;
   const corsHeaders = buildCorsHeaders(options.cors);
+  const onLLMOutput = typeof options.onLLMOutput === 'function' ? options.onLLMOutput : null;
+  const blobStore = options.blobStore || null;
+  const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
+    ? options.maxLoopIterations
+    : 10;
+
+  // One-shot startup warning: a caller who sets both `onLLMOutput`
+  // and `splitPattern` almost certainly hasn't realised the hook
+  // path doesn't run the sentence splitter. We don't fail (the combo
+  // is benign), just nudge them in the console so the dead config
+  // doesn't go unnoticed in production logs.
+  if (onLLMOutput && options.splitPattern !== undefined) {
+    const warn = globalThis.console && globalThis.console.warn;
+    if (typeof warn === 'function') {
+      warn('[amsg-instant] splitPattern is ignored when onLLMOutput is provided. Move splitting logic into your hook if needed.');
+    }
+  }
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -97,6 +134,22 @@ export function createInstantHandler(options) {
     // hits before we ever try to parse the JSON body.
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(request.url);
+    } catch {
+      parsedUrl = null;
+    }
+    const pathname = parsedUrl ? parsedUrl.pathname : '';
+
+    // `GET /blob/:key` — public envelope read. Hard-coded path. No
+    // auth (SW can't easily attach the caller's Bearer/clientToken);
+    // protection is UUID v4 + TTL. CORS opens it for cross-origin SW
+    // fetches.
+    if (pathname.startsWith('/blob/') && request.method === 'GET') {
+      return handleBlobRead(request, pathname, blobStore, corsHeaders);
     }
 
     if (request.method !== 'POST') {
@@ -136,7 +189,24 @@ export function createInstantHandler(options) {
       });
     }
 
-    const validation = validateInstantPayload(payload);
+    const isContinue = pathname === '/continue';
+
+    // Validator selection — `/continue` uses its own schema, `/instant`
+    // (and any other POST path) goes through `validateInstantPayload`
+    // with a `hookPath` flag so it can reject `completePrompt` when
+    // the agentic loop is configured. Backwards compat preserved when
+    // pathname is anything else (e.g. `/`, `/foo`): legacy v0.6
+    // behaviour was to accept any POST regardless of path.
+    let validation;
+    if (isContinue) {
+      validation = validateContinuePayload(payload, { maxLoopIterations });
+    } else {
+      validation = validateInstantPayload(payload, {
+        hookPath: !!onLLMOutput,
+        maxLoopIterations,
+      });
+    }
+
     if (!validation.valid) {
       return respond(400, {
         success: false,
@@ -159,19 +229,120 @@ export function createInstantHandler(options) {
       const result = await processInstantMessage(payload, {
         vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
-        onEvent
+        onEvent,
+        onLLMOutput,
+        blobStore,
+        maxLoopIterations,
+        requestUrl: request.url,
+        isResume: isContinue,
       });
       return respond(200, { success: true, data: result });
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
-      const status = code === 'PUSH_SEND_FAILED' || code === 'LLM_CALL_FAILED' ? 502 : 500;
+      const status = mapErrorStatus(err, code);
+      // Unified envelope: every error goes through `error: { code, message }`
+      // so SDK consumers can always read `body.error.code`. The plan's
+      // earlier draft had HOOK_THREW emit a flat `error: 'hook_threw'`
+      // string — that diverged from every other v0.6/v0.7 error and made
+      // `body.error.code` undefined for hook failures. The push-payload
+      // wire format (what the SW receives) stays as `{type:'error',
+      // code:'HOOK_THREW',...}` — that's a separate layer.
       return respond(status, {
         success: false,
-        error: { code, message: err?.message || '内部错误' }
+        error: { code, message: err?.message || '内部错误' },
       });
     }
   };
+}
+
+/**
+ * Map an Error to its HTTP status code. `HookError` is in-process
+ * caller-supplied code that misbehaved — 500. `LlmCallError` /
+ * `PUSH_SEND_FAILED` are upstream — 502. `PayloadTooLargeError` is
+ * a config mismatch (no blob store) on a hook-path response — 500
+ * is more honest than 413 since the limit isn't the HTTP body, it's
+ * the *push payload*.
+ *
+ * @param {unknown} err
+ * @param {string} code
+ * @returns {number}
+ */
+function mapErrorStatus(err, code) {
+  if (err instanceof HookError) return 500;
+  if (err instanceof LlmCallError) return 502;
+  if (err instanceof PayloadTooLargeError) return 500;
+  if (code === 'PUSH_SEND_FAILED' || code === 'LLM_CALL_FAILED') return 502;
+  return 500;
+}
+
+/**
+ * `GET /blob/:key` handler. Returns the previously-stored blob body
+ * to the SW, with `Access-Control-Allow-Origin: *` so a cross-origin
+ * SW fetch can read it. Multiple reads within the TTL return the
+ * same body — push-redelivery scenarios rely on this so the SW can
+ * dedup *after* fetching.
+ *
+ * @param {Request} request
+ * @param {string} pathname
+ * @param {import('./blob-store/interface.js').BlobStoreConfig | null} blobStore
+ * @param {Record<string, string>} baseHeaders
+ * @returns {Promise<Response>}
+ */
+async function handleBlobRead(request, pathname, blobStore, baseHeaders) {
+  if (!blobStore || !blobStore.adapter) {
+    return new Response(JSON.stringify({ error: 'blob_store_not_configured' }), {
+      status: 404,
+      headers: {
+        ...baseHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+  const key = pathname.slice('/blob/'.length);
+  if (!BLOB_KEY_REGEX.test(key)) {
+    return new Response(JSON.stringify({ error: 'invalid_key' }), {
+      status: 400,
+      headers: {
+        ...baseHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+  let body;
+  try {
+    body = await blobStore.adapter.read(key);
+  } catch {
+    return new Response(JSON.stringify({ error: 'blob_read_failed' }), {
+      status: 502,
+      headers: {
+        ...baseHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+  if (typeof body !== 'string') {
+    return new Response(JSON.stringify({ error: 'blob_not_found_or_expired' }), {
+      status: 404,
+      headers: {
+        ...baseHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+  return new Response(body, {
+    status: 200,
+    headers: {
+      ...baseHeaders,
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    },
+  });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -313,6 +484,14 @@ async function verifyBearerToken(request, signingKey, respond) {
 
 // ─── Public re-exports (for advanced users / SSR / tests) ──────────────
 
-export { validateInstantPayload, validateAvatarUrl } from './validation.js';
-export { splitMessageIntoSentences, processInstantMessage, normalizeAiApiUrl } from './message-processor.js';
+export { validateInstantPayload, validateAvatarUrl, validateContinuePayload } from './validation.js';
+export {
+  splitMessageIntoSentences,
+  processInstantMessage,
+  normalizeAiApiUrl,
+  buildInstantPushPayload,
+  sendPushWithMaybeBlob,
+} from './message-processor.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
+export { HookError, PayloadTooLargeError, LlmCallError, MemoryStoreFullError } from './errors.js';
+export { buildSessionContext, extractAssistantMessage } from './session-context.js';

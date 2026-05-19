@@ -1,5 +1,40 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.7.0 — 2026-05-19 — Agentic Loop Framework
+
+**New**
+
+- **`onLLMOutput` hook**: caller controls per-turn decision. Hook returns one of `{ decision: 'finish' | 'tool-request' | 'continue' | 'skip-push' }`. When the hook is provided, the handler switches to a per-turn agentic loop; when omitted, the handler runs the legacy v0.6 one-shot path **byte-for-byte unchanged**. The two paths are independent and do not share schema.
+- **`/continue` endpoint** (hardcoded path) for tool-call resumption. Reuses `/instant`'s full auth chain (Bearer JWT + clientToken, in the same order). Worker stays stateless; the caller persists session state on its end.
+- **Custom push payload schema** via the hook's return value. `buildInstantPushPayload` is now exported as a public helper for callers who want the v0.6 13-field shape inside their own hook.
+- **Optional `blobStore` config** with a `BlobStoreAdapter` interface (`put` + non-destructive `read`). Six built-in adapters covering the major serverless / Node deployment targets, picked by the platform's native storage so callers don't need a custom adapter for typical setups:
+  - **Cloudflare**: `.../blob/d1`, `.../blob/kv`
+  - **Vercel / any serverless** (Upstash Redis, also covers Vercel KV which is Upstash under the hood): `.../blob/upstash`
+  - **Netlify** (Netlify Blobs; no native TTL, adapter wraps body with embedded `expiresAt`): `.../blob/netlify`
+  - **Postgres** (Neon / Supabase / Vercel Postgres / self-hosted via `pg`-compatible client): `.../blob/postgres`
+  - **Memory** (long-lived Node only — Memory adapter is unsafe on isolate-based serverless): `.../blob/memory`
+  - Arbitrary backends (DynamoDB / Cassandra / …) still plug in with a ~30-line custom adapter implementing the same two methods — templates in `examples/custom-blob-store/`.
+- **`/blob/:key` GET endpoint** (hardcoded path; UUID-v4 protected; non-destructive multi-read within TTL; no auth header required so SW can fetch). Response carries `Access-Control-Allow-Origin: *` so cross-origin SW fetches can read the body. Envelope carries an absolute `url` field derived from the inbound `request.url`, so SW doesn't need a separate endpoint config.
+- **`maxLoopIterations` guardrail** (default 10). Guards in-loop runaway within a single worker invocation. On overflow: emits `loop_exceeded`, pushes a diagnostic envelope, returns HTTP **200** with `{ status: 'loop_exceeded', ... }` (not 5xx — the worker has fulfilled its "deliver a diagnostic" contract).
+- **New event taxonomy** — single-level type-named discriminator (no `error+code` nesting). Three semantic tiers:
+  - **progress**: `llm_start`, `llm_done`, `final_pushed`, `tool_request_pushed`, `continue_received`, `blob_written`
+  - **soft failure**: `blob_put_failed`, `blob_orphaned`, `diagnostic_push_failed`, `payload_too_large`
+  - **hard error**: `hook_threw`, `loop_exceeded`, `llm_call_failed`
+- **Named Error classes**: `HookError` (`.code='HOOK_THREW'`), `PayloadTooLargeError` (`.code='PAYLOAD_TOO_LARGE'`), `LlmCallError` (`.code='LLM_CALL_FAILED'`), `MemoryStoreFullError` (`.code='MEMORY_STORE_FULL'`). Callers can `instanceof`-dispatch instead of string-comparing `.code`. Three-tier naming is consistent: `hook_threw` (event) ↔ `HOOK_THREW` (push code / `.code`) ↔ `HookError` (class) ↔ `{ error: 'hook_threw' }` (HTTP body), so log search / Sentry grouping needs no mental translation.
+
+**Changed**
+
+- `processInstantMessage` now **branches at entry**: no `onLLMOutput` → legacy v0.6 path (byte-identical to v0.6); with `onLLMOutput` → multi-turn agentic loop. The two paths are independent.
+- Default `maxInlineBytes` for the blob envelope detour is **2600 B**. Comparison uses **UTF-8 byte length** (via `TextEncoder`), not JS string `.length` — CJK content would otherwise bypass the limit and trip push-service 413. The 2600 default leaves ~220 B margin under `web-push-php`'s cross-service compatibility default of 2820 B.
+- Hook path appends `choices[0].message` whole object to history (preserves `tool_calls` / `reasoning_content` / `refusal`). Legacy path unchanged.
+- `validateInstantPayload` now takes an optional `{ hookPath, maxLoopIterations }` second argument. When `hookPath: true` it rejects `completePrompt` with `400 COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH`.
+- `splitPattern` config remains effective on the legacy path; on the hook path it is **silently ignored** and the handler emits a one-shot `console.warn` at construction time.
+
+**Backwards compatibility**
+
+- **Zero breaking changes.** All v0.6 callers (no `onLLMOutput` configured) keep their byte-for-byte legacy behaviour — same 13-field default payload, same `1500 ms` sentence spacing, same `splitPattern` semantics, same `onEvent` shape for legacy events.
+- New events and the `/continue` + `/blob/:key` endpoints only activate when the relevant options are set. A subpath-mount caveat applies to deployers wanting to mount the handler under e.g. `/amsg/*` — see README §Subpath mount.
+
 ## 0.6.1 — 2026-05-18
 
 **Fix**

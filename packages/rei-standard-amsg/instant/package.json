@@ -1,7 +1,7 @@
 {
   "name": "@rei-standard/amsg-instant",
-  "version": "0.6.1",
-  "description": "ReiStandard Active Messaging — stateless one-shot instant push handler. Zero runtime deps, pure Web Crypto. Deployable to Cloudflare Workers / Vercel Edge / Netlify / Node with no flags.",
+  "version": "0.7.0",
+  "description": "ReiStandard Active Messaging — agentic-loop framework for instant push. Pluggable per-turn hook + optional blob envelope for oversize payloads. Zero runtime deps, pure Web Crypto. Deployable to Cloudflare Workers / Vercel Edge / Netlify / Node with no flags. Fully back-compat with v0.6 one-shot mode.",
   "repository": {
     "type": "git",
     "url": "https://github.com/Tosd0/ReiStandard",
@@ -41,6 +41,36 @@
       "types": "./dist/adapters/vercel.d.ts",
       "import": "./dist/adapters/vercel.mjs",
       "require": "./dist/adapters/vercel.cjs"
+    },
+    "./blob/memory": {
+      "types": "./dist/blob/memory.d.ts",
+      "import": "./dist/blob/memory.mjs",
+      "require": "./dist/blob/memory.cjs"
+    },
+    "./blob/d1": {
+      "types": "./dist/blob/d1.d.ts",
+      "import": "./dist/blob/d1.mjs",
+      "require": "./dist/blob/d1.cjs"
+    },
+    "./blob/kv": {
+      "types": "./dist/blob/kv.d.ts",
+      "import": "./dist/blob/kv.mjs",
+      "require": "./dist/blob/kv.cjs"
+    },
+    "./blob/upstash": {
+      "types": "./dist/blob/upstash.d.ts",
+      "import": "./dist/blob/upstash.mjs",
+      "require": "./dist/blob/upstash.cjs"
+    },
+    "./blob/netlify": {
+      "types": "./dist/blob/netlify.d.ts",
+      "import": "./dist/blob/netlify.mjs",
+      "require": "./dist/blob/netlify.cjs"
+    },
+    "./blob/postgres": {
+      "types": "./dist/blob/postgres.d.ts",
+      "import": "./dist/blob/postgres.mjs",
+      "require": "./dist/blob/postgres.cjs"
     }
   },
   "files": [
