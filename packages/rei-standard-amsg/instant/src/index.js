@@ -71,6 +71,18 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *             instead. Without `blobStore` the over-sized payload
  *             throws `PayloadTooLargeError`.
  * @property {number} [maxLoopIterations=10]  - Hard ceiling on in-loop `decision:'continue'` rounds within a single worker invocation. Cross-invocation `/continue` floods are the deployer's auth/rate-limit concern.
+ * @property {boolean} [autoEmitReasoning=true]
+ *           - **v0.8 hook-path config.** When `true` (default), the
+ *             framework auto-emits a `ReasoningPush` before invoking
+ *             `onLLMOutput` whenever the LLM response carries a
+ *             non-empty `choices[0].message.reasoning_content`. The
+ *             hook can still `skip-push` its own content/tool push —
+ *             the reasoning push has already shipped. Set to `false`
+ *             when the hook author wants total control over every
+ *             push that leaves the worker; in that mode the hook can
+ *             read `ctx.llmResponse.choices[0].message.reasoning_content`
+ *             and produce its own `buildReasoningPush(...)` envelope.
+ *             Legacy (non-hook) path always auto-emits regardless.
  */
 
 /**
@@ -106,6 +118,10 @@ export function createInstantHandler(options) {
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
     : 10;
+  // Default true: reasoning emission "just works" out of the box for
+  // most hook callers. The legacy path ignores this setting and
+  // always auto-emits.
+  const autoEmitReasoning = options.autoEmitReasoning !== false;
 
   // One-shot startup warning: a caller who sets both `onLLMOutput`
   // and `splitPattern` almost certainly hasn't realised the hook
@@ -252,6 +268,7 @@ export function createInstantHandler(options) {
         onLLMOutput,
         blobStore,
         maxLoopIterations,
+        autoEmitReasoning,
         requestUrl: request.url,
         isResume: isContinue,
       });
@@ -260,13 +277,13 @@ export function createInstantHandler(options) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
       const status = mapErrorStatus(err, code);
-      // Unified envelope: every error goes through `error: { code, message }`
-      // so SDK consumers can always read `body.error.code`. The plan's
-      // earlier draft had HOOK_THREW emit a flat `error: 'hook_threw'`
-      // string — that diverged from every other v0.6/v0.7 error and made
-      // `body.error.code` undefined for hook failures. The push-payload
-      // wire format (what the SW receives) stays as `{type:'error',
-      // code:'HOOK_THREW',...}` — that's a separate layer.
+      // Unified HTTP envelope: every error goes through
+      // `error: { code, message }` so SDK consumers can always read
+      // `body.error.code`. The push-payload wire format (what the SW
+      // receives) is a separate layer — since 0.8.0 it's an ErrorPush
+      // (`messageKind: 'error'`, `code`, `message`, `iteration?`) built
+      // via `buildErrorPush(...)`. The pre-0.8.0 `{type:'error', code,
+      // ...}` envelope is gone — do not look for the `type` field.
       return respond(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' },
@@ -508,9 +525,26 @@ export {
   splitMessageIntoSentences,
   processInstantMessage,
   normalizeAiApiUrl,
-  buildInstantPushPayload,
   sendPushWithMaybeBlob,
+  readReasoningContent,
 } from './message-processor.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
 export { HookError, PayloadTooLargeError, LlmCallError, MemoryStoreFullError } from './errors.js';
 export { buildSessionContext, extractAssistantMessage } from './session-context.js';
+
+// Re-export the shared push schema so hook authors can import builders
+// and types from a single place (instant) rather than having to add a
+// second dependency on @rei-standard/amsg-shared.
+export {
+  MESSAGE_KIND,
+  MESSAGE_TYPE,
+  PUSH_SOURCE,
+  buildContentPush,
+  buildReasoningPush,
+  buildToolRequestPush,
+  buildErrorPush,
+  isContentPush,
+  isReasoningPush,
+  isToolRequestPush,
+  isErrorPush,
+} from '@rei-standard/amsg-shared';

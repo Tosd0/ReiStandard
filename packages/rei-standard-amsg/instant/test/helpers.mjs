@@ -173,14 +173,19 @@ export function createFetchRouter(routes) {
   return { fetch: fetchImpl, pushCalls };
 }
 
-/** Convenience: build a fake LLM response with the given content. */
-export function makeLlmResponse(content) {
+/**
+ * Convenience: build a fake LLM response with the given content. Any
+ * `extra` keys are merged onto `choices[0].message`, so callers can
+ * inject `reasoning_content` / `tool_calls` / `refusal` without
+ * needing a second helper.
+ */
+export function makeLlmResponse(content, extra = {}) {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
     async json() {
-      return { choices: [{ message: { content } }] };
+      return { choices: [{ message: { content, ...extra } }] };
     },
   };
 }

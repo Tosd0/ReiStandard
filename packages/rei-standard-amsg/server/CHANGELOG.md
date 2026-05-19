@@ -1,5 +1,39 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.4.0-next.0 — Three-axis push schema + ReasoningPush (pre-release)
+
+Published under the `next` dist-tag (repo convention for prereleases). Coordinated with the other amsg sub-packages' `*-next.0` releases. Install with `npm install @rei-standard/amsg-server@next`. Schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.
+
+---
+
+Coordinated minor across the whole amsg ecosystem. The server's push wire shape now follows `@rei-standard/amsg-shared`'s discriminated union, indexed by `messageKind`. LLM-driven paths (`prompted` / `auto` / the via-server `instant` path) also lift `choices[0].message.reasoning_content` into a first-class `ReasoningPush` ahead of the content burst.
+
+### Breaking
+
+- **Push wire shape now follows `@rei-standard/amsg-shared`'s `AmsgPush` union.** Every push carries `messageKind: 'content' | 'reasoning'` as a literal-type discriminator. `ContentPush` keeps every field the 2.3.x 13-field shape had (`title`, `message`, `contactName`, `messageId`, `messageIndex`, `totalMessages`, `messageType`, `messageSubtype`, `taskId`, `timestamp`, `source`, `avatarUrl`, `metadata`) — plus the new `messageKind: 'content'` discriminator and `sessionId`.
+- **`sessionId` is now part of every push.** Server-emitted pushes use `sess_task_<task.id>` for scheduled rows (stable across retries) or `sess_<uuid>` when there is no task id (the legacy in-server instant path). Same `sessionId` is shared across the auto-emitted ReasoningPush and the entire ContentPush burst from one LLM round.
+
+### New
+
+- **Auto-emit `ReasoningPush` before the content burst** when the LLM response carries non-empty `choices[0].message.reasoning_content`. Applies to `prompted`, `auto`, and the legacy in-server `instant` path. `fixed` and explicit-`userMessage` paths produce no LLM response, so the reasoning step is naturally skipped.
+- **Server-driven failures continue to flow through DB `status: 'failed'`** — server does NOT push an `ErrorPush` to clients. (This is the schema-unification release, not a behavior-expansion release; the in-band push error envelope is a separate feature shipped only by `@rei-standard/amsg-instant`.)
+
+### Migration from 2.3.x
+
+| 2.3.x                                                  | 2.4.0                                                                              |
+|--------------------------------------------------------|-------------------------------------------------------------------------------------|
+| Hand-rolled 13-field `notificationPayload`             | `buildContentPush({...})` from `@rei-standard/amsg-shared`                          |
+| `messagesSent` reflects sentence count                 | Unchanged — still sentence count. ReasoningPush is auxiliary, not counted.          |
+| Push payload has no `messageKind`                      | Push payload carries `messageKind: 'content'`. SW dispatch on `payload.messageKind` |
+| Push payload has no `sessionId`                        | Push payload carries `sessionId`. Same id across ReasoningPush + ContentPush burst  |
+| No reasoning push                                      | If LLM returns non-empty `reasoning_content`, a separate `ReasoningPush` is sent first |
+
+If you have a SW that hand-sniffs push fields, switch to the `messageKind` discriminator. If you have a client that pairs server-sent sentences (e.g. via `messageId` regex), use `sessionId` instead — it's stable and explicit.
+
+### Dependencies
+
+- Adds `@rei-standard/amsg-shared` at exact version `0.1.0` (no caret). The coordinated minor upgrade is intentionally strict — npm shouldn't resolve a mixed-version graph across the ecosystem.
+
 ## 2.3.2 — 2026-05-18
 
 ### Docs

@@ -1,10 +1,12 @@
-# 主动消息 API 技术规范（v2.3）
+# 主动消息 API 技术规范（v2.4）
 
 > 状态：当前生效（Active）
 >
-> 版本日期：2026-05-18
+> 版本日期：2026-05-19
 >
-> 对齐实现：`@rei-standard/amsg-server` 2.3.2、`@rei-standard/amsg-instant` 0.6.1、`@rei-standard/amsg-client` 2.2.3、`@rei-standard/amsg-sw` 2.0.1。
+> 对齐实现（**prerelease**，仓库 `publish-workspaces.mjs` 自动按 prerelease 版本号路由到 `next` dist-tag，不进 `latest`）：`@rei-standard/amsg-shared` 0.1.0-next.0、`@rei-standard/amsg-server` 2.4.0-next.0、`@rei-standard/amsg-instant` 0.8.0-next.0、`@rei-standard/amsg-client` 2.3.0-next.0、`@rei-standard/amsg-sw` 2.1.0-next.0。安装：`npm install @rei-standard/amsg-shared@next`（其余同理）。规范条款在 prerelease 期不再改，`next` 窗口是给下游集成方端到端验证用的；契约通过后会发对应正式 minor（去掉 `-next.N` 后缀）。
+>
+> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。包间依赖一律使用精确版本（不带 `^`），所有 `dependencies` 字段都钉死在对应的 `*-next.0`。
 
 ## 1. 目标与范围
 
@@ -35,6 +37,7 @@
 - `messages` 数组提示词（互斥替代 `completePrompt`），见 §6.1。`amsg-server` 2.2.0+ 与 `amsg-instant` 0.5.0+ 实装。
 - `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 与 `amsg-instant` 0.6.0+ 实装。
 - `avatarUrl` 严格校验（拒 `data:` URI、限长度 ≤ 2048），见 §6.2。`amsg-server` 2.3.1+、`amsg-instant` 0.6.1+、`amsg-client` 2.2.3+ 实装。
+- **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0-next.0、`amsg-server` 2.4.0-next.0、`amsg-instant` 0.8.0-next.0、`amsg-sw` 2.1.0-next.0、`amsg-client` 2.3.0-next.0 协同实装（`next` dist-tag 预发布）。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
 
 ## 3. 角色与职责
 
@@ -213,6 +216,103 @@ export const config = {
 错误信息须明示原因和建议（如"请改为公网可访问的 https:// 图片 URL"或"建议使用 CDN 缩略图"）。客户端 SDK 同时做本地预校验（`amsg-client` 2.2.3+），抛出 `Error` 的 `.code` 为 `INVALID_AVATAR_URL_LOCAL`，避免一次远端往返。
 
 预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）。
+
+### 6.3 推送 wire shape：三轴判别联合
+
+自 v2.4 起，所有 amsg 包推出的 Web Push payload 统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合。每条推送由三个**正交**的维度描述：
+
+| 轴 | 字段 | 取值 | 由谁定 |
+|---|---|---|---|
+| Dispatch | `messageType` | `instant` / `fixed` / `prompted` / `auto` | 包（固定枚举） |
+| Business | `messageSubtype` | 任意字符串 | 调用方（自由命名） |
+| Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` | 包（固定枚举） |
+
+外加 `source: 'instant' | 'scheduled'` —— 路由来源（`amsg-instant` 输出恒为 `'instant'`；`amsg-server` 任何输出恒为 `'scheduled'`）。`messageType: 'instant'` 必配 `source: 'instant'`；其余三种 `messageType` 必配 `source: 'scheduled'`。
+
+`messageKind` 是**字面量类型判别器**：TS 端 `switch (push.messageKind)` 即可窄化到具体子类型；JS 端用 `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` 守卫函数。
+
+#### 6.3.1 所有 push 共有字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `messageKind` | `'content' \| 'reasoning' \| 'tool_request' \| 'error'` | 判别器 |
+| `messageType` | `'instant' \| 'fixed' \| 'prompted' \| 'auto'` | Dispatch 轴 |
+| `source` | `'instant' \| 'scheduled'` | 路由来源 |
+| `messageId` | `string` | 每条推送唯一，格式由 producer 自定 |
+| `sessionId` | `string` | **同一 LLM 轮次内共享**（含自动发出的 ReasoningPush + 后续 ContentPush burst）；agentic-loop 跨 iteration 复用同一 id |
+| `timestamp` | `string` (ISO 8601) | producer 端时钟 |
+| `messageSubtype` | `string?` | 业务命名空间，producer 默认填 `'chat'` |
+| `metadata` | `object?` | **调用方透传**；包不得写入此字段 |
+
+#### 6.3.2 `ContentPush`（`messageKind: 'content'`）
+
+最终面向用户的文本片段。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `message` | `string` | 要展示的句子/段落 |
+| `messageIndex` | `number?` | 1-based 段索引，单条不带 |
+| `totalMessages` | `number?` | 总段数，单条不带 |
+| `title` | `string?` | 通知标题 |
+| `contactName` | `string?` | 发送者显示名 |
+| `avatarUrl` | `string \| null?` | 仅 `https:`，`data:` 入口拦截 |
+| `taskId` | `string \| null?` | 调度任务 ID（仅 server 路径） |
+
+#### 6.3.3 `ReasoningPush`（`messageKind: 'reasoning'`）
+
+LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `reasoningContent` | `string` | 推理文本 |
+| `title` | `string?` | |
+| `contactName` | `string?` | |
+| `avatarUrl` | `string \| null?` | |
+
+**不带** `messageIndex` / `totalMessages` —— 推理是一轮 LLM 一条，不是分句 burst。这两个字段在类型上故意缺席。
+
+#### 6.3.4 `ToolRequestPush`（`messageKind: 'tool_request'`）
+
+由 agentic-loop 钩子返回 `{ decision: 'tool-request', pushPayload }` 触发。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `toolCalls` | `Array<object>` | OpenAI `choices[0].message.tool_calls` 形状透传 |
+| `title` | `string?` | |
+| `contactName` | `string?` | |
+| `message` | `string?` | 可选人类可读标签 |
+
+客户端执行工具后通过 `/continue` 恢复。
+
+#### 6.3.5 `ErrorPush`（`messageKind: 'error'`）
+
+生产端诊断错误。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `code` | `string` | producer 定义的稳定码，例如 `HOOK_THREW` / `LOOP_EXCEEDED` |
+| `message` | `string` | 人类可读描述 |
+| `iteration` | `number?` | agentic-loop 迭代序号（如适用） |
+
+**v2.4 移除：旧的 `{ type: 'error', code: '...' }` 错误信封**（0.7.x `amsg-instant` 用于 `HOOK_THREW` / `LOOP_EXCEEDED`）已删除。错误推送统一走 `ErrorPush` 形状，顶层不再有 `type: 'error'` 字段——不要在新代码里找这个字段。
+
+完整字段表、builders、类型守卫与常量见 [`../packages/rei-standard-amsg/shared/README.md`](../packages/rei-standard-amsg/shared/README.md)。
+
+### 6.4 `ReasoningPush` 自动发出不变量
+
+LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回 `choices[0].message.reasoning_content` 非空时，必须**先**发一条独立的 `ReasoningPush`，**再**发后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端可以靠 `sessionId` 把"思考中"UI 拼到真正回复上。
+
+具体规则：
+
+1. **触发条件**：`choices[0].message.reasoning_content` 是非空字符串。空串、`null`、`undefined` 均不触发。
+2. **顺序**：`ReasoningPush` 必须先于该 LLM 轮的任何 `ContentPush` 发出（client 端可据此切换"思考中" UI）。
+3. **`sessionId` 共享**：
+   - 同一 LLM 轮：`ReasoningPush` + 该轮所有 `ContentPush` 共用一个 `sessionId`。
+   - Agentic loop：同一 `/instant` 请求的所有 iteration 共用一个 `sessionId`（不是每轮重新 mint）。
+   - `amsg-server` 端：调度行用 `sess_task_<task.id>`（跨重试稳定）；无 task id 时 mint `sess_<uuid>`。
+4. **钩子路径 opt-out**：`amsg-instant` 的 `createInstantHandler({ autoEmitReasoning: false })` 让钩子作者拿回完整控制权——此时框架不发自动 ReasoningPush，钩子自行读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush(...)` 自建。legacy（非钩子）路径**始终**自动发，无 opt-out。
+5. **非 LLM 路径不触发**：`fixed` 任务与 `userMessage` 显式路径不产 LLM 响应，自然不发 ReasoningPush。
+6. **`messageIndex` / `totalMessages` 不带**：ReasoningPush 不参与分句 burst 计数；server 端的 `messagesSent` 也只数 ContentPush。
 
 ## 7. 一体化初始化接口
 

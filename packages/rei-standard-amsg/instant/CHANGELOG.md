@@ -1,6 +1,48 @@
 # Changelog — @rei-standard/amsg-instant
 
-## Unreleased
+## 0.8.0-next.0 — Three-axis push schema + ReasoningPush (pre-release)
+
+Published under the `next` dist-tag (repo convention for prereleases). Coordinated with `@rei-standard/amsg-shared@0.1.0-next.0`, `amsg-server@2.4.0-next.0`, `amsg-sw@2.1.0-next.0`, `amsg-client@2.3.0-next.0`. Install with `npm install @rei-standard/amsg-instant@next`. The schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.
+
+---
+
+Coordinated minor across the whole amsg ecosystem. This release replaces the legacy 13-field push envelope (and the standalone `{ type:'error', code:'...' }` shape) with a discriminated union from the new `@rei-standard/amsg-shared` package, indexed by `messageKind`. It also lifts LLM `reasoning_content` into its own first-class push so clients can render "thinking…" UI ahead of the actual reply.
+
+### Breaking
+
+- **Push wire shape now follows `@rei-standard/amsg-shared`'s `AmsgPush` union.** Every push carries `messageKind: 'content' | 'reasoning' | 'tool_request' | 'error'` as a literal-type discriminator. TS callers `switch (push.messageKind)` and narrow on it.
+- **The 0.7.x `{ type: 'error', code: '...' }` diagnostic envelope (used for `HOOK_THREW` and `LOOP_EXCEEDED`) is gone.** Diagnostics are now `ErrorPush` (`messageKind: 'error'` + same `code` / `message` fields). The legacy `type: 'error'` field is **not** present on the new envelope — do not look for it.
+- **Public export `buildInstantPushPayload` removed.** Use `buildContentPush` from `@rei-standard/amsg-shared` (re-exported from this package). The new builder takes the three-axis fields (`messageType` / `source` / `messageKind`) + the legacy 13 fields as optionals.
+
+### New
+
+- **Auto-emit `ReasoningPush` before the content burst / hook.** When the LLM response carries a non-empty `choices[0].message.reasoning_content`, the framework now ships a separate `ReasoningPush` first, then the existing content path. Both the legacy sentence-split path AND the agentic-loop hook path do this.
+- **`autoEmitReasoning` config (default `true`)** — hook-path opt-out. Set to `false` on `createInstantHandler({...})` when the hook author wants total control over every push that leaves the worker. In that mode, hooks can read `ctx.llmResponse.choices[0].message.reasoning_content` and build their own `buildReasoningPush(...)` envelope. The legacy (non-hook) path always auto-emits regardless — it has no hook control point to honor.
+- **`sessionId` is stable across one LLM round.** The auto-emitted ReasoningPush and the content burst that follows it share the same `sessionId`. In the agentic-loop path, all iterations of a single `/instant` request also share one `sessionId`. Legacy path: mints `sess_<uuid>` if the payload didn't carry one. Hook path: reuses `payload.sessionId` or mints a UUID. **The hook is responsible for propagating `ctx.sessionId` into its own `pushPayload`** — the framework does not inject it.
+- **Blob envelope now carries `messageKind`.** When a push exceeds `maxInlineBytes`, the `{ _blob, key, url }` envelope now also includes `messageKind` (and the legacy `type` field for hand-rolled hook payloads). The SW can dispatch on the discriminator without having to fetch the blob first.
+- **Builder / type guard re-exports.** `buildContentPush`, `buildReasoningPush`, `buildToolRequestPush`, `buildErrorPush`, `isContentPush`, `isReasoningPush`, `isToolRequestPush`, `isErrorPush`, `MESSAGE_KIND`, `MESSAGE_TYPE`, `PUSH_SOURCE` are all re-exported from `@rei-standard/amsg-instant` so hook authors don't need a second dependency on `@rei-standard/amsg-shared`.
+- **`readReasoningContent(llmResponse)` helper** exported for hook authors who need to inspect or post-process reasoning content before deciding what to push.
+- **New event types**: `reasoning_pushed`, `reasoning_push_failed`. Both carry `sessionId` and (for the hook path) `iteration`.
+
+### Migration from 0.7.x
+
+| 0.7.x                                                                  | 0.8.0                                                                                    |
+|------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
+| `buildInstantPushPayload({ message, index, total, contactName, ... })` | `buildContentPush({ messageType: 'instant', source: 'instant', messageId, sessionId, message, messageIndex, totalMessages, contactName, ... })` from `@rei-standard/amsg-instant` |
+| Hook payload `{ type: 'tool-request', ... }` (free-form)               | Either keep it free-form (still legal — `pushPayload: unknown`) or call `buildToolRequestPush({ ... })` for a typed envelope |
+| SW dispatch by ad-hoc field sniffing on push payload                   | SW dispatch by `payload.messageKind` switch (consume the shared `AmsgPush` discriminated union) |
+| `{ type: 'error', code: 'HOOK_THREW', message, sessionId, iteration }` | Auto-built — no caller-side change needed; the wire shape now uses `messageKind: 'error'` instead of `type: 'error'` |
+| Hook fully owned every push (incl. reasoning, if you built one)        | Framework auto-emits `ReasoningPush` before the hook runs. Set `autoEmitReasoning: false` on `createInstantHandler({...})` to restore total hook control. |
+| Hook returned `pushPayload` without a `sessionId` field                | **Set `sessionId: ctx.sessionId`** in your hook's `pushPayload`. The framework does NOT auto-inject it (the `pushPayload: unknown` contract is preserved). Without this the SW can't pair your content push with the auto-emitted ReasoningPush. |
+| Legacy path push failure aborted the whole burst                       | Reasoning-push failure is now best-effort (`reasoning_push_failed` event + continue). Content-push failures still abort, same as before. |
+
+If you have a hook that builds its own pushPayload object, **set `sessionId: ctx.sessionId`** in it so the SW can pair your content push with the auto-emitted ReasoningPush.
+
+### Dependencies
+
+- Adds `@rei-standard/amsg-shared` at exact version `0.1.0` (no caret). The coordinated minor upgrade is intentionally strict — npm shouldn't resolve a mixed-version graph across the ecosystem.
+
+## Unreleased (pre-0.8.0)
 
 **Fix**
 

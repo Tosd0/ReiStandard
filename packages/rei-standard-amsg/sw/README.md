@@ -3,9 +3,53 @@
 `@rei-standard/amsg-sw` 是 ReiStandard 主动消息标准的 Service Worker 插件包，目标是让推送展示和离线重试“开箱即用”。
 
 
+## v2.1.0 — 按 kind 分发的客户端事件
+
+2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error`）区分内容类型。SW 在收到 push 后会做两件事：
+
+1. **永远** 通过 `postMessage` 把 payload 广播给所有受控窗口（包括 `includeUncontrolled: true` 的未受控窗口）。
+2. **仅当** `messageKind === 'content'` 或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
+
+### 新增导出 `REI_SW_EVENT`
+
+事件名由 SW 在每次广播时打在 `e.data.event` 上：
+
+| 常量 | 字符串值 | 触发条件 |
+|------|---------|---------|
+| `REI_SW_EVENT.CONTENT_RECEIVED`      | `'rei-amsg-content-received'`      | `payload.messageKind === 'content'` |
+| `REI_SW_EVENT.REASONING_RECEIVED`    | `'rei-amsg-reasoning-received'`    | `payload.messageKind === 'reasoning'` |
+| `REI_SW_EVENT.TOOL_REQUEST_RECEIVED` | `'rei-amsg-tool-request-received'` | `payload.messageKind === 'tool_request'` |
+| `REI_SW_EVENT.ERROR_RECEIVED`        | `'rei-amsg-error-received'`        | `payload.messageKind === 'error'` |
+| `REI_SW_EVENT.UNKNOWN_RECEIVED`      | `'rei-amsg-unknown-received'`      | 缺 `messageKind`（2.0.x 老 payload / blob envelope） |
+
+### 客户端订阅示例
+
+```js
+navigator.serviceWorker.addEventListener('message', (e) => {
+  if (e.data?.type !== 'REI_AMSG_PUSH') return;
+  switch (e.data.event) {
+    case 'rei-amsg-content-received':      /* 渲染 app 内消息 */ break;
+    case 'rei-amsg-reasoning-received':    /* 渲染思考中 UI */ break;
+    case 'rei-amsg-tool-request-received': /* 弹出工具执行确认 */ break;
+    case 'rei-amsg-error-received':        /* 显示错误 toast */ break;
+    case 'rei-amsg-unknown-received':      /* 2.0.x 老 payload 的兼容路径 */ break;
+  }
+});
+```
+
+### Blob envelope
+
+当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
+
+### 升级注意事项
+
+- 想给 `reasoning` / `tool_request` / `error` 也弹通知的业务：必须自行在 app 内监听上面的 postMessage 事件、调 `Notification` 或 `registration.showNotification`。SW 默认不再为它们弹通知。
+- 客户端代码继续兼容只有 `installReiSW` + `REI_SW_MESSAGE_TYPE`（队列）的 2.0.x 写法——新增导出不破坏既有 API。
+- 想拿到 push 类型相关的 TS 类型：从 `@rei-standard/amsg-shared` 引 `AmsgPush` 等类型（本包通过 JSDoc 引用同一份类型）。
+
 ## 功能概览
 
-- 处理 `push` 事件：自动解析 payload 并展示通知
+- 处理 `push` 事件：按 `messageKind` 三轴 schema 分发到客户端 + 仅 `content` 走 `showNotification`
 - 处理 `message` 事件：支持离线请求入队与主动冲刷队列
 - 处理 `sync` 事件：在网络恢复后自动重试队列请求
 - 使用 IndexedDB 存储待发送请求，避免页面关闭后丢失
@@ -97,7 +141,17 @@ export async function enqueueRequestToSW(requestPayload) {
 ## 导出 API（Exports）
 
 - `installReiSW`
+- `REI_SW_EVENT` — 2.1.0 新增，按 kind 分发的客户端事件名
+- `REI_AMSG_POSTMESSAGE_TYPE` — 2.1.0 新增，SW → client 广播信封的 `type` 字段（恒为 `'REI_AMSG_PUSH'`）
 - `REI_SW_MESSAGE_TYPE`
+
+`REI_SW_EVENT` 包含（详见上文 v2.1.0 章节）：
+
+- `CONTENT_RECEIVED`
+- `REASONING_RECEIVED`
+- `TOOL_REQUEST_RECEIVED`
+- `ERROR_RECEIVED`
+- `UNKNOWN_RECEIVED`
 
 `REI_SW_MESSAGE_TYPE` 包含：
 

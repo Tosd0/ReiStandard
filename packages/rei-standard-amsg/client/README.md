@@ -2,6 +2,42 @@
 
 `@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应和 Push 订阅。
 
+## v2.3.0 — Shared push types
+
+The client now re-exports `@rei-standard/amsg-shared` 的类型、运行时常量（`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`）、推送 builder（`buildContentPush` 等）和类型守卫（`isContentPush` 等）。调用方可以直接 `import { MessageKind, buildContentPush, isContentPush } from '@rei-standard/amsg-client'`，无需单独再装一个 `@rei-standard/amsg-shared` 依赖。client 本身在运行时不消费这些导出 —— 它们是给同时调 `ReiClient` 又在 Service Worker / 客户端处理推送的 app 用的便利出口。
+
+```js
+// app.js — 用 ReiClient 发即时消息
+import { ReiClient } from '@rei-standard/amsg-client';
+
+const client = new ReiClient({
+  baseUrl: 'https://instant.example.com',
+  instantEncryption: false,
+});
+await client.sendInstant({
+  contactName: 'Rei',
+  completePrompt: '你是 Rei，用一句话提醒用户带伞',
+  apiUrl: 'https://api.openai.com/v1/chat/completions',
+  apiKey: '...',
+  primaryModel: 'gpt-4o-mini',
+  pushSubscription: subscription.toJSON(),
+});
+
+// service-worker.js — 用 isContentPush 在收到推送时收窄类型
+import { isContentPush } from '@rei-standard/amsg-client';
+
+self.addEventListener('push', (event) => {
+  const payload = event.data?.json();
+  if (isContentPush(payload)) {
+    // payload 已被收窄为 ContentPush —— 安全读取 payload.message
+    event.waitUntil(
+      self.registration.showNotification(payload.contactName ?? 'Rei', {
+        body: payload.message,
+      })
+    );
+  }
+});
+```
 
 ## 安装
 

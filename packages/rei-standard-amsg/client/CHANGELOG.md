@@ -1,5 +1,37 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.3.0-next.0 — Shared push types re-exports (pre-release)
+
+Published under the `next` dist-tag (repo convention for prereleases). Coordinated with the other amsg sub-packages' `*-next.0` releases. Install with `npm install @rei-standard/amsg-client@next`. Schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.
+
+---
+
+Coordinated minor across the whole amsg ecosystem (shared 0.1.0 / instant 0.7.0 / server 2.3.2 / sw 2.x). The client itself does not send or receive pushes — it only talks to amsg-server / amsg-instant over HTTP — but caller apps that build the client and also handle pushes (typically in a Service Worker) used to need a second dependency on `@rei-standard/amsg-shared` to get the canonical kind/type/source constants, builders, and type guards. 2.3.0 collapses that into a single import surface.
+
+### New
+
+- Re-exports from `@rei-standard/amsg-shared` 0.1.0:
+  - **Runtime constants**: `MESSAGE_KIND` (`CONTENT` / `REASONING` / `TOOL_REQUEST` / `ERROR`), `MESSAGE_TYPE` (`INSTANT` / `FIXED` / `PROMPTED` / `AUTO`), `PUSH_SOURCE` (`INSTANT` / `SCHEDULED`).
+  - **Builders**: `buildContentPush`, `buildReasoningPush`, `buildToolRequestPush`, `buildErrorPush`.
+  - **Type guards**: `isContentPush`, `isReasoningPush`, `isToolRequestPush`, `isErrorPush`.
+  - **JSDoc type aliases**: `MessageKind`, `MessageType`, `PushSource`, `AmsgPush`, `ContentPush`, `ReasoningPush`, `ToolRequestPush`, `ErrorPush`.
+
+One import surface — caller apps that consume `ReiClient` and also handle pushes (e.g. in a Service Worker) no longer need a separate dep on `@rei-standard/amsg-shared`. Everything is reachable from `@rei-standard/amsg-client`.
+
+### Compatibility
+
+- Zero runtime behavior change. `ReiClient` API is byte-for-byte unchanged — no method signatures, request shapes, or error codes were touched.
+- The re-exports are tree-shake-friendly (shared package is `sideEffects: false`). Bundlers that ship `ReiClient` only will not pull in the builders.
+
+### Dependencies
+
+- Adds `@rei-standard/amsg-shared` at exact `0.1.0` (no caret). Part of the coordinated minor; pinned so a future shared minor cannot silently slip in via `npm install` without a matching client release.
+
+### Migration
+
+- No caller-side action needed. Strictly additive.
+- Apps that already depend on `@rei-standard/amsg-shared` directly can keep that dep or drop it in favor of importing from `@rei-standard/amsg-client` — both routes resolve to the same module instance because npm dedupes the exact-pinned `0.1.0`.
+
 ## 2.2.3 — 2026-05-18
 
 ### Fix

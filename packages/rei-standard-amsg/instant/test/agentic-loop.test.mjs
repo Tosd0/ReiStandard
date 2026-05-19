@@ -216,8 +216,10 @@ describe('agentic loop — loop-exceeded', () => {
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
     const decoded = JSON.parse(decrypted);
-    assert.equal(decoded.type, 'error');
+    assert.equal(decoded.messageKind, 'error');
     assert.equal(decoded.code, 'LOOP_EXCEEDED');
+    // Legacy {type:'error'} envelope is gone in 0.8.0.
+    assert.equal('type' in decoded, false);
   });
 });
 
@@ -243,7 +245,10 @@ describe('agentic loop — hook contract violations', () => {
     assert.ok(events.find((e) => e.type === 'hook_threw'));
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
-    assert.equal(JSON.parse(decrypted).code, 'HOOK_THREW');
+    const decoded = JSON.parse(decrypted);
+    assert.equal(decoded.code, 'HOOK_THREW');
+    assert.equal(decoded.messageKind, 'error');
+    assert.equal('type' in decoded, false);
   });
 
   it('hook returns null → HookError path', async () => {

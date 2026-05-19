@@ -1,13 +1,30 @@
 /**
  * Message Processor (SDK version)
- * ReiStandard SDK v2.0.1
+ * ReiStandard amsg-server v2.4.0
  *
- * Handles single message content generation and Web Push delivery.
- * Receives its dependencies (encryption helpers, webpush, VAPID config)
- * via a context object so that it stays free of process.env references.
+ * Handles single message content generation and Web Push delivery for
+ * scheduled tasks (`fixed` / `prompted` / `auto`) and the legacy
+ * via-server instant path (`messageType: 'instant'`).
+ *
+ * Push wire shape comes from `@rei-standard/amsg-shared`'s
+ * discriminated union (`AmsgPush`). The SW (`@rei-standard/amsg-sw`)
+ * routes on `messageKind`. Server-driven pushes always carry
+ * `source: 'instant'` (for the legacy in-server instant) or
+ * `source: 'scheduled'` (for everything else).
+ *
+ * v2.4.0: when the LLM response carries non-empty
+ * `choices[0].message.reasoning_content`, the processor now emits a
+ * standalone `ReasoningPush` **before** the `ContentPush` burst.
+ * `messagesSent` in the return value continues to reflect the sentence
+ * count only (reasoning is an auxiliary push, not a sentence).
  */
 
 import { randomUUID } from 'crypto';
+import {
+  buildContentPush,
+  buildReasoningPush,
+} from '@rei-standard/amsg-shared';
+
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
@@ -60,6 +77,25 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
 }
 
 /**
+ * Read `choices[0].message.reasoning_content` as a non-empty trimmed
+ * string, or null when absent / empty. Mirrors
+ * `amsg-instant/src/message-processor.js#readReasoningContent`.
+ *
+ * @param {unknown} llmResponse
+ * @returns {string | null}
+ */
+function readReasoningContent(llmResponse) {
+  if (!llmResponse || typeof llmResponse !== 'object') return null;
+  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const message = /** @type {{ message?: { reasoning_content?: unknown } }} */ (choices[0])?.message;
+  const raw = message?.reasoning_content;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
  * @typedef {Object} ProcessorContext
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
  * @property {Object}  vapid             - { email, publicKey, privateKey }
@@ -85,14 +121,19 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
 
     let messageContent;
+    /** @type {unknown} */
+    let llmResponse = null;
 
     if (decryptedPayload.messageType === 'fixed') {
       messageContent = decryptedPayload.userMessage;
 
     } else if (decryptedPayload.messageType === 'instant') {
-      const hasPrompt = !!decryptedPayload.completePrompt || (Array.isArray(decryptedPayload.messages) && decryptedPayload.messages.length > 0);
+      const hasPrompt = !!decryptedPayload.completePrompt
+        || (Array.isArray(decryptedPayload.messages) && decryptedPayload.messages.length > 0);
       if (hasPrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
-        messageContent = await _callAI(decryptedPayload);
+        const aiResult = await _callAI(decryptedPayload);
+        messageContent = aiResult.content;
+        llmResponse = aiResult.response;
       } else if (decryptedPayload.userMessage) {
         messageContent = decryptedPayload.userMessage;
       } else {
@@ -100,7 +141,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       }
 
     } else if (decryptedPayload.messageType === 'prompted' || decryptedPayload.messageType === 'auto') {
-      messageContent = await _callAI(decryptedPayload);
+      const aiResult = await _callAI(decryptedPayload);
+      messageContent = aiResult.content;
+      llmResponse = aiResult.response;
     } else {
       throw new Error('Invalid message configuration: no content source available');
     }
@@ -117,25 +160,68 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     }
 
     const pushSubscription = decryptedPayload.pushSubscription;
+    // sessionId is shared across the optional ReasoningPush and every
+    // ContentPush from this LLM round. Pin it to the task id when
+    // available (scheduled tasks) so retries reuse the same id;
+    // otherwise mint a UUID.
+    const sessionId = task.id != null
+      ? `sess_task_${task.id}`
+      : `sess_${randomUUID()}`;
+    const source = decryptedPayload.messageType === 'instant' ? 'instant' : 'scheduled';
+    const messageSubtype = decryptedPayload.messageSubtype || 'chat';
+    const avatarUrl = decryptedPayload.avatarUrl || null;
+    const metadata = decryptedPayload.metadata || {};
+
+    // `messageId` format — deterministic when we have a task.id so a
+    // retry produces the same id for the same (task, sentence) pair
+    // (downstream dedupers can key on it). Falls back to a UUID for
+    // the legacy in-server instant path that has no row id.
+    const messageIdBase = task.id != null
+      ? `msg_task_${task.id}`
+      : `msg_${randomUUID()}_instant`;
+
+    // ReasoningPush — auto-emitted before the content burst when the
+    // LLM response carried non-empty reasoning_content. `fixed` and
+    // explicit-userMessage paths produce no LLM response, so this
+    // block is naturally skipped for them (llmResponse stays null).
+    const reasoning = readReasoningContent(llmResponse);
+    if (reasoning) {
+      const reasoningPush = buildReasoningPush({
+        messageType: decryptedPayload.messageType,
+        source,
+        messageId: `${messageIdBase}_reasoning`,
+        sessionId,
+        reasoningContent: reasoning,
+        timestamp: new Date().toISOString(),
+        title: `来自 ${decryptedPayload.contactName}`,
+        contactName: decryptedPayload.contactName,
+        avatarUrl,
+        messageSubtype,
+        metadata,
+      });
+      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
 
     for (let i = 0; i < messages.length; i++) {
-      const notificationPayload = {
-        title: `来自 ${decryptedPayload.contactName}`,
+      const contentPush = buildContentPush({
+        messageType: decryptedPayload.messageType,
+        source,
+        messageId: `${messageIdBase}_${i}`,
+        sessionId,
         message: messages[i],
+        timestamp: new Date().toISOString(),
+        title: `来自 ${decryptedPayload.contactName}`,
         contactName: decryptedPayload.contactName,
-        messageId: `msg_${randomUUID()}_${task.id || 'instant'}_${i}`,
+        avatarUrl,
+        messageSubtype,
         messageIndex: i + 1,
         totalMessages: messages.length,
-        messageType: decryptedPayload.messageType,
-        messageSubtype: decryptedPayload.messageSubtype || 'chat',
         taskId: task.id || null,
-        timestamp: new Date().toISOString(),
-        source: decryptedPayload.messageType === 'instant' ? 'instant' : 'scheduled',
-        avatarUrl: decryptedPayload.avatarUrl || null,
-        metadata: decryptedPayload.metadata || {}
-      };
+        metadata,
+      });
 
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(notificationPayload));
+      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
 
       if (i < messages.length - 1) {
         await new Promise(resolve => setTimeout(resolve, 1500));
@@ -239,7 +325,15 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
 
 /**
  * Call an OpenAI-compatible API.
+ *
+ * Returns the full response object alongside the extracted (trimmed)
+ * `content` string. Callers that only need the text can ignore
+ * `response`; callers that want `reasoning_content` / `tool_calls`
+ * read from `response.choices[0].message`.
+ *
  * @private
+ * @param {Object} payload
+ * @returns {Promise<{ response: unknown, content: string }>}
  */
 async function _callAI(payload) {
   const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
@@ -276,7 +370,7 @@ async function _callAI(payload) {
     throw new Error('AI API error: response missing choices[0].message.content');
   }
 
-  return content.trim();
+  return { response: aiData, content: content.trim() };
 }
 
 /**
@@ -333,20 +427,6 @@ function buildAiRequestBody(payload) {
  * tests. The two packages share this logic but each carry their own copy
  * to avoid an architectural dependency (server should not depend on the
  * stateless worker package).
- *
- * Rules (idempotent — running it twice equals running it once):
- *   - Already ends with `/chat/completions`             → leave as-is.
- *   - Bare host (no path or just `/`)                   → append `/v1/chat/completions`.
- *   - Path ends with a version segment like `/v1`,
- *     `/v2`, … (with or without trailing slash)         → append only
- *     `/chat/completions`; never doubles `/v1` for
- *     callers who already include it.
- *   - Anything else (custom path that doesn't match the
- *     OpenAI shape, e.g. `/v1/messages` for
- *     Anthropic-style proxies)                          → leave as-is. The caller
- *     knows their own routing.
- *
- * Query string is preserved verbatim.
  *
  * @param {string} apiUrl
  * @returns {string}

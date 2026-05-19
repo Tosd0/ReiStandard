@@ -2,33 +2,78 @@
  * ReiStandard Service Worker helpers.
  *
  * Drop-in plugin for Service Workers that handles:
- *  - Basic push payload -> notification rendering
- *  - Offline request queueing and retry with Background Sync
+ *  - Three-axis `push` payload dispatch — keyed by `payload.messageKind`
+ *    (see `@rei-standard/amsg-shared`). Every push is mirrored to every
+ *    controlled client via `postMessage` under a per-kind event name.
+ *  - Notification rendering for `messageKind: 'content'` (and legacy
+ *    payloads without `messageKind`, for back-compat with 2.0.x
+ *    producers).
+ *  - Offline request queueing and retry with Background Sync.
  *
  * Notes:
  *  - This plugin intentionally does not install `notificationclick`.
  *    Main applications can implement their own click navigation logic.
+ *  - `reasoning` / `tool_request` / `error` pushes are dispatched as
+ *    `postMessage` events but **do not** trigger `showNotification` —
+ *    apps render those in-app via the postMessage channel.
+ *  - Blob envelopes (`{ _blob: true, key, url, messageKind? }`) are
+ *    dispatched to clients verbatim. The SW never auto-fetches the
+ *    blob body — that's the client's job.
  *
  * Usage (inside your sw.js):
- *   import { installReiSW, REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-sw';
+ *   import { installReiSW, REI_SW_EVENT, REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-sw';
  *   installReiSW(self);
  *
  * Usage (inside your web app):
- *   navigator.serviceWorker.controller?.postMessage({
- *     type: REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST,
- *     request: {
- *       url: '/api/messages/send',
- *       method: 'POST',
- *       headers: { 'Content-Type': 'application/json' },
- *       body: { text: 'hello' }
+ *   navigator.serviceWorker.addEventListener('message', (e) => {
+ *     if (e.data?.type !== 'REI_AMSG_PUSH') return;
+ *     switch (e.data.event) {
+ *       case REI_SW_EVENT.CONTENT_RECEIVED:      // render in-app message
+ *       case REI_SW_EVENT.REASONING_RECEIVED:    // render thinking UI
+ *       case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: // prompt tool exec
+ *       case REI_SW_EVENT.ERROR_RECEIVED:        // show error toast
+ *       case REI_SW_EVENT.UNKNOWN_RECEIVED:      // legacy 2.0.x payload
  *     }
  *   });
+ */
+
+/**
+ * @typedef {import('@rei-standard/amsg-shared').AmsgPush} AmsgPush
+ * @typedef {import('@rei-standard/amsg-shared').ContentPush} ContentPush
+ * @typedef {import('@rei-standard/amsg-shared').ReasoningPush} ReasoningPush
+ * @typedef {import('@rei-standard/amsg-shared').ToolRequestPush} ToolRequestPush
+ * @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush
  */
 
 const REI_SW_DB_NAME = 'rei-sw';
 const REI_SW_DB_STORE = 'request-outbox';
 const REI_SW_DB_VERSION = 1;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
+
+/**
+ * Wire-level message type for SW → client postMessage envelopes.
+ * Clients filter on `e.data.type === 'REI_AMSG_PUSH'` before reading
+ * `e.data.event` (which is one of {@link REI_SW_EVENT}'s values).
+ */
+export const REI_AMSG_POSTMESSAGE_TYPE = 'REI_AMSG_PUSH';
+
+/**
+ * Per-kind event names dispatched to controlled clients. Each push the
+ * SW receives is mirrored to every window via
+ * `postMessage({ type: 'REI_AMSG_PUSH', event: <one of these>, payload })`.
+ *
+ * The mapping is keyed by `payload.messageKind`. Legacy payloads (and
+ * blob envelopes) without a `messageKind` field dispatch as
+ * {@link REI_SW_EVENT.UNKNOWN_RECEIVED} so apps can still handle 2.0.x
+ * producers during migration.
+ */
+export const REI_SW_EVENT = Object.freeze({
+  CONTENT_RECEIVED: 'rei-amsg-content-received',
+  REASONING_RECEIVED: 'rei-amsg-reasoning-received',
+  TOOL_REQUEST_RECEIVED: 'rei-amsg-tool-request-received',
+  ERROR_RECEIVED: 'rei-amsg-error-received',
+  UNKNOWN_RECEIVED: 'rei-amsg-unknown-received'
+});
 
 export const REI_SW_MESSAGE_TYPE = Object.freeze({
   ENQUEUE_REQUEST: 'REI_ENQUEUE_REQUEST',
@@ -56,15 +101,25 @@ export function installReiSW(sw, opts = {}) {
     const payload = readPushPayload(event);
     if (!payload) return;
 
-    const notification = createNotificationFromPayload(payload, {
-      defaultIcon,
-      defaultBadge
-    });
-    if (!notification) return;
+    const eventName = resolveEventName(payload);
+    const shouldRenderNotification = isNotificationKind(payload);
 
-    event.waitUntil(
-      sw.registration.showNotification(notification.title, notification.options)
-    );
+    /** @type {Array<Promise<unknown>>} */
+    const work = [dispatchPushToClients(sw, eventName, payload)];
+
+    if (shouldRenderNotification) {
+      const notification = createNotificationFromPayload(payload, {
+        defaultIcon,
+        defaultBadge
+      });
+      if (notification) {
+        work.push(
+          sw.registration.showNotification(notification.title, notification.options)
+        );
+      }
+    }
+
+    event.waitUntil(Promise.all(work));
   });
 
   sw.addEventListener('message', (event) => {
@@ -87,6 +142,85 @@ export function installReiSW(sw, opts = {}) {
     if (event.tag !== REI_SW_SYNC_TAG) return;
     event.waitUntil(flushQueuedRequests(sw));
   });
+}
+
+/**
+ * Map a parsed push payload to its corresponding per-kind event name.
+ * Falls back to `UNKNOWN_RECEIVED` for legacy 2.0.x payloads and blob
+ * envelopes without `messageKind`.
+ *
+ * @param {Record<string, unknown>} payload
+ * @returns {string}
+ */
+function resolveEventName(payload) {
+  const kind = payload && typeof payload === 'object' ? payload.messageKind : undefined;
+  switch (kind) {
+    case 'content':
+      return REI_SW_EVENT.CONTENT_RECEIVED;
+    case 'reasoning':
+      return REI_SW_EVENT.REASONING_RECEIVED;
+    case 'tool_request':
+      return REI_SW_EVENT.TOOL_REQUEST_RECEIVED;
+    case 'error':
+      return REI_SW_EVENT.ERROR_RECEIVED;
+    default:
+      return REI_SW_EVENT.UNKNOWN_RECEIVED;
+  }
+}
+
+/**
+ * True when the payload should trigger `showNotification`. Only
+ * `messageKind: 'content'` renders a notification; everything else
+ * (`reasoning`, `tool_request`, `error`) is dispatched silently so
+ * apps can render them in-app.
+ *
+ * Legacy payloads with no `messageKind` field still render a
+ * notification — that's the 2.0.x back-compat path.
+ *
+ * @param {Record<string, unknown>} payload
+ * @returns {boolean}
+ */
+function isNotificationKind(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const kind = payload.messageKind;
+  if (kind === undefined || kind === null) return true;
+  return kind === 'content';
+}
+
+/**
+ * Broadcast a parsed push payload to every controlled client. Failures
+ * on individual `postMessage` calls are swallowed — one offline tab
+ * shouldn't break delivery to the others. The whole broadcast is
+ * resolved (never rejected) so it can be safely passed to
+ * `event.waitUntil`.
+ *
+ * @param {ServiceWorkerGlobalScope} sw
+ * @param {string}                   eventName
+ * @param {Record<string, unknown>}  payload
+ * @returns {Promise<void>}
+ */
+async function dispatchPushToClients(sw, eventName, payload) {
+  try {
+    const clientList = await sw.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    });
+    const envelope = {
+      type: REI_AMSG_POSTMESSAGE_TYPE,
+      event: eventName,
+      payload
+    };
+    for (const client of clientList) {
+      try {
+        client.postMessage(envelope);
+      } catch (_postError) {
+        // Per-client failures must not abort the broadcast.
+      }
+    }
+  } catch (_matchError) {
+    // No window clients available, or the matchAll call rejected.
+    // Either way, fail silently — notification rendering still wins.
+  }
 }
 
 function readPushPayload(event) {

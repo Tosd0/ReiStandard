@@ -1,14 +1,15 @@
 {
-  "name": "@rei-standard/amsg-sw",
-  "version": "2.1.0-next.0",
-  "description": "ReiStandard Active Messaging service worker SDK — three-axis push schema (content / reasoning / tool_request / error) with per-kind client postMessage events",
+  "name": "@rei-standard/amsg-shared",
+  "version": "0.1.0-next.0",
+  "description": "ReiStandard Active Messaging shared types and push builders — the lowest layer (no deps on other amsg packages)",
   "repository": {
     "type": "git",
     "url": "https://github.com/Tosd0/ReiStandard",
-    "directory": "packages/rei-standard-amsg/sw"
+    "directory": "packages/rei-standard-amsg/shared"
   },
   "license": "MIT",
   "type": "module",
+  "sideEffects": false,
   "publishConfig": {
     "access": "public"
   },
@@ -26,14 +27,11 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('dist/index.d.ts', 'dist/index.d.cts')\"",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"
-  },
-  "dependencies": {
-    "@rei-standard/amsg-shared": "0.1.0-next.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",

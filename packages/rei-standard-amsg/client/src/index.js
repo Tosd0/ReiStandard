@@ -22,6 +22,15 @@
  *   await client.scheduleMessage({ ... });
  */
 
+/** @typedef {import('@rei-standard/amsg-shared').MessageKind} MessageKind */
+/** @typedef {import('@rei-standard/amsg-shared').MessageType} MessageType */
+/** @typedef {import('@rei-standard/amsg-shared').PushSource} PushSource */
+/** @typedef {import('@rei-standard/amsg-shared').AmsgPush} AmsgPush */
+/** @typedef {import('@rei-standard/amsg-shared').ContentPush} ContentPush */
+/** @typedef {import('@rei-standard/amsg-shared').ReasoningPush} ReasoningPush */
+/** @typedef {import('@rei-standard/amsg-shared').ToolRequestPush} ToolRequestPush */
+/** @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush */
+
 /**
  * @typedef {Object} ReiClientConfig
  * @property {string} baseUrl                            - Default base URL of the API (e.g. https://host/api/v1).
@@ -506,3 +515,17 @@ export class ReiClient {
     return arr;
   }
 }
+
+export {
+  MESSAGE_KIND,
+  MESSAGE_TYPE,
+  PUSH_SOURCE,
+  buildContentPush,
+  buildReasoningPush,
+  buildToolRequestPush,
+  buildErrorPush,
+  isContentPush,
+  isReasoningPush,
+  isToolRequestPush,
+  isErrorPush,
+} from '@rei-standard/amsg-shared';
