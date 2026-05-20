@@ -253,7 +253,11 @@ function createNotificationFromPayload(payload, defaults) {
     ? payload.notification
     : {};
 
-  const title = pushNotification.title || payload.title || 'New notification';
+  const title =
+    pushNotification.title ||
+    payload.title ||
+    (payload.contactName && `来自 ${payload.contactName}`) ||
+    'New notification';
   const body = pushNotification.body || payload.body || payload.message || '';
   const data = payload.data && typeof payload.data === 'object'
     ? { ...payload.data }
