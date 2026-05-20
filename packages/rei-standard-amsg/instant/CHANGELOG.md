@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.1 — avatarUrl 软清空 (pre-release)
+
+Cherry-pick stable `0.7.1` 的 `avatarUrl` 软清空策略到 next 预发布线。`/instant` 与 `/continue` 路径不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串 / 不是合法 URL）会在 payload 上**置为 `null`** + `console.warn`，整次推送继续；`INVALID_PAYLOAD_FORMAT` 不再为 `avatarUrl` 触发，其它字段错误码不变。详见 `0.7.1` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-client` 2.3.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。
+
+`next.0` → `next.1` 行为变化只此一项；三轴 push schema 部分**完全不动**。
+
 ## 0.8.0-next.0 — Three-axis push schema + ReasoningPush (pre-release)
 
 Published under the `next` dist-tag (repo convention for prereleases). Coordinated with `@rei-standard/amsg-shared@0.1.0-next.0`, `amsg-server@2.4.0-next.0`, `amsg-sw@2.1.0-next.0`, `amsg-client@2.3.0-next.0`. Install with `npm install @rei-standard/amsg-instant@next`. The schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.

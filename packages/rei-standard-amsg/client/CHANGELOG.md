@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.3.0-next.1 — avatarUrl 本地软清空 (pre-release)
+
+Cherry-pick stable `2.2.4` 的本地 `avatarUrl` 软清空到 next 预发布线。`scheduleMessage` / `sendInstant` / `updateMessage` 不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串）改为 `console.warn` + 在 payload 上置 `null`（`updateMessage` 路径走 `delete` 以保留服务端原头像），请求继续发送。`Error.code === 'INVALID_AVATAR_URL_LOCAL'` 已移除；`PAYLOAD_TOO_LARGE_LOCAL`（3KB 体积上限）保留不变。详见 `2.2.4` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。
+
+`next.0` → `next.1` 行为变化只此一项；shared push types re-exports 部分**完全不动**。
+
 ## 2.3.0-next.0 — Shared push types re-exports (pre-release)
 
 Published under the `next` dist-tag (repo convention for prereleases). Coordinated with the other amsg sub-packages' `*-next.0` releases. Install with `npm install @rei-standard/amsg-client@next`. Schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.

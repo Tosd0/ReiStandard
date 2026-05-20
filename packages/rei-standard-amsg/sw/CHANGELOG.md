@@ -1,5 +1,28 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.1.0-next.1 — 标题 fallback 至 `来自 {contactName}` (pre-release)
+
+Cherry-pick stable `2.0.2` 的标题 fallback 修复到 next 预发布线。`createNotificationFromPayload` 的标题链从
+
+```js
+pushNotification.title || payload.title || 'New notification'
+```
+
+加一档 `contactName` 兜底，与 server / instant 默认 envelope 的 `title: '来自 ${contactName}'` 行为对齐：
+
+```js
+pushNotification.title
+  || payload.title
+  || (payload.contactName && `来自 ${payload.contactName}`)
+  || 'New notification'
+```
+
+custom hook（0.7.x / 0.8.0-next.x 自定义 envelope）忘了塞 `title` 但塞了 `contactName` 的情况，通知不再掉到 'New notification' 这种英文兜底上。
+
+与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-client` 2.3.0-next.1（avatarUrl 软清空）同步。
+
+`next.0` → `next.1` 行为变化只此一项；三轴 push schema 部分**完全不动**。
+
 ## 2.1.0-next.0 — Three-axis push schema + per-kind client events (pre-release)
 
 Published under the `next` dist-tag (repo convention for prereleases). Coordinated with the other amsg sub-packages' `*-next.0` releases. Install with `npm install @rei-standard/amsg-sw@next`. Schema is locked; the next-tag window is for downstream integrators to validate end-to-end before this graduates to `latest`.
