@@ -180,24 +180,24 @@ await client.sendInstant({
 - 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
 - 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
 
-### 本地预校验：`avatarUrl` 与 payload 体积（2.2.3+）
+### 本地软清空：`avatarUrl` 与 payload 体积（2.2.4+ / 2.3.0-next.1+）
 
-`scheduleMessage` / `sendInstant` / `updateMessage` 在发请求**之前**会在本地做两项预检，避免一次远端往返才拿到 `413` 或 Web Push 4KB 上限报错：
+`scheduleMessage` / `sendInstant` / `updateMessage` 在发请求**之前**会在本地做两项保护：
 
-| 触发条件 | 抛出 `Error.code` | 触发原因（背景说明，不在 message 里） |
+| 触发条件 | 处理方式 | 触发原因（背景说明，不在 message 里） |
 | --- | --- | --- |
-| `payload.avatarUrl` 以 `data:` 开头（含 `data:image/...;base64,...`） | `INVALID_AVATAR_URL_LOCAL` | base64 内嵌头像把单个 push payload 撑到几十 KB，远端 Web Push 服务直接返回 4KB 超限 / 网关 `413`。 |
-| `payload.avatarUrl` 长度 > 2048 字符 | `INVALID_AVATAR_URL_LOCAL` | 同上。建议用 CDN 缩略图 URL。 |
-| `payload.avatarUrl` 不是字符串 | `INVALID_AVATAR_URL_LOCAL` | 类型错误。 |
-| `JSON.stringify(payload)` UTF-8 字节数 > 3072 | `PAYLOAD_TOO_LARGE_LOCAL` | 远端网关 / Web Push 4KB 硬上限的本地兜底。错误对象带 `.details = { method, actualBytes, limitBytes }` 方便定位。 |
+| `payload.avatarUrl` 以 `data:` 开头（含 `data:image/...;base64,...`） | `console.warn` + 在 payload 上把 `avatarUrl` 置为 `null`，请求照发（`updateMessage` 从 patch 里删除该字段，保留服务端原头像） | base64 内嵌头像把单个 push payload 撑到几十 KB，远端 Web Push 服务直接返回 4KB 超限 / 网关 `413`。 |
+| `payload.avatarUrl` 长度 > 2048 字符 | 同上 | 同上。建议用 CDN 缩略图 URL。 |
+| `payload.avatarUrl` 不是字符串 | 同上 | 类型错误。 |
+| `JSON.stringify(payload)` UTF-8 字节数 > 3072 | 抛出 `Error.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，错误对象带 `.details = { method, actualBytes, limitBytes }` | 远端网关 / Web Push 4KB 硬上限的本地兜底。 |
+
+头像是装饰字段，单个不合规 URL 不再让整次调度 / 推送挂掉；想拦到错误请监听 `console.warn`，或在调用前自己用 `validateAvatarUrl` 预检（server / instant 包都有导出）。`PAYLOAD_TOO_LARGE_LOCAL` 仍然是真正的"整包过大"信号，照常用 try/catch 捕获：
 
 ```js
 try {
   await client.sendInstant(payload);
 } catch (err) {
-  if (err.code === 'INVALID_AVATAR_URL_LOCAL') {
-    // err.message 形如「头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL」
-  } else if (err.code === 'PAYLOAD_TOO_LARGE_LOCAL') {
+  if (err.code === 'PAYLOAD_TOO_LARGE_LOCAL') {
     // err.details = { method: 'sendInstant', actualBytes: 8732, limitBytes: 3072 }
   } else {
     throw err;
@@ -205,7 +205,7 @@ try {
 }
 ```
 
-服务端（`@rei-standard/amsg-instant` 0.6.1+ / `@rei-standard/amsg-server` 2.3.1+）有等价的二道防线，业务可以放心依赖 client 这一道做 UX 提示。
+服务端（`@rei-standard/amsg-instant` 0.7.1+ / 0.8.0-next.1+，`@rei-standard/amsg-server` 2.3.3+ / 2.4.0-next.1+）有同样的软清空二道防线，client 这一道主要省一次远端往返。
 
 ## 导出 API（Exports）
 

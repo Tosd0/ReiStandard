@@ -9,7 +9,7 @@
 - 业务端点统一使用 `Authorization: Bearer <tenantToken>`
 - `send-notifications` 支持 `cronToken`（Header 或 query token）
 
-2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 严格校验）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-严格校验)；行为已对齐 `amsg-instant`，向后兼容。
+2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)；行为已对齐 `amsg-instant`，向后兼容。
 
 ## 安装
 

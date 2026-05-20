@@ -36,7 +36,7 @@
 
 - `messages` 数组提示词（互斥替代 `completePrompt`），见 §6.1。`amsg-server` 2.2.0+ 与 `amsg-instant` 0.5.0+ 实装。
 - `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 与 `amsg-instant` 0.6.0+ 实装。
-- `avatarUrl` 严格校验（拒 `data:` URI、限长度 ≤ 2048），见 §6.2。`amsg-server` 2.3.1+、`amsg-instant` 0.6.1+、`amsg-client` 2.2.3+ 实装。
+- `avatarUrl` 软清空策略（不合法值仅 `console.warn` 并置空，不再 400 整个任务），见 §6.2。`amsg-server` 2.3.3+ / 2.4.0-next.1+、`amsg-instant` 0.7.1+ / 0.8.0-next.1+、`amsg-client` 2.2.4+ / 2.3.0-next.1+ 实装；2.3.1 ~ 2.3.2 / 0.6.1 ~ 0.7.0 / 2.2.3 ~ 2.3.0-next.0 走老版"严格 400"。
 - **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0-next.0、`amsg-server` 2.4.0-next.0、`amsg-instant` 0.8.0-next.0、`amsg-sw` 2.1.0-next.0、`amsg-client` 2.3.0-next.0 协同实装（`next` dist-tag 预发布）。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
 
 ## 3. 角色与职责
@@ -198,24 +198,28 @@ export const config = {
 
 `amsg-server` 与 `amsg-instant` 两端独立实现但行为字节级一致；预校验工具：`validateLlmMessagesArray(messages)`、`validateSplitPattern(value)`。
 
-### 6.2 `avatarUrl` 严格校验
+### 6.2 `avatarUrl` 软清空策略
 
 `avatarUrl` 字段（`schedule-message` / `update-message` / `amsg-instant` payload，可选）的合法规则：
 
 - 必须是字符串，且 `new URL(...)` 能解析。
-- **拒** `data:` 开头的 URI（不区分大小写）—— base64 内嵌图片会把 push payload 撑到几十 KB，触发下游 Web Push 4KB 硬上限或网关 `413 Payload Too Large`。
-- **拒** 长度 > 2048 字符的 URL。
+- **不接受** `data:` 开头的 URI（不区分大小写）—— base64 内嵌图片会把 push payload 撑到几十 KB，触发下游 Web Push 4KB 硬上限或网关 `413 Payload Too Large`。
+- **不接受** 长度 > 2048 字符的 URL。
 - `undefined` / `null` 视为"未传"，零行为变化。
 
-违规返回：
+**处理方式（amsg-server 2.3.3+ / 2.4.0-next.1+，amsg-instant 0.7.1+ / 0.8.0-next.1+，amsg-client 2.2.4+ / 2.3.0-next.1+）**：头像是装饰性字段，单独一个不合法 URL 不应该把整条推送 fail 掉。所以服务端 / 客户端遇到上面任何不合法情形，**不返回 4xx**，而是：
 
+1. 把 `avatarUrl` 在 payload 上**置为 `null`**（schedule / instant 路径）；`update-message` 路径则**从 patch 里删掉**该字段，已存储的旧头像保持不变。
+2. 在控制台 `console.warn` 出原因（含建议，如"请改为公网可访问的 https:// 图片 URL"）。
+3. 继续处理 payload 其它字段。
+
+老版本（`amsg-server` 2.3.1 ~ 2.3.2 / 2.4.0-next.0、`amsg-instant` 0.6.1 ~ 0.7.0 / 0.8.0-next.0、`amsg-client` 2.2.3 / 2.3.0-next.0）走严格 400：
 - `amsg-server.schedule-message` → `400 INVALID_PARAMETERS`
 - `amsg-server.update-message` → `400 INVALID_UPDATE_DATA`
 - `amsg-instant` → `400 INVALID_PAYLOAD_FORMAT`
+- `amsg-client` 本地预校验抛 `Error` 的 `.code === 'INVALID_AVATAR_URL_LOCAL'`（2.2.4+ 已移除，改为本地 `console.warn` + 置空）。
 
-错误信息须明示原因和建议（如"请改为公网可访问的 https:// 图片 URL"或"建议使用 CDN 缩略图"）。客户端 SDK 同时做本地预校验（`amsg-client` 2.2.3+），抛出 `Error` 的 `.code` 为 `INVALID_AVATAR_URL_LOCAL`，避免一次远端往返。
-
-预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）。
+预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）—— 返回错误描述字符串或 `null`，**纯函数**，不副作用；上层调用方按软清空策略处理。
 
 ### 6.3 推送 wire shape：三轴判别联合
 
@@ -456,7 +460,8 @@ v2.x 后续增量（向后兼容，无需迁移）：
 
 - `messages` 数组（2.2.0+）：未使用此字段的调用方零修改。
 - `splitPattern`（2.3.0+）：未传时走默认正则，老库存任务字段缺失也按默认处理。
-- `avatarUrl` 严格校验（2.3.1+）：之前传 `data:` URI 当 avatarUrl 实际上一直推不出来（触发下游 4KB / 413），收紧到入口立即报错而已；从未推成功的调用者无感升级。
+- `avatarUrl` 严格校验（2.3.1 ~ 2.3.2）：之前传 `data:` URI 当 avatarUrl 实际上一直推不出来（触发下游 4KB / 413），收紧到入口立即报错而已；从未推成功的调用者无感升级。
+- `avatarUrl` 软清空（server 2.3.3+ / 2.4.0-next.1+，instant 0.7.1+ / 0.8.0-next.1+，client 2.2.4+ / 2.3.0-next.1+）：把"严格 400"放宽为"`console.warn` + 置空 + 继续"。整条推送不再因为一个装饰性字段挂掉；之前依赖 400 报错的调用方只需改成观察 `console.warn`。详见 §6.2。
 
 ## 12. 实现一致性要求（DoD）
 

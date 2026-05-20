@@ -113,7 +113,7 @@ Content-Type: application/json
 ```ts
 {
   contactName: string;
-  avatarUrl?: string | null;        // 0.6.1+：拒 data: URI / 长度 > 2KB（base64 头像会触发 413 / Web Push 4KB 上限）
+  avatarUrl?: string | null;        // 0.7.1+ / 0.8.0-next.1+：不合法值（data: URI / 长度 > 2KB / 非字符串）软清空 + console.warn，整次推送不再 fail
 
   // === 提示词，二选一恰好一个（0.5.0+）===
   completePrompt?: string;         // 简单推送场景：单 user 消息
