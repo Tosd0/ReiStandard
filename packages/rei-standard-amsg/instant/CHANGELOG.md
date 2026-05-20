@@ -1,5 +1,62 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.2 — splitPattern hook-mode 修复 + reasoning 两层切分 (pre-release)
+
+Coordinated with `@rei-standard/amsg-shared@0.1.0-next.2`. Install with `npm install @rei-standard/amsg-instant@next`.
+
+### Fixed
+
+- **`splitPattern` 在 hook 模式下重新生效**。0.7 引入的「`splitPattern is ignored when onLLMOutput is provided` 启动 warn + 不切分」是设计抽风：`splitPattern` 是「消息文本切气泡」的 UX 配置，跟 hook 决定「本轮发什么」完全正交。next.2 把它在 hook 模式下重新启用，hook 返回 `decision: 'finish'` / `'tool-request'` 后，framework 按 `messageKind` 对 pushPayload 的文本字段应用 `splitPattern`：`content.message` / `tool_request.message`（默认开，句号正则 `/([。！？!?]+)/`）。`ToolRequestPush` 切片时 `toolCalls` 仍是原子数组，绑定到含 LAST prefix 段的 chunk（emit 为 `tool_request`），前 N-1 段降级为 `content`（不带 `toolCalls`）— 保证 narration 全显示完再启动 tool 执行。
+- **删除 0.7 加的 `splitPattern is ignored when onLLMOutput is provided` 启动 warn**。
+
+### New
+
+- **`reasoningSplitPattern` / `errorSplitPattern` payload 字段** — 按 `messageKind` 独立的句号切配置：
+
+  | `messageKind`  | 字段                      | 默认                |
+  |----------------|---------------------------|---------------------|
+  | `content`      | `splitPattern`            | `/([。！？!?]+)/` (开) |
+  | `tool_request` | `splitPattern`            | `/([。！？!?]+)/` (开) |
+  | `reasoning`    | `reasoningSplitPattern`   | **不切**            |
+  | `error`        | `errorSplitPattern`       | **不切**            |
+  | 自由 payload   | —                         | 不切                |
+
+  四个 kind 共享的「禁用」语义：显式 `null` 或 `[]` 关闭切分。差别在 `undefined`（字段省略）：`content` / `tool_request` 回落默认句号正则；`reasoning` / `error` 保持不切（这俩历史上就没切片 UX，默认 off 才符合预期）。
+
+- **`reasoningChunkBytes` handler option（默认 2000，`null` 禁用）** — `ReasoningPush.reasoningContent` 的 UTF-8 字节上限。reasoning-heavy LLM（DeepSeek-R1 / GLM-4.5 / Qwen3-Thinking）经常输出 3-10 KB reasoning，超 Web Push ~2.6 KB 上限。next.2 内置 transparent 字节切分：超限时按 UTF-8 codepoint 边界切成 N 份，每片带 `chunkIndex` / `totalChunks`，SW 按这两个字段拼回完整字符串。**绝大多数 reasoning-heavy 部署不再需要 BlobStore。** `createInstantHandler` 构造期校验 `reasoningChunkBytes ∈ [500, maxInlineBytes - 600]`（600 B 余量给 push payload 元字段），不合法抛 `TypeError`。
+
+- **两层 cascade（Layer 1 句切 → Layer 2 字节切）** — `reasoningSplitPattern` 先按句切成 M 段，每段单独量字节，超阈值的段再字节切成 N 块。最终 push 同时带两组索引：
+  - Layer 1：`messageIndex` 1..M / `totalMessages` M（M=1 时不写）
+  - Layer 2：`chunkIndex` 1..N / `totalChunks` N（N=1 时不写）
+
+  SW 拼接：按 `sessionId` 分桶 → 按 `messageIndex` 分子桶 → 按 `chunkIndex` 排序拼字符串。
+
+- **新事件 `reasoning_chunked`** — `{ sessionId, iteration?, totalChunks, totalBytes }`。只在 Layer 2 实际切分时 fire 一次（Layer 1 单独的句切不 fire），避免事件洪水。
+
+- **`chunkReasoningByUtf8Bytes` re-export** — 从 `@rei-standard/amsg-shared` 直接 re-export 出来，hook 作者想自己切（`autoEmitReasoning: false` + 手动 dispatch）也能用。
+
+### 行为兼容
+
+- 不传任何新字段：`reasoning_content` 小于 2000 B 时 wire format 跟 next.1 byte-for-byte 一致。
+- 老 SW 拿到单 chunk 单 segment 的 ReasoningPush 完全照常消费（新字段都 optional，单值时不写）。
+- HOOK_THREW 诊断仍走 `sendWebPush` 单 shot（特殊路径，跟 byte chunking 解耦）。
+- LOOP_EXCEEDED 诊断走 `sendChunkedPush` 仍然遵循 `errorSplitPattern`（默认不切）。
+
+### 投递时序
+
+- Layer 1 段间间隔：`SLEEP_BETWEEN_MESSAGES_MS`（1500 ms，typing-bubble UX）
+- Layer 2 同段 chunk 间间隔：`SLEEP_BETWEEN_REASONING_CHUNKS_MS`（100 ms，transport-only，不需要打字感）
+- 一律串行，每个 chunk 等前一个 push 返回再发，避免 push gateway 速率限制 + SW 按 `chunkIndex` 重排
+- 内部统一通过 `sendPushWithMaybeBlob`，单 chunk 超限仍可走 BlobStore envelope（兜底未变）
+
+### Unchanged
+
+- hook API（4-decision 契约）/ agentic loop / `/continue` / `maxLoopIterations` / `autoEmitReasoning` 全部不变
+- BlobStore 路径、envelope schema、`maxInlineBytes` 等不变
+- 凭据（vapid / apiKey / pushSubscription）继续不暴露给 hook
+- 不引入新错误码、不改 HTTP 状态码映射
+- `runLegacyInstant`（不传 `onLLMOutput` 的 0.6 兼容路径）也吃 Layer 2 字节切，跟 `runAgenticLoop` 行为一致
+
 ## 0.8.0-next.1 — avatarUrl 软清空 (pre-release)
 
 Cherry-pick stable `0.7.1` 的 `avatarUrl` 软清空策略到 next 预发布线。`/instant` 与 `/continue` 路径不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串 / 不是合法 URL）会在 payload 上**置为 `null`** + `console.warn`，整次推送继续；`INVALID_PAYLOAD_FORMAT` 不再为 `avatarUrl` 触发，其它字段错误码不变。详见 `0.7.1` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-client` 2.3.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。

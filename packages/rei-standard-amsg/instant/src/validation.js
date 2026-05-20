@@ -308,15 +308,8 @@ export function validateInstantPayload(payload, opts) {
     };
   }
 
-  const splitErr = validateSplitPattern(payload.splitPattern);
-  if (splitErr) {
-    return {
-      valid: false,
-      errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: splitErr,
-      details: { invalidFields: ['splitPattern'] }
-    };
-  }
+  const splitErr = validatePerKindSplitPatterns(payload);
+  if (splitErr) return splitErr;
 
   // Hook-path-only fields are validated regardless of which path
   // we're on — even legacy callers passing them should get a clean
@@ -453,7 +446,38 @@ export function validateContinuePayload(payload, opts) {
     payload.avatarUrl = null;
   }
 
+  const splitErr = validatePerKindSplitPatterns(payload);
+  if (splitErr) return splitErr;
+
   return validateHookPathSharedFields(payload, opts) || { valid: true };
+}
+
+/**
+ * Validate the three per-kind split-pattern fields. All three follow
+ * the same shape rules (`validateSplitPattern`) — only their
+ * semantics differ at runtime (`content` / `tool_request` default-on,
+ * `reasoning` / `error` default-off).
+ *
+ * @param {Object} payload
+ */
+function validatePerKindSplitPatterns(payload) {
+  for (const field of ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']) {
+    const err = validateSplitPattern(payload[field]);
+    if (err) {
+      // Re-label the error with the actual field name so the caller
+      // knows which knob to fix. `validateSplitPattern` itself uses
+      // the literal label "splitPattern" / "splitPattern[i]"; rewrite
+      // it for the per-kind fields.
+      const labelled = field === 'splitPattern' ? err : err.replace(/^splitPattern/, field);
+      return {
+        valid: false,
+        errorCode: 'INVALID_PAYLOAD_FORMAT',
+        errorMessage: labelled,
+        details: { invalidFields: [field] },
+      };
+    }
+  }
+  return null;
 }
 
 /**

@@ -121,17 +121,35 @@ export const PUSH_SOURCE = Object.freeze({
  * out of the upstream response into its own push. Emitted **before**
  * the matching {@link ContentPush} burst when present and non-empty.
  *
- * Intentionally does NOT carry `messageIndex` / `totalMessages` —
- * reasoning is a single push per LLM round, never a split-burst.
- * That's why those fields are absent at the type level rather than
- * `optional` (which would leave callers wondering when they're set).
+ * Reasoning carries two orthogonal "multi-part" axes, both optional —
+ * they are *omitted* when the part count is 1 so the wire stays
+ * byte-for-byte compatible with single-shot ReasoningPush callers:
+ *
+ *   - `messageIndex` / `totalMessages` — set when a semantic
+ *     splitter (`reasoningSplitPattern` in amsg-instant) has cut the
+ *     reasoning into multiple sentences for typing-bubble UX.
+ *
+ *   - `chunkIndex` / `totalChunks` — set when a single segment was
+ *     too large for the Web Push payload limit and the producer had
+ *     to slice it across multiple pushes at UTF-8 byte boundaries.
+ *     Transport-only; SW reassembles the original `reasoningContent`
+ *     by sorting on `chunkIndex` within a `(sessionId, messageIndex)`
+ *     bucket. See `chunkReasoningByUtf8Bytes` for the safe-edge
+ *     splitter helper.
+ *
+ * Both axes can coexist on the same push when a sentence-split
+ * segment is itself oversized.
  *
  * @typedef {AmsgPushCommon & {
  *   messageKind: 'reasoning',
  *   reasoningContent: string,
- *   title?:        string,
- *   contactName?:  string,
- *   avatarUrl?:    string | null,
+ *   title?:         string,
+ *   contactName?:   string,
+ *   avatarUrl?:     string | null,
+ *   messageIndex?:  number,
+ *   totalMessages?: number,
+ *   chunkIndex?:    number,
+ *   totalChunks?:   number,
  * }} ReasoningPush
  */
 
@@ -257,8 +275,16 @@ export function buildContentPush(args) {
  * matching `ContentPush` burst when the LLM response carried a non-
  * empty `reasoning_content`.
  *
- * Does NOT take `messageIndex` / `totalMessages` — reasoning is one
- * push per LLM round.
+ * Two optional multi-part axes (both omitted from wire when the part
+ * count is 1, so single-shot reasoning stays byte-for-byte compatible):
+ *
+ *   - `messageIndex` / `totalMessages` — semantic splitter (sentence
+ *     regex) produced multiple segments.
+ *   - `chunkIndex` / `totalChunks` — byte splitter (UTF-8 payload-limit
+ *     workaround) sliced a single segment across multiple pushes.
+ *
+ * Both can be set together when a sentence-split segment is itself
+ * oversized. See README §"Reasoning chunking".
  *
  * @param {Object} args
  * @param {MessageType} args.messageType
@@ -271,6 +297,10 @@ export function buildContentPush(args) {
  * @param {string}      [args.contactName]
  * @param {string | null} [args.avatarUrl]
  * @param {string}      [args.messageSubtype]
+ * @param {number}      [args.messageIndex]
+ * @param {number}      [args.totalMessages]
+ * @param {number}      [args.chunkIndex]
+ * @param {number}      [args.totalChunks]
  * @param {Object}      [args.metadata]
  * @returns {ReasoningPush}
  */
@@ -297,6 +327,10 @@ export function buildReasoningPush(args) {
   if (args.contactName !== undefined) push.contactName = args.contactName;
   if (args.avatarUrl !== undefined) push.avatarUrl = args.avatarUrl;
   if (args.messageSubtype !== undefined) push.messageSubtype = args.messageSubtype;
+  if (args.messageIndex !== undefined) push.messageIndex = args.messageIndex;
+  if (args.totalMessages !== undefined) push.totalMessages = args.totalMessages;
+  if (args.chunkIndex !== undefined) push.chunkIndex = args.chunkIndex;
+  if (args.totalChunks !== undefined) push.totalChunks = args.totalChunks;
   if (args.metadata !== undefined) push.metadata = args.metadata;
   return push;
 }
@@ -437,4 +471,81 @@ export function isToolRequestPush(value) {
 export function isErrorPush(value) {
   return !!value && typeof value === 'object'
     && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'error';
+}
+
+// ─── Reasoning byte chunker ─────────────────────────────────────────────
+
+const REASONING_CHUNK_ENCODER = new TextEncoder();
+const REASONING_CHUNK_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Slice a string into UTF-8 byte chunks no larger than `maxBytes`,
+ * always cutting at codepoint boundaries (never inside a multi-byte
+ * char). Designed for the {@link ReasoningPush} byte-chunking path
+ * in amsg-instant — producers facing the ~3 KB Web Push payload
+ * limit slice oversized reasoning into N pushes with
+ * `chunkIndex` / `totalChunks`, the SW reassembles by concat.
+ *
+ * Algorithm: TextEncoder → Uint8Array → backward scan from each
+ * candidate cut index until the byte is a UTF-8 lead byte (any byte
+ * where `(b & 0xC0) !== 0x80`; continuation bytes are `0b10xxxxxx`).
+ * TextDecoder turns each slice back into a JS string.
+ *
+ *   chunkReasoningByUtf8Bytes('A寿B', 4) → ['A寿', 'B']  // '寿' = 3 B,
+ *                                                       // cut at safe edge
+ *
+ * Constraints:
+ *   - `maxBytes` MUST be ≥ 4 (UTF-8 codepoints can be up to 4 bytes;
+ *     any smaller threshold has no valid cut point for a 4-byte char
+ *     and is also operationally nonsensical). Throws `RangeError`
+ *     otherwise.
+ *   - Empty `text` → `[]` (caller can check `.length === 0`).
+ *   - `text` whose total UTF-8 byte length ≤ `maxBytes` → `[text]`
+ *     (no chunking).
+ *   - `text` MUST be a string. Non-string throws `TypeError`.
+ *
+ * Joining the result `chunks.join('')` is guaranteed to equal the
+ * input `text` (no data loss, no extra whitespace).
+ *
+ * @param {string} text
+ * @param {number} maxBytes
+ * @returns {string[]}
+ */
+export function chunkReasoningByUtf8Bytes(text, maxBytes) {
+  if (typeof text !== 'string') {
+    throw new TypeError('[amsg-shared] chunkReasoningByUtf8Bytes: text must be a string');
+  }
+  if (!Number.isInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError(
+      '[amsg-shared] chunkReasoningByUtf8Bytes: maxBytes must be an integer ≥ 4 (UTF-8 max codepoint width)'
+    );
+  }
+  if (text.length === 0) return [];
+
+  const bytes = REASONING_CHUNK_ENCODER.encode(text);
+  if (bytes.byteLength <= maxBytes) return [text];
+
+  /** @type {string[]} */
+  const chunks = [];
+  let start = 0;
+  while (start < bytes.byteLength) {
+    let end = Math.min(start + maxBytes, bytes.byteLength);
+
+    if (end < bytes.byteLength) {
+      // Walk back to a lead byte. UTF-8 continuation bytes are
+      // `0b10xxxxxx` → (b & 0xC0) === 0x80. Any other byte starts a
+      // new codepoint, so `end` is a safe boundary as long as the
+      // byte AT `end` is NOT a continuation byte.
+      while (end > start && (bytes[end] & 0xC0) === 0x80) {
+        end--;
+      }
+      // The precondition `maxBytes ≥ 4` guarantees `end > start`
+      // here: a window of ≥4 bytes always contains at least one
+      // lead byte (UTF-8 codepoints are ≤ 4 bytes).
+    }
+
+    chunks.push(REASONING_CHUNK_DECODER.decode(bytes.subarray(start, end)));
+    start = end;
+  }
+  return chunks;
 }

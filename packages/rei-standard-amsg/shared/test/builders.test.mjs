@@ -13,6 +13,7 @@ import {
   isReasoningPush,
   isToolRequestPush,
   isErrorPush,
+  chunkReasoningByUtf8Bytes,
 } from '../src/index.js';
 
 const COMMON = Object.freeze({
@@ -72,16 +73,49 @@ test('buildContentPush forwards passthrough metadata without mutating', () => {
   assert.equal(push.metadata, metadata);
 });
 
-test('buildReasoningPush returns a ReasoningPush without index/total fields', () => {
+test('buildReasoningPush returns a ReasoningPush without index/total/chunk fields by default', () => {
   const push = buildReasoningPush({
     ...COMMON,
     reasoningContent: 'thinking out loud',
   });
   assert.equal(push.messageKind, 'reasoning');
   assert.equal(push.reasoningContent, 'thinking out loud');
+  // None of the multi-part axes are present when the caller didn't
+  // explicitly pass them — keeps the single-shot wire byte-for-byte
+  // compatible with pre-byte-chunking ReasoningPush callers.
   assert.ok(!('messageIndex' in push));
   assert.ok(!('totalMessages' in push));
+  assert.ok(!('chunkIndex' in push));
+  assert.ok(!('totalChunks' in push));
   assert.ok(isReasoningPush(push));
+});
+
+test('buildReasoningPush carries chunkIndex / totalChunks when explicitly passed', () => {
+  const push = buildReasoningPush({
+    ...COMMON,
+    reasoningContent: 'first 2000 bytes…',
+    chunkIndex: 1,
+    totalChunks: 3,
+  });
+  assert.equal(push.chunkIndex, 1);
+  assert.equal(push.totalChunks, 3);
+});
+
+test('buildReasoningPush carries both messageIndex/totalMessages and chunkIndex/totalChunks (cascade)', () => {
+  // The cascade case: sentence-split produced 3 segments, segment 2
+  // was itself oversized and got byte-chunked into 5 sub-pushes.
+  const push = buildReasoningPush({
+    ...COMMON,
+    reasoningContent: 'middle of sentence 2…',
+    messageIndex: 2,
+    totalMessages: 3,
+    chunkIndex: 1,
+    totalChunks: 5,
+  });
+  assert.equal(push.messageIndex, 2);
+  assert.equal(push.totalMessages, 3);
+  assert.equal(push.chunkIndex, 1);
+  assert.equal(push.totalChunks, 5);
 });
 
 test('buildReasoningPush rejects empty reasoningContent', () => {
@@ -170,4 +204,87 @@ test('required fields reject empty string (not just undefined) for ID-shaped fie
   assert.throws(() => buildContentPush({ ...COMMON, sessionId: '', message: 'x' }), /'sessionId' is required/);
   assert.throws(() => buildReasoningPush({ ...COMMON, messageId: '', reasoningContent: 'y' }), /'messageId' is required/);
   assert.throws(() => buildErrorPush({ ...COMMON, code: '', message: 'm' }), /'code' is required/);
+});
+
+// ─── chunkReasoningByUtf8Bytes ──────────────────────────────────────────
+
+test('chunkReasoningByUtf8Bytes — empty string returns []', () => {
+  assert.deepEqual(chunkReasoningByUtf8Bytes('', 100), []);
+});
+
+test('chunkReasoningByUtf8Bytes — text under threshold returns single chunk', () => {
+  const text = 'hello world'; // 11 bytes ASCII
+  assert.deepEqual(chunkReasoningByUtf8Bytes(text, 100), [text]);
+});
+
+test('chunkReasoningByUtf8Bytes — text exactly at threshold returns single chunk', () => {
+  const text = 'a'.repeat(100); // 100 bytes ASCII
+  assert.deepEqual(chunkReasoningByUtf8Bytes(text, 100), [text]);
+});
+
+test('chunkReasoningByUtf8Bytes — ASCII over threshold splits into N chunks (joined = original)', () => {
+  const text = 'a'.repeat(250); // 250 bytes ASCII
+  const chunks = chunkReasoningByUtf8Bytes(text, 100);
+  assert.equal(chunks.length, 3);
+  assert.equal(chunks[0].length, 100);
+  assert.equal(chunks[1].length, 100);
+  assert.equal(chunks[2].length, 50);
+  assert.equal(chunks.join(''), text);
+});
+
+test('chunkReasoningByUtf8Bytes — pure CJK boundaries always at codepoint (寿)', () => {
+  // '寿' = 3 UTF-8 bytes. 1000 chars × 3 = 3000 bytes total.
+  // maxBytes 999 = 333 chars exactly. With maxBytes 1000 = 333.33 →
+  // 333 chars (999 bytes) per chunk, rest trails. Either way every
+  // boundary must hit a codepoint edge — no half-character.
+  const text = '寿'.repeat(1000);
+  const chunks = chunkReasoningByUtf8Bytes(text, 999);
+  assert.ok(chunks.length >= 3);
+  // Reconstruction safety — every chunk decodes cleanly + concat matches.
+  assert.equal(chunks.join(''), text);
+  // No chunk exceeds the byte cap.
+  const encoder = new TextEncoder();
+  for (const c of chunks) {
+    assert.ok(encoder.encode(c).byteLength <= 999, `chunk byte len ${encoder.encode(c).byteLength}`);
+  }
+});
+
+test('chunkReasoningByUtf8Bytes — pure emoji (4-byte chars) never cuts inside surrogate', () => {
+  // '🙂' = 4 UTF-8 bytes (U+1F642, outside the BMP).
+  // 500 × 4 = 2000 bytes total. maxBytes 1003 → not a multiple of 4,
+  // so the splitter MUST walk back to the previous lead byte for at
+  // least one boundary. Joined chunks must still round-trip exactly.
+  const text = '🙂'.repeat(500);
+  const chunks = chunkReasoningByUtf8Bytes(text, 1003);
+  assert.ok(chunks.length >= 2);
+  assert.equal(chunks.join(''), text);
+  const encoder = new TextEncoder();
+  for (const c of chunks) {
+    assert.ok(encoder.encode(c).byteLength <= 1003);
+  }
+});
+
+test('chunkReasoningByUtf8Bytes — mixed ASCII + CJK + emoji round-trips at various caps', () => {
+  const text = 'Hello 你好 🙂 worldこんにちは🌏'.repeat(20);
+  for (const cap of [50, 100, 256, 500, 1024]) {
+    const chunks = chunkReasoningByUtf8Bytes(text, cap);
+    assert.equal(chunks.join(''), text, `cap=${cap}`);
+    const encoder = new TextEncoder();
+    for (const c of chunks) {
+      assert.ok(encoder.encode(c).byteLength <= cap, `cap=${cap}, chunk too big`);
+    }
+  }
+});
+
+test('chunkReasoningByUtf8Bytes — rejects maxBytes < 4 (no valid cut for 4-byte chars)', () => {
+  assert.throws(() => chunkReasoningByUtf8Bytes('hi', 3), /maxBytes must be an integer ≥ 4/);
+  assert.throws(() => chunkReasoningByUtf8Bytes('hi', 0), /maxBytes must be an integer ≥ 4/);
+  assert.throws(() => chunkReasoningByUtf8Bytes('hi', -1), /maxBytes must be an integer ≥ 4/);
+  assert.throws(() => chunkReasoningByUtf8Bytes('hi', 1.5), /maxBytes must be an integer ≥ 4/);
+});
+
+test('chunkReasoningByUtf8Bytes — rejects non-string text', () => {
+  assert.throws(() => chunkReasoningByUtf8Bytes(null, 100), /text must be a string/);
+  assert.throws(() => chunkReasoningByUtf8Bytes(undefined, 100), /text must be a string/);
+  assert.throws(() => chunkReasoningByUtf8Bytes(42, 100), /text must be a string/);
 });

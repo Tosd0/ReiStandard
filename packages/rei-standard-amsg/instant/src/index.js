@@ -48,6 +48,34 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 /**
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
+ *
+ * Note on per-kind split-pattern fields (request-payload, not handler options):
+ *
+ *   Each `messageKind` reads its own pattern field with its own default:
+ *
+ *     | messageKind    | field on payload          | default                     |
+ *     |----------------|---------------------------|-----------------------------|
+ *     | `content`      | `splitPattern`            | `/([。！？!?]+)/` (split-on) |
+ *     | `tool_request` | `splitPattern`            | `/([。！？!?]+)/` (split-on) |
+ *     | `reasoning`    | `reasoningSplitPattern`   | **not split**               |
+ *     | `error`        | `errorSplitPattern`       | **not split**               |
+ *     | free-form      | —                         | not split                   |
+ *
+ *   Disable semantics: an explicit `null` or `[]` disables splitting
+ *   for that kind. The asymmetry sits in `undefined` (field absent):
+ *   `content` / `tool_request` fall back to the default sentence
+ *   regex; `reasoning` / `error` stay unsplit. This makes the
+ *   default-on / default-off bucket explicit in the wire format.
+ *
+ *   ToolRequestPush splitting demotes prefix chunks to `content`
+ *   (without `toolCalls`) and binds `toolCalls` to the LAST prefix
+ *   segment (kept as `tool_request`), so narration finishes before
+ *   the client starts executing tools.
+ *
+ *   Auto-emitted ReasoningPush (from `choices[0].message.reasoning_content`)
+ *   and framework-built ErrorPush diagnostics (`LOOP_EXCEEDED`) both
+ *   read the same kind-specific fields. `HOOK_THREW` is a
+ *   special-case single-shot diagnostic and bypasses the splitter.
  * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Weak by design: the token is visible in any frontend bundle that uses it. Use `tokenSigningKey` for real auth.
  * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
  * @property {CorsConfig} [cors]              - CORS configuration. Defaults to `{ allowOrigin: '*' }`. Every response (including the 204 preflight short-circuit) carries the matching `Access-Control-Allow-*` headers.
@@ -83,6 +111,25 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *             read `ctx.llmResponse.choices[0].message.reasoning_content`
  *             and produce its own `buildReasoningPush(...)` envelope.
  *             Legacy (non-hook) path always auto-emits regardless.
+ * @property {number | null} [reasoningChunkBytes=2000]
+ *           - **next.2 transport knob.** Cap on the UTF-8 byte size
+ *             of a single `ReasoningPush.reasoningContent`. When the
+ *             auto-emitted (or hook-returned) reasoning exceeds this
+ *             threshold, the framework slices it at UTF-8 codepoint
+ *             boundaries via `chunkReasoningByUtf8Bytes` and ships N
+ *             ReasoningPushes with `chunkIndex` / `totalChunks` set;
+ *             the SW reassembles by sorting chunks within a
+ *             `(sessionId, messageIndex)` bucket. Default 2000 keeps
+ *             each full push payload (incl. envelope overhead) safely
+ *             under the 2.6 KB Web Push limit without BlobStore.
+ *             Set to `null` to disable byte chunking entirely —
+ *             oversized reasoning then falls back to BlobStore (if
+ *             configured) or throws `PayloadTooLargeError`.
+ *             Layered with `reasoningSplitPattern` (sentence regex,
+ *             request-payload field): sentence-split runs first, then
+ *             oversized sentences cascade-chunk by byte. Throws
+ *             `TypeError` at handler construction when not in
+ *             `[500, maxInlineBytes - 600]` (or `null`).
  */
 
 /**
@@ -122,18 +169,10 @@ export function createInstantHandler(options) {
   // most hook callers. The legacy path ignores this setting and
   // always auto-emits.
   const autoEmitReasoning = options.autoEmitReasoning !== false;
-
-  // One-shot startup warning: a caller who sets both `onLLMOutput`
-  // and `splitPattern` almost certainly hasn't realised the hook
-  // path doesn't run the sentence splitter. We don't fail (the combo
-  // is benign), just nudge them in the console so the dead config
-  // doesn't go unnoticed in production logs.
-  if (onLLMOutput && options.splitPattern !== undefined) {
-    const warn = globalThis.console && globalThis.console.warn;
-    if (typeof warn === 'function') {
-      warn('[amsg-instant] splitPattern is ignored when onLLMOutput is provided. Move splitting logic into your hook if needed.');
-    }
-  }
+  // Eager validation: `reasoningChunkBytes` throws at handler
+  // construction (not on the first request) so misconfiguration
+  // surfaces in startup logs / unit tests, not in production traffic.
+  const reasoningChunkBytes = resolveReasoningChunkBytes(options, blobStore);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -269,6 +308,7 @@ export function createInstantHandler(options) {
         blobStore,
         maxLoopIterations,
         autoEmitReasoning,
+        reasoningChunkBytes,
         requestUrl: request.url,
         isResume: isContinue,
       });
@@ -290,6 +330,55 @@ export function createInstantHandler(options) {
       });
     }
   };
+}
+
+// Defaults pinned at module scope so the validator and the resolver
+// agree without a second source of truth.
+const DEFAULT_REASONING_CHUNK_BYTES = 2000;
+const DEFAULT_MAX_INLINE_BYTES_FOR_OVERHEAD_CHECK = 2600;
+const REASONING_CHUNK_BYTES_MIN = 500;
+const REASONING_CHUNK_OVERHEAD_MARGIN = 600;
+
+/**
+ * Resolve and validate `options.reasoningChunkBytes`. Returns the
+ * resolved sentinel value to pass into `processInstantMessage`'s ctx:
+ *   - positive integer when chunking is enabled (caller-provided or default 2000)
+ *   - `null` when chunking is explicitly disabled
+ *
+ * Throws `TypeError` at handler construction (NOT at request time) so
+ * deploys with bad config fail fast in their startup logs / CI rather
+ * than ship a worker that crashes on the first reasoning-heavy LLM
+ * response.
+ *
+ * The acceptable range is `[REASONING_CHUNK_BYTES_MIN,
+ * maxInlineBytes - REASONING_CHUNK_OVERHEAD_MARGIN]`. The 600 B
+ * overhead margin reserves space for a chunk's push-payload metadata
+ * (messageKind / sessionId / messageId / chunkIndex / totalChunks /
+ * timestamp / contactName / avatarUrl / messageSubtype) so a chunk
+ * sized exactly at `reasoningChunkBytes` still fits inline.
+ *
+ * @param {Object} options
+ * @param {import('./blob-store/interface.js').BlobStoreConfig | null} blobStore
+ * @returns {number | null}
+ */
+function resolveReasoningChunkBytes(options, blobStore) {
+  const raw = options.reasoningChunkBytes;
+  if (raw === undefined) return DEFAULT_REASONING_CHUNK_BYTES;
+  if (raw === null) return null;
+  const maxInline = (blobStore && Number.isInteger(blobStore.maxInlineBytes) && blobStore.maxInlineBytes > 0)
+    ? blobStore.maxInlineBytes
+    : DEFAULT_MAX_INLINE_BYTES_FOR_OVERHEAD_CHECK;
+  const upperBound = maxInline - REASONING_CHUNK_OVERHEAD_MARGIN;
+  if (
+    !Number.isInteger(raw) ||
+    raw < REASONING_CHUNK_BYTES_MIN ||
+    raw > upperBound
+  ) {
+    throw new TypeError(
+      `[amsg-instant] reasoningChunkBytes must be a positive integer in [${REASONING_CHUNK_BYTES_MIN}, ${upperBound}] (= maxInlineBytes ${maxInline} − ${REASONING_CHUNK_OVERHEAD_MARGIN} overhead margin), or null to disable. Got: ${raw}`
+    );
+  }
+  return raw;
 }
 
 /**
@@ -547,4 +636,5 @@ export {
   isReasoningPush,
   isToolRequestPush,
   isErrorPush,
+  chunkReasoningByUtf8Bytes,
 } from '@rei-standard/amsg-shared';

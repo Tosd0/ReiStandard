@@ -39,6 +39,8 @@ npm install @rei-standard/amsg-instant
 | `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
 | `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
+| `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
+| `reasoningChunkBytes` | number \| null | ❌ | **0.8.0-next.2+**：`ReasoningPush.reasoningContent` 的 UTF-8 字节上限。默认 `2000` — reasoning 超 2 KB 时框架按 codepoint 边界切成 N 份带 `chunkIndex` / `totalChunks` 投递，SW 拼接还原。设 `null` 禁用字节切（超限走 BlobStore 或抛 `PAYLOAD_TOO_LARGE`）。构造期校验范围 `[500, maxInlineBytes - 600]`，不合法抛 `TypeError`。详见 [Reasoning chunking](#reasoning-chunking080-next2)。 |
 
 ### 鉴权策略
 
@@ -129,8 +131,10 @@ Content-Type: application/json
   temperature?: number;            // 0.5.0+：透传给 LLM；completePrompt 路径未传默认 0.8
   messageSubtype?: string;         // SW 端分类标签，取值由业务决定
 
-  // === 分句正则（0.6.0+），可选 ===
-  splitPattern?: string | string[]; // 自定义把 LLM 输出切成多条推送的正则；不传走默认 /([。！？!?]+)/
+  // === 分句正则（按 messageKind 独立配置），可选 ===
+  splitPattern?: string | string[] | null;            // content / tool_request：默认 /([。！？!?]+)/，null/[] 关闭
+  reasoningSplitPattern?: string | string[] | null;   // 0.8.0-next.2+，reasoning：默认不切；传了就按这个切
+  errorSplitPattern?: string | string[] | null;       // 0.8.0-next.2+，error：默认不切；传了就按这个切
 
   pushSubscription: {              // Web Push 标准订阅
     endpoint: string;
@@ -180,9 +184,15 @@ curl -X POST https://instant.example.com/instant \
   }'
 ```
 
-#### `splitPattern`：自定义分句正则（0.6.0+）
+#### `splitPattern` 系列：按 `messageKind` 独立的分句正则（0.6.0+ / 0.8.0-next.2+）
 
-LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每条之间间隔 1.5s，看起来像真人一句句打字）。`splitPattern` 让调用方覆盖这个正则：
+LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每条之间间隔 1.5s，看起来像真人一句句打字）。三个字段各管一类 push 的切分：
+
+| 字段                      | 控制的 `messageKind`           | 默认（字段省略时）         |
+|---------------------------|--------------------------------|----------------------------|
+| `splitPattern`            | `content` / `tool_request`     | `/([。！？!?]+)/`（开）    |
+| `reasoningSplitPattern`   | `reasoning`                    | **不切**                   |
+| `errorSplitPattern`       | `error`                        | **不切**                   |
 
 ```jsonc
 // 单正则：按换行切
@@ -190,15 +200,25 @@ LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每
 
 // 数组：级联——先按段落切，每段再按句号切
 { "splitPattern": ["(\\n\\n+)", "([。！？!?]+)"] }
+
+// reasoning 长文本想切气泡：默认不切，得显式传
+{ "reasoningSplitPattern": "([。！？!?]+)" }
+
+// 关闭 content 的默认切分（整段一条 push）
+{ "splitPattern": null }
 ```
 
-**约定**：
+**`ToolRequestPush` 切片特殊处理**：`toolCalls` 是原子数组不切。`message` 切成 N 段时前 N-1 段降级为 `messageKind: 'content'`（不带 `toolCalls`），最后一段保留 `tool_request` + 完整 `toolCalls`，保证 narration 全显示完再启动 tool 执行。
+
+**通用约定**：
 
 - 传**正则 source**，不要带两边的 `/.../` 也不要带尾部 flag（`/foo/i` 会被当字面量斜杠 + 字面量 `i` 匹配）。需要大小写不敏感请用 `[Aa]` 这种字符类替代。
 - 想保留分隔符（默认就是把句号回贴到前一段），把分隔符包进 `(...)` 捕获组。库不会自动包——传 `"\\n+"` 而不是 `"(\\n+)"` 会得到首尾相连、分隔符丢失的奇怪结果。
 - 数组语义是**级联**（split → split → split），不是"任一匹配就切"。需要后者请用 `|` 自己合一条正则。
 - 上限：每项 ≤ 200 字符，数组 ≤ 10 项；非法或无法 `new RegExp(...)` 通过 → `400 INVALID_PAYLOAD_FORMAT`。
-- 不传 / `null` / `[]` → 走默认正则，行为字节级与 0.5.x 一致。
+- **`undefined` vs `null` / `[]` 语义不同**：
+  - `splitPattern`：`undefined` = 用默认正则；`null` / `[]` = 关闭切分。
+  - `reasoningSplitPattern` / `errorSplitPattern`：`undefined` = 不切（保守默认）；`null` / `[]` 也是不切（显式关闭，效果一样）。这俩 kind 默认 off，是因为它们历史上就没切片 UX，引入 default-on 会改老 caller 行为。
 
 #### `apiUrl` 规范化（0.4.0+）
 
@@ -424,6 +444,165 @@ POST body（结构与 `/instant` 入口相同 + `sessionId` + `iteration`）：
 
 ---
 
+## Reasoning chunking（0.8.0-next.2+）
+
+reasoning-heavy LLM（DeepSeek-R1 / GLM-4.5 / Qwen3-Thinking 等）经常输出 3-10 KB `reasoning_content`，远超 Web Push 单 payload ~2.6 KB 安全线。next.2 内置 transparent 字节切分：framework 在产出 `ReasoningPush` 时自动按 UTF-8 codepoint 边界切成 N 份带 `chunkIndex` / `totalChunks` 投递，SW 拼回完整字符串。**绝大多数 reasoning-heavy 部署不再需要 BlobStore。**
+
+### 两层 cascade
+
+```
+reasoningContent
+        │
+        ▼
+Layer 1 — 语义切（reasoningSplitPattern，默认 OFF）
+  • 按 regex 切成 M 段，每段带 messageIndex 1..M / totalMessages M
+        │
+        ▼  对每个 Layer-1 段独立量字节
+Layer 2 — 字节切（reasoningChunkBytes，默认 ON，2000 B）
+  • 段字节 ≤ 阈值：单 push（不写 chunkIndex / totalChunks）
+  • 段字节 > 阈值：codepoint 边界切成 N 份，每片带 chunkIndex 1..N / totalChunks N
+        │
+        ▼
+serial dispatch via sendPushWithMaybeBlob
+  • 同段 Layer-2 chunk 间间隔 100 ms（transport-only）
+  • Layer-1 段间间隔 1500 ms（typing-bubble UX）
+```
+
+### 默认配置 = 透明
+
+零配置就 work：
+
+```js
+createInstantHandler({
+  vapid: { ... },
+  onLLMOutput: hook,
+  // reasoningChunkBytes 默认 2000 — 不需要配
+});
+```
+
+- 短 reasoning（< 2000 B）：单 push，wire 跟 next.1 byte-for-byte 一致。
+- 长 reasoning（> 2000 B）：自动切分，老 SW 拿到不带 `chunkIndex` 的单 push 走老路径；新 SW 看到 `chunkIndex` / `totalChunks` 走累积拼接。
+
+### 显式禁用 byte chunking
+
+```js
+createInstantHandler({
+  vapid: { ... },
+  onLLMOutput: hook,
+  reasoningChunkBytes: null,  // 关闭 Layer 2
+  blobStore: { adapter: ... }, // 大 reasoning 走 envelope，没配 blobStore 会抛 PAYLOAD_TOO_LARGE
+});
+```
+
+`reasoningSplitPattern` 和 `reasoningChunkBytes` 是**两个独立开关**：
+- `reasoningSplitPattern: null` 只关 Layer 1（句切），不影响 Layer 2 字节切。
+- `reasoningChunkBytes: null` 只关 Layer 2（字节切），不影响 Layer 1 句切。
+
+### Wire format
+
+#### 单 chunk（≤ 阈值，无 Layer 1） — 跟 next.1 完全一致
+
+```json
+{
+  "messageKind": "reasoning",
+  "messageType": "instant",
+  "source": "instant",
+  "messageId": "msg_<uuid>_iter_0_reasoning",
+  "sessionId": "sess_abc",
+  "timestamp": "2026-05-20T12:00:00Z",
+  "reasoningContent": "short reasoning…"
+}
+```
+
+#### Pure Layer 2（无句切，大 reasoning）
+
+```json
+// Chunk 1 of 3
+{
+  "messageKind": "reasoning",
+  "messageId": "msg_<uuid>_iter_0_reasoning_chunk_1",
+  "sessionId": "sess_abc",
+  "chunkIndex": 1,
+  "totalChunks": 3,
+  "reasoningContent": "first 2000 bytes…"
+}
+```
+
+#### Cascade（Layer 1 + Layer 2）
+
+```json
+// Layer-1 段 2/3，Layer-2 chunk 1/3
+{
+  "messageKind": "reasoning",
+  "messageId": "msg_<uuid>_iter_0_reasoning_chunk_1",
+  "sessionId": "sess_abc",
+  "messageIndex": 2,
+  "totalMessages": 3,
+  "chunkIndex": 1,
+  "totalChunks": 3,
+  "reasoningContent": "first 2000 bytes of sentence 2…"
+}
+```
+
+### SW 端拼接合约
+
+```js
+// 伪代码 — 在 SW 的 'push' 事件 handler 里
+const buffers = new Map();   // sessionId → { [messageIndex]: { chunks: Map<chunkIndex,text>, total: number } }
+
+function onReasoningPush(p) {
+  // Single-shot — neither axis present. 直接消费。
+  if (p.chunkIndex === undefined && p.messageIndex === undefined) {
+    return deliverComplete(p.sessionId, p.reasoningContent);
+  }
+
+  // 按 (sessionId, messageIndex) 分桶 — messageIndex 不存在视作 0。
+  const segIdx = p.messageIndex ?? 0;
+  const segTotal = p.totalMessages ?? 1;
+  const chunkIdx = p.chunkIndex ?? 1;
+  const chunkTotal = p.totalChunks ?? 1;
+
+  const bySession = buffers.get(p.sessionId) ?? new Map();
+  buffers.set(p.sessionId, bySession);
+  const seg = bySession.get(segIdx) ?? { chunks: new Map(), total: chunkTotal };
+  seg.chunks.set(chunkIdx, p.reasoningContent);
+  bySession.set(segIdx, seg);
+
+  // 检查所有 segIdx 1..segTotal 都到齐 + 每段 chunks 1..total 都到齐 → 拼接消费。
+  if (bySession.size === segTotal &&
+      [...bySession.values()].every(s => s.chunks.size === s.total)) {
+    const full = [...bySession.entries()]
+      .sort(([a],[b]) => a - b)
+      .map(([_, s]) => [...s.chunks.entries()].sort(([a],[b]) => a - b).map(([_, t]) => t).join(''))
+      .join('');
+    deliverComplete(p.sessionId, full);
+    buffers.delete(p.sessionId);
+  }
+}
+```
+
+**关键不变量**：
+- `chunkIndex` / `totalChunks` 仅在 byte 切实际发生（N > 1）时出现，单 chunk 一律省略。
+- `messageIndex` / `totalMessages` 仅在 `reasoningSplitPattern` 实际切了（M > 1）时出现。
+- Web Push 到达顺序**不保证**，SW 必须按 `chunkIndex` 排序。
+- 跨 sessionId 不要混。每个 LLM round 一个 sessionId。
+
+### 事件
+
+framework 在 Layer 2 实际触发时 fire 一次 `reasoning_chunked`：
+
+```js
+onEvent: (e) => {
+  if (e.type === 'reasoning_chunked') {
+    console.log(`session=${e.sessionId} bytes=${e.totalBytes} chunks=${e.totalChunks} iter=${e.iteration}`);
+  }
+}
+```
+
+Layer 1 单独的句切不 fire 此事件（用户自己配的，可观测性走业务日志）。
+
+---
+
 ## BlobStore（0.7.0+）
 
 ### 为什么需要它
@@ -449,16 +628,17 @@ agentic loop 模式下 payload 大小分布（经验值）：
 | tool-request push（带本轮 LLM 原文） | 0.8–1.8 KB | 2.5 KB | 3.5 KB |
 | tool-request + reasoning | 1.5–3 KB | 4 KB（临界） | 5–6 KB（超） |
 
-→ **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。`BlobStore` 是**兜底**：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, type? }`，SW 端 `GET ${url}` 拿真 body。
+→ **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。0.8.0-next.2 引入 [reasoning byte chunking](#reasoning-chunking080-next2) 后，reasoning 超限的场景默认自动切分不再依赖 BlobStore；`BlobStore` 主要是 ContentPush / ToolRequestPush 超限的兜底（以及 reasoning byte chunking 被显式关闭时的 fallback）：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, type? }`，SW 端 `GET ${url}` 拿真 body。
 
 ### 何时启用 / 何时跳过
 
 | 场景 | 推荐 |
 |---|---|
 | 不配 `onLLMOutput`（v0.6 legacy 路径） | **不需要配** —— 分句拆出来每段都 < 1 KB |
-| agentic loop，不开 reasoning、不带 replay history | 建议配（保守安全线下 p90 接近撞线） |
-| agentic loop，开 reasoning 显示 | **强烈推荐** —— 必撞 |
-| 任何 tool-request 流程 | 推荐配 |
+| agentic loop，只用 reasoning，不带长 ContentPush | **不需要配** —— next.2 起 reasoning 自动 byte chunking，2 KB / chunk |
+| agentic loop，ContentPush 偶尔很长（代码块 / 长答案） | 推荐配 |
+| 显式关闭 `reasoningChunkBytes: null` | **强烈推荐** —— 大 reasoning 兜底走 envelope |
+| 任何 tool-request 流程 | 推荐配（toolCalls + narration 偶尔会撞线） |
 | 一次推完整 history | **必须配** —— 必超 |
 
 **不配 + 超限的行为**：抛 `PayloadTooLargeError` + emit `payload_too_large`，不静默截断。调用方据此决定要不要上 BlobStore。
