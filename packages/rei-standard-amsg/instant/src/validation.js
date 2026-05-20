@@ -55,12 +55,17 @@ const SPLIT_PATTERN_MAX_ITEMS = 10;
  * `validateSplitPattern` (kept in lockstep). Accepts string, string[], or
  * absent/null. Returns an error message string, or null when valid.
  *
+ * Used for both request-level fields (`splitPattern` /
+ * `reasoningSplitPattern` / `errorSplitPattern`) and the per-push
+ * override `pushPayload.splitPattern` returned by hook authors
+ * (0.8.0-next.3+). Same shape rules, same caps.
+ *
  * The size caps are an input-size guard, NOT a ReDoS defense — a 6-char
  * pattern like `(a+)+$` is enough to trigger catastrophic backtracking.
  * Worker / runtime CPU limits are the real backstop; the blast radius is
  * self-inflicted only (caller's regex on caller's own LLM output).
  */
-function validateSplitPattern(value) {
+export function validateSplitPattern(value) {
   if (value === undefined || value === null) return null;
   const isArray = Array.isArray(value);
   const items = isArray ? value : [value];

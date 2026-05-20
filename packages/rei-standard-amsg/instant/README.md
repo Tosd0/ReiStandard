@@ -220,6 +220,30 @@ LLM 返回的整段文本默认按 `/([。！？!?]+)/` 切成多条推送（每
   - `splitPattern`：`undefined` = 用默认正则；`null` / `[]` = 关闭切分。
   - `reasoningSplitPattern` / `errorSplitPattern`：`undefined` = 不切（保守默认）；`null` / `[]` 也是不切（显式关闭，效果一样）。这俩 kind 默认 off，是因为它们历史上就没切片 UX，引入 default-on 会改老 caller 行为。
 
+##### Per-push override：`pushPayload.splitPattern`（0.8.0-next.3+）
+
+在 hook 模式下，`onLLMOutput` 返回的 `pushPayload` 自身可以带一个 `splitPattern` 字段，作用域只限**这一个 push**。它优先于请求级的 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern`，规则比请求级简单一些：
+
+- **字段名永远是 `splitPattern`**，不分 kind——因为 push 自己的 `messageKind` 已经定了。`reasoning` push 想切片，写 `pushPayload.splitPattern: '(...)'` 即可（无需 `reasoningSplitPattern`）。
+- **优先级 / 语义区分 `undefined` vs `null`**：
+  - 写 `splitPattern: null`（或 `[]`）= **显式关切**（这一个 push 不切，请求级被盖住）。
+  - 写 `splitPattern: '(...)'` / `splitPattern: ['(\\n+)', '(...)']` = **显式开切**（用这套正则切，请求级被盖住）。
+  - `splitPattern: undefined` 或字段缺省 = **没意见**，回退到请求级 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern`。
+- **校验**：与请求级共享 `validateSplitPattern`——形状或正则非法 → 抛 `HookError`，message 形如 `pushPayload.splitPattern invalid: <原因>`，明确点位是 push 上的字段（不会跟请求级混）。
+- **wire 不带这个字段**：库会在交付前把它从 chunks 里 strip 掉，SW 永远收不到 `splitPattern`。strip 一次性完成——`splitHookPushPayload` 每个 push 跑一次，N-段切片 / ToolRequestPush 的 prefix 降级段都从已剥离的 parent spread，不会被二次切。
+
+```js
+onLLMOutput: async (ctx) => ({
+  decision: 'finish',
+  pushPayload: {
+    ...buildContentPush({ /* ... */ }),
+    splitPattern: null, // 这一段不切——即使请求级的 splitPattern 是开着的
+  },
+});
+```
+
+什么时候用：hook 想让某一类 push（比如「短促回复」「错误提示」）整段送出，而其他 push 仍按请求级配置切分。如果你想全局关闭，仍然直接在请求 body 上传 `splitPattern: null` 更省事。
+
 #### `apiUrl` 规范化（0.4.0+）
 
 为了让用户不必死记 OpenAI 路径全名，Worker 会按下表规则补全 `apiUrl`。规则幂等：跑两次 = 跑一次，所以传完整 URL 也不会被改坏。

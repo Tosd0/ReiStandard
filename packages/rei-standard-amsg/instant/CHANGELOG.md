@@ -1,5 +1,29 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.3 — `pushPayload.splitPattern` per-push override (pre-release)
+
+Coordinated with `@rei-standard/amsg-shared@0.1.0-next.3`. Install with `npm install @rei-standard/amsg-instant@next`.
+
+next.2 把 `splitPattern` 定位成纯请求级配置——hook 在自己返回的 `pushPayload` 上写 `splitPattern: null` 会被静默忽略（库不报错、不警告、TS 也不挡，因为 `ContentPush` 等 typedef 没有声明这个字段，spread 加任意 key 就会绕过 excess-property check）。这是 leaky API：用错位置看起来正常通过，但行为完全没生效。next.3 把这个口子收紧。
+
+### Fixed
+
+- **`pushPayload.splitPattern` 现在被识别为 per-push override**。hook 返回的 `pushPayload` 自身带 `splitPattern` 字段时，对这一个 push 优先级高于请求级的 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern`。字段名永远是 `splitPattern`（不分 kind，因为 push 的 `messageKind` 已经定了切谁的文本）。`null` / `[]` 关切；string / string[] 走 cascade。
+- **`undefined` 跟 `null` 严格区分**：`splitPattern: undefined`（或字段缺省）= 「没意见，回退请求级」；`splitPattern: null` / `[]` = 「这一个 push 显式关切，盖住请求级」。这跟请求级字段的语义、跟 JS 对 `undefined` 的直觉、跟 next.2 之前的请求级行为都保持一致——`undefined` 不会被错读成「override 在场但 disable」。
+- **Override 校验沿用 `validateSplitPattern`**——形状错（非 string/array、超 200 字符、超 10 项）或正则不可编译（`new RegExp(...)` throws）→ 抛 `HookError`，message 形如 `pushPayload.splitPattern invalid: <原因>`，明确点位（不会跟请求级混）。validateSplitPattern 原本带的 `splitPattern` / `splitPattern[i]` 前缀会被 strip，避免 `pushPayload.splitPattern invalid: splitPattern 不是...` 这种重复读起来含糊。
+- **Wire 不带 `splitPattern`**——库在交付前从所有 chunks（含 N-段切片、单段透传、ToolRequestPush 的 prefix 降级段）上 strip 掉这个字段，SW 永远收不到。`splitHookPushPayload` 每个 push 跑一次，降级 chunks 从已剥离的 parent spread，**不会发生二次切**。
+
+### Unchanged
+
+- 请求级 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern` 语义和优先级**完全不变**——只是新增了 per-push 覆盖通道。
+- 没在 `pushPayload` 上写 `splitPattern` 的 hook 行为跟 next.2 byte-for-byte 一致（auto-emit reasoning、framework 内置的 `LOOP_EXCEEDED` ErrorPush 等都没有这字段，全部回退到请求级）。
+- 公共 API（hook 契约、handler options、HTTP wire format）零变化。
+
+### Coordinated
+
+- 跟 `@rei-standard/amsg-shared@0.1.0-next.3` 一起发——shared 这版顺手补齐 `notification` 字段在 `ContentPush` / `ToolRequestPush` typedef 上的 7 字段 typed support + `buildContentPush` / `buildToolRequestPush` 的 `notification?` 入参（解决跟本 next.3 同源的 leaky-API：SW 早就消费 `notification.{title,body,icon,badge,tag,renotify,requireInteraction}`，但 typedef 没声明导致 caller 只能 untyped spread）。详见 shared CHANGELOG `0.1.0-next.3`。
+- `amsg-server` / `amsg-sw` / `amsg-client` 不动。SW 行为未变，只是 shared 把它已经支持的字段类型化了。
+
 ## 0.8.0-next.2 — splitPattern hook-mode 修复 + reasoning 两层切分 (pre-release)
 
 Coordinated with `@rei-standard/amsg-shared@0.1.0-next.2`. Install with `npm install @rei-standard/amsg-instant@next`.

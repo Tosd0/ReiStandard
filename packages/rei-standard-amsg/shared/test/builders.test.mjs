@@ -125,6 +125,98 @@ test('buildReasoningPush rejects empty reasoningContent', () => {
   );
 });
 
+// ─── notification typed support (next.3+) ─────────────────────────────
+//
+// `notification` was previously an untyped spread footgun — hook
+// authors could write any of the seven fields amsg-sw reads
+// (`title` / `body` / `icon` / `badge` / `tag` / `renotify` /
+// `requireInteraction`), but the builder didn't accept it as a typed
+// arg so spread-based usage bypassed the IDE.
+
+test('buildContentPush threads notification through verbatim', () => {
+  const notification = {
+    title: 'Custom',
+    body: 'Hello',
+    icon: 'https://cdn.example/icon.png',
+    badge: 'https://cdn.example/badge.png',
+    tag: 'thread-42',
+    renotify: true,
+    requireInteraction: false,
+  };
+  const push = buildContentPush({ ...COMMON, message: 'hi', notification });
+  assert.deepEqual(push.notification, notification);
+  // Reference passthrough — not deep-cloned, same as `metadata`.
+  assert.equal(push.notification, notification);
+});
+
+test('buildContentPush omits notification key when arg is undefined', () => {
+  const push = buildContentPush({ ...COMMON, message: 'hi' });
+  assert.ok(!('notification' in push));
+});
+
+test('buildContentPush rejects non-object notification', () => {
+  for (const bad of [null, 'string', 42, true, [1, 2]]) {
+    assert.throws(
+      () => buildContentPush({ ...COMMON, message: 'hi', notification: bad }),
+      /'notification' must be a plain object/,
+      `value ${JSON.stringify(bad)} should reject`,
+    );
+  }
+});
+
+test('buildContentPush rejects non-string notification.{title,body,icon,badge,tag}', () => {
+  for (const field of ['title', 'body', 'icon', 'badge', 'tag']) {
+    assert.throws(
+      () => buildContentPush({ ...COMMON, message: 'hi', notification: { [field]: 42 } }),
+      new RegExp(`'notification\\.${field}' must be a string`),
+      `notification.${field}: 42 should reject`,
+    );
+  }
+});
+
+test('buildContentPush rejects non-boolean notification.{renotify,requireInteraction}', () => {
+  for (const field of ['renotify', 'requireInteraction']) {
+    assert.throws(
+      () => buildContentPush({ ...COMMON, message: 'hi', notification: { [field]: 'yes' } }),
+      new RegExp(`'notification\\.${field}' must be a boolean`),
+      `notification.${field}: "yes" should reject`,
+    );
+  }
+});
+
+test('buildContentPush tolerates unknown notification fields (SW forward-compat)', () => {
+  // The SW reads a known set of fields; anything else is ignored at
+  // its end. Builder shouldn't gatekeep beyond shape — typed args are
+  // a TS-side helper, not a wire validator.
+  const push = buildContentPush({
+    ...COMMON,
+    message: 'hi',
+    notification: { title: 'ok', futureField: 'whatever' },
+  });
+  assert.equal(push.notification.futureField, 'whatever');
+});
+
+test('buildToolRequestPush threads notification through (for demoted prefix chunks)', () => {
+  const notification = { title: 'pre-tool narration', tag: 'tool-call-42' };
+  const push = buildToolRequestPush({
+    ...COMMON,
+    toolCalls: [{ id: 'c1', type: 'function', function: { name: 'x' } }],
+    notification,
+  });
+  assert.deepEqual(push.notification, notification);
+});
+
+test('buildToolRequestPush rejects malformed notification', () => {
+  assert.throws(
+    () => buildToolRequestPush({
+      ...COMMON,
+      toolCalls: [{ id: 'c1', type: 'function', function: { name: 'x' } }],
+      notification: 'not-an-object',
+    }),
+    /'notification' must be a plain object/,
+  );
+});
+
 test('buildToolRequestPush requires a non-empty toolCalls array', () => {
   const push = buildToolRequestPush({
     ...COMMON,

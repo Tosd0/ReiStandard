@@ -100,6 +100,38 @@ export const PUSH_SOURCE = Object.freeze({
 // ─── Per-kind interfaces ────────────────────────────────────────────────
 
 /**
+ * SW-rendering directive carried on `ContentPush` / `ToolRequestPush`.
+ * Mirrors the seven fields that `amsg-sw`'s `createNotificationFromPayload`
+ * actually consumes (`notification.{title,body,icon,badge,tag,renotify,requireInteraction}`)
+ * — typing all seven (rather than just `title` / `body`) so callers
+ * don't lose IDE checking on the other five and slip back into the
+ * untyped-spread footgun this typedef was added to close.
+ *
+ * Routing in SW (kept here so producers don't have to cross-check):
+ *   - `messageKind: 'content'` (and legacy un-kinded payloads) →
+ *     `notification.*` is consulted, with per-field fallback to
+ *     the top-level `title` / `avatarUrl` / `messageId` and finally
+ *     to the SW's `defaultIcon` / `defaultBadge` options. Everything
+ *     else (`tag`, `renotify`, `requireInteraction`) has no top-level
+ *     fallback — set them under `notification` or accept the SW
+ *     default (`messageId`-derived tag, no renotify, no requireInteraction).
+ *   - `messageKind: 'reasoning'` / `'tool_request'` / `'error'` →
+ *     dispatched silently to controlled clients. `notification` is
+ *     ignored. (It's still typed on `ToolRequestPush` because the
+ *     splitter demotes prefix chunks to `messageKind: 'content'`, at
+ *     which point the field starts mattering.)
+ *
+ * @typedef {Object} NotificationDirective
+ * @property {string}  [title]              - Notification title override.
+ * @property {string}  [body]               - Notification body override.
+ * @property {string}  [icon]               - Icon URL override (falls back to top-level `avatarUrl` then SW `defaultIcon`).
+ * @property {string}  [badge]              - Badge URL override (falls back to SW `defaultBadge`).
+ * @property {string}  [tag]                - Notification grouping tag; matching tag replaces the prior notification.
+ * @property {boolean} [renotify]           - When tag matches, still vibrate/sound. Default false at SW.
+ * @property {boolean} [requireInteraction] - Notification stays until user dismisses. Default false at SW.
+ */
+
+/**
  * Final user-facing content. Sentence-split bursts of N use
  * `messageIndex` (1-based) + `totalMessages` so the client can
  * reassemble or animate.
@@ -113,6 +145,7 @@ export const PUSH_SOURCE = Object.freeze({
  *   messageIndex?: number,
  *   totalMessages?: number,
  *   taskId?:       string | null,
+ *   notification?: NotificationDirective,
  * }} ContentPush
  */
 
@@ -168,6 +201,7 @@ export const PUSH_SOURCE = Object.freeze({
  *   title?:       string,
  *   contactName?: string,
  *   message?:     string,
+ *   notification?: NotificationDirective,
  * }} ToolRequestPush
  */
 
@@ -238,6 +272,12 @@ function requireField(kind, field, value) {
  * @param {number}      [args.totalMessages]
  * @param {string | null} [args.taskId]
  * @param {Object}      [args.metadata]
+ * @param {NotificationDirective} [args.notification]
+ *                       - SW-side `showNotification` overrides for content
+ *                         (and for ToolRequestPush prefix chunks that get
+ *                         demoted to `content` during sentence-split). All
+ *                         fields optional; see {@link NotificationDirective}
+ *                         for the SW fallback chain.
  * @returns {ContentPush}
  */
 export function buildContentPush(args) {
@@ -248,6 +288,7 @@ export function buildContentPush(args) {
   if (typeof args.message !== 'string') {
     throw new Error("[amsg-shared] ContentPush: 'message' must be a string");
   }
+  validateNotificationArg('ContentPush', args.notification);
 
   /** @type {ContentPush} */
   const push = {
@@ -267,6 +308,7 @@ export function buildContentPush(args) {
   if (args.totalMessages !== undefined) push.totalMessages = args.totalMessages;
   if (args.taskId !== undefined) push.taskId = args.taskId;
   if (args.metadata !== undefined) push.metadata = args.metadata;
+  if (args.notification !== undefined) push.notification = args.notification;
   return push;
 }
 
@@ -352,6 +394,15 @@ export function buildReasoningPush(args) {
  * @param {string}      [args.message]
  * @param {string}      [args.messageSubtype]
  * @param {Object}      [args.metadata]
+ * @param {NotificationDirective} [args.notification]
+ *                       - SW notification overrides. Used after the
+ *                         splitter demotes prefix chunks to `content`
+ *                         (where `messageKind: 'content'` triggers
+ *                         `showNotification`). On the un-demoted last
+ *                         chunk (`messageKind: 'tool_request'`) the
+ *                         SW dispatches silently and the field is
+ *                         ignored — typed here purely so the demoted
+ *                         chunks inherit it via the splitter's spread.
  * @returns {ToolRequestPush}
  */
 export function buildToolRequestPush(args) {
@@ -362,6 +413,7 @@ export function buildToolRequestPush(args) {
   if (!Array.isArray(args.toolCalls) || args.toolCalls.length === 0) {
     throw new Error("[amsg-shared] ToolRequestPush: 'toolCalls' must be a non-empty array");
   }
+  validateNotificationArg('ToolRequestPush', args.notification);
 
   /** @type {ToolRequestPush} */
   const push = {
@@ -378,7 +430,38 @@ export function buildToolRequestPush(args) {
   if (args.message !== undefined) push.message = args.message;
   if (args.messageSubtype !== undefined) push.messageSubtype = args.messageSubtype;
   if (args.metadata !== undefined) push.metadata = args.metadata;
+  if (args.notification !== undefined) push.notification = args.notification;
   return push;
+}
+
+/**
+ * Validate the optional `notification` argument on
+ * `buildContentPush` / `buildToolRequestPush`. Plain object required
+ * (`null` / arrays / primitives rejected); field-level shape is
+ * checked best-effort — `title` / `body` / `icon` / `badge` / `tag`
+ * must be strings when present, `renotify` / `requireInteraction`
+ * must be booleans. Unknown keys are tolerated so the SW's
+ * forward-compatibility (it just won't read them) is preserved.
+ *
+ * @param {string} kind
+ * @param {unknown} value
+ */
+function validateNotificationArg(kind, value) {
+  if (value === undefined) return;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`[amsg-shared] ${kind}: 'notification' must be a plain object`);
+  }
+  const n = /** @type {Record<string, unknown>} */ (value);
+  for (const f of ['title', 'body', 'icon', 'badge', 'tag']) {
+    if (n[f] !== undefined && typeof n[f] !== 'string') {
+      throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a string when present`);
+    }
+  }
+  for (const f of ['renotify', 'requireInteraction']) {
+    if (n[f] !== undefined && typeof n[f] !== 'boolean') {
+      throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a boolean when present`);
+    }
+  }
 }
 
 /**

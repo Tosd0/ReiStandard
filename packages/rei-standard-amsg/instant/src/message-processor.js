@@ -26,6 +26,7 @@ import { sendWebPush } from './webpush.js';
 import { randomUUID } from './utils.js';
 import { HookError, LlmCallError, PayloadTooLargeError } from './errors.js';
 import { buildSessionContext, extractAssistantMessage } from './session-context.js';
+import { validateSplitPattern } from './validation.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 // Sub-chunk spacing within a single Layer-1 segment. Byte-chunking is
@@ -121,20 +122,48 @@ export function splitMessageIntoSentences(messageContent, splitPattern = null) {
  * `error` it means "do not split" (the kinds that didn't have a UX
  * for splitting historically).
  *
+ * Per-push override (0.8.0-next.3+): when the hook returns a
+ * `pushPayload` that owns a `splitPattern` field, the resolved
+ * `pushPattern` argument carries that value and takes precedence over
+ * the kind-specific request field above. The override is kind-
+ * agnostic (just `splitPattern` — the kind is already pinned by
+ * `pushPayload.messageKind`), so disable semantics collapse to the
+ * shared `null` / `[]` rule and never fall back to default-on. Callers
+ * pass `pushOverridePresent = false` when the field is absent so the
+ * request-level fallback kicks in.
+ *
  * @param {Record<string, unknown>} payload
  * @param {unknown} kind
+ * @param {unknown} pushPattern        - The hook-returned override (only consulted when `pushOverridePresent`).
+ * @param {boolean} pushOverridePresent - True iff `pushPayload` owned `splitPattern` (even when `null`).
  * @returns {{ textField: 'message' | 'reasoningContent', pattern: unknown, disabled: boolean } | null}
- *   `null` when the kind is not splittable (`'error'` with no opt-in
- *   pattern, unknown / free-form kinds).
+ *   `null` when the kind is not splittable (unknown / free-form kinds
+ *   with no override). An override on a free-form kind still applies
+ *   when there's a usable text field — see `splitHookPushPayload`.
  */
-function pickSplitConfig(payload, kind) {
+function pickSplitConfig(payload, kind, pushPattern, pushOverridePresent) {
+  // Resolve text-field by kind. Per-push override flips disable
+  // semantics to "explicit null/[] = off; anything else = use it".
+  const resolveDisabled = (pattern) =>
+    pattern === null || (Array.isArray(pattern) && pattern.length === 0);
+
   if (kind === 'content' || kind === 'tool_request') {
+    if (pushOverridePresent) {
+      return { textField: 'message', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
+    }
     const pattern = payload.splitPattern;
     const disabled = pattern === null
       || (Array.isArray(pattern) && pattern.length === 0);
     return { textField: 'message', pattern, disabled };
   }
   if (kind === 'reasoning') {
+    if (pushOverridePresent) {
+      // Per-push override skips the request-level "default-off"
+      // asymmetry: if the hook went out of its way to set the field
+      // on the push, treat any non-null/non-[] value as "split with
+      // this pattern" — same rule as content/tool_request override.
+      return { textField: 'reasoningContent', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
+    }
     const pattern = payload.reasoningSplitPattern;
     // Default-off: undefined / null / [] all mean "do not split".
     const disabled = pattern === undefined
@@ -143,6 +172,9 @@ function pickSplitConfig(payload, kind) {
     return { textField: 'reasoningContent', pattern, disabled };
   }
   if (kind === 'error') {
+    if (pushOverridePresent) {
+      return { textField: 'message', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
+    }
     const pattern = payload.errorSplitPattern;
     // Default-off, same as reasoning.
     const disabled = pattern === undefined
@@ -175,6 +207,15 @@ function pickSplitConfig(payload, kind) {
  *   - anything else    → passthrough; the framework can't guess which
  *                        field of a free-form hook payload to split.
  *
+ * Per-push override (0.8.0-next.3+): when the hook-returned
+ * `pushPayload` owns a `splitPattern` field, it takes precedence over
+ * the kind-specific request field — including disabling the default
+ * split with `splitPattern: null` on a `content` push. The field is
+ * shape-validated (same caps as request-level via
+ * `validateSplitPattern`); malformed override throws `HookError`. The
+ * directive is stripped before delivery so it never appears on the
+ * wire, regardless of whether the split actually fired.
+ *
  * The original payload's `toolCalls`, `metadata`, and all push
  * metadata fields (`messageType` / `source` / `sessionId` / `timestamp`
  * / `messageKind` / `messageSubtype` / `taskId`) are preserved
@@ -195,14 +236,50 @@ function splitHookPushPayload(pushPayload, payload) {
   const pushObj = /** @type {Record<string, unknown>} */ (pushPayload);
   const kind = pushObj.messageKind;
 
-  const cfg = pickSplitConfig(payload || {}, kind);
-  if (!cfg || cfg.disabled) return [pushPayload];
+  // Extract + validate the per-push override (if any) and produce a
+  // clean copy of pushObj that never carries `splitPattern` downstream
+  // — both single-chunk passthrough returns and N-chunk maps below
+  // use `cleanPushObj` so the directive can't leak onto the wire.
+  //
+  // `undefined` is treated as **absent** (same convention as
+  // request-level fields and as plain JS "value not really set"), so
+  // `pushPayload.splitPattern: undefined` falls back to the request-
+  // level field rather than being interpreted as a degenerate
+  // override. Only a non-`undefined` value (including `null` / `[]`)
+  // counts as an override. `JSON.stringify` already drops `undefined`
+  // properties at the wire layer, so the `undefined` case needs no
+  // explicit strip.
+  const pushPattern = pushObj.splitPattern;
+  const pushOverridePresent = pushPattern !== undefined;
+  let cleanPushObj = pushObj;
+  if (pushOverridePresent) {
+    const validationErr = validateSplitPattern(pushPattern);
+    if (validationErr) {
+      // Same severity as other pushPayload-shape contract violations
+      // (see `sendPushWithMaybeBlob`): surface as HookError so the
+      // caller's hook author sees a loud failure instead of a silent
+      // unsplit push. `validateSplitPattern` labels its errors with
+      // the literal "splitPattern" prefix (shared with the request-
+      // level validator) — strip it so the HookError doesn't read
+      // "pushPayload.splitPattern invalid: splitPattern ...".
+      const cleanedErr = validationErr.replace(
+        /^splitPattern(\[\d+\])?\s*/,
+        (_m, idx) => idx ? `${idx} ` : '',
+      );
+      throw new HookError(`pushPayload.splitPattern invalid: ${cleanedErr}`);
+    }
+    const { splitPattern: _strip, ...rest } = pushObj;
+    cleanPushObj = rest;
+  }
 
-  const text = pushObj[cfg.textField];
-  if (typeof text !== 'string' || text.length === 0) return [pushPayload];
+  const cfg = pickSplitConfig(payload || {}, kind, pushPattern, pushOverridePresent);
+  if (!cfg || cfg.disabled) return [cleanPushObj];
+
+  const text = cleanPushObj[cfg.textField];
+  if (typeof text !== 'string' || text.length === 0) return [cleanPushObj];
 
   const segments = splitMessageIntoSentences(text, cfg.pattern);
-  if (segments.length <= 1) return [pushPayload];
+  if (segments.length <= 1) return [cleanPushObj];
 
   const total = segments.length;
   return segments.map((segment, i) => {
@@ -213,7 +290,7 @@ function splitHookPushPayload(pushPayload, payload) {
       // Demote prefix chunks to ContentPush — drop `toolCalls` so the
       // client UI doesn't try to execute the tool N times. The last
       // chunk (below) keeps the original kind + toolCalls intact.
-      const { toolCalls: _drop, ...rest } = pushObj;
+      const { toolCalls: _drop, ...rest } = cleanPushObj;
       return {
         ...rest,
         messageKind: 'content',
@@ -225,7 +302,7 @@ function splitHookPushPayload(pushPayload, payload) {
     }
 
     return {
-      ...pushObj,
+      ...cleanPushObj,
       messageId: chunkMessageId,
       [cfg.textField]: segment,
       messageIndex: i + 1,

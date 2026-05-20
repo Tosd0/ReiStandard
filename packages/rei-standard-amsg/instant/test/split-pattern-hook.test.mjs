@@ -764,6 +764,398 @@ describe('hook mode + splitPattern — serial ordering', () => {
   });
 });
 
+// ─── 10b) per-push splitPattern override on pushPayload (next.3+) ───────
+//
+// 0.8.0-next.2 treated `splitPattern` strictly as a request-level field
+// — a hook that wrote `splitPattern: null` on its own pushPayload had
+// the field silently ignored (the only way to disable splitting for one
+// push was to flip the outer request body). next.3 promotes
+// `pushPayload.splitPattern` to a per-push override that takes
+// precedence over the request-level field for that one push, and gets
+// stripped before delivery so it never leaks onto the wire.
+
+describe('hook mode + splitPattern — per-push override', () => {
+  it('pushPayload.splitPattern: null disables split even when outer request is default-on', async () => {
+    const { pushes, sleeps } = await runProcessor(
+      basePayload(), // outer request: splitPattern undefined → default sentence-split on
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'override-null',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+            splitPattern: null,
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 1, 'override null → single push');
+    assert.equal(pushes[0].message, 'A。B。C。');
+    assert.equal(pushes[0].messageId, 'override-null');
+    assert.deepEqual(sleeps, []);
+    // Stripped before delivery — never appears on the wire.
+    assert.equal('splitPattern' in pushes[0], false);
+  });
+
+  it('pushPayload.splitPattern beats outer request splitPattern (override > request)', async () => {
+    // Outer says split-by-newline, push override says split-by-sentence.
+    // Override should win → 3 chunks on `。`, not 1.
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: '(\\n+)' }),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'override-string',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 3);
+    assert.deepEqual(pushes.map((p) => p.message), ['A。', 'B。', 'C。']);
+    // Stripped from every chunk, not just one.
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+  });
+
+  it('pushPayload.splitPattern: [] disables (same `null`-or-empty rule as request-level)', async () => {
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: '([。！？!?]+)' }),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'override-empty',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+            splitPattern: [],
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].message, 'A。B。C。');
+    assert.equal('splitPattern' in pushes[0], false);
+  });
+
+  it('pushPayload.splitPattern enables split on a default-off kind (reasoning)', async () => {
+    // Reasoning is default-off at request level. Hook puts splitPattern
+    // on the ReasoningPush → that one push splits even though the
+    // request omitted `reasoningSplitPattern`.
+    const { pushes, sleeps } = await runProcessor(
+      basePayload(),
+      {
+        autoEmitReasoning: false,
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'reasoning',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'reason-override',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            reasoningContent: 'first。second。third。',
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 3);
+    assert.deepEqual(pushes.map((p) => p.messageKind), ['reasoning', 'reasoning', 'reasoning']);
+    assert.deepEqual(pushes.map((p) => p.reasoningContent), ['first。', 'second。', 'third。']);
+    assert.deepEqual(sleeps, [1500, 1500]);
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+  });
+
+  it('pushPayload.splitPattern enables split on a default-off kind (error)', async () => {
+    const { pushes } = await runProcessor(
+      basePayload(),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'error',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'err-override',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            code: 'CUSTOM_FAIL',
+            message: 'first。second。third。',
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 3);
+    assert.deepEqual(pushes.map((p) => p.messageKind), ['error', 'error', 'error']);
+    assert.deepEqual(pushes.map((p) => p.code), ['CUSTOM_FAIL', 'CUSTOM_FAIL', 'CUSTOM_FAIL']);
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+  });
+
+  it('absent pushPayload.splitPattern falls through to outer request (existing behaviour)', async () => {
+    // No `splitPattern` field on the push → outer request controls.
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: null }),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'no-override',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 1, 'outer null disables → single push');
+    assert.equal(pushes[0].message, 'A。B。C。');
+  });
+
+  it('malformed pushPayload.splitPattern surfaces as HookError', async () => {
+    // Unbalanced regex group — same shape rule as request-level.
+    await assert.rejects(
+      runProcessor(
+        basePayload(),
+        {
+          onLLMOutput: (sctx) => ({
+            decision: 'finish',
+            pushPayload: {
+              messageKind: 'content',
+              messageType: 'instant',
+              source: 'instant',
+              messageId: 'bad-override',
+              sessionId: sctx.sessionId,
+              timestamp: '2026-01-01T00:00:00.000Z',
+              message: 'A。B。C。',
+              splitPattern: '(',
+            },
+          }),
+        }
+      ),
+      (err) => {
+        assert.equal(err.name, 'HookError');
+        assert.ok(/pushPayload\.splitPattern invalid/.test(err.message));
+        return true;
+      }
+    );
+  });
+
+  it('ToolRequestPush override demotes prefix chunks + binds toolCalls to last (same as request-level)', async () => {
+    const toolCalls = [{ id: 'c1', type: 'function', function: { name: 'x' } }];
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: null }), // outer says off — override re-enables for this push only
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'tool-request',
+          pushPayload: {
+            messageKind: 'tool_request',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'tool-override',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'one。two。three。',
+            toolCalls,
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 3);
+    assert.deepEqual(pushes.map((p) => p.messageKind), ['content', 'content', 'tool_request']);
+    assert.equal('toolCalls' in pushes[0], false);
+    assert.equal('toolCalls' in pushes[1], false);
+    assert.deepEqual(pushes[2].toolCalls, toolCalls);
+    // Override field is stripped from every chunk, including the
+    // demoted ContentPush chunks (which spread from cleanPushObj).
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+  });
+
+  it('splitPattern stripped even when override fires but produces a single segment', async () => {
+    // Punctuation-free message + a regex that won't match → single
+    // chunk passthrough. The strip should still apply.
+    const { pushes } = await runProcessor(
+      basePayload(),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'no-match-strip',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'no punctuation here',
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].messageId, 'no-match-strip', 'no-match passthrough still preserves messageId');
+    assert.equal('splitPattern' in pushes[0], false, 'no-match passthrough still strips override');
+  });
+
+  // ─── undefined vs null distinction ──────────────────────────────────
+  //
+  // `null` is an *opinion* ("explicitly off for this push, ignore the
+  // request-level field"). `undefined` is *not an opinion* ("I didn't
+  // set this, do whatever the request-level field says"). Matches the
+  // request-level convention and plain-JS reading of `undefined`.
+
+  it('splitPattern: undefined is treated as absent — falls back to outer request', async () => {
+    // Outer says default-on. Push has the field set to `undefined`.
+    // Should behave the same as if the field were absent: split.
+    const { pushes } = await runProcessor(
+      basePayload(),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'undef-fallback',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+            splitPattern: undefined,
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 3, 'undefined override must NOT shadow outer default-on');
+    assert.deepEqual(pushes.map((p) => p.message), ['A。', 'B。', 'C。']);
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+  });
+
+  it('splitPattern: undefined + outer null → respects outer null (still falls back)', async () => {
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: null }),
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'finish',
+          pushPayload: {
+            messageKind: 'content',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'undef-outer-null',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'A。B。C。',
+            splitPattern: undefined,
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 1, 'undefined must fall back to outer null → unsplit');
+    assert.equal(pushes[0].message, 'A。B。C。');
+  });
+
+  // ─── non-recursive split: demoted chunks aren't re-split ────────────
+  //
+  // `splitHookPushPayload` runs exactly once per push delivery. The
+  // ToolRequestPush prefix-demotion path produces ContentPush chunks
+  // that share the same `cleanPushObj` (already-stripped) parent — so
+  // there's no second pass that could see the override and re-split.
+  // This test wires up a scenario that would catch any future
+  // recursion: a 5-segment override that, if applied twice, would
+  // shatter into 25+ chunks. Asserting exact count == 5 pins the
+  // single-pass invariant.
+
+  it('strip is clone-based — does NOT mutate the original pushPayload', async () => {
+    // Hook authors may legitimately return a cached / shared
+    // pushPayload template (e.g. a frozen base + per-iteration
+    // overrides). If the library used `delete` on the original
+    // object, the second reuse of the same reference would silently
+    // lose its `splitPattern`. Assert clone-based strip by inspecting
+    // the original object after delivery.
+    const shared = {
+      messageKind: 'content',
+      messageType: 'instant',
+      source: 'instant',
+      messageId: 'shared-template',
+      sessionId: 'sess-clone',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: 'A。B。C。',
+      splitPattern: null, // explicit-off
+    };
+    const { pushes } = await runProcessor(
+      basePayload(),
+      {
+        onLLMOutput: () => ({ decision: 'finish', pushPayload: shared }),
+      }
+    );
+    assert.equal(pushes.length, 1, 'override null disables → single push');
+    // Wire-clean.
+    for (const p of pushes) assert.equal('splitPattern' in p, false);
+    // Original object untouched — hook author's template is safe to
+    // reuse on the next iteration / next request.
+    assert.equal('splitPattern' in shared, true, 'original pushPayload must NOT be mutated');
+    assert.equal(shared.splitPattern, null, 'original splitPattern value preserved');
+    assert.equal(shared.messageId, 'shared-template', 'other fields untouched');
+  });
+
+  it('override on ToolRequestPush splits once — demoted ContentPush chunks not re-split', async () => {
+    const toolCalls = [{ id: 'c1', type: 'function', function: { name: 'x' } }];
+    const { pushes } = await runProcessor(
+      basePayload({ splitPattern: null }), // outer off, override on
+      {
+        onLLMOutput: (sctx) => ({
+          decision: 'tool-request',
+          pushPayload: {
+            messageKind: 'tool_request',
+            messageType: 'instant',
+            source: 'instant',
+            messageId: 'recursion-check',
+            sessionId: sctx.sessionId,
+            timestamp: '2026-01-01T00:00:00.000Z',
+            message: 'a。b。c。d。e。', // 5 sentences → 5 chunks if single-pass
+            toolCalls,
+            splitPattern: '([。！？!?]+)',
+          },
+        }),
+      }
+    );
+    assert.equal(pushes.length, 5, 'must be exactly 5 — recursion would inflate this');
+    assert.deepEqual(pushes.map((p) => p.messageKind), [
+      'content', 'content', 'content', 'content', 'tool_request',
+    ]);
+    assert.deepEqual(pushes.map((p) => p.message), ['a。', 'b。', 'c。', 'd。', 'e。']);
+    // Demoted ContentPush prefix chunks (chunks 0..3) carry no
+    // toolCalls and no splitPattern. Final tool_request chunk still
+    // has toolCalls but no splitPattern.
+    for (let i = 0; i < 4; i++) {
+      assert.equal('toolCalls' in pushes[i], false, `chunk ${i}: no toolCalls`);
+      assert.equal('splitPattern' in pushes[i], false, `chunk ${i}: no splitPattern`);
+    }
+    assert.deepEqual(pushes[4].toolCalls, toolCalls);
+    assert.equal('splitPattern' in pushes[4], false, 'final chunk: no splitPattern');
+  });
+});
+
 // ─── 11) no startup warn about splitPattern + onLLMOutput combo ─────────
 
 describe('createInstantHandler — no warn about splitPattern in hook mode', () => {
