@@ -179,16 +179,16 @@ export class ReiClient {
    *
    * The payload is automatically encrypted before transmission.
    *
-   * Throws (without a network round-trip):
-   *   - `INVALID_AVATAR_URL_LOCAL` — `avatarUrl` is a `data:` URI, > 2 KB,
-   *     or otherwise unacceptable.
-   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
+   * client soft-strips it on the payload and emits a `console.warn` — the
+   * schedule still ships, just without an avatar. The only throw left is
+   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
    *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
    */
   async scheduleMessage(payload) {
-    this._validateAvatarUrl(payload && payload.avatarUrl);
+    this._sanitizeAvatarUrl(payload);
     const json = JSON.stringify(payload);
     this._assertPayloadSize(json, 'scheduleMessage');
     const encrypted = await this._encrypt(json);
@@ -228,10 +228,10 @@ export class ReiClient {
    *
    * Routes to `customBaseUrls.instant` if configured, otherwise `baseUrl`.
    *
-   * Throws (without a network round-trip):
-   *   - `INVALID_AVATAR_URL_LOCAL` — `avatarUrl` is a `data:` URI, > 2 KB,
-   *     or otherwise unacceptable.
-   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
+   * client soft-strips it on the payload and emits a `console.warn` — the
+   * push still ships, just without an icon. The only throw left is
+   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
    *
    * @param {Object} payload - Instant message payload.
    * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
@@ -239,7 +239,7 @@ export class ReiClient {
    * @returns {Promise<Object>} `{ success, data?: { messagesSent, sentAt }, error? }`
    */
   async sendInstant(payload, endpointPath = '/instant', opts = {}) {
-    this._validateAvatarUrl(payload && payload.avatarUrl);
+    this._sanitizeAvatarUrl(payload);
     const json = JSON.stringify(payload);
     this._assertPayloadSize(json, 'sendInstant');
 
@@ -276,17 +276,23 @@ export class ReiClient {
   /**
    * Update an existing scheduled message.
    *
-   * Throws (without a network round-trip):
-   *   - `INVALID_AVATAR_URL_LOCAL` — `updates.avatarUrl` is a `data:` URI,
-   *     > 2 KB, or otherwise unacceptable.
-   *   - `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized updates exceed 3 KB.
+   * If `updates.avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string),
+   * the client soft-strips it from the patch and emits a `console.warn` —
+   * the rest of the update still applies, and the stored avatar is left
+   * untouched. The only throw left is `PAYLOAD_TOO_LARGE_LOCAL` —
+   * JSON-serialized updates exceed 3 KB.
    *
    * @param {string} uuid    - Task UUID.
    * @param {Object} updates - Fields to update.
    * @returns {Promise<Object>}
    */
   async updateMessage(uuid, updates) {
-    this._validateAvatarUrl(updates && updates.avatarUrl);
+    // Match server-side semantics: a stripped patch shouldn't overwrite the
+    // stored avatar with `null`. When sanitize fires, remove the field
+    // entirely so the existing image is preserved.
+    if (this._sanitizeAvatarUrl(updates)) {
+      delete updates.avatarUrl;
+    }
     const json = JSON.stringify(updates);
     this._assertPayloadSize(json, 'updateMessage');
     const encrypted = await this._encrypt(json);
@@ -379,33 +385,36 @@ export class ReiClient {
   // ─── Local preflight (no network) ────────────────────────────────
 
   /**
-   * Reject `avatarUrl` values that would 100% fail downstream — `data:`
-   * URIs (base64 inline image) and anything longer than 2 KB. Mirrors the
-   * server-side check in `@rei-standard/amsg-instant` / `@rei-standard/amsg-server`;
-   * intentionally a fast preflight that does not parse the URL (server
-   * still does that, and `URL` is the bigger of the two costs in browsers).
+   * Sanitize `avatarUrl` on an outgoing payload. If the value is unusable
+   * (`data:` URI / oversized / non-string), set the field to `null` on the
+   * payload, log a `console.warn`, and let the rest of the request go
+   * through. Avatar is cosmetic — failing the entire schedule / instant
+   * call over a bad image URL is too punishing. Mirrors the server-side
+   * soft-strip in `@rei-standard/amsg-server` 2.3.3+ and `@rei-standard/amsg-instant`
+   * 0.7.1+. See standards §6.2.
    *
    * @private
-   * @param {unknown} value
+   * @param {object|null|undefined} target - Payload-like object holding `avatarUrl`.
+   * @returns {boolean} `true` if the field was stripped, `false` otherwise.
    */
-  _validateAvatarUrl(value) {
-    if (value === undefined || value === null) return;
+  _sanitizeAvatarUrl(target) {
+    if (!target || typeof target !== 'object') return false;
+    const value = target.avatarUrl;
+    if (value === undefined || value === null) return false;
+    let reason = null;
     if (typeof value !== 'string') {
-      throw makeLocalError('INVALID_AVATAR_URL_LOCAL', 'avatarUrl 必须是字符串');
+      reason = 'avatarUrl 必须是字符串';
+    } else if (/^data:/i.test(value)) {
+      reason = '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
+    } else if (value.length > AVATAR_URL_MAX_LENGTH) {
+      reason = `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
     }
-    if (/^data:/i.test(value)) {
-      throw makeLocalError(
-        'INVALID_AVATAR_URL_LOCAL',
-        '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL'
-      );
+    if (reason) {
+      console.warn('[rei-standard-amsg-client] avatarUrl 不合法，已置空：', reason);
+      target.avatarUrl = null;
+      return true;
     }
-    if (value.length > AVATAR_URL_MAX_LENGTH) {
-      throw makeLocalError(
-        'INVALID_AVATAR_URL_LOCAL',
-        `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`,
-        { actualLength: value.length, limit: AVATAR_URL_MAX_LENGTH }
-      );
-    }
+    return false;
   }
 
   /**

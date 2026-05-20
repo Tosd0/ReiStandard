@@ -283,12 +283,11 @@ export function validateInstantPayload(payload, opts) {
 
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
-    return {
-      valid: false,
-      errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: avatarErr,
-      details: { invalidFields: ['avatarUrl'] }
-    };
+    // Soft-strip: a bad avatarUrl (data: URI / oversized / malformed) used to
+    // 400 the whole /instant call. Avatar is cosmetic — drop the field, log,
+    // and let the push go through without an icon. See standards §6.2.
+    console.warn('[amsg-instant] avatarUrl 不合法，已置空：', avatarErr);
+    payload.avatarUrl = null;
   }
 
   // messageSubtype is a free-form string tag for SW-side classification.
@@ -448,10 +447,10 @@ export function validateContinuePayload(payload, opts) {
   }
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
-    return {
-      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: avatarErr, details: { invalidFields: ['avatarUrl'] }
-    };
+    // Soft-strip: same policy as /instant — drop the field, log, continue.
+    // See standards §6.2.
+    console.warn('[amsg-instant] /continue avatarUrl 不合法，已置空：', avatarErr);
+    payload.avatarUrl = null;
   }
 
   return validateHookPathSharedFields(payload, opts) || { valid: true };

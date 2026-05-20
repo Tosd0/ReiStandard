@@ -261,7 +261,11 @@ export function validateScheduleMessagePayload(payload) {
 
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
-    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: avatarErr, details: { invalidFields: ['avatarUrl'] } };
+    // Soft-strip: a bad avatarUrl (data: URI / oversized / malformed) used to
+    // 400 the whole schedule. Avatar is cosmetic — drop the field, log, and
+    // let the rest of the task ship. See standards §6.2.
+    console.warn('[amsg-server] avatarUrl 不合法，已置空：', avatarErr);
+    payload.avatarUrl = null;
   }
   if (payload.uuid && !isValidUUID(payload.uuid)) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['uuid (invalid UUID format)'] } };

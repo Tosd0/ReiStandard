@@ -222,10 +222,12 @@ describe('validateInstantPayload', () => {
     assert.match(r.errorMessage, /splitPattern\[1\]/);
   });
 
-  // ── avatarUrl (0.6.1) ──────────────────────────────────────────────
+  // ── avatarUrl (0.6.1 → soft-strip in 0.7.1) ──────────────────────────
   it('accepts a normal https avatarUrl', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 'https://example.com/a.png' }));
+    const payload = makeValidPayload({ avatarUrl: 'https://example.com/a.png' });
+    const r = validateInstantPayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, 'https://example.com/a.png');
   });
 
   it('treats avatarUrl=null / undefined as absent', () => {
@@ -233,48 +235,51 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ avatarUrl: undefined })).valid, true);
   });
 
-  it('rejects avatarUrl that is a data: URI', () => {
-    const r = validateInstantPayload(makeValidPayload({
+  it('soft-strips data: avatarUrl and continues', () => {
+    const payload = makeValidPayload({
       avatarUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQ',
-    }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PAYLOAD_FORMAT');
-    assert.match(r.errorMessage, /data:/);
-    assert.deepEqual(r.details.invalidFields, ['avatarUrl']);
+    });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl with uppercase DATA: prefix (case-insensitive)', () => {
-    const r = validateInstantPayload(makeValidPayload({
-      avatarUrl: 'DATA:image/png;base64,xxx',
-    }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /data:/i);
+  it('soft-strips uppercase DATA: avatarUrl (case-insensitive)', () => {
+    const payload = makeValidPayload({ avatarUrl: 'DATA:image/png;base64,xxx' });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl longer than 2048 chars', () => {
+  it('soft-strips avatarUrl longer than 2048 chars', () => {
     const longUrl = 'https://example.com/' + 'a'.repeat(2048);
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: longUrl }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /2048/);
+    const payload = makeValidPayload({ avatarUrl: longUrl });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
   it('accepts avatarUrl exactly at the 2048 char limit', () => {
     const url = 'https://x/' + 'a'.repeat(2048 - 'https://x/'.length);
     assert.equal(url.length, 2048);
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: url }));
+    const payload = makeValidPayload({ avatarUrl: url });
+    const r = validateInstantPayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, url);
   });
 
-  it('rejects avatarUrl that is not a string', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 123 }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /字符串/);
+  it('soft-strips avatarUrl that is not a string', () => {
+    const payload = makeValidPayload({ avatarUrl: 123 });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl that is not a valid URL', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 'not a url' }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /URL/);
+  it('soft-strips avatarUrl that is not a valid URL', () => {
+    const payload = makeValidPayload({ avatarUrl: 'not a url' });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 });
 

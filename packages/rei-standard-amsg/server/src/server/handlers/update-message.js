@@ -113,7 +113,11 @@ export function createUpdateMessageHandler(ctx) {
     if (Object.prototype.hasOwnProperty.call(updates, 'avatarUrl')) {
       const avatarErr = validateAvatarUrl(updates.avatarUrl);
       if (avatarErr) {
-        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: avatarErr, details: { invalidFields: ['avatarUrl'] } } } };
+        // Soft-strip: drop the bad avatarUrl from the patch (keeps the
+        // existing stored avatar untouched) and continue applying the rest
+        // of the update. See standards §6.2.
+        console.warn('[amsg-server] update-message avatarUrl 不合法，已忽略：', avatarErr);
+        delete updates.avatarUrl;
       }
     }
 

@@ -903,25 +903,26 @@ describe('avatarUrl validation', () => {
     assert.match(validateAvatarUrl('not a url'), /URL/);
   });
 
-  it('schedule payload: rejects data: avatarUrl with INVALID_PARAMETERS', () => {
-    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'data:image/png;base64,xxx' }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
-    assert.deepEqual(r.details.invalidFields, ['avatarUrl']);
-    assert.match(r.errorMessage, /data:/);
+  it('schedule payload: soft-strips data: avatarUrl (v2.3.3+)', () => {
+    const payload = basePayload({ avatarUrl: 'data:image/png;base64,xxx' });
+    const r = validateScheduleMessagePayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('schedule payload: rejects oversized avatarUrl', () => {
-    const r = validateScheduleMessagePayload(basePayload({
+  it('schedule payload: soft-strips oversized avatarUrl', () => {
+    const payload = basePayload({
       avatarUrl: 'https://example.com/' + 'a'.repeat(2048),
-    }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
-    assert.match(r.errorMessage, /2048/);
+    });
+    const r = validateScheduleMessagePayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
   it('schedule payload: accepts a normal https avatarUrl', () => {
-    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'https://example.com/a.png' }));
+    const payload = basePayload({ avatarUrl: 'https://example.com/a.png' });
+    const r = validateScheduleMessagePayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, 'https://example.com/a.png');
   });
 });
