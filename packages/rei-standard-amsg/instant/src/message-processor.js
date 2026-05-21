@@ -164,11 +164,17 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
  *
  * @param {Object} reasoningPush
  * @param {number | null | undefined} reasoningChunkBytes
- * @param {number | undefined} iteration
+ * @param {number | undefined} iteration  - Legacy path passes `undefined`;
+ *   the messageId template falls back to `iter_0` in that case. Hook path
+ *   always passes an integer iteration counter.
  * @returns {Array<Object>}
  */
 function sliceReasoningPush(reasoningPush, reasoningChunkBytes, iteration) {
   if (reasoningChunkBytes === null) return [reasoningPush];
+  // `chunkReasoningByUtf8Bytes` from @rei-standard/amsg-shared requires
+  // maxBytes >= 4 (UTF-8 max codepoint width); honour that floor here so a
+  // pathological ctx.reasoningChunkBytes injection falls back to the default
+  // instead of crashing inside the shared lib.
   const threshold = (Number.isInteger(reasoningChunkBytes) && reasoningChunkBytes >= 4)
     ? reasoningChunkBytes
     : DEFAULT_REASONING_CHUNK_BYTES;
@@ -196,6 +202,9 @@ function sliceReasoningPush(reasoningPush, reasoningChunkBytes, iteration) {
 /**
  * Ship a ReasoningPush, byte-chunking if oversized. Fires a single
  * `reasoning_chunked` event when chunking actually splits the push.
+ * No event fires when chunking is a no-op (single push) — the event is
+ * meant to signal Layer-2 byte chunking actually triggered, not just
+ * normal reasoning emission.
  * Serial delivery with `SLEEP_BETWEEN_REASONING_CHUNKS_MS` (100 ms)
  * between chunks — byte chunking is a transport-level workaround, not
  * a typing-bubble UX axis, so the inter-chunk gap is much smaller than
