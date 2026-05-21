@@ -701,3 +701,62 @@ describe('validateInstantPayload hookPath flag', () => {
     assert.equal(r.valid, true);
   });
 });
+
+// ─── next.4 — decision contract: pushPayloads ──────────────────────────
+
+describe('next.4 — decision contract: pushPayloads', () => {
+  async function dispatchHookReturn(hookReturn) {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('llm answer'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => hookReturn,
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    return { res, body: await res.json(), router };
+  }
+
+  it('rejects singular pushPayload field with HookError + migration message', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayload: { messageKind: 'content', message: 'hi' },
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in next\.4, use pushPayloads: \[yourPayload\]/);
+  });
+
+  it('rejects when BOTH pushPayload and pushPayloads are set', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayload: { messageKind: 'content', message: 'a' },
+      pushPayloads: [{ messageKind: 'content', message: 'b' }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in next\.4, use pushPayloads/);
+  });
+
+  it('rejects pushPayloads: [] (empty array)', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayloads: [],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /use decision: skip-push to skip notification entirely/);
+  });
+
+  it('rejects a push that carries splitPattern', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'hi', splitPattern: '([。！？!?]+)' }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /splitPattern is removed in next\.4/);
+  });
+});

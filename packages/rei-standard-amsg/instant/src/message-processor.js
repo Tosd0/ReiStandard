@@ -1040,12 +1040,45 @@ function assertValidDecision(decision) {
   if (typeof tag !== 'string' || !VALID_DECISIONS.has(tag)) {
     throw new TypeError(`onLLMOutput returned invalid decision tag: ${stringifyForError(tag)}`);
   }
-  if (tag === 'continue' && !Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
-    throw new TypeError('decision:"continue" requires a nextHistory array');
+
+  const hasSingular = Object.prototype.hasOwnProperty.call(decision, 'pushPayload');
+  const hasPlural = Object.prototype.hasOwnProperty.call(decision, 'pushPayloads');
+
+  if (hasSingular) {
+    throw new TypeError(
+      hasPlural
+        ? 'pushPayload (singular) is removed in next.4, use pushPayloads'
+        : 'pushPayload (singular) is removed in next.4, use pushPayloads: [yourPayload]'
+    );
   }
-  if ((tag === 'finish' || tag === 'tool-request')
-      && /** @type {{ pushPayload?: unknown }} */ (decision).pushPayload === undefined) {
-    throw new TypeError(`decision:"${tag}" requires a pushPayload`);
+
+  if (tag === 'continue') {
+    if (!Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
+      throw new TypeError('decision:"continue" requires a nextHistory array');
+    }
+    return;
+  }
+
+  if (tag === 'skip-push') {
+    return;
+  }
+
+  // 'finish' / 'tool-request' — both need pushPayloads array
+  if (!hasPlural || !Array.isArray(/** @type {{ pushPayloads?: unknown }} */ (decision).pushPayloads)) {
+    throw new TypeError(`decision:"${tag}" requires a pushPayloads array`);
+  }
+  const pushes = /** @type {Array<unknown>} */ (decision.pushPayloads);
+  if (pushes.length === 0) {
+    throw new TypeError('pushPayloads: [] — use decision: skip-push to skip notification entirely');
+  }
+  for (let i = 0; i < pushes.length; i++) {
+    const p = pushes[i];
+    if (!p || typeof p !== 'object' || Array.isArray(p)) {
+      throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyForError(p)}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
+      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in next.4; caller is responsible for splitting`);
+    }
   }
 }
 
