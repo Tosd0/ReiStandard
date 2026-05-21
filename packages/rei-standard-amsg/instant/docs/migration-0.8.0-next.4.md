@@ -271,6 +271,10 @@ If you only need byte-bound transparent chunking (the common case for DeepSeek-R
 - HTTP status codes (200 / 400 / 401 / 500 / 502) — same.
 - `onEvent` event taxonomy — same names (`llm_done`, `final_pushed`, `tool_request_pushed`, `reasoning_pushed`, etc.).
 
+## Note: `amsg-server` unaffected
+
+This breaking change is `amsg-instant`-only. `@rei-standard/amsg-server` (the scheduled-message package, current stable 2.3.x) keeps `splitPattern` as a request-body field — its scheduling flow has different ergonomics. Don't carry your `splitPattern: '...'` from the server's `/schedule-message` payload over to the instant's `/instant` request body — they diverge here.
+
 ## Questions a reviewer should ask
 
 - "Is the per-push `notification` actually being read by the SW?" Yes — the SW reads `notification.{title,body,icon,badge,tag,renotify,requireInteraction}` and shows them. The amsg-shared package's `ContentPush` / `ToolRequestPush` typedefs have included `notification?` since next.3.

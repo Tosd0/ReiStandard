@@ -539,7 +539,7 @@ async function runLegacyInstant(payload, ctx) {
   }
 
   // Step 2: ContentPush burst.
-  const messages = splitMessageIntoSentences(messageContent, payload.splitPattern ?? null);
+  const messages = splitMessageIntoSentences(messageContent);
 
   for (let i = 0; i < messages.length; i++) {
     const contentPush = buildContentPush({

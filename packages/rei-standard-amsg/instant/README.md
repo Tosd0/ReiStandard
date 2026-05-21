@@ -868,7 +868,7 @@ Redis / Upstash 等带原生 TTL 的后端不用挂；KV 同理。
 
 - 不配 `onLLMOutput` → 跑 legacy 路径，字节级与 v0.6 一致（同 13 字段 payload、同 1500 ms 间隔、同 `onEvent` 事件）。legacy 路径内部仍按 `/([。！？!?]+)/` 默认句切，**只是**请求 body 上的 `splitPattern` 公共旋钮在 0.8.0-next.4 里被移除了（详见 0.8 迁移指南）。
 - `messageSubtype`、`metadata` 等所有 v0.6 字段保持原样
-- `buildInstantPushPayload` 现在是 public helper —— 你的 v0.6 测试如果之前 monkey-patch 过它，现在可以直接 import
+- 想自己拼 ContentPush（v0.6 时代会去 monkey-patch `buildInstantPushPayload` 的场景）现在直接用 `buildContentPush(...)` —— 它由 `@rei-standard/amsg-shared` 实现、并从 `@rei-standard/amsg-instant` 原样 re-export，不用额外加依赖
 
 只在你**想用 agentic loop** 的时候才动配置：把 `onLLMOutput` 加进 `createInstantHandler` 入参，里头自己决定 finish / tool-request / continue / skip-push。其他都不需要碰。
 
@@ -1030,7 +1030,6 @@ await client.sendInstant({
 
 - `createInstantHandler(options)`
 - `validateInstantPayload(payload)`
-- `splitMessageIntoSentences(text)`
 - `processInstantMessage(payload, ctx)`
 - `normalizeAiApiUrl(apiUrl)` — 0.4.0 新增，幂等地补全 `/v1/chat/completions`
 - `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现

@@ -9,7 +9,6 @@
 > | 增量 | SDK 起始版本 | 示例缺什么 |
 > |---|---|---|
 > | OpenAI 格式 `messages` 数组（system / 多轮 / tool role）+ `temperature` 透传 | server 2.2.0 · instant 0.5.0 · client 2.2.1 | `lib/message-processor.js` 的 `buildAiRequestBody` 把 prompt 硬包成单条 user 消息 |
-> | `splitPattern` 自定义分句正则（`string \| string[]`，级联） | server 2.3.0 · instant 0.6.0 | 仍硬编码 `/([。！？!?]+)/` 分句 |
 > | `avatarUrl` 软清空（不合法值 `console.warn` + 置空，不再 400 整个任务） | server 2.3.3 / 2.4.0-next.1 · instant 0.7.1 / 0.8.0-next.1 · client 2.2.4 / 2.3.0-next.1 | 只检 `new URL(...)` 能 parse；`data:` base64 头像会进库再触发下游 413 |
 >
 > 新接入请直接用 SDK 包（`@rei-standard/amsg-server` / `amsg-instant` / `amsg-client`），行为已按规范对齐到字节级。这份示例的文档与代码后续会同步更新。
