@@ -10,7 +10,7 @@ Install with `npm install @rei-standard/amsg-instant@next`. Pre-release — brea
 - Request-body fields `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern` — rejected with 400 `INVALID_PAYLOAD_FORMAT` and a migration hint pointing at `pushPayloads`.
 - `pushPayload.splitPattern` per-push override (next.3 only) — rejected with `HookError`.
 - Public export `splitMessageIntoSentences` — used to be exported from `@rei-standard/amsg-instant` for hook authors who wanted "the same default split as the legacy path". The legacy path still uses it internally; hook authors implement their own split.
-- Internal helpers `splitHookPushPayload` / `splitOnceByRegex` / `pickSplitConfig` / `validateSplitPattern` / `validatePerKindSplitPatterns` / `DEFAULT_SPLIT_REGEX` / `SPLIT_PATTERN_MAX_*` — all gone (or only kept where needed for the legacy path).
+- Most internal split helpers (`splitHookPushPayload` / `pickSplitConfig` / `validatePerKindSplitPatterns` / `validateSplitPattern` / `SPLIT_PATTERN_MAX_*`) removed. `splitMessageIntoSentences` / `splitOnceByRegex` / `DEFAULT_SPLIT_REGEX` stay module-internal because `runLegacyInstant` still uses them.
 - The two-layer reasoning cascade collapsed to one layer (byte chunking). The Layer-1 sentence split via `reasoningSplitPattern` is gone with the field.
 
 ### Changed

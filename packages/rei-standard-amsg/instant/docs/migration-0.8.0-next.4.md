@@ -225,6 +225,7 @@ createInstantHandler({
 
 // In hook:
 import { buildReasoningPush } from '@rei-standard/amsg-instant';
+import { randomUUID } from 'node:crypto'; // or globalThis.crypto.randomUUID() on Cloudflare Workers / browsers
 
 const reasoning = ctx.llmResponse.choices[0].message.reasoning_content;
 const reasoningSegments = reasoning
@@ -236,7 +237,7 @@ const reasoningSegments = reasoning
       .filter((s) => s.length > 0)
   : [];
 
-const reasoningPushes = reasoningSegments.map((piece) => buildReasoningPush({
+const reasoningPushes = reasoningSegments.map((piece, i) => buildReasoningPush({
   messageType: 'instant',
   source: 'instant',
   messageId: `msg_${randomUUID()}_iter_${ctx.iteration}_reasoning_${i}`,
