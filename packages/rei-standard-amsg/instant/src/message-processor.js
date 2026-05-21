@@ -86,7 +86,7 @@ function splitOnceByRegex(chunk, regex) {
  * @param {string | string[] | null} [splitPattern=null]
  * @returns {string[]}
  */
-export function splitMessageIntoSentences(messageContent, splitPattern = null) {
+function splitMessageIntoSentences(messageContent, splitPattern = null) {
   const sources =
     splitPattern == null ? null :
     Array.isArray(splitPattern) ? splitPattern :
@@ -312,31 +312,45 @@ function splitHookPushPayload(pushPayload, payload) {
 }
 
 /**
- * Split `pushPayload` per kind and ship the chunks sequentially with
- * `SLEEP_BETWEEN_MESSAGES_MS` spacing. Each chunk goes through
- * `sendPushWithMaybeBlob` so the blob detour still applies per-chunk.
+ * Deliver `pushPayloads` sequentially via `sendPushWithMaybeBlob`,
+ * spacing `SLEEP_BETWEEN_MESSAGES_MS` (1500 ms) between consecutive
+ * pushes. Each push goes through `sendPushWithMaybeBlob` so the blob
+ * detour still applies per-push.
  *
- * Returns the chunk count actually emitted (callers use this for
- * `messagesSent` event payloads). Throws on the first chunk that
- * fails delivery — caller decides whether that aborts the whole turn
- * or is best-effort (e.g. auto-emitted reasoning is best-effort).
+ * Per-push auto-fill (mutates the push object in place — the hook
+ * returned a plain literal, we own it from this point):
+ *   - `messageId`     — only when the hook didn't set one (auto-fill
+ *                       with `msg_<uuid>_chunk_<i>` so deduplication
+ *                       on the SW side works across retries).
+ *   - `messageIndex`  — always overwritten (1-based) with the array index.
+ *   - `totalMessages` — always overwritten with `pushPayloads.length`.
  *
- * @param {unknown} pushPayload
+ * Throws on the first failed push; subsequent pushes are not attempted.
+ * Callers decide whether to surface the throw or treat the partial
+ * delivery as best-effort.
+ *
+ * @param {Array<Record<string, unknown>>} pushPayloads
  * @param {Record<string, unknown>} payload
  * @param {Object} ctx
  * @param {string} sessionId
  * @param {(ms: number) => Promise<void>} sleep
  * @returns {Promise<number>}
  */
-async function sendChunkedPush(pushPayload, payload, ctx, sessionId, sleep) {
-  const chunks = splitHookPushPayload(pushPayload, payload);
-  for (let i = 0; i < chunks.length; i++) {
-    await sendPushWithMaybeBlob(chunks[i], payload, ctx, sessionId);
-    if (i < chunks.length - 1) {
+async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sleep) {
+  const total = pushPayloads.length;
+  for (let i = 0; i < total; i++) {
+    const push = pushPayloads[i];
+    if (push.messageId === undefined) {
+      push.messageId = `msg_${randomUUID()}_chunk_${i}`;
+    }
+    push.messageIndex = i + 1;
+    push.totalMessages = total;
+    await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+    if (i < total - 1) {
       await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   }
-  return chunks.length;
+  return total;
 }
 
 // ─── Reasoning two-layer cascade ────────────────────────────────────────
@@ -974,22 +988,22 @@ async function runAgenticLoop(payload, ctx) {
       return { status: 'skipped', sessionId, iteration };
     }
 
-    // 'finish' or 'tool-request' — both deliver a push, with optional
-    // sentence-split per `messageKind`:
-    //   `content` / `tool_request` → `payload.splitPattern`   (default on)
-    //   `reasoning`                → `payload.reasoningSplitPattern` (default off)
-    //   `error`                    → `payload.errorSplitPattern`     (default off)
-    //   free-form pushPayload      → never split
-    // Reasoning additionally goes through Layer 2 byte chunking
-    // (`ctx.reasoningChunkBytes`, default 2000 B) so a hook returning
-    // a single large ReasoningPush still ships under the Web Push
-    // payload limit without forcing the hook author to slice.
-    const isReasoning = decision.pushPayload
-      && typeof decision.pushPayload === 'object'
-      && /** @type {{messageKind?: unknown}} */ (decision.pushPayload).messageKind === 'reasoning';
-    const messagesSent = isReasoning
-      ? await emitReasoning(decision.pushPayload, payload, ctx, sessionId, sleep, iteration)
-      : await sendChunkedPush(decision.pushPayload, payload, ctx, sessionId, sleep);
+    // 'finish' or 'tool-request' — deliver pushPayloads sequentially.
+    // The lib does no splitting; the hook returned the exact N pushes.
+    // Reasoning pushes coming from the hook flow through the same
+    // delivery path — `autoEmitReasoning` (default on) handles the
+    // framework-emitted ReasoningPush that comes from the LLM's
+    // `reasoning_content` field BEFORE the hook fires, and Task 4
+    // rewires `emitReasoning` to a single-layer byte-chunker. Hooks
+    // wanting custom reasoning chunking now slice themselves and pass
+    // the pieces as individual `pushPayloads` entries.
+    const messagesSent = await sendPushesSequentially(
+      decision.pushPayloads,
+      payload,
+      ctx,
+      sessionId,
+      sleep,
+    );
     onEvent({
       type: decision.decision === 'finish' ? 'final_pushed' : 'tool_request_pushed',
       sessionId,
@@ -1012,11 +1026,9 @@ async function runAgenticLoop(payload, ctx) {
     timestamp: new Date().toISOString(),
   });
   try {
-    // Honour `payload.errorSplitPattern` so a caller that configured
-    // diagnostic chunking gets it consistently across hook-returned
-    // ErrorPushes and framework-emitted ones. Default-off → single
-    // push, same as pre-next.2.
-    await sendChunkedPush(diagnostic, payload, ctx, sessionId, sleep);
+    // The diagnostic is a single push by construction (one
+    // `buildErrorPush(...)` call above); no looping needed.
+    await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
   } catch (err) {
     onEvent({ type: 'diagnostic_push_failed', code: 'LOOP_EXCEEDED', sessionId, cause: err });
   }

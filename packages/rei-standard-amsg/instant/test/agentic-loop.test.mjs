@@ -26,6 +26,7 @@ import {
   HookError,
   PayloadTooLargeError,
   MemoryStoreFullError,
+  processInstantMessage,
   validateContinuePayload,
   validateInstantPayload,
 } from '../src/index.js';
@@ -758,5 +759,110 @@ describe('next.4 — decision contract: pushPayloads', () => {
     assert.equal(res.status, 500);
     assert.equal(body.error.code, 'HOOK_THREW');
     assert.match(body.error.message, /splitPattern is removed in next\.4/);
+  });
+});
+
+// ─── next.4 — pushPayloads happy paths ─────────────────────────────────
+
+describe('next.4 — pushPayloads happy paths', () => {
+  it('sends N pushes from a 3-element pushPayloads array with messageIndex/totalMessages auto-fill', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    const sleeps = [];
+    const result = await processInstantMessage(basePayload(), {
+      vapid,
+      fetch: router.fetch,
+      sleep: (ms) => { sleeps.push(ms); return Promise.resolve(); },
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'first' },
+          { messageKind: 'content', message: 'second' },
+          { messageKind: 'content', message: 'third' },
+        ],
+      }),
+      autoEmitReasoning: false,
+      requestUrl: 'http://localhost/instant',
+    });
+    assert.equal(result.status, 'finished');
+    assert.equal(router.pushCalls.length, 3);
+    const decoded = [];
+    for (const c of router.pushCalls) decoded.push(JSON.parse(await decryptCapturedPushBody(c.body, subKit)));
+    assert.deepEqual(decoded.map(p => p.message), ['first', 'second', 'third']);
+    assert.deepEqual(decoded.map(p => p.messageIndex), [1, 2, 3]);
+    assert.deepEqual(decoded.map(p => p.totalMessages), [3, 3, 3]);
+    // 1500 between push 1↔2 and 2↔3
+    assert.deepEqual(sleeps, [1500, 1500]);
+  });
+
+  it('preserves hook-set messageId, overwrites caller-set messageIndex/totalMessages', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    await processInstantMessage(basePayload(), {
+      vapid,
+      fetch: router.fetch,
+      sleep: () => Promise.resolve(),
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'a', messageId: 'custom-id-1', messageIndex: 99, totalMessages: 99 },
+          { messageKind: 'content', message: 'b' },
+        ],
+      }),
+      autoEmitReasoning: false,
+      requestUrl: 'http://localhost/instant',
+    });
+    const decoded = [];
+    for (const c of router.pushCalls) decoded.push(JSON.parse(await decryptCapturedPushBody(c.body, subKit)));
+    assert.equal(decoded[0].messageId, 'custom-id-1', 'caller messageId kept');
+    assert.notEqual(decoded[1].messageId, decoded[0].messageId, 'auto messageId distinct');
+    assert.equal(decoded[0].messageIndex, 1, 'lib overwrites caller messageIndex');
+    assert.equal(decoded[0].totalMessages, 2, 'lib overwrites caller totalMessages');
+    assert.equal(decoded[1].messageIndex, 2);
+    assert.equal(decoded[1].totalMessages, 2);
+  });
+
+  it('mid-array push failure aborts remaining pushes, no final_pushed event', async () => {
+    let pushIdx = 0;
+    const events = [];
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+      pushHandler: () => {
+        pushIdx++;
+        if (pushIdx === 2) {
+          return { ok: false, status: 502, statusText: 'Bad Gateway', async text() { return 'fail'; } };
+        }
+        return { ok: true, status: 201, async text() { return ''; } };
+      },
+    });
+    let caught;
+    try {
+      await processInstantMessage(basePayload(), {
+        vapid,
+        fetch: router.fetch,
+        sleep: () => Promise.resolve(),
+        onEvent: (e) => events.push(e),
+        onLLMOutput: () => ({
+          decision: 'finish',
+          pushPayloads: [
+            { messageKind: 'content', message: 'one' },
+            { messageKind: 'content', message: 'two' },
+            { messageKind: 'content', message: 'three' },
+          ],
+        }),
+        autoEmitReasoning: false,
+        requestUrl: 'http://localhost/instant',
+      });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught, 'mid-array failure should propagate');
+    assert.equal(pushIdx, 2, 'second push attempted, third skipped');
+    assert.equal(events.some(e => e.type === 'final_pushed'), false, 'no final_pushed on partial delivery');
   });
 });
