@@ -47,43 +47,6 @@ export function validateAvatarUrl(value) {
   return null;
 }
 
-const SPLIT_PATTERN_MAX_LENGTH = 200;
-const SPLIT_PATTERN_MAX_ITEMS = 10;
-
-/**
- * Validate the optional `splitPattern` field. Mirrors amsg-server's
- * `validateSplitPattern` (kept in lockstep). Accepts string, string[], or
- * absent/null. Returns an error message string, or null when valid.
- *
- * As of next.4 the three request-body fields (`splitPattern` /
- * `reasoningSplitPattern` / `errorSplitPattern`) are rejected outright
- * in `validateInstantPayload` / `validateContinuePayload` — only the
- * per-push override `pushPayload.splitPattern` returned by hook authors
- * still reaches this validator (via `splitHookPushPayload` in
- * `message-processor.js`). Task 2/3 of the next.4 migration removes
- * that last call site; this helper goes with it.
- */
-export function validateSplitPattern(value) {
-  if (value === undefined || value === null) return null;
-  const isArray = Array.isArray(value);
-  const items = isArray ? value : [value];
-  if (isArray && items.length === 0) return null;          // empty array = use default
-  if (items.length > SPLIT_PATTERN_MAX_ITEMS) {
-    return `splitPattern 数组最多 ${SPLIT_PATTERN_MAX_ITEMS} 项`;
-  }
-  for (let i = 0; i < items.length; i++) {
-    const s = items[i];
-    const label = isArray ? `splitPattern[${i}]` : 'splitPattern';
-    if (typeof s !== 'string') return `${label} 必须是字符串`;
-    if (s.length > SPLIT_PATTERN_MAX_LENGTH) {
-      return `${label} 不能超过 ${SPLIT_PATTERN_MAX_LENGTH} 字符`;
-    }
-    try { new RegExp(s); }
-    catch (_) { return `${label} 不是有效正则表达式`; }
-  }
-  return null;
-}
-
 function validateMessagesArray(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return 'messages 必须是长度 ≥ 1 的数组';

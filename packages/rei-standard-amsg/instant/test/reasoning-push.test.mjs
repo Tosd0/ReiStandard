@@ -243,3 +243,52 @@ describe('hook path — ReasoningPush auto-emission', () => {
     assert.equal(decoded[1].sessionId, 'sess-stable-1');
   });
 });
+
+// ─── next.4 — reasoning byte-chunking simplified ───────────────────────
+
+describe('next.4 — reasoning byte-chunking simplified', () => {
+  it('short reasoning ships as a single push (no chunkIndex on wire)', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('hi.', { reasoning_content: 'short thought' }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+    await handler(makeRequest(basePayload()));
+    const decoded = await decryptAll(router.pushCalls);
+    const r = decoded.find(p => p.messageKind === 'reasoning');
+    assert.ok(r, 'expected a reasoning push');
+    assert.equal('chunkIndex' in r, false);
+    assert.equal('totalChunks' in r, false);
+    assert.equal('messageIndex' in r, false, 'no Layer-1 split → no messageIndex');
+    assert.equal(r.reasoningContent, 'short thought');
+  });
+
+  it('oversized reasoning gets byte-chunked into N pushes with chunkIndex/totalChunks', async () => {
+    const big = 'x'.repeat(5500); // > default 2000 B threshold
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('hi.', { reasoning_content: big }),
+    });
+    const events = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onEvent: (e) => events.push(e),
+    });
+    await handler(makeRequest(basePayload()));
+    const decoded = await decryptAll(router.pushCalls);
+    const reasoning = decoded.filter(p => p.messageKind === 'reasoning');
+    assert.ok(reasoning.length >= 3, `expected >= 3 chunks for 5500B reasoning at 2000B threshold, got ${reasoning.length}`);
+    for (let i = 0; i < reasoning.length; i++) {
+      assert.equal(reasoning[i].chunkIndex, i + 1);
+      assert.equal(reasoning[i].totalChunks, reasoning.length);
+    }
+    // Reassembling yields the original
+    const reassembled = reasoning.map(p => p.reasoningContent).join('');
+    assert.equal(reassembled, big);
+    // reasoning_chunked event fires exactly once
+    const chunkedEvts = events.filter(e => e.type === 'reasoning_chunked');
+    assert.equal(chunkedEvts.length, 1);
+    assert.equal(chunkedEvts[0].totalChunks, reasoning.length);
+  });
+});

@@ -26,11 +26,10 @@ import { sendWebPush } from './webpush.js';
 import { randomUUID } from './utils.js';
 import { HookError, LlmCallError, PayloadTooLargeError } from './errors.js';
 import { buildSessionContext, extractAssistantMessage } from './session-context.js';
-import { validateSplitPattern } from './validation.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
-// Sub-chunk spacing within a single Layer-1 segment. Byte-chunking is
-// a transport-level workaround (Web Push payload limit), NOT a
+// Inter-chunk spacing for reasoning byte chunks. Byte-chunking is a
+// transport-level workaround (Web Push payload limit), NOT a
 // typing-bubble UX axis, so the inter-chunk gap is much smaller than
 // the inter-sentence gap. 100 ms is enough to avoid pummelling the
 // push gateway in a tight loop while keeping perceived latency low.
@@ -79,8 +78,9 @@ function splitOnceByRegex(chunk, regex) {
  * — e.g. `"([\\n]+)"` not `"[\\n]+"`. We don't auto-wrap; that would require
  * parsing escaped/character-class/non-capturing groups.
  *
- * Validation (length cap, regex compilability, array size) is enforced by
- * `validateSplitPattern` upstream — this function trusts its inputs.
+ * Internal to `runLegacyInstant` — the legacy path still applies the
+ * default sentence regex to content. The hook path no longer splits
+ * (Task 4); hooks return the exact pushPayloads they want delivered.
  *
  * @param {string} messageContent
  * @param {string | string[] | null} [splitPattern=null]
@@ -102,213 +102,6 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
   }
 
   return chunks.length > 0 ? chunks : [messageContent];
-}
-
-/**
- * Pick the right split-pattern field + disable semantics for a given
- * `messageKind`. The three kinds split with different defaults:
- *
- *   | messageKind    | field on payload          | default when field is absent |
- *   |----------------|---------------------------|------------------------------|
- *   | `content`      | `splitPattern`            | sentence regex (split on)    |
- *   | `tool_request` | `splitPattern`            | sentence regex (split on)    |
- *   | `reasoning`    | `reasoningSplitPattern`   | **no split**                 |
- *   | `error`        | `errorSplitPattern`       | **no split**                 |
- *
- * Disable semantics in all four cases: an explicit `null` or `[]`
- * disables splitting. The asymmetry is in `undefined` (i.e. caller
- * omitted the field): for `content` / `tool_request` that means "use
- * default sentence regex" (preserves 0.6 UX); for `reasoning` /
- * `error` it means "do not split" (the kinds that didn't have a UX
- * for splitting historically).
- *
- * Per-push override (0.8.0-next.3+): when the hook returns a
- * `pushPayload` that owns a `splitPattern` field, the resolved
- * `pushPattern` argument carries that value and takes precedence over
- * the kind-specific request field above. The override is kind-
- * agnostic (just `splitPattern` — the kind is already pinned by
- * `pushPayload.messageKind`), so disable semantics collapse to the
- * shared `null` / `[]` rule and never fall back to default-on. Callers
- * pass `pushOverridePresent = false` when the field is absent so the
- * request-level fallback kicks in.
- *
- * @param {Record<string, unknown>} payload
- * @param {unknown} kind
- * @param {unknown} pushPattern        - The hook-returned override (only consulted when `pushOverridePresent`).
- * @param {boolean} pushOverridePresent - True iff `pushPayload` owned `splitPattern` (even when `null`).
- * @returns {{ textField: 'message' | 'reasoningContent', pattern: unknown, disabled: boolean } | null}
- *   `null` when the kind is not splittable (unknown / free-form kinds
- *   with no override). An override on a free-form kind still applies
- *   when there's a usable text field — see `splitHookPushPayload`.
- */
-function pickSplitConfig(payload, kind, pushPattern, pushOverridePresent) {
-  // Resolve text-field by kind. Per-push override flips disable
-  // semantics to "explicit null/[] = off; anything else = use it".
-  const resolveDisabled = (pattern) =>
-    pattern === null || (Array.isArray(pattern) && pattern.length === 0);
-
-  if (kind === 'content' || kind === 'tool_request') {
-    if (pushOverridePresent) {
-      return { textField: 'message', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
-    }
-    const pattern = payload.splitPattern;
-    const disabled = pattern === null
-      || (Array.isArray(pattern) && pattern.length === 0);
-    return { textField: 'message', pattern, disabled };
-  }
-  if (kind === 'reasoning') {
-    if (pushOverridePresent) {
-      // Per-push override skips the request-level "default-off"
-      // asymmetry: if the hook went out of its way to set the field
-      // on the push, treat any non-null/non-[] value as "split with
-      // this pattern" — same rule as content/tool_request override.
-      return { textField: 'reasoningContent', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
-    }
-    const pattern = payload.reasoningSplitPattern;
-    // Default-off: undefined / null / [] all mean "do not split".
-    const disabled = pattern === undefined
-      || pattern === null
-      || (Array.isArray(pattern) && pattern.length === 0);
-    return { textField: 'reasoningContent', pattern, disabled };
-  }
-  if (kind === 'error') {
-    if (pushOverridePresent) {
-      return { textField: 'message', pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
-    }
-    const pattern = payload.errorSplitPattern;
-    // Default-off, same as reasoning.
-    const disabled = pattern === undefined
-      || pattern === null
-      || (Array.isArray(pattern) && pattern.length === 0);
-    return { textField: 'message', pattern, disabled };
-  }
-  return null;
-}
-
-/**
- * Per-kind splitter. Given a `pushPayload` and the request `payload`
- * (which carries the kind-specific split-pattern fields), apply the
- * right pattern to the kind's text field and return an array of
- * one-per-push payloads ready for sequential delivery.
- *
- * Routing per `messageKind`:
- *   - `'content'`      → reads `payload.splitPattern`, splits `message`
- *   - `'reasoning'`    → reads `payload.reasoningSplitPattern`, splits
- *                        `reasoningContent` (default-off)
- *   - `'tool_request'` → reads `payload.splitPattern`, splits
- *                        `message`; `toolCalls` binds to the LAST
- *                        prefix chunk (emitted as `tool_request`).
- *                        Chunks 0..N-2 are demoted to `messageKind:
- *                        'content'` (without `toolCalls`) so the
- *                        narration finishes BEFORE the client starts
- *                        executing tools.
- *   - `'error'`        → reads `payload.errorSplitPattern`, splits
- *                        `message` (default-off)
- *   - anything else    → passthrough; the framework can't guess which
- *                        field of a free-form hook payload to split.
- *
- * Per-push override (0.8.0-next.3+): when the hook-returned
- * `pushPayload` owns a `splitPattern` field, it takes precedence over
- * the kind-specific request field — including disabling the default
- * split with `splitPattern: null` on a `content` push. The field is
- * shape-validated (same caps as request-level via
- * `validateSplitPattern`); malformed override throws `HookError`. The
- * directive is stripped before delivery so it never appears on the
- * wire, regardless of whether the split actually fired.
- *
- * The original payload's `toolCalls`, `metadata`, and all push
- * metadata fields (`messageType` / `source` / `sessionId` / `timestamp`
- * / `messageKind` / `messageSubtype` / `taskId`) are preserved
- * verbatim per chunk. Only `messageId` is regenerated per chunk
- * (independent IDs, shared sessionId) and `messageIndex` /
- * `totalMessages` are populated 1-based.
- *
- * @param {unknown} pushPayload
- * @param {Record<string, unknown>} payload    - The validated request payload.
- * @returns {Array<unknown>}  - Length ≥ 1. Single-element when not
- *                              splittable or when the split produces
- *                              one chunk (so callers always loop).
- */
-function splitHookPushPayload(pushPayload, payload) {
-  if (!pushPayload || typeof pushPayload !== 'object' || Array.isArray(pushPayload)) {
-    return [pushPayload];
-  }
-  const pushObj = /** @type {Record<string, unknown>} */ (pushPayload);
-  const kind = pushObj.messageKind;
-
-  // Extract + validate the per-push override (if any) and produce a
-  // clean copy of pushObj that never carries `splitPattern` downstream
-  // — both single-chunk passthrough returns and N-chunk maps below
-  // use `cleanPushObj` so the directive can't leak onto the wire.
-  //
-  // `undefined` is treated as **absent** (same convention as
-  // request-level fields and as plain JS "value not really set"), so
-  // `pushPayload.splitPattern: undefined` falls back to the request-
-  // level field rather than being interpreted as a degenerate
-  // override. Only a non-`undefined` value (including `null` / `[]`)
-  // counts as an override. `JSON.stringify` already drops `undefined`
-  // properties at the wire layer, so the `undefined` case needs no
-  // explicit strip.
-  const pushPattern = pushObj.splitPattern;
-  const pushOverridePresent = pushPattern !== undefined;
-  let cleanPushObj = pushObj;
-  if (pushOverridePresent) {
-    const validationErr = validateSplitPattern(pushPattern);
-    if (validationErr) {
-      // Same severity as other pushPayload-shape contract violations
-      // (see `sendPushWithMaybeBlob`): surface as HookError so the
-      // caller's hook author sees a loud failure instead of a silent
-      // unsplit push. `validateSplitPattern` labels its errors with
-      // the literal "splitPattern" prefix (shared with the request-
-      // level validator) — strip it so the HookError doesn't read
-      // "pushPayload.splitPattern invalid: splitPattern ...".
-      const cleanedErr = validationErr.replace(
-        /^splitPattern(\[\d+\])?\s*/,
-        (_m, idx) => idx ? `${idx} ` : '',
-      );
-      throw new HookError(`pushPayload.splitPattern invalid: ${cleanedErr}`);
-    }
-    const { splitPattern: _strip, ...rest } = pushObj;
-    cleanPushObj = rest;
-  }
-
-  const cfg = pickSplitConfig(payload || {}, kind, pushPattern, pushOverridePresent);
-  if (!cfg || cfg.disabled) return [cleanPushObj];
-
-  const text = cleanPushObj[cfg.textField];
-  if (typeof text !== 'string' || text.length === 0) return [cleanPushObj];
-
-  const segments = splitMessageIntoSentences(text, cfg.pattern);
-  if (segments.length <= 1) return [cleanPushObj];
-
-  const total = segments.length;
-  return segments.map((segment, i) => {
-    const isLast = i === total - 1;
-    const chunkMessageId = `msg_${randomUUID()}_chunk_${i}`;
-
-    if (kind === 'tool_request' && !isLast) {
-      // Demote prefix chunks to ContentPush — drop `toolCalls` so the
-      // client UI doesn't try to execute the tool N times. The last
-      // chunk (below) keeps the original kind + toolCalls intact.
-      const { toolCalls: _drop, ...rest } = cleanPushObj;
-      return {
-        ...rest,
-        messageKind: 'content',
-        messageId: chunkMessageId,
-        message: segment,
-        messageIndex: i + 1,
-        totalMessages: total,
-      };
-    }
-
-    return {
-      ...cleanPushObj,
-      messageId: chunkMessageId,
-      [cfg.textField]: segment,
-      messageIndex: i + 1,
-      totalMessages: total,
-    };
-  });
 }
 
 /**
@@ -353,100 +146,60 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
   return total;
 }
 
-// ─── Reasoning two-layer cascade ────────────────────────────────────────
+// ─── Reasoning byte chunking ────────────────────────────────────────────
 
 /**
- * Expand a single `ReasoningPush` into the flat leaf array of pushes
- * the framework will actually deliver, applying the two-layer cascade:
+ * Slice a ReasoningPush into one or more byte-bounded pushes. When
+ * `reasoningContent` UTF-8 length exceeds `reasoningChunkBytes`, the
+ * lib chunks at UTF-8 codepoint boundaries via
+ * `chunkReasoningByUtf8Bytes` and ships each chunk as its own push
+ * with `chunkIndex` / `totalChunks`. Otherwise ships as one.
  *
- *   Layer 1 — semantic split via `payload.reasoningSplitPattern`
- *             (delegates to `splitHookPushPayload`). Default-off;
- *             when set, produces M segments carrying
- *             `messageIndex` / `totalMessages`.
- *
- *   Layer 2 — UTF-8 byte chunking via `reasoningChunkBytes` ctx
- *             knob. Default-on (threshold 2000 B); when a Layer-1
- *             segment exceeds the threshold, the segment is sliced at
- *             codepoint boundaries (via `chunkReasoningByUtf8Bytes`)
- *             into N sub-pushes carrying `chunkIndex` / `totalChunks`.
- *             `null` disables Layer 2 entirely — oversized segments
- *             then fall through to `sendPushWithMaybeBlob` and either
- *             hit BlobStore (if configured) or throw
- *             `PayloadTooLargeError`.
- *
- * Layer 1 fields (messageIndex / totalMessages) come straight from
- * `splitHookPushPayload`. Layer 2 fields (chunkIndex / totalChunks)
- * are added per-leaf when N > 1; otherwise the leaf wire-matches the
- * pre-byte-chunking shape byte-for-byte.
+ * `null` for `reasoningChunkBytes` disables chunking entirely —
+ * oversized reasoning then either flows through `sendPushWithMaybeBlob`
+ * (and BlobStore) or throws `PayloadTooLargeError`.
  *
  * `messageId` is regenerated per leaf so each push has a unique id:
  *   `msg_<uuid>_iter_<iteration>_reasoning_chunk_<chunkIndex>`
  *
  * @param {Object} reasoningPush
- * @param {Object} payload
  * @param {number | null | undefined} reasoningChunkBytes
- * @param {number | undefined} iteration   - 0 for legacy path, the agentic-loop iteration otherwise.
+ * @param {number | undefined} iteration
  * @returns {Array<Object>}
  */
-function expandReasoningPushChunks(reasoningPush, payload, reasoningChunkBytes, iteration) {
-  // Layer 1: defer to the shared splitter. Returns 1 element when
-  // `reasoningSplitPattern` is unset/disabled; ≥2 when sentence split
-  // produces multiple segments.
-  const layer1 = splitHookPushPayload(reasoningPush, payload);
-
-  // Resolve the byte threshold:
-  //   - `null`     → Layer 2 explicitly disabled
-  //   - `undefined`→ ctx didn't carry the resolved option (callers that
-  //                  invoke `processInstantMessage` directly, e.g. tests).
-  //                  Fall back to the same default as `createInstantHandler`.
-  //   - positive integer → use as threshold
-  if (reasoningChunkBytes === null) return layer1;
+function sliceReasoningPush(reasoningPush, reasoningChunkBytes, iteration) {
+  if (reasoningChunkBytes === null) return [reasoningPush];
   const threshold = (Number.isInteger(reasoningChunkBytes) && reasoningChunkBytes >= 4)
     ? reasoningChunkBytes
     : DEFAULT_REASONING_CHUNK_BYTES;
 
-  /** @type {Array<Object>} */
-  const out = [];
-  for (const segment of layer1) {
-    const text = segment && typeof segment === 'object'
-      ? /** @type {{reasoningContent?: unknown}} */ (segment).reasoningContent
-      : undefined;
-    if (typeof text !== 'string' || text.length === 0) {
-      out.push(segment);
-      continue;
-    }
-    const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(text).byteLength;
-    if (byteLen <= threshold) {
-      out.push(segment);
-      continue;
-    }
-    const pieces = chunkReasoningByUtf8Bytes(text, threshold);
-    const totalChunks = pieces.length;
-    const iterTag = Number.isInteger(iteration) ? iteration : 0;
-    for (let i = 0; i < totalChunks; i++) {
-      out.push({
-        ...segment,
-        messageId: `msg_${randomUUID()}_iter_${iterTag}_reasoning_chunk_${i + 1}`,
-        reasoningContent: pieces[i],
-        chunkIndex: i + 1,
-        totalChunks,
-      });
-    }
-  }
-  return out;
+  const text = typeof reasoningPush.reasoningContent === 'string'
+    ? reasoningPush.reasoningContent
+    : '';
+  if (!text) return [reasoningPush];
+
+  const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(text).byteLength;
+  if (byteLen <= threshold) return [reasoningPush];
+
+  const pieces = chunkReasoningByUtf8Bytes(text, threshold);
+  const totalChunks = pieces.length;
+  const iterTag = Number.isInteger(iteration) ? iteration : 0;
+  return pieces.map((piece, i) => ({
+    ...reasoningPush,
+    messageId: `msg_${randomUUID()}_iter_${iterTag}_reasoning_chunk_${i + 1}`,
+    reasoningContent: piece,
+    chunkIndex: i + 1,
+    totalChunks,
+  }));
 }
 
 /**
- * Ship a `ReasoningPush` through the two-layer cascade. Serial
- * delivery with `SLEEP_BETWEEN_REASONING_CHUNKS_MS` (100 ms) between
- * Layer-2 chunks of the same Layer-1 segment, and
- * `SLEEP_BETWEEN_MESSAGES_MS` (1500 ms) between Layer-1 segments —
- * the larger gap preserves typing-bubble UX between sentences while
- * the smaller gap keeps byte-chunking latency low.
- *
- * Fires a single `reasoning_chunked` event when Layer 2 actually
- * produces > 1 chunk (independent of Layer 1 count) so operators see
- * the byte-chunking trigger without per-chunk event noise.
+ * Ship a ReasoningPush, byte-chunking if oversized. Fires a single
+ * `reasoning_chunked` event when chunking actually splits the push.
+ * Serial delivery with `SLEEP_BETWEEN_REASONING_CHUNKS_MS` (100 ms)
+ * between chunks — byte chunking is a transport-level workaround, not
+ * a typing-bubble UX axis, so the inter-chunk gap is much smaller than
+ * the inter-sentence gap.
  *
  * @param {Object} reasoningPush
  * @param {Object} payload
@@ -457,16 +210,9 @@ function expandReasoningPushChunks(reasoningPush, payload, reasoningChunkBytes, 
  * @returns {Promise<number>}  Total leaves shipped.
  */
 async function emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iteration) {
-  const leaves = expandReasoningPushChunks(reasoningPush, payload, ctx.reasoningChunkBytes, iteration);
+  const leaves = sliceReasoningPush(reasoningPush, ctx.reasoningChunkBytes, iteration);
 
-  // Detect "byte chunking actually fired" — i.e. at least one leaf
-  // carries chunkIndex/totalChunks. We don't fire on Layer-1-only
-  // splits (those are user-configured semantic splits, not transport
-  // overflow events).
-  const byteChunked = leaves.some(
-    (l) => l && typeof l === 'object' && /** @type {{totalChunks?: unknown}} */ (l).totalChunks !== undefined
-  );
-  if (byteChunked) {
+  if (leaves.length > 1) {
     const onEvent = typeof ctx.onEvent === 'function' ? ctx.onEvent : () => {};
     const totalBytes = typeof reasoningPush.reasoningContent === 'string'
       ? PUSH_PAYLOAD_BYTE_ENCODER.encode(reasoningPush.reasoningContent).byteLength
@@ -479,17 +225,7 @@ async function emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iter
   for (let i = 0; i < leaves.length; i++) {
     await sendPushWithMaybeBlob(leaves[i], payload, ctx, sessionId);
     if (i < leaves.length - 1) {
-      // Same Layer-1 segment iff messageIndex matches (or neither has
-      // one — Layer 1 was disabled, all leaves are byte chunks of a
-      // single segment).
-      const cur = leaves[i];
-      const next = leaves[i + 1];
-      const curIdx = cur && typeof cur === 'object'
-        ? /** @type {{messageIndex?: unknown}} */ (cur).messageIndex : undefined;
-      const nextIdx = next && typeof next === 'object'
-        ? /** @type {{messageIndex?: unknown}} */ (next).messageIndex : undefined;
-      const sameSegment = curIdx === nextIdx;
-      await sleep(sameSegment ? SLEEP_BETWEEN_REASONING_CHUNKS_MS : SLEEP_BETWEEN_MESSAGES_MS);
+      await sleep(SLEEP_BETWEEN_REASONING_CHUNKS_MS);
     }
   }
   return leaves.length;
@@ -769,10 +505,10 @@ async function runLegacyInstant(payload, ctx) {
     // user-facing content burst. Mirrors the hook path's
     // `reasoning_push_failed` event (runAgenticLoop).
     //
-    // Two-layer cascade via `emitReasoning`:
-    //   Layer 1 — `payload.reasoningSplitPattern` (default off, sentence split)
-    //   Layer 2 — `ctx.reasoningChunkBytes`     (default 2000, byte chunking)
-    // Single reasoning < threshold + no sentence pattern → wire matches pre-next.2 exactly.
+    // `emitReasoning` byte-chunks via `ctx.reasoningChunkBytes`
+    // (default 2000 B): short reasoning ships as a single push;
+    // oversized reasoning is sliced into N chunks at UTF-8 codepoint
+    // boundaries with `chunkIndex` / `totalChunks`.
     let reasoningShipped = false;
     try {
       // Legacy path has no "iteration" — pass undefined so messageId
@@ -918,11 +654,9 @@ async function runAgenticLoop(payload, ctx) {
           metadata: payload.metadata || {},
         });
         try {
-          // Two-layer cascade — Layer 1 (`reasoningSplitPattern`,
-          // default off) then Layer 2 (`reasoningChunkBytes`, default
-          // 2000 B). Default config: single short reasoning ships as
-          // one push (wire-identical to pre-next.2); long reasoning
-          // auto-chunks with `chunkIndex`/`totalChunks`.
+          // Byte-chunk via `ctx.reasoningChunkBytes` (default 2000 B):
+          // short reasoning ships as one push; oversized reasoning is
+          // sliced into N chunks with `chunkIndex`/`totalChunks`.
           await emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iteration);
           onEvent({ type: 'reasoning_pushed', sessionId, iteration });
         } catch (err) {
@@ -991,12 +725,12 @@ async function runAgenticLoop(payload, ctx) {
     // 'finish' or 'tool-request' — deliver pushPayloads sequentially.
     // The lib does no splitting; the hook returned the exact N pushes.
     // Reasoning pushes coming from the hook flow through the same
-    // delivery path — `autoEmitReasoning` (default on) handles the
+    // delivery path. `autoEmitReasoning` (default on) handles the
     // framework-emitted ReasoningPush that comes from the LLM's
-    // `reasoning_content` field BEFORE the hook fires, and Task 4
-    // rewires `emitReasoning` to a single-layer byte-chunker. Hooks
-    // wanting custom reasoning chunking now slice themselves and pass
-    // the pieces as individual `pushPayloads` entries.
+    // `reasoning_content` field BEFORE the hook fires; `emitReasoning`
+    // is a single-layer byte-chunker. Hooks wanting custom reasoning
+    // chunking slice themselves and pass the pieces as individual
+    // `pushPayloads` entries.
     const messagesSent = await sendPushesSequentially(
       decision.pushPayloads,
       payload,
