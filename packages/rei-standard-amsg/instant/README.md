@@ -302,13 +302,13 @@ type LLMOutputDecision =
 
 lib 给每个 push 自动补这 3 个机械字段（hook 自己设 `messageId` 会被尊重，其余 2 个无论 hook 写什么都被覆盖）：
 
-| 字段            | 自动补充行为                                       |
-|-----------------|---------------------------------------------------|
-| `messageId`     | 未设时 lib 用 `msg_<uuid>_chunk_<i>` 填上         |
-| `messageIndex`  | 永远是 1-based 数组下标 + 1（hook 写啥都覆盖）    |
-| `totalMessages` | 永远是 `pushPayloads.length`                      |
+| 字段            | 自动补充行为                                                       |
+|-----------------|-------------------------------------------------------------------|
+| `messageId`     | hook 未设 → lib 用 `msg_<uuid>_chunk_<i>` 填上；hook 已设 → 保留   |
+| `messageIndex`  | 永远覆盖：1-based 数组下标（i + 1）                                |
+| `totalMessages` | 永远覆盖：`pushPayloads.length`                                    |
 
-剩下所有字段（`messageKind` / `notification` / `metadata` / `messageKind` 特定字段 / 等）都是 per-push，caller 完全控制。每个 push 必须 **JSON-safe**（无循环引用 / BigInt / function 字段），否则被当作 hook 契约违反走 `HookError` / `HOOK_THREW` 路径。
+剩下所有字段（`messageKind` / `notification` / `metadata` / kind 特定字段（e.g. tool_request 的 toolCalls / reasoning 的 reasoningContent / error 的 code） / 等）都是 per-push，caller 完全控制。每个 push 必须 **JSON-safe**（无循环引用 / BigInt / function 字段），否则被当作 hook 契约违反走 `HookError` / `HOOK_THREW` 路径。
 
 ### 切分由 caller 负责（0.8.0-next.4 起）
 
