@@ -1,5 +1,44 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.4 — BREAKING: pushPayloads-only hook decision API (pre-release)
+
+Install with `npm install @rei-standard/amsg-instant@next`. Pre-release — breaking on purpose. 见 [`docs/migration-0.8.0-next.4.md`](./docs/migration-0.8.0-next.4.md) 完整迁移指南.
+
+### Removed
+
+- `decision.pushPayload` (singular). Replaced by `decision.pushPayloads: PushPayload[]`.
+- Request-body fields `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern` — rejected with 400 `INVALID_PAYLOAD_FORMAT` and a migration hint pointing at `pushPayloads`.
+- `pushPayload.splitPattern` per-push override (next.3 only) — rejected with `HookError`.
+- Public export `splitMessageIntoSentences` — used to be exported from `@rei-standard/amsg-instant` for hook authors who wanted "the same default split as the legacy path". The legacy path still uses it internally; hook authors implement their own split.
+- Internal helpers `splitHookPushPayload` / `splitOnceByRegex` / `pickSplitConfig` / `validateSplitPattern` / `validatePerKindSplitPatterns` / `DEFAULT_SPLIT_REGEX` / `SPLIT_PATTERN_MAX_*` — all gone (or only kept where needed for the legacy path).
+- The two-layer reasoning cascade collapsed to one layer (byte chunking). The Layer-1 sentence split via `reasoningSplitPattern` is gone with the field.
+
+### Changed
+
+- `runAgenticLoop`'s finish / tool-request branch now reads `decision.pushPayloads` and ships each push via `sendPushWithMaybeBlob` with `SLEEP_BETWEEN_MESSAGES_MS` (1500ms) between consecutive pushes. Per-push: `messageId` is auto-filled when absent (`msg_<uuid>_chunk_<i>`); `messageIndex` / `totalMessages` are always overwritten with array-derived values.
+- LOOP_EXCEEDED diagnostic is now a single `sendPushWithMaybeBlob` call (no looping needed — the diagnostic is one push).
+- Reasoning auto-emit (`autoEmitReasoning: true`, default): now a single transform. Short reasoning → 1 push; oversized → N byte-chunked pushes with `chunkIndex` / `totalChunks` (Layer-2 only).
+
+### Unchanged
+
+- Legacy v0.6 compat path (no `onLLMOutput`) still splits raw LLM text by sentence regex and ships sequential pushes — byte-level identical to v0.6. The public `splitPattern` knob on the request body is gone, but the path's internal behaviour is preserved (default regex `/([。！？!?]+)/`).
+- HOOK_THREW handling (single-shot diagnostic, best-effort delivery), blob envelope, `maxLoopIterations`, `autoEmitReasoning`, `reasoningChunkBytes`, all 4 decisions (`finish` / `tool-request` / `continue` / `skip-push`).
+- VAPID / push subscription / `apiKey` are still not exposed to the hook.
+- HTTP status code mapping unchanged.
+
+### Migration cheat sheet
+
+| next.3                                                                  | next.4                                                                        |
+|-------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| `return { decision: 'finish', pushPayload: { ... } }`                   | `return { decision: 'finish', pushPayloads: [{ ... }] }`                      |
+| Request body `splitPattern: '([。！？!?]+)'`                            | Implement the split in your hook; return one push per segment                 |
+| `pushPayload.splitPattern: null` (per-push disable from next.3)         | Return `pushPayloads: [singleUnsplit]`                                        |
+| `reasoningSplitPattern` request field                                   | Set `autoEmitReasoning: false`, build N reasoning pushes yourself with `buildReasoningPush(...)`, include them at the start of `pushPayloads` |
+
+### Why breaking in pre-release
+
+The `0.8.0-next.*` series is pre-1.0 unstable. next.2 + next.3 stacked two overlapping mechanisms (lib-side splitPattern auto-split + hook-side pushPayload singular). next.4 collapses both into one (caller returns the exact pushes it wants sent) before 1.0 freezes the public surface.
+
 ## 0.8.0-next.3 — `pushPayload.splitPattern` per-push override (pre-release)
 
 Coordinated with `@rei-standard/amsg-shared@0.1.0-next.3`. Install with `npm install @rei-standard/amsg-instant@next`.
