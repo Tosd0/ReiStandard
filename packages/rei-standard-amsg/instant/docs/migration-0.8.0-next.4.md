@@ -18,8 +18,8 @@ Two problems made this leak abstractions:
 
 A single-pass regex can't:
 
-- Cut on `\n` AND on the boundary between two CJK characters in the same call.
-- Pull `[[SEND_EMOJI: xxx]]` inline tags out as their own segment between sentences.
+- Combine multiple heuristics in a single pass: newlines, custom sentinels, cross-language sentence boundaries, tag-level breaks.
+- Pull inline business tags (custom placeholders / markup fragments) out as their own segments between sentences.
 - Drop empty segments after the cut and then merge / re-split by business rules.
 
 Callers wanted real JS functions to do the split, not regex sources. The framework's "give us a regex" API was strictly less expressive.
@@ -28,8 +28,8 @@ Callers wanted real JS functions to do the split, not regex sources. The framewo
 
 `splitHookPushPayload` cloned every field besides `message`. But real callers needed per-chunk variation in:
 
-- `notification.body` — OS banner shows sanitized text; `message` keeps raw text for client app post-processing. Banner text and bubble text disagree.
-- `metadata.directives` — side-effect markers must appear on exactly one of N pushes (else client replays N times).
+- `notification.body` — OS banner has length / character-set limits and may need a stripped-down preview; the `message` field carries the full payload (markup, business tags, codes) for the client app to post-process. Banner text and in-app text legitimately diverge.
+- `metadata` — per-chunk state: chunk-specific tracking IDs, A/B test variants, locale, single-fire side-effect markers (e.g., a "play sound" flag that must land on exactly one of N pushes).
 - `metadata.iteration` — agentic-loop state per chunk.
 - `messageId` — must be unique per push (SW IDB keyPath; duplicates overwrite).
 
@@ -84,7 +84,7 @@ return {
     messageKind: 'content',
     sessionId: ctx.sessionId,
     message: 'Hello',
-    notification: { title: 'Sully', body: 'Hello' },
+    notification: { title: 'Assistant', body: 'Hello' },
   },
 };
 ```
@@ -97,7 +97,7 @@ return {
     messageKind: 'content',
     sessionId: ctx.sessionId,
     message: 'Hello',
-    notification: { title: 'Sully', body: 'Hello' },
+    notification: { title: 'Assistant', body: 'Hello' },
   }],
 };
 ```
@@ -145,7 +145,7 @@ This pattern is verbose by design — caller now sees exactly what the lib was d
 
 ### Recipe 3: per-chunk `notification.body` (THE feature this unlocks)
 
-Use case: client-app `message` text contains tags / emoji codes / inline markup. OS banner must show sanitized text.
+Use case: client-app `message` text carries markup, business tags, or compact codes; OS banner needs a different display string (shorter, plain-text, or localized).
 
 ```js
 return {
@@ -154,26 +154,26 @@ return {
     {
       messageKind: 'content',
       sessionId: ctx.sessionId,
-      message: '你看',
-      notification: { title: '来自 Sully', body: '你看' },
+      message: 'Greetings, traveler.',
+      notification: { title: 'Quest Master', body: 'Greetings, traveler.' },
     },
     {
       messageKind: 'content',
       sessionId: ctx.sessionId,
-      message: '[[SEND_EMOJI: 笑]]',                       // raw, client renders as emoji
-      notification: { title: '来自 Sully', body: '[表情：笑]' },  // sanitized for OS banner
+      message: '<thinking>plotting next move</thinking>',           // internal markup, client renders / hides
+      notification: { title: 'Quest Master', body: '…' },           // condensed banner preview
     },
     {
       messageKind: 'content',
       sessionId: ctx.sessionId,
-      message: '我没事的',
-      notification: { title: '来自 Sully', body: '我没事的' },
+      message: 'The path forward is yours to choose.',
+      notification: { title: 'Quest Master', body: 'The path forward is yours to choose.' },
     },
   ],
 };
 ```
 
-Pre-next.4, this required either dropping inline tags from `message` (losing client semantics) or skipping `notification` entirely (no banner). With per-push `notification`, both audiences get what they want.
+Pre-next.4, either `message` had to lose the client-side markup (and the client lost rendering context) or `notification` had to be skipped (no banner). With per-push `notification`, both audiences get what they want.
 
 ### Recipe 4: tool-request with mixed kinds
 
@@ -186,16 +186,16 @@ return {
     {
       messageKind: 'content',
       sessionId: ctx.sessionId,
-      message: '让我同时查日记和天气',
-      notification: { title: '来自 Sully', body: '让我同时查日记和天气' },
+      message: 'Let me check both at once.',
+      notification: { title: 'Assistant', body: 'Let me check both at once.' },
     },
     {
       messageKind: 'tool_request',
       sessionId: ctx.sessionId,
       message: '',
       toolCalls: [
-        { id: 'rd_1', type: 'function', function: { name: 'notion_read_diary', arguments: '{"date":"2024-05-21"}' } },
-        { id: 'ws_1', type: 'function', function: { name: 'web_search',        arguments: '{"query":"北京天气"}' } },
+        { id: 'tc_1', type: 'function', function: { name: 'lookup_user',   arguments: '{"id":"u_42"}' } },
+        { id: 'tc_2', type: 'function', function: { name: 'fetch_weather', arguments: '{"city":"Seattle"}' } },
       ],
       // No notification — client doesn't show a banner for the tool call itself.
     },
