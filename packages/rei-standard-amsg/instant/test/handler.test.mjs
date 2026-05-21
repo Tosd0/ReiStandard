@@ -5,12 +5,6 @@ import {
   createInstantHandler,
   validateInstantPayload,
 } from '../src/index.js';
-// `splitMessageIntoSentences` lost its public re-export from src/index.js in
-// next.4 (hook authors no longer get a split helper). The legacy test block
-// below (`describe('splitMessageIntoSentences', ...)`) is slated for removal
-// in Task 6 of the migration; meanwhile, pull the function from its internal
-// home so this file still loads.
-import { splitMessageIntoSentences } from '../src/message-processor.js';
 import {
   generateTestVapid,
   generateTestSubscription,
@@ -174,59 +168,6 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: 'hot' })).valid, false);
   });
 
-  // ── splitPattern (0.6.0) ───────────────────────────────────────────
-  it('accepts splitPattern as a single string', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: '([\\n]+)' })).valid, true);
-  });
-
-  it('accepts splitPattern as an array of strings (cascade)', () => {
-    assert.equal(
-      validateInstantPayload(makeValidPayload({ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'] })).valid,
-      true
-    );
-  });
-
-  it('treats empty splitPattern array as absent (uses default)', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: [] })).valid, true);
-  });
-
-  it('treats splitPattern=null as absent', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: null })).valid, true);
-  });
-
-  it('rejects splitPattern array element that is not a string', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: ['ok', 123] }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /splitPattern\[1\]/);
-  });
-
-  it('rejects splitPattern item longer than 200 chars', () => {
-    const long = 'a'.repeat(201);
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: long }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /200/);
-  });
-
-  it('rejects splitPattern array with more than 10 items', () => {
-    const r = validateInstantPayload(makeValidPayload({
-      splitPattern: Array.from({ length: 11 }, () => '.'),
-    }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /10/);
-  });
-
-  it('rejects splitPattern that is not a valid RegExp source', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: '[' }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /正则|RegExp|regex/i);
-  });
-
-  it('rejects splitPattern array element that is not a valid RegExp', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: ['(\\n+)', '['] }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /splitPattern\[1\]/);
-  });
-
   // ── avatarUrl (0.6.1 → soft-strip in 0.7.1) ──────────────────────────
   it('accepts a normal https avatarUrl', () => {
     const payload = makeValidPayload({ avatarUrl: 'https://example.com/a.png' });
@@ -304,71 +245,6 @@ describe('next.4 — split-pattern fields removed', () => {
     const r = validateInstantPayload(makeValidPayload({ errorSplitPattern: '([。！？!?]+)' }));
     assert.equal(r.valid, false);
     assert.match(r.errorMessage, /errorSplitPattern is removed in next\.4/);
-  });
-});
-
-// ─── Unit: sentence splitting ─────────────────────────────────────────
-
-describe('splitMessageIntoSentences', () => {
-  it('splits on Chinese punctuation', () => {
-    const result = splitMessageIntoSentences('你好。今天天气真好！要带伞吗？');
-    assert.deepEqual(result, ['你好。', '今天天气真好！', '要带伞吗？']);
-  });
-
-  it('splits on English ! and ? but NOT . (mirrors amsg-server regex)', () => {
-    const result = splitMessageIntoSentences('Hello. World! Done?');
-    assert.deepEqual(result, ['Hello. World!', 'Done?']);
-  });
-
-  it('returns single-element array when no terminal punctuation', () => {
-    const result = splitMessageIntoSentences('no terminal punctuation here');
-    assert.deepEqual(result, ['no terminal punctuation here']);
-  });
-
-  // ── splitPattern override (0.6.0) ──────────────────────────────────
-  it('accepts a single splitPattern string and uses it instead of default', () => {
-    const result = splitMessageIntoSentences('行一\n行二\n行三', '([\\n]+)');
-    assert.deepEqual(result, ['行一\n', '行二\n', '行三']);
-  });
-
-  it('accepts splitPattern as a string[] cascade (paragraph → sentence)', () => {
-    const result = splitMessageIntoSentences(
-      '段一句一。段一句二。\n\n段二句一。',
-      ['(\\n\\n+)', '([。！？!?]+)']
-    );
-    // Cascade:
-    //   1. split by (\n\n+) → ['段一句一。段一句二。\n\n', '段二句一。']
-    //   2. split each by ([。！？!?]+); the trailing \n\n in chunk 1 becomes an
-    //      empty trimmed part and is dropped by the existing filter.
-    assert.deepEqual(result, ['段一句一。', '段一句二。', '段二句一。']);
-  });
-
-  it('uses default when splitPattern is null / undefined / []', () => {
-    const expected = ['你好。', '世界！'];
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', null), expected);
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', undefined), expected);
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', []), expected);
-  });
-
-  it('falls back to [original] when splitPattern matches everything', () => {
-    const result = splitMessageIntoSentences('abc', '.*');
-    assert.deepEqual(result, ['abc']);
-  });
-
-  it('passes chunk through unchanged when cascade regex does not match', () => {
-    // First regex matches nothing → chunk passed as-is to second regex which splits.
-    const result = splitMessageIntoSentences('a.b.c', ['(z+)', '(\\.)']);
-    assert.deepEqual(result, ['a.', 'b.', 'c']);
-  });
-
-  it('without a capture group, splitter does NOT re-attach delimiter (documented behavior)', () => {
-    // No capture group → split() returns only text parts; reduce keeps even
-    // indices and `arr[i+1]` is the next text chunk, not a delimiter — so we
-    // see the documented quirk where every other chunk is concatenated.
-    const result = splitMessageIntoSentences('a.b.c', '\\.');
-    // 'a.b.c'.split(/\./) === ['a','b','c']; reduce picks i=0 and i=2.
-    // i=0 → 'a' + arr[1] ('b') = 'ab'; i=2 → 'c' + undefined → 'c'.
-    assert.deepEqual(result, ['ab', 'c']);
   });
 });
 
