@@ -611,7 +611,6 @@ async function verifyBearerToken(request, signingKey, respond) {
 
 export { validateInstantPayload, validateAvatarUrl, validateContinuePayload } from './validation.js';
 export {
-  splitMessageIntoSentences,
   processInstantMessage,
   normalizeAiApiUrl,
   sendPushWithMaybeBlob,

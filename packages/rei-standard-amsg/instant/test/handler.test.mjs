@@ -3,9 +3,14 @@ import assert from 'node:assert/strict';
 
 import {
   createInstantHandler,
-  splitMessageIntoSentences,
   validateInstantPayload,
 } from '../src/index.js';
+// `splitMessageIntoSentences` lost its public re-export from src/index.js in
+// next.4 (hook authors no longer get a split helper). The legacy test block
+// below (`describe('splitMessageIntoSentences', ...)`) is slated for removal
+// in Task 6 of the migration; meanwhile, pull the function from its internal
+// home so this file still loads.
+import { splitMessageIntoSentences } from '../src/message-processor.js';
 import {
   generateTestVapid,
   generateTestSubscription,
@@ -280,6 +285,25 @@ describe('validateInstantPayload', () => {
     const r = validateInstantPayload(payload);
     assert.equal(r.valid, true);
     assert.equal(payload.avatarUrl, null);
+  });
+});
+
+describe('next.4 — split-pattern fields removed', () => {
+  it('rejects request body splitPattern with INVALID_PAYLOAD_FORMAT', () => {
+    const r = validateInstantPayload(makeValidPayload({ splitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.equal(r.errorCode, 'INVALID_PAYLOAD_FORMAT');
+    assert.match(r.errorMessage, /splitPattern is removed in next\.4/);
+  });
+  it('rejects request body reasoningSplitPattern', () => {
+    const r = validateInstantPayload(makeValidPayload({ reasoningSplitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /reasoningSplitPattern is removed in next\.4/);
+  });
+  it('rejects request body errorSplitPattern', () => {
+    const r = validateInstantPayload(makeValidPayload({ errorSplitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /errorSplitPattern is removed in next\.4/);
   });
 });
 

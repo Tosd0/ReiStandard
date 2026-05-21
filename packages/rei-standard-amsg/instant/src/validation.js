@@ -55,15 +55,13 @@ const SPLIT_PATTERN_MAX_ITEMS = 10;
  * `validateSplitPattern` (kept in lockstep). Accepts string, string[], or
  * absent/null. Returns an error message string, or null when valid.
  *
- * Used for both request-level fields (`splitPattern` /
- * `reasoningSplitPattern` / `errorSplitPattern`) and the per-push
- * override `pushPayload.splitPattern` returned by hook authors
- * (0.8.0-next.3+). Same shape rules, same caps.
- *
- * The size caps are an input-size guard, NOT a ReDoS defense — a 6-char
- * pattern like `(a+)+$` is enough to trigger catastrophic backtracking.
- * Worker / runtime CPU limits are the real backstop; the blast radius is
- * self-inflicted only (caller's regex on caller's own LLM output).
+ * As of next.4 the three request-body fields (`splitPattern` /
+ * `reasoningSplitPattern` / `errorSplitPattern`) are rejected outright
+ * in `validateInstantPayload` / `validateContinuePayload` — only the
+ * per-push override `pushPayload.splitPattern` returned by hook authors
+ * still reaches this validator (via `splitHookPushPayload` in
+ * `message-processor.js`). Task 2/3 of the next.4 migration removes
+ * that last call site; this helper goes with it.
  */
 export function validateSplitPattern(value) {
   if (value === undefined || value === null) return null;
@@ -313,8 +311,16 @@ export function validateInstantPayload(payload, opts) {
     };
   }
 
-  const splitErr = validatePerKindSplitPatterns(payload);
-  if (splitErr) return splitErr;
+  const removedField = ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']
+    .find((field) => payload[field] !== undefined);
+  if (removedField) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] },
+    };
+  }
 
   // Hook-path-only fields are validated regardless of which path
   // we're on — even legacy callers passing them should get a clean
@@ -451,38 +457,18 @@ export function validateContinuePayload(payload, opts) {
     payload.avatarUrl = null;
   }
 
-  const splitErr = validatePerKindSplitPatterns(payload);
-  if (splitErr) return splitErr;
+  const removedField = ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']
+    .find((field) => payload[field] !== undefined);
+  if (removedField) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] },
+    };
+  }
 
   return validateHookPathSharedFields(payload, opts) || { valid: true };
-}
-
-/**
- * Validate the three per-kind split-pattern fields. All three follow
- * the same shape rules (`validateSplitPattern`) — only their
- * semantics differ at runtime (`content` / `tool_request` default-on,
- * `reasoning` / `error` default-off).
- *
- * @param {Object} payload
- */
-function validatePerKindSplitPatterns(payload) {
-  for (const field of ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']) {
-    const err = validateSplitPattern(payload[field]);
-    if (err) {
-      // Re-label the error with the actual field name so the caller
-      // knows which knob to fix. `validateSplitPattern` itself uses
-      // the literal label "splitPattern" / "splitPattern[i]"; rewrite
-      // it for the per-kind fields.
-      const labelled = field === 'splitPattern' ? err : err.replace(/^splitPattern/, field);
-      return {
-        valid: false,
-        errorCode: 'INVALID_PAYLOAD_FORMAT',
-        errorMessage: labelled,
-        details: { invalidFields: [field] },
-      };
-    }
-  }
-  return null;
 }
 
 /**
