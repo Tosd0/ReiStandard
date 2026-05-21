@@ -148,7 +148,7 @@ describe('hook path — ReasoningPush auto-emission', () => {
       // ctx.sessionId is exposed for exactly this purpose.
       onLLMOutput: (ctx) => ({
         decision: 'finish',
-        pushPayload: { messageKind: 'content', message: ctx.llmOutputText, sessionId: ctx.sessionId },
+        pushPayloads: [{ messageKind: 'content', message: ctx.llmOutputText, sessionId: ctx.sessionId }],
       }),
     });
     const res = await handler(makeRequest(hookPayload({ sessionId: 'sess-pair-1' })));
@@ -178,7 +178,7 @@ describe('hook path — ReasoningPush auto-emission', () => {
       autoEmitReasoning: false,
       onLLMOutput: (ctx) => ({
         decision: 'finish',
-        pushPayload: { messageKind: 'content', message: ctx.llmOutputText },
+        pushPayloads: [{ messageKind: 'content', message: ctx.llmOutputText }],
       }),
     });
     const res = await handler(makeRequest(hookPayload()));
@@ -228,7 +228,7 @@ describe('hook path — ReasoningPush auto-emission', () => {
         }
         return {
           decision: 'finish',
-          pushPayload: { messageKind: 'content', message: ctx.llmOutputText, sessionId: ctx.sessionId },
+          pushPayloads: [{ messageKind: 'content', message: ctx.llmOutputText, sessionId: ctx.sessionId }],
         };
       },
     });

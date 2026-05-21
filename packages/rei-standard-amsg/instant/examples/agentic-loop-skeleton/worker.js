@@ -53,7 +53,7 @@ async function onLLMOutput(ctx) {
   if (text.includes('NEED_TOOL')) {
     return {
       decision: 'tool-request',
-      pushPayload: buildToolRequestPush({
+      pushPayloads: [buildToolRequestPush({
         messageType: 'instant',
         source: 'instant',
         messageId: `msg_${crypto.randomUUID()}_tool`,
@@ -67,7 +67,7 @@ async function onLLMOutput(ctx) {
         contactName: ctx.contactName,
         // SW can include arbitrary client routing state in metadata.
         metadata: { iteration: ctx.iteration, messages: ctx.messages },
-      }),
+      })],
     };
   }
 
@@ -97,7 +97,7 @@ async function onLLMOutput(ctx) {
   // hook contract is `pushPayload: unknown`.
   return {
     decision: 'finish',
-    pushPayload: buildContentPush({
+    pushPayloads: [buildContentPush({
       messageType: 'instant',
       source: 'instant',
       messageId: `msg_${crypto.randomUUID()}_content_0`,
@@ -109,7 +109,7 @@ async function onLLMOutput(ctx) {
       messageIndex: 1,
       totalMessages: 1,
       taskId: null,
-    }),
+    })],
   };
 }
 

@@ -94,7 +94,7 @@ describe('agentic loop — decision: finish', () => {
       fetch: router.fetch,
       onLLMOutput: (ctx) => ({
         decision: 'finish',
-        pushPayload: { type: 'custom', text: ctx.llmOutputText },
+        pushPayloads: [{ type: 'custom', text: ctx.llmOutputText }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -103,7 +103,13 @@ describe('agentic loop — decision: finish', () => {
     assert.equal(body.data.status, 'finished');
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
-    assert.deepEqual(JSON.parse(decrypted), { type: 'custom', text: 'hi there' });
+    const decoded = JSON.parse(decrypted);
+    assert.equal(decoded.type, 'custom');
+    assert.equal(decoded.text, 'hi there');
+    // sendPushesSequentially auto-fills these on every push.
+    assert.equal(decoded.messageIndex, 1);
+    assert.equal(decoded.totalMessages, 1);
+    assert.match(decoded.messageId, /^msg_[0-9a-f-]+_chunk_0$/);
   });
 });
 
@@ -120,7 +126,7 @@ describe('agentic loop — decision: tool-request', () => {
       fetch: router.fetch,
       onLLMOutput: () => ({
         decision: 'tool-request',
-        pushPayload: { type: 'tool-request', tool: 'get_weather' },
+        pushPayloads: [{ type: 'tool-request', tool: 'get_weather' }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -154,7 +160,7 @@ describe('agentic loop — decision: continue → finish', () => {
           };
         }
         observedHistory = ctx.messages;
-        return { decision: 'finish', pushPayload: { type: 'done' } };
+        return { decision: 'finish', pushPayloads: [{ type: 'done' }] };
       },
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -294,7 +300,7 @@ describe('agentic loop — hook contract violations', () => {
       fetch: router.fetch,
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'finish', big: 1n },
+        pushPayloads: [{ type: 'finish', big: 1n }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -318,7 +324,7 @@ describe('agentic loop — SessionContext does not expose credentials', () => {
       fetch: router.fetch,
       onLLMOutput: (ctx) => {
         captured = ctx;
-        return { decision: 'finish', pushPayload: { ok: true } };
+        return { decision: 'finish', pushPayloads: [{ ok: true }] };
       },
     });
     await handler(makeRequest('http://h/instant', basePayload()));
@@ -344,9 +350,18 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
         llm: () => makeLlmResponse('x'),
       });
       const blobAdapter = createMemoryBlobStore();
-      // Build a JSON string of *exactly* `len` UTF-8 bytes:
-      //   `{"type":"x","p":"...payload..."}` — fixed overhead 17 chars.
-      const overhead = '{"type":"x","p":""}'.length;
+      // Build a JSON string of *exactly* `len` UTF-8 bytes after the
+      // sendPushesSequentially auto-fill mutates the push object.
+      // Final shape: {"type":"x","p":"...","messageId":"msg_<uuid>_chunk_0","messageIndex":1,"totalMessages":1}
+      // messageId is the only variable-width field; its UUID is 36 chars,
+      // so messageId value length is `msg_`.length + 36 + `_chunk_0`.length = 48.
+      const overhead = JSON.stringify({
+        type: 'x',
+        p: '',
+        messageId: 'm'.repeat(48),
+        messageIndex: 1,
+        totalMessages: 1,
+      }).length;
       const filler = 'a'.repeat(len - overhead);
       const handler = createInstantHandler({
         vapid,
@@ -354,7 +369,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
         blobStore: { adapter: blobAdapter },
         onLLMOutput: () => ({
           decision: 'finish',
-          pushPayload: { type: 'x', p: filler },
+          pushPayloads: [{ type: 'x', p: filler }],
         }),
       });
       const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -388,7 +403,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       blobStore: { adapter: blobAdapter },
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'cjk', p: cjk },
+        pushPayloads: [{ type: 'cjk', p: cjk }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -409,7 +424,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       onEvent: (e) => events.push(e),
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'big', p: 'a'.repeat(5000) },
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -435,7 +450,7 @@ describe('/blob/:key endpoint', () => {
       blobStore: { adapter: blobAdapter },
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'big', p: 'a'.repeat(5000) },
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
       }),
     });
     await handler(makeRequest('http://h/instant', basePayload()));
@@ -548,12 +563,12 @@ describe('/continue endpoint', () => {
         if (ctx.iteration === 0) {
           return {
             decision: 'tool-request',
-            pushPayload: { type: 'tool-request', tool: 'fetch_x' },
+            pushPayloads: [{ type: 'tool-request', tool: 'fetch_x' }],
           };
         }
         return {
           decision: 'finish',
-          pushPayload: { type: 'finish', text: ctx.llmOutputText },
+          pushPayloads: [{ type: 'finish', text: ctx.llmOutputText }],
         };
       },
     });
