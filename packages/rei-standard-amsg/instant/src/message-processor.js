@@ -45,65 +45,6 @@ const DEFAULT_BLOB_TTL_SECONDS = 60;
 const VALID_DECISIONS = new Set(['finish', 'tool-request', 'continue', 'skip-push']);
 const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 
-const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
-
-function splitOnceByRegex(chunk, regex) {
-  const out = chunk
-    .split(regex)
-    .reduce((acc, part, i, arr) => {
-      if (i % 2 === 0 && part.trim()) {
-        const punctuation = arr[i + 1] || '';
-        acc.push(part.trim() + punctuation);
-      }
-      return acc;
-    }, [])
-    .filter(s => s.length > 0);
-  // No-match fallback: pass the chunk through untouched so a later regex in
-  // a cascade can still take a swing at it.
-  return out.length > 0 ? out : [chunk];
-}
-
-/**
- * Split a message into individual sentences for sequential delivery.
- * Mirrors amsg-server message-processor.js (do not drift).
- *
- * `splitPattern` is an optional caller-provided override:
- *   - `string`              → single regex source, used in place of the default
- *   - `string[]`            → applied as a cascade: split by patterns[0], then
- *                             split each resulting chunk by patterns[1], etc.
- *   - omitted / null / [] / undefined → default /([。！？!?]+)/
- *
- * Capture-group convention: if you want the delimiter re-attached to the
- * preceding chunk (matches default behavior), wrap your delimiter in `(...)`
- * — e.g. `"([\\n]+)"` not `"[\\n]+"`. We don't auto-wrap; that would require
- * parsing escaped/character-class/non-capturing groups.
- *
- * Internal to `runLegacyInstant` — the legacy path still applies the
- * default sentence regex to content. The hook path no longer splits
- * (Task 4); hooks return the exact pushPayloads they want delivered.
- *
- * @param {string} messageContent
- * @param {string | string[] | null} [splitPattern=null]
- * @returns {string[]}
- */
-function splitMessageIntoSentences(messageContent, splitPattern = null) {
-  const sources =
-    splitPattern == null ? null :
-    Array.isArray(splitPattern) ? splitPattern :
-    [splitPattern];
-
-  const regexes = (sources && sources.length > 0)
-    ? sources.map(s => new RegExp(s))
-    : [DEFAULT_SPLIT_REGEX];
-
-  let chunks = [messageContent];
-  for (const regex of regexes) {
-    chunks = chunks.flatMap(c => splitOnceByRegex(c, regex));
-  }
-
-  return chunks.length > 0 ? chunks : [messageContent];
-}
-
 /**
  * Deliver `pushPayloads` sequentially via `sendPushWithMaybeBlob`,
  * spacing `SLEEP_BETWEEN_MESSAGES_MS` (1500 ms) between consecutive
@@ -138,7 +79,22 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
     }
     push.messageIndex = i + 1;
     push.totalMessages = total;
-    await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+    try {
+      await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+    } catch (err) {
+      // HookError / PayloadTooLargeError already carry their own .code and
+      // should propagate unwrapped — those are caller-shape contract
+      // violations, not transport failures.
+      if (err && (err.code === 'HOOK_THREW' || err.code === 'PAYLOAD_TOO_LARGE')) {
+        throw err;
+      }
+      const wrapped = new Error(err?.message || 'Web Push delivery failed');
+      wrapped.code = 'PUSH_SEND_FAILED';
+      wrapped.statusCode = err?.statusCode;
+      wrapped.messageIndex = i + 1;
+      wrapped.cause = err;
+      throw wrapped;
+    }
     if (i < total - 1) {
       await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
@@ -539,7 +495,21 @@ async function runLegacyInstant(payload, ctx) {
   }
 
   // Step 2: ContentPush burst.
-  const messages = splitMessageIntoSentences(messageContent);
+  // Sentence split — legacy path's v0.6-compat behaviour. The default
+  // regex matches Chinese full-stop family + ASCII ./!/? clusters; the
+  // reduce reattaches the matched delimiter to the preceding segment
+  // (split returns interleaved [segment, delim, segment, delim, ...]).
+  // No caller knob — the public `splitPattern` field is gone in next.4.
+  const splitOutput = messageContent
+    .split(/([。！？!?]+)/)
+    .reduce((acc, part, i, arr) => {
+      if (i % 2 === 0 && part.trim()) acc.push(part.trim() + (arr[i + 1] || ''));
+      return acc;
+    }, [])
+    .filter((s) => s.length > 0);
+  // Fallback preserves no-punctuation messages as a single push (matches
+  // the deleted helper's behaviour when the regex didn't match).
+  const messages = splitOutput.length > 0 ? splitOutput : [messageContent];
 
   for (let i = 0; i < messages.length; i++) {
     const contentPush = buildContentPush({
@@ -833,6 +803,12 @@ function assertValidDecision(decision) {
     }
     if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
       throw new TypeError(`pushPayloads[${i}].splitPattern is removed in next.4; caller is responsible for splitting`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'messageId')) {
+      const id = p.messageId;
+      if (typeof id !== 'string' || id === '') {
+        throw new TypeError(`pushPayloads[${i}].messageId must be a non-empty string when set, got ${stringifyForError(id)}`);
+      }
     }
   }
 }

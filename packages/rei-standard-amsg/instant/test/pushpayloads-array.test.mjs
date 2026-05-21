@@ -160,6 +160,8 @@ describe('3) mid-array throw aborts remaining + no final_pushed', () => {
       });
     } catch (e) { caught = e; }
     assert.ok(caught);
+    assert.equal(caught.code, 'PUSH_SEND_FAILED');
+    assert.equal(caught.messageIndex, 2);
     assert.equal(pushIdx, 2);
     assert.equal(events.some(e => e.type === 'final_pushed'), false);
   });
@@ -312,5 +314,36 @@ describe('13) reasoning auto-emit precedes hook pushPayloads', () => {
     assert.equal(pushes[0].reasoningContent, 'thinking...');
     assert.equal(pushes[1].messageKind, 'content');
     assert.equal(pushes[1].message, 'final answer');
+  });
+});
+
+// 14) messageId edge cases: empty string / null / non-string
+describe('14) messageId must be a non-empty string when set', () => {
+  it('rejects messageId: "" (empty string)', async () => {
+    const { res, body } = await runHandler({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'a', messageId: '' }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /messageId must be a non-empty string/);
+  });
+  it('rejects messageId: null', async () => {
+    const { res, body } = await runHandler({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'a', messageId: null }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /messageId must be a non-empty string/);
+  });
+  it('rejects messageId: 42 (non-string)', async () => {
+    const { res, body } = await runHandler({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'a', messageId: 42 }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /messageId must be a non-empty string/);
   });
 });

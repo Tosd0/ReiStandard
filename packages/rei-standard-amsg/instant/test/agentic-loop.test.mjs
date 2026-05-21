@@ -877,6 +877,8 @@ describe('next.4 — pushPayloads happy paths', () => {
       caught = err;
     }
     assert.ok(caught, 'mid-array failure should propagate');
+    assert.equal(caught.code, 'PUSH_SEND_FAILED');
+    assert.equal(caught.messageIndex, 2);
     assert.equal(pushIdx, 2, 'second push attempted, third skipped');
     assert.equal(events.some(e => e.type === 'final_pushed'), false, 'no final_pushed on partial delivery');
   });
