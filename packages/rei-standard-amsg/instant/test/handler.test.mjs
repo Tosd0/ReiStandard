@@ -159,6 +159,106 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(p).valid, false);
   });
 
+  // ── assistant tool_call carrier (OpenAI 协议: 带 tool_calls 时 content 可空) ──
+  it('accepts assistant + tool_calls + empty content string', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: '搜小红书' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'xhs_browse', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: '{"notes":[]}' },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('accepts assistant + tool_calls + null content', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } },
+        ],
+      },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('accepts assistant + tool_calls + missing content key', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        tool_calls: [
+          { id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } },
+        ],
+      },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('rejects assistant with empty content AND empty tool_calls', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: '', tool_calls: [] },
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /不能是空字符串/);
+  });
+
+  it('rejects assistant with malformed tool_calls entry', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c' }] }, // 缺 function
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /tool_calls\[0\] 形状非法/);
+  });
+
+  it('accepts tool message with empty-string content (空结果合法)', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: '' },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('requires tool_call_id on tool messages', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'tool', content: 'result' }, // 缺 tool_call_id
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /tool_call_id 必填/);
+  });
+
   it('accepts optional temperature', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: 0.3 })).valid, true);
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: null })).valid, true);

@@ -21,10 +21,10 @@
 
 /**
  * @typedef {Object} ChatMessage
- * @property {string} role  - One of system / user / assistant / tool / etc.
- * @property {string | unknown[]} [content]
- * @property {unknown} [tool_calls]
- * @property {string} [tool_call_id]
+ * @property {'system' | 'user' | 'assistant' | 'tool'} role
+ * @property {string | unknown[] | null} [content]  - 文本或多模态数组. 带 tool_calls 的 assistant 消息允许为 null / 空串 / 缺省.
+ * @property {Array<{ id: string, type: 'function', function: { name: string, arguments: string } }>} [tool_calls]  - assistant 发起工具调用时携带.
+ * @property {string} [tool_call_id]  - tool 消息必填, 用于关联到此前的 tool_call.
  * @property {string} [name]
  */
 

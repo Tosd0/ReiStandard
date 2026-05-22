@@ -1,5 +1,21 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.5 — `validateMessagesArray` 放宽 OpenAI tool-call 形态 (pre-release)
+
+非破坏性修复。`validateMessagesArray` 此前过严，会拒绝合法的 OpenAI 工具调用消息：
+
+- **`role: 'assistant'` + 非空 `tool_calls`**:`content` 现在允许为 `''` / `null` / 缺省 — 符合 OpenAI Chat Completions 协议（assistant 只发工具调用、没有 narration 是合法的）。同时对 `tool_calls` 数组做轻量形状校验（每条要 `{ id, type:'function', function:{ name, arguments } }`），形状非法时给出明确报错。
+- **`role: 'tool'`**:`content` 允许为空串（工具返空结果合法，如 search 无命中）；`tool_call_id` 现在强校验为必填字符串 — 这是 OpenAI 协议的硬约束，库之前漏校。
+- `system` / `user` / 不带 `tool_calls` 的 `assistant`：维持原校验，行为不变。
+
+### 类型
+
+`ChatMessage` typedef 同步更新：`role` 收窄为字面量联合；`content` 类型加入 `null`；`tool_calls` 改为结构化签名（`{ id, type:'function', function:{ name, arguments } }[]`）；`tool_call_id` 文档说明其在 tool 消息上必填。dist `*.d.ts` / `*.d.cts` 由 tsup 从源码 JSDoc 自动生成。
+
+### 影响
+
+任何之前因 `content: ''` 而 400 的 agentic-loop hook（典型场景：assistant 这一轮只回了 tool_calls 没有 narration，下一轮需要把 hook 内部历史回放给 `/continue`）现在可以直接通过。无需调整既有 hook 代码。
+
 ## 0.8.0-next.4 — BREAKING: pushPayloads-only hook decision API (pre-release)
 
 Install with `npm install @rei-standard/amsg-instant@next`. Pre-release — breaking on purpose. 见 [`docs/migration-0.8.0-next.4.md`](./docs/migration-0.8.0-next.4.md) 完整迁移指南.

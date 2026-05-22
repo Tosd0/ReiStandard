@@ -59,6 +59,37 @@ function validateMessagesArray(messages) {
     if (!VALID_MESSAGE_ROLES.has(m.role)) {
       return `messages[${i}].role 必须是 system / user / assistant / tool 之一`;
     }
+
+    // OpenAI 协议:assistant 消息在带 tool_calls 时, content 可为 null / 空串 / 缺省.
+    // 跳过 content 校验, 但仍要求 tool_calls 是非空数组 (否则就是无意义的纯空 assistant).
+    const isAssistantToolCallCarrier =
+      m.role === 'assistant'
+      && Array.isArray(m.tool_calls)
+      && m.tool_calls.length > 0;
+    if (isAssistantToolCallCarrier) {
+      // tool_calls 形状轻量校验 — 不严, 上游 LLM API 会再校一遍.
+      for (let j = 0; j < m.tool_calls.length; j++) {
+        const tc = m.tool_calls[j];
+        if (!tc || typeof tc !== 'object' || typeof tc.id !== 'string' || !tc.function) {
+          return `messages[${i}].tool_calls[${j}] 形状非法 (需要 { id, type:'function', function:{ name, arguments } })`;
+        }
+      }
+      continue;
+    }
+
+    // tool 消息: content 允许空串 (工具返回空结果是合法的, 例如 search 无命中);
+    // tool_call_id 必填 — 这是 OpenAI 协议的硬约束 (用于关联到此前的 tool_call).
+    if (m.role === 'tool') {
+      if (typeof m.content !== 'string' && !Array.isArray(m.content)) {
+        return `messages[${i}].content (tool) 必须是字符串或数组`;
+      }
+      if (typeof m.tool_call_id !== 'string' || !m.tool_call_id) {
+        return `messages[${i}].tool_call_id 必填 (tool 消息必须关联到一次 tool_call)`;
+      }
+      continue;
+    }
+
+    // system / user / 不带 tool_calls 的 assistant: 老校验.
     if (typeof m.content === 'string') {
       if (!m.content) {
         return `messages[${i}].content 不能是空字符串`;
