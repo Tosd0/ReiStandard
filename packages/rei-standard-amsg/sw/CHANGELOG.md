@@ -1,5 +1,10 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.1.0-next.3 — 新增 `onBusinessPayload` 离线钩子 (pre-release)
+
+- **新增**：`installReiSW` 的 options 参数增加 `onBusinessPayload: (payload: any) => void | Promise<void>` 钩子，支持业务端自行拦截完整的解析后 payload 并离线写库。
+- **功能集成**：在 SW 进行系统通知展示和 `postMessage` 客户端派发前，回调该拦截器。该钩子自动被融合进 `event.waitUntil` 生命周期链路，支持返回 `Promise` 以绝对保证离线写入能够在 SW 休眠前全部执行完毕。
+
 ## 2.1.0-next.2 — BREAKING: generic multipart reassembly (pre-release)
 
 next 阶段统一 multipart transport。SW 现在识别 `messageKind: "_multipart"` 的运输层分片，透明还原原始 payload 后再按原始 `messageKind` 走现有分发和通知策略。

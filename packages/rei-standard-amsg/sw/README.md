@@ -78,6 +78,11 @@ installReiSW(self, {
     maxTotalBytes: 256_000,
     maxChunks: 128,
     cleanupIntervalMs: 15 * 60_000
+  },
+  // （新增于 2.1.0-next.3）离线持久化等业务拦截钩子：
+  onBusinessPayload: async (payload) => {
+    // 收到完整 payload 时触发，由于内置在 event.waitUntil 中，能够确保离线写库完毕再允许 SW 休眠
+    // await db.saveIncomingMessage(payload);
   }
 });
 ```
@@ -125,7 +130,10 @@ import { installReiSW } from '@rei-standard/amsg-sw';
 installReiSW(self, {
   defaultIcon: '/icon-192x192.png',
   defaultBadge: '/badge-72x72.png',
-  multipart: { enabled: true }
+  multipart: { enabled: true },
+  onBusinessPayload: async (payload) => {
+    // 这里可安全地进行应用级别的离线数据库存储
+  }
 });
 
 // 业务侧自行实现点击跳转

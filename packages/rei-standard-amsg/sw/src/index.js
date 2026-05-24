@@ -111,6 +111,7 @@ export const REI_SW_MESSAGE_TYPE = Object.freeze({
  * @property {number} [multipart.maxTotalBytes=256000]
  * @property {number} [multipart.maxChunks=128]
  * @property {number} [multipart.cleanupIntervalMs=900000]
+ * @property {(payload: any) => void | Promise<void>} [onBusinessPayload]
  */
 
 /**
@@ -133,6 +134,7 @@ export function installReiSW(sw, opts = {}) {
       defaultBadge,
       defaultIcon,
       multipart,
+      onBusinessPayload: opts.onBusinessPayload,
       getLastMultipartCleanupAt: () => lastMultipartCleanupAt,
       setLastMultipartCleanupAt: (value) => { lastMultipartCleanupAt = value; },
     }));
@@ -174,6 +176,7 @@ async function handlePushPayload(sw, payload, ctx) {
   await dispatchBusinessPayload(sw, payload, {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
+    onBusinessPayload: ctx.onBusinessPayload,
   });
 }
 
@@ -190,6 +193,19 @@ async function dispatchBusinessPayload(sw, payload, defaults) {
       work.push(
         sw.registration.showNotification(notification.title, notification.options)
       );
+    }
+  }
+
+  if (typeof defaults.onBusinessPayload === 'function') {
+    try {
+      const result = defaults.onBusinessPayload(payload);
+      if (result instanceof Promise) {
+        work.push(result.catch(error => {
+          console.error('[rei-standard-amsg-sw] onBusinessPayload promise rejected:', error);
+        }));
+      }
+    } catch (error) {
+      console.error('[rei-standard-amsg-sw] onBusinessPayload error:', error);
     }
   }
 
