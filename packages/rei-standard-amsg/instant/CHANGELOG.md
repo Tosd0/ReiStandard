@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.7 — Dependency bump (pre-release)
+
+- 依赖更新：升级 `@rei-standard/amsg-shared` 到 `0.1.0-next.4` 以获取最新的 `notification.show` 和 `multipart` 相关工具。删除了项目内的 `base64` / `concat` 工具函数，迁移使用 `amsg-shared` 导出的底层工具，提升代码可维护性。
+
 ## 0.8.0-next.6 — BREAKING: generic multipart transport (pre-release)
 
 next 阶段把 oversized push 的 transport 收敛成一套通用 multipart 协议。旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除；`reasoning`、`tool_request`、`content`、`error`、`emotion_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，都可以被 `_multipart` 包装。

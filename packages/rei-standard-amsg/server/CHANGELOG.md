@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.4.0-next.2 — Dependency bump (pre-release)
+
+- 依赖更新：同步升级 `@rei-standard/amsg-shared` 至 `0.1.0-next.4`。
+
 ## 2.4.0-next.1 — avatarUrl 软清空 (pre-release)
 
 Cherry-pick stable `2.3.3` 的 `avatarUrl` 软清空策略到 next 预发布线。把 2.3.1 引入的"严格 400"放宽为"`console.warn` + 把 `avatarUrl` 置空 + 继续"：`schedule-message` 不合法的 `avatarUrl` 在 payload 上置 `null`，`update-message` 把不合法字段从 patch 里 `delete`（旧头像保持不变）。`INVALID_PARAMETERS` / `INVALID_UPDATE_DATA` 不再为 `avatarUrl` 触发，其它字段错误码不变。详见 `2.3.3` stable 条目；与 `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-client` 2.3.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。

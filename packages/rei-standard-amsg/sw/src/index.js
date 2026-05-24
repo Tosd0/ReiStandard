@@ -51,11 +51,15 @@
  * @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush
  */
 
+import { MESSAGE_KIND, base64UrlToBytes, concatBytes } from '@rei-standard/amsg-shared';
+
 const REI_SW_DB_NAME = 'rei-sw';
 const REI_SW_DB_STORE = 'request-outbox';
 const REI_SW_MULTIPART_STORE = 'multipart-pending';
 const REI_SW_MULTIPART_DONE_STORE = 'multipart-done';
-const REI_SW_DB_VERSION = 2;
+const REI_SW_MULTIPART_CHUNK_STORE = 'multipart-chunk';
+const REI_SW_DB_VERSION = 3;
+let cachedDB = null;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
 const MULTIPART_MESSAGE_KIND = '_multipart';
 const MULTIPART_ENCODING = 'json-utf8-base64url';
@@ -68,6 +72,7 @@ const DEFAULT_MULTIPART_OPTIONS = Object.freeze({
 });
 const memoryMultipartPending = new Map();
 const memoryMultipartDone = new Map();
+const memoryMultipartChunks = new Map();
 
 /**
  * Wire-level message type for SW → client postMessage envelopes.
@@ -182,10 +187,33 @@ async function handlePushPayload(sw, payload, ctx) {
 
 async function dispatchBusinessPayload(sw, payload, defaults) {
   const eventName = resolveEventName(payload);
-  const shouldRenderNotification = isNotificationKind(payload);
+
+  let clientList = [];
+  try {
+    clientList = await sw.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    });
+  } catch (_matchError) {
+    // Ignored
+  }
+  
+  let shouldRenderNotification = false;
+  const showOpt = payload && payload.notification ? payload.notification.show : undefined;
+
+  if (showOpt === 'always') {
+    shouldRenderNotification = true;
+  } else if (showOpt === 'when-hidden') {
+    const hasVisibleClient = clientList.some(client => client.visibilityState === 'visible');
+    shouldRenderNotification = !hasVisibleClient;
+  } else if (showOpt === false) {
+    shouldRenderNotification = false;
+  } else {
+    shouldRenderNotification = isNotificationKind(payload);
+  }
 
   /** @type {Array<Promise<unknown>>} */
-  const work = [dispatchPushToClients(sw, eventName, payload)];
+  const work = [dispatchPushToClients(sw, eventName, payload, clientList)];
 
   if (shouldRenderNotification) {
     const notification = createNotificationFromPayload(payload, defaults);
@@ -223,13 +251,13 @@ async function dispatchBusinessPayload(sw, payload, defaults) {
 function resolveEventName(payload) {
   const kind = payload && typeof payload === 'object' ? payload.messageKind : undefined;
   switch (kind) {
-    case 'content':
+    case MESSAGE_KIND.CONTENT:
       return REI_SW_EVENT.CONTENT_RECEIVED;
-    case 'reasoning':
+    case MESSAGE_KIND.REASONING:
       return REI_SW_EVENT.REASONING_RECEIVED;
-    case 'tool_request':
+    case MESSAGE_KIND.TOOL_REQUEST:
       return REI_SW_EVENT.TOOL_REQUEST_RECEIVED;
-    case 'error':
+    case MESSAGE_KIND.ERROR:
       return REI_SW_EVENT.ERROR_RECEIVED;
     default:
       return REI_SW_EVENT.UNKNOWN_RECEIVED;
@@ -252,7 +280,7 @@ function isNotificationKind(payload) {
   if (!payload || typeof payload !== 'object') return false;
   const kind = payload.messageKind;
   if (kind === undefined || kind === null) return true;
-  return kind === 'content';
+  return kind === MESSAGE_KIND.CONTENT;
 }
 
 /**
@@ -267,9 +295,9 @@ function isNotificationKind(payload) {
  * @param {Record<string, unknown>}  payload
  * @returns {Promise<void>}
  */
-async function dispatchPushToClients(sw, eventName, payload) {
+async function dispatchPushToClients(sw, eventName, payload, preFetchedClientList = null) {
   try {
-    const clientList = await sw.clients.matchAll({
+    const clientList = preFetchedClientList || await sw.clients.matchAll({
       type: 'window',
       includeUncontrolled: true
     });
@@ -324,12 +352,12 @@ function createNotificationFromPayload(payload, defaults) {
   const title =
     pushNotification.title ||
     payload.title ||
-    (payload.contactName && `来自 ${payload.contactName}`) ||
+    payload.contactName ||
     'New notification';
   const body = pushNotification.body || payload.body || payload.message || '';
-  const data = payload.data && typeof payload.data === 'object'
-    ? { ...payload.data }
-    : {};
+  const data = pushNotification.data && typeof pushNotification.data === 'object'
+    ? { ...pushNotification.data }
+    : (payload.data && typeof payload.data === 'object' ? { ...payload.data } : {});
 
   // Keep original payload so the app can decide how to route clicks.
   if (data.payload == null) data.payload = payload;
@@ -422,29 +450,38 @@ async function acceptMultipartChunk(sw, payload, options) {
         total: normalized.total,
         originalMessageKind: normalized.originalMessageKind,
         encoding: normalized.encoding,
-        chunks: {},
+        receivedCount: 0,
         receivedBytes: 0,
       };
 
   if (base.total !== normalized.total || base.encoding !== normalized.encoding) {
     await deleteMultipartPending(normalized.id);
+    await deleteMultipartChunks(normalized.id, base.total);
     return null;
   }
 
-  if (base.chunks[String(normalized.index)] !== undefined) {
-    return null;
-  }
+  const chunkId = `${normalized.id}_${normalized.index}`;
+  const chunkExists = await hasMultipartChunk(chunkId);
+  if (chunkExists) return null;
 
-  base.chunks[String(normalized.index)] = normalized.chunk;
+  base.receivedCount++;
   base.receivedBytes = positiveIntegerOrDefault(base.receivedBytes, 0) +
     normalized.chunkBytes.byteLength;
+
   if (base.receivedBytes > options.maxTotalBytes) {
     await deleteMultipartPending(normalized.id);
+    await deleteMultipartChunks(normalized.id, base.total);
     return null;
   }
 
-  const received = Object.keys(base.chunks).length;
-  if (received < base.total) {
+  await writeMultipartChunk({
+    id_index: chunkId,
+    id: normalized.id,
+    index: normalized.index,
+    chunk: normalized.chunk
+  });
+
+  if (base.receivedCount < base.total) {
     await writeMultipartPending(base);
     return null;
   }
@@ -452,10 +489,12 @@ async function acceptMultipartChunk(sw, payload, options) {
   await deleteMultipartPending(base.id);
   let restored;
   try {
-    restored = restoreMultipartPayload(base, options);
+    restored = await restoreMultipartPayload(base, options);
   } catch (_error) {
+    await deleteMultipartChunks(base.id, base.total);
     return null;
   }
+  await deleteMultipartChunks(base.id, base.total);
   // Keep the done marker longer than the pending TTL so push-service
   // redelivery cannot trigger a second business event after completion.
   const doneTtlMs = Math.max(base.ttlMs * 2, base.ttlMs + 1);
@@ -478,7 +517,7 @@ function normalizeMultipartChunk(payload, options) {
   let chunkBytes;
   try {
     chunkBytes = base64UrlToBytes(payload.chunk);
-  } catch (_error) {
+  } catch (_error) { console.error("RESTORE ERROR", _error);
     return null;
   }
 
@@ -506,16 +545,16 @@ function normalizeMultipartChunk(payload, options) {
   };
 }
 
-function restoreMultipartPayload(record, options) {
+async function restoreMultipartPayload(record, options) {
   /** @type {Uint8Array[]} */
   const chunks = [];
   let totalBytes = 0;
   for (let index = 1; index <= record.total; index++) {
-    const chunk = record.chunks[String(index)];
-    if (typeof chunk !== 'string') {
+    const chunkRecord = await readMultipartChunk(record.id, index);
+    if (!chunkRecord || typeof chunkRecord.chunk !== 'string') {
       throw new Error('[rei-standard-amsg-sw] multipart missing chunk');
     }
-    const bytes = base64UrlToBytes(chunk);
+    const bytes = base64UrlToBytes(chunkRecord.chunk);
     totalBytes += bytes.byteLength;
     if (totalBytes > options.maxTotalBytes) {
       throw new Error('[rei-standard-amsg-sw] multipart payload exceeds maxTotalBytes');
@@ -523,7 +562,7 @@ function restoreMultipartPayload(record, options) {
     chunks.push(bytes);
   }
 
-  const json = new TextDecoder('utf-8', { fatal: false }).decode(concatBytes(chunks));
+  const json = new TextDecoder('utf-8', { fatal: false }).decode(concatBytes(...chunks));
   return JSON.parse(json);
 }
 
@@ -535,61 +574,73 @@ async function maybeCleanupMultipart(sw, ctx) {
   ctx.setLastMultipartCleanupAt(now);
   try {
     await cleanupMultipartStores(sw, now);
-  } catch (_error) {
+  } catch (_error) { console.error("RESTORE ERROR", _error);
     // Cleanup is observability/housekeeping; never block a fresh push.
   }
 }
 
 async function cleanupMultipartStores(sw, now) {
-  const pending = await listMultipartPending();
-  for (const record of pending) {
-    if (record.expiresAt > now) continue;
-    await deleteMultipartPending(record.id);
+  if (!hasIndexedDB()) {
+    for (const [id, record] of memoryMultipartPending.entries()) {
+      if (record.expiresAt <= now) {
+        memoryMultipartPending.delete(id);
+        await deleteMultipartChunks(id, record.total);
+        await dispatchMultipartExpired(sw, record);
+      }
+    }
+    for (const [id, record] of memoryMultipartDone.entries()) {
+      if (record.expiresAt <= now) {
+        memoryMultipartDone.delete(id);
+      }
+    }
+    return;
+  }
+
+  const pendingExpired = await withDatabaseStore(REI_SW_MULTIPART_STORE, 'readonly', (store, resolve, reject) => {
+    const index = store.index('expiresAt');
+    const range = IDBKeyRange.upperBound(now);
+    const req = index.getAll(range);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  for (const record of pendingExpired) {
+    await deleteStoreRecord(REI_SW_MULTIPART_STORE, record.id);
+    await deleteMultipartChunks(record.id, record.total);
     await dispatchMultipartExpired(sw, record);
   }
 
-  const done = await listMultipartDone();
-  for (const record of done) {
-    if (record.expiresAt <= now) {
-      await deleteMultipartDone(record.id);
+  const doneExpiredKeys = await withDatabaseStore(REI_SW_MULTIPART_DONE_STORE, 'readonly', (store, resolve, reject) => {
+    const index = store.index('expiresAt');
+    const range = IDBKeyRange.upperBound(now);
+    if (index.getAllKeys) {
+      const req = index.getAllKeys(range);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    } else {
+      const req = index.getAll(range);
+      req.onsuccess = () => resolve((req.result || []).map(r => r.id));
+      req.onerror = () => reject(req.error);
     }
+  });
+
+  for (const id of doneExpiredKeys) {
+    await deleteStoreRecord(REI_SW_MULTIPART_DONE_STORE, id);
   }
 }
 
 async function dispatchMultipartExpired(sw, record) {
   await dispatchPushToClients(sw, REI_SW_EVENT.MULTIPART_EXPIRED, {
     id: record.id,
-    received: record.chunks && typeof record.chunks === 'object'
-      ? Object.keys(record.chunks).length
+    received: typeof record.receivedCount === 'number'
+      ? record.receivedCount
       : 0,
     total: record.total,
     originalMessageKind: record.originalMessageKind,
   });
 }
 
-function base64UrlToBytes(input) {
-  const s = String(input).replace(/-/g, '+').replace(/_/g, '/');
-  const pad = (4 - (s.length % 4)) % 4;
-  const padded = s + '='.repeat(pad);
-  const bin = (typeof atob === 'function')
-    ? atob(padded)
-    : Buffer.from(padded, 'base64').toString('binary');
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
 
-function concatBytes(chunks) {
-  let total = 0;
-  for (const chunk of chunks) total += chunk.byteLength;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
 
 async function enqueueAndFlush(sw, event, requestPayload) {
   try {
@@ -669,7 +720,7 @@ function normalizeRequestBody(bodyInput) {
 
   try {
     return JSON.stringify(bodyInput);
-  } catch (_error) {
+  } catch (_error) { console.error("RESTORE ERROR", _error);
     throw new Error('[rei-standard-amsg-sw] request body is not serializable');
   }
 }
@@ -703,7 +754,7 @@ async function trySendQueuedRequest(queuedRequest) {
     }
 
     return false;
-  } catch (_error) {
+  } catch (_error) { console.error("RESTORE ERROR", _error);
     return false;
   }
 }
@@ -714,7 +765,7 @@ async function registerFlushSync(sw) {
 
   try {
     await syncManager.register(REI_SW_SYNC_TAG);
-  } catch (_error) {
+  } catch (_error) { console.error("RESTORE ERROR", _error);
     // Ignore unsupported/denied sync registration and rely on manual flush.
   }
 }
@@ -762,6 +813,59 @@ function deleteMultipartDone(id) {
 
 function listMultipartDone() {
   return listStoreRecords(REI_SW_MULTIPART_DONE_STORE);
+}
+
+async function hasMultipartChunk(id_index) {
+  if (!hasIndexedDB()) return memoryMultipartChunks.has(id_index);
+  return withDatabaseStore(REI_SW_MULTIPART_CHUNK_STORE, 'readonly', (store, resolve, reject) => {
+    const request = store.count(id_index);
+    request.onsuccess = () => resolve(request.result > 0);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function writeMultipartChunk(record) {
+  if (!hasIndexedDB()) {
+    memoryMultipartChunks.set(record.id_index, cloneRecord(record));
+    return Promise.resolve();
+  }
+  return putStoreRecord(REI_SW_MULTIPART_CHUNK_STORE, record);
+}
+
+function readMultipartChunk(id, index) {
+  const id_index = `${id}_${index}`;
+  if (!hasIndexedDB()) {
+    return Promise.resolve(cloneRecord(memoryMultipartChunks.get(id_index) || null));
+  }
+  return readStoreRecord(REI_SW_MULTIPART_CHUNK_STORE, id_index);
+}
+
+async function deleteMultipartChunks(id, total) {
+  if (!hasIndexedDB()) {
+    for (let index = 1; index <= total; index++) {
+      memoryMultipartChunks.delete(`${id}_${index}`);
+    }
+    return;
+  }
+  return withDatabaseStore(REI_SW_MULTIPART_CHUNK_STORE, 'readwrite', (store, resolve, reject) => {
+    let pending = total;
+    let failed = false;
+    for (let index = 1; index <= total; index++) {
+      const request = store.delete(`${id}_${index}`);
+      request.onsuccess = () => {
+        if (failed) return;
+        pending--;
+        if (pending === 0) resolve(undefined);
+      };
+      request.onerror = () => {
+        if (!failed) {
+          failed = true;
+          reject(request.error);
+        }
+      };
+    }
+    if (total === 0) resolve(undefined);
+  });
 }
 
 async function readStoreRecord(storeName, id) {
@@ -816,16 +920,12 @@ async function listStoreRecords(storeName) {
 
 async function withDatabaseStore(storeName, mode, handler) {
   const db = await openQueueDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction(storeName, mode);
-      const store = transaction.objectStore(storeName);
-      transaction.onerror = () => reject(transaction.error || new Error('Database transaction failed'));
-      Promise.resolve(handler(store, resolve, reject)).catch(reject);
-    });
-  } finally {
-    db.close();
-  }
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(storeName, mode);
+    const store = transaction.objectStore(storeName);
+    transaction.onerror = () => reject(transaction.error || new Error('Database transaction failed'));
+    Promise.resolve(handler(store, resolve, reject)).catch(reject);
+  });
 }
 
 function hasIndexedDB() {
@@ -837,6 +937,7 @@ function hasIndexedDB() {
 function memoryStoreFor(storeName) {
   if (storeName === REI_SW_MULTIPART_DONE_STORE) return memoryMultipartDone;
   if (storeName === REI_SW_MULTIPART_STORE) return memoryMultipartPending;
+  if (storeName === REI_SW_MULTIPART_CHUNK_STORE) return memoryMultipartChunks;
   throw new Error(`[rei-standard-amsg-sw] unknown memory store: ${storeName}`);
 }
 
@@ -846,42 +947,55 @@ function cloneRecord(record) {
 }
 
 function openQueueDatabase() {
+  if (cachedDB) return Promise.resolve(cachedDB);
+
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(REI_SW_DB_NAME, REI_SW_DB_VERSION);
 
     request.onupgradeneeded = () => {
       const db = request.result;
-      createObjectStoreIfMissing(db, REI_SW_DB_STORE, { keyPath: 'id', autoIncrement: true });
-      createObjectStoreIfMissing(db, REI_SW_MULTIPART_STORE, { keyPath: 'id' });
-      createObjectStoreIfMissing(db, REI_SW_MULTIPART_DONE_STORE, { keyPath: 'id' });
+      const tx = request.transaction;
+      createObjectStoreIfMissing(db, tx, REI_SW_DB_STORE, { keyPath: 'id', autoIncrement: true });
+      const mpStore = createObjectStoreIfMissing(db, tx, REI_SW_MULTIPART_STORE, { keyPath: 'id' });
+      const mpDoneStore = createObjectStoreIfMissing(db, tx, REI_SW_MULTIPART_DONE_STORE, { keyPath: 'id' });
+      createObjectStoreIfMissing(db, tx, REI_SW_MULTIPART_CHUNK_STORE, { keyPath: 'id_index' });
+
+      if (mpStore && !mpStore.indexNames.contains('expiresAt')) {
+        mpStore.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
+      if (mpDoneStore && !mpDoneStore.indexNames.contains('expiresAt')) {
+        mpDoneStore.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
     };
 
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      cachedDB = request.result;
+      cachedDB.onversionchange = () => {
+        cachedDB.close();
+        cachedDB = null;
+      };
+      resolve(cachedDB);
+    };
     request.onerror = () => reject(request.error || new Error('Failed to open queue database'));
   });
 }
 
-function createObjectStoreIfMissing(db, name, options) {
-  if (db.objectStoreNames.contains(name)) return;
-  db.createObjectStore(name, options);
+function createObjectStoreIfMissing(db, tx, name, options) {
+  if (db.objectStoreNames.contains(name)) return tx.objectStore(name);
+  return db.createObjectStore(name, options);
 }
 
 async function withQueueStore(mode, handler) {
   const db = await openQueueDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(REI_SW_DB_STORE, mode);
+    const store = transaction.objectStore(REI_SW_DB_STORE);
 
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction(REI_SW_DB_STORE, mode);
-      const store = transaction.objectStore(REI_SW_DB_STORE);
+    transaction.oncomplete = () => resolve(undefined);
+    transaction.onerror = () => reject(transaction.error || new Error('Queue transaction failed'));
 
-      transaction.oncomplete = () => resolve(undefined);
-      transaction.onerror = () => reject(transaction.error || new Error('Queue transaction failed'));
-
-      Promise.resolve(handler(store, resolve, reject)).catch(reject);
-    });
-  } finally {
-    db.close();
-  }
+    Promise.resolve(handler(store, resolve, reject)).catch(reject);
+  });
 }
 
 async function addQueuedRequest(request) {

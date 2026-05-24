@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.3.0-next.2 — Dependency bump (pre-release)
+
+- 依赖更新：同步升级 `@rei-standard/amsg-shared` 至 `0.1.0-next.4`。
+
 ## 2.3.0-next.1 — avatarUrl 本地软清空 (pre-release)
 
 Cherry-pick stable `2.2.4` 的本地 `avatarUrl` 软清空到 next 预发布线。`scheduleMessage` / `sendInstant` / `updateMessage` 不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串）改为 `console.warn` + 在 payload 上置 `null`（`updateMessage` 路径走 `delete` 以保留服务端原头像），请求继续发送。`Error.code === 'INVALID_AVATAR_URL_LOCAL'` 已移除；`PAYLOAD_TOO_LARGE_LOCAL`（3KB 体积上限）保留不变。详见 `2.2.4` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。

@@ -95,33 +95,28 @@ export const PUSH_SOURCE = Object.freeze({
  * @property {string}      timestamp     - ISO 8601 timestamp at producer.
  * @property {string}      [messageSubtype] - Caller-defined business namespace. Defaults to 'chat' at producers.
  * @property {Object}      [metadata]    - Caller passthrough. Packages MUST NOT write here.
+ * @property {NotificationDirective} [notification] - SW notification strategy.
  */
 
 // ─── Per-kind interfaces ────────────────────────────────────────────────
 
 /**
- * SW-rendering directive carried on `ContentPush` / `ToolRequestPush`.
- * Mirrors the seven fields that `amsg-sw`'s `createNotificationFromPayload`
- * actually consumes (`notification.{title,body,icon,badge,tag,renotify,requireInteraction}`)
- * — typing all seven (rather than just `title` / `body`) so callers
- * don't lose IDE checking on the other five and slip back into the
- * untyped-spread footgun this typedef was added to close.
+ * SW-rendering directive. Mirrors the fields that `amsg-sw`'s
+ * `createNotificationFromPayload` consumes (`notification.{title,body,icon,badge,tag,renotify,requireInteraction,data}`)
+ * — typing all fields so callers don't lose IDE checking and slip back into the untyped-spread footgun.
  *
  * Routing in SW (kept here so producers don't have to cross-check):
- *   - `messageKind: 'content'` (and legacy un-kinded payloads) →
- *     `notification.*` is consulted, with per-field fallback to
+ *   - By default (`show: "auto"` or omitted), `messageKind: 'content'` (and legacy un-kinded payloads)
+ *     will display a system notification. `reasoning` / `tool_request` / `error` will dispatch silently.
+ *   - `show: "always"`, `"when-hidden"`, or `false` overrides this default.
+ *   - When rendering, `notification.*` is consulted, with per-field fallback to
  *     the top-level `title` / `avatarUrl` / `messageId` and finally
  *     to the SW's `defaultIcon` / `defaultBadge` options. Everything
  *     else (`tag`, `renotify`, `requireInteraction`) has no top-level
- *     fallback — set them under `notification` or accept the SW
- *     default (`messageId`-derived tag, no renotify, no requireInteraction).
- *   - `messageKind: 'reasoning'` / `'tool_request'` / `'error'` →
- *     dispatched silently to controlled clients. `notification` is
- *     ignored. (It's still typed on `ToolRequestPush` because the
- *     splitter demotes prefix chunks to `messageKind: 'content'`, at
- *     which point the field starts mattering.)
+ *     fallback — set them under `notification` or accept the SW default.
  *
  * @typedef {Object} NotificationDirective
+ * @property {"auto" | "always" | "when-hidden" | false} [show] - Rendering strategy. Defaults to "auto" (render only if messageKind is content).
  * @property {string}  [title]              - Notification title override.
  * @property {string}  [body]               - Notification body override.
  * @property {string}  [icon]               - Icon URL override (falls back to top-level `avatarUrl` then SW `defaultIcon`).
@@ -129,6 +124,7 @@ export const PUSH_SOURCE = Object.freeze({
  * @property {string}  [tag]                - Notification grouping tag; matching tag replaces the prior notification.
  * @property {boolean} [renotify]           - When tag matches, still vibrate/sound. Default false at SW.
  * @property {boolean} [requireInteraction] - Notification stays until user dismisses. Default false at SW.
+ * @property {Record<string, unknown>} [data] - Custom payload data to attach to the notification.
  */
 
 /**
@@ -145,7 +141,6 @@ export const PUSH_SOURCE = Object.freeze({
  *   messageIndex?: number,
  *   totalMessages?: number,
  *   taskId?:       string | null,
- *   notification?: NotificationDirective,
  * }} ContentPush
  */
 
@@ -201,7 +196,6 @@ export const PUSH_SOURCE = Object.freeze({
  *   title?:       string,
  *   contactName?: string,
  *   message?:     string,
- *   notification?: NotificationDirective,
  * }} ToolRequestPush
  */
 
@@ -354,6 +348,7 @@ export function buildReasoningPush(args) {
   if (typeof args.reasoningContent !== 'string' || !args.reasoningContent) {
     throw new Error("[amsg-shared] ReasoningPush: 'reasoningContent' must be a non-empty string");
   }
+  validateNotificationArg('ReasoningPush', args.notification);
 
   /** @type {ReasoningPush} */
   const push = {
@@ -374,6 +369,7 @@ export function buildReasoningPush(args) {
   if (args.chunkIndex !== undefined) push.chunkIndex = args.chunkIndex;
   if (args.totalChunks !== undefined) push.totalChunks = args.totalChunks;
   if (args.metadata !== undefined) push.metadata = args.metadata;
+  if (args.notification !== undefined) push.notification = args.notification;
   return push;
 }
 
@@ -435,9 +431,8 @@ export function buildToolRequestPush(args) {
 }
 
 /**
- * Validate the optional `notification` argument on
- * `buildContentPush` / `buildToolRequestPush`. Plain object required
- * (`null` / arrays / primitives rejected); field-level shape is
+ * Validate the optional `notification` argument.
+ * Plain object required (`null` / arrays / primitives rejected); field-level shape is
  * checked best-effort — `title` / `body` / `icon` / `badge` / `tag`
  * must be strings when present, `renotify` / `requireInteraction`
  * must be booleans. Unknown keys are tolerated so the SW's
@@ -452,6 +447,9 @@ function validateNotificationArg(kind, value) {
     throw new Error(`[amsg-shared] ${kind}: 'notification' must be a plain object`);
   }
   const n = /** @type {Record<string, unknown>} */ (value);
+  if (n.show !== undefined && !['auto', 'always', 'when-hidden', false].includes(n.show)) {
+    throw new Error(`[amsg-shared] ${kind}: 'notification.show' must be "auto", "always", "when-hidden", or false`);
+  }
   for (const f of ['title', 'body', 'icon', 'badge', 'tag']) {
     if (n[f] !== undefined && typeof n[f] !== 'string') {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a string when present`);
@@ -461,6 +459,9 @@ function validateNotificationArg(kind, value) {
     if (n[f] !== undefined && typeof n[f] !== 'boolean') {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a boolean when present`);
     }
+  }
+  if (n.data !== undefined && (n.data === null || typeof n.data !== 'object' || Array.isArray(n.data))) {
+    throw new Error(`[amsg-shared] ${kind}: 'notification.data' must be a plain object when present`);
   }
 }
 
@@ -481,6 +482,7 @@ function validateNotificationArg(kind, value) {
  * @param {number}      [args.iteration]
  * @param {string}      [args.messageSubtype]
  * @param {Object}      [args.metadata]
+ * @param {NotificationDirective} [args.notification]
  * @returns {ErrorPush}
  */
 export function buildErrorPush(args) {
@@ -492,6 +494,7 @@ export function buildErrorPush(args) {
   if (typeof args.message !== 'string') {
     throw new Error("[amsg-shared] ErrorPush: 'message' must be a string");
   }
+  validateNotificationArg('ErrorPush', args.notification);
 
   /** @type {ErrorPush} */
   const push = {
@@ -507,6 +510,7 @@ export function buildErrorPush(args) {
   if (args.iteration !== undefined) push.iteration = args.iteration;
   if (args.messageSubtype !== undefined) push.messageSubtype = args.messageSubtype;
   if (args.metadata !== undefined) push.metadata = args.metadata;
+  if (args.notification !== undefined) push.notification = args.notification;
   return push;
 }
 
@@ -631,4 +635,50 @@ export function chunkReasoningByUtf8Bytes(text, maxBytes) {
     start = end;
   }
   return chunks;
+}
+
+// ─── Shared Utilities ───────────────────────────────────────────────────
+
+/**
+ * Coerce ArrayBuffer | Uint8Array | view → Uint8Array (no copy when possible).
+ */
+export function toUint8(buf) {
+  if (buf instanceof Uint8Array) return buf;
+  if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+  if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  throw new TypeError('Expected ArrayBuffer / Uint8Array');
+}
+
+/**
+ * Decode base64url (with or without padding) → Uint8Array.
+ * @param {string} input
+ * @returns {Uint8Array}
+ */
+export function base64UrlToBytes(input) {
+  const s = String(input).replace(/-/g, '+').replace(/_/g, '/');
+  const pad = (4 - (s.length % 4)) % 4;
+  const padded = s + '='.repeat(pad);
+  const bin = (typeof atob === 'function')
+    ? atob(padded)
+    : Buffer.from(padded, 'base64').toString('binary');
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Concatenate Uint8Arrays into a single Uint8Array.
+ * @param {...(Uint8Array | ArrayBuffer | ArrayBufferView)} chunks
+ * @returns {Uint8Array}
+ */
+export function concatBytes(...chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c), offset);
+    offset += c.byteLength;
+  }
+  return out;
 }

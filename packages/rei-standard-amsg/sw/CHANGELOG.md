@@ -1,5 +1,16 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.1.0-next.4 — notification.show 及 Multipart chunk store (pre-release)
+
+### New
+- **`notification.show`** 通知显示策略: 支持 `"auto"` | `"always"` | `"when-hidden"` | `false`。现在可以直接通过包级策略实现 "有可见窗口时静默，无可见窗口时弹通知" (`"when-hidden"`) 等应用场景。
+
+### Changed
+- **性能优化**：`dispatchBusinessPayload` 现在只会调用一次 `sw.clients.matchAll` 从而避免多余的 IPC 开销。
+- **IndexedDB 性能优化**：通过 `cachedDB` 保持 DB 连接，防止碎片化的 `openQueueDatabase` 导致的延迟。`REI_SW_DB_VERSION` 升级至 `3`。
+- **Multipart Chunk Store**：新增 `multipart-chunk` object store 用于独立存储分片的 payload，提升了超大 payload 还原的内存稳定性和入库速度。添加了 `expiresAt` 索引大幅加速清理超时数据的过程。
+- **去处硬编码**：移除了 `createNotificationFromPayload` 中硬编码的 “来自 {contactName}” 兜底，现在只会优雅地 fallback 到 `payload.contactName`。使用 `amsg-shared` 导出的 `MESSAGE_KIND` 枚举替代了魔法字符串。
+
 ## 2.1.0-next.3 — 新增 `onBusinessPayload` 离线钩子 (pre-release)
 
 - **新增**：`installReiSW` 的 options 参数增加 `onBusinessPayload: (payload: any) => void | Promise<void>` 钩子，支持业务端自行拦截完整的解析后 payload 并离线写库。

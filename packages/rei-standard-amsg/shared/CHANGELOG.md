@@ -1,5 +1,11 @@
 # @rei-standard/amsg-shared
 
+## 0.1.0-next.4 — NotificationDirective 与 Shared utilities (pre-release)
+
+### New
+- **Shared Utilities**：新增并导出了底层工具函数 `base64UrlToBytes`, `toUint8`, 和 `concatBytes`，统一了底层依赖。
+- **NotificationDirective**：新增了对 `notification.show` (`"auto"` | `"always"` | `"when-hidden"` | `false`) 参数的类型定义与验证逻辑。
+
 ## 0.1.0-next.3 — `notification` 字段 typed support (pre-release)
 
 Coordinated with `@rei-standard/amsg-instant@0.8.0-next.3`. Install with `npm install @rei-standard/amsg-shared@next`. Wire format unchanged — additive typedef + new optional builder arg.

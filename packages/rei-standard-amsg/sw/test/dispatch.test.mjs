@@ -17,7 +17,7 @@ import {
  * `event.waitUntil` chain so tests can assert on side effects
  * synchronously after the await.
  */
-function createSwMock({ clientCount = 1 } = {}) {
+function createSwMock({ clientCount = 1, visibleCount = 0 } = {}) {
   /** @type {Map<string, Function>} */
   const listeners = new Map();
   /** @type {Array<{ title: string, options: Record<string, unknown> }>} */
@@ -27,6 +27,7 @@ function createSwMock({ clientCount = 1 } = {}) {
 
   const clients = Array.from({ length: clientCount }, (_, index) => ({
     id: `client-${index}`,
+    visibilityState: index < visibleCount ? 'visible' : 'hidden',
     postMessage(message) {
       postedMessages.push({ client: index, message });
     }
@@ -442,3 +443,131 @@ test('one client throwing inside postMessage does not block delivery to the othe
   // Notification rendering ran independently of the broken client.
   assert.equal(notificationCount, 1);
 });
+
+test('notification.show: "auto" or undefined behavior', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  // Content -> show
+  await triggerPush({ ...COMMON, messageKind: 'content', message: 'Hello' });
+  assert.equal(notifications.length, 1);
+
+  // Tool request -> no show
+  await triggerPush({ ...COMMON, messageKind: 'tool_request', toolCalls: [{}] });
+  assert.equal(notifications.length, 1, 'Still 1 because tool_request does not show');
+});
+
+test('notification.show: "always" forces notification', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'reasoning',
+    reasoningContent: 'thinking',
+    notification: { show: 'always', title: 'Always Show' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, 'Always Show');
+});
+
+test('notification.show: "when-hidden" shows when no visible clients', async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 0 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'tool_request',
+    toolCalls: [{}],
+    notification: { show: 'when-hidden', title: 'When Hidden' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, 'When Hidden');
+});
+
+test('notification.show: "when-hidden" DOES NOT show when there is a visible client', async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 2, visibleCount: 1 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'tool_request',
+    toolCalls: [{}],
+    notification: { show: 'when-hidden' }
+  });
+
+  assert.equal(notifications.length, 0);
+});
+
+test('notification.show: false prevents content notification', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Silent message',
+    notification: { show: false }
+  });
+
+  assert.equal(notifications.length, 0);
+});
+
+test('notification.data is passed through to notification options', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Hello',
+    notification: { show: 'always', data: { customField: 'value' } }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.data.customField, 'value');
+});
+
+test('multipart fully received payload with notification.show: "when-hidden" checks visible client', async () => {
+  // Test 1: with visible client -> no notification
+  {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+    installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+    const payload = {
+      ...COMMON,
+      messageKind: 'tool_request',
+      toolCalls: [{}],
+      notification: { show: 'when-hidden' }
+    };
+    const parts = buildMultipartPayloads(payload, { id: 'mp_wh_visible', maxChunkBytes: 80 });
+
+    for (const part of parts) {
+      await triggerPush(part);
+    }
+    assert.equal(notifications.length, 0);
+  }
+
+  // Test 2: without visible client -> notification
+  {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 0 });
+    installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+    const payload = {
+      ...COMMON,
+      messageKind: 'tool_request',
+      toolCalls: [{}],
+      notification: { show: 'when-hidden', title: 'Multipart Hidden' }
+    };
+    const parts = buildMultipartPayloads(payload, { id: 'mp_wh_hidden', maxChunkBytes: 80 });
+
+    for (const part of parts) {
+      await triggerPush(part);
+    }
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].title, 'Multipart Hidden');
+  }
+});
+
