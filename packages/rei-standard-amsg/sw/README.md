@@ -39,6 +39,55 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 });
 ```
 
+### 通知显示策略 (Notification Rendering)
+
+默认情况下：
+- `content` 和老式 payload：自动弹系统通知。
+- `reasoning` / `tool_request` / `error`：不弹通知，只触发 client 事件。
+
+通过 `payload.notification.show`，你可以显式覆盖这个默认行为。此字段由服务端或产生 payload 时指定：
+
+- `"auto"` 或不传：保持默认行为。
+- `"always"`：强制弹系统通知，无视 `messageKind`。
+- `"when-hidden"`：仅当没有 `visibilityState === "visible"` 的客户端时才弹系统通知。如果应用在前台，则静默。
+- `false`：强制不弹通知，即使是 `content`。适合完全交给应用自行接管或自绘弹窗的场景。
+
+当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
+
+#### 场景示例
+
+**1. tool_request 需要用户处理**
+某些 Agent loop 跑到 `tool_request` 时需要用户在界面上确认或执行。由于默认 `tool_request` 不弹通知，用户如果在后台可能会漏掉：
+
+```json
+{
+  "messageKind": "tool_request",
+  "sessionId": "...",
+  "toolCalls": [],
+  "notification": {
+    "show": "when-hidden",
+    "title": "需要继续处理",
+    "body": "点开应用继续完成工具调用"
+  }
+}
+```
+
+**2. Content 消息完全由前端接管**
+应用层想在页面前台做非常定制的 Toast，不想弹系统级别通知：
+
+```json
+{
+  "messageKind": "content",
+  "message": "...",
+  "notification": {
+    "show": false
+  }
+}
+```
+
+> **注意：对于 multipart 传输**
+> 当 payload 通过 `_multipart` 分片时，未收齐前不仅不派发业务事件，也**绝不**弹系统通知。收齐并还原为原始 payload 后，再按原始 payload 的 `notification.show` 策略执行判定。
+
 ### Blob envelope
 
 当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
@@ -101,7 +150,7 @@ TTL 到期仍未收齐时，SW 会清理 pending 并广播：
 
 ### 升级注意事项
 
-- 想给 `reasoning` / `tool_request` / `error` 也弹通知的业务：必须自行在 app 内监听上面的 postMessage 事件、调 `Notification` 或 `registration.showNotification`。SW 默认不再为它们弹通知。
+- 想给 `reasoning` / `tool_request` / `error` 弹通知的业务：SW 默认不再为它们弹通知，但可以通过设置 `payload.notification.show = "always"` 或 `"when-hidden"` 来让 SW 在包层直接弹通知。无需再强求在 app 内自绘。
 - 应用级 SW 可以删除旧 reasoning `chunkIndex` / `totalChunks` 拼接逻辑；next 版本只会把完整还原后的 reasoning payload 发给 client。
 - 客户端代码继续兼容只有 `installReiSW` + `REI_SW_MESSAGE_TYPE`（队列）的 2.0.x 写法——新增导出不破坏既有 API。
 - 想拿到 push 类型相关的 TS 类型：从 `@rei-standard/amsg-shared` 引 `AmsgPush` 等类型（本包通过 JSDoc 引用同一份类型）。
