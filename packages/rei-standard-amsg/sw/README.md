@@ -20,6 +20,7 @@
 | `REI_SW_EVENT.REASONING_RECEIVED`    | `'rei-amsg-reasoning-received'`    | `payload.messageKind === 'reasoning'` |
 | `REI_SW_EVENT.TOOL_REQUEST_RECEIVED` | `'rei-amsg-tool-request-received'` | `payload.messageKind === 'tool_request'` |
 | `REI_SW_EVENT.ERROR_RECEIVED`        | `'rei-amsg-error-received'`        | `payload.messageKind === 'error'` |
+| `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片 TTL 到期仍未收齐 |
 | `REI_SW_EVENT.UNKNOWN_RECEIVED`      | `'rei-amsg-unknown-received'`      | 缺 `messageKind`（2.0.x 老 payload / blob envelope） |
 
 ### 客户端订阅示例
@@ -32,6 +33,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
     case 'rei-amsg-reasoning-received':    /* 渲染思考中 UI */ break;
     case 'rei-amsg-tool-request-received': /* 弹出工具执行确认 */ break;
     case 'rei-amsg-error-received':        /* 显示错误 toast */ break;
+    case 'rei-amsg-multipart-expired':     /* 观测 transport 缺片 */ break;
     case 'rei-amsg-unknown-received':      /* 2.0.x 老 payload 的兼容路径 */ break;
   }
 });
@@ -41,15 +43,68 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
 
+### Generic multipart transport（next）
+
+next 阶段移除了旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format。现在 `_multipart` 是统一 transport kind，任何原始 payload 都可以被包起来：
+
+```json
+{
+  "messageKind": "_multipart",
+  "multipart": {
+    "version": 1,
+    "id": "mp_<uuid>",
+    "index": 1,
+    "total": 4,
+    "encoding": "json-utf8-base64url",
+    "originalMessageKind": "reasoning",
+    "createdAt": 1710000000000,
+    "ttlMs": 60000
+  },
+  "chunk": "base64url..."
+}
+```
+
+SW 收到 `_multipart` 后会先写 IndexedDB，支持乱序、重复分片和 SW 重启恢复。未收齐时不 `postMessage`、不 `showNotification`。收齐后按 `index` 拼回原始 JSON payload，删除 pending，写短期 done 标记避免推送服务重投递造成二次业务事件，然后递归走普通 `messageKind` 分发。
+
+配置：
+
+```js
+installReiSW(self, {
+  defaultIcon: '/icon-192x192.png',
+  defaultBadge: '/badge-72x72.png',
+  multipart: {
+    enabled: true,
+    ttlMs: 60_000,
+    maxTotalBytes: 256_000,
+    maxChunks: 128,
+    cleanupIntervalMs: 15 * 60_000
+  }
+});
+```
+
+TTL 到期仍未收齐时，SW 会清理 pending 并广播：
+
+```js
+{
+  type: 'REI_AMSG_PUSH',
+  event: 'rei-amsg-multipart-expired',
+  payload: { id, received, total, originalMessageKind }
+}
+```
+
+业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知。
+
 ### 升级注意事项
 
 - 想给 `reasoning` / `tool_request` / `error` 也弹通知的业务：必须自行在 app 内监听上面的 postMessage 事件、调 `Notification` 或 `registration.showNotification`。SW 默认不再为它们弹通知。
+- 应用级 SW 可以删除旧 reasoning `chunkIndex` / `totalChunks` 拼接逻辑；next 版本只会把完整还原后的 reasoning payload 发给 client。
 - 客户端代码继续兼容只有 `installReiSW` + `REI_SW_MESSAGE_TYPE`（队列）的 2.0.x 写法——新增导出不破坏既有 API。
 - 想拿到 push 类型相关的 TS 类型：从 `@rei-standard/amsg-shared` 引 `AmsgPush` 等类型（本包通过 JSDoc 引用同一份类型）。
 
 ## 功能概览
 
 - 处理 `push` 事件：按 `messageKind` 三轴 schema 分发到客户端 + 仅 `content` 走 `showNotification`
+- 透明重组 `_multipart` transport：应用层只收到完整原始 payload
 - 处理 `message` 事件：支持离线请求入队与主动冲刷队列
 - 处理 `sync` 事件：在网络恢复后自动重试队列请求
 - 使用 IndexedDB 存储待发送请求，避免页面关闭后丢失
@@ -69,7 +124,8 @@ import { installReiSW } from '@rei-standard/amsg-sw';
 
 installReiSW(self, {
   defaultIcon: '/icon-192x192.png',
-  defaultBadge: '/badge-72x72.png'
+  defaultBadge: '/badge-72x72.png',
+  multipart: { enabled: true }
 });
 
 // 业务侧自行实现点击跳转
@@ -151,6 +207,7 @@ export async function enqueueRequestToSW(requestPayload) {
 - `REASONING_RECEIVED`
 - `TOOL_REQUEST_RECEIVED`
 - `ERROR_RECEIVED`
+- `MULTIPART_EXPIRED`
 - `UNKNOWN_RECEIVED`
 
 `REI_SW_MESSAGE_TYPE` 包含：

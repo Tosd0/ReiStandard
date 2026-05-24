@@ -1,5 +1,32 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.1.0-next.2 — BREAKING: generic multipart reassembly (pre-release)
+
+next 阶段统一 multipart transport。SW 现在识别 `messageKind: "_multipart"` 的运输层分片，透明还原原始 payload 后再按原始 `messageKind` 走现有分发和通知策略。
+
+### New
+
+- **`installReiSW(self, { multipart })`** — 新增 multipart 配置：
+  - `enabled`（默认 `true`）
+  - `ttlMs`（默认 `60_000`）
+  - `maxTotalBytes`（默认 `256_000`）
+  - `maxChunks`（默认 `128`）
+  - `cleanupIntervalMs`（默认 `15 * 60_000`）
+- **IndexedDB-backed pending multipart store** — 支持乱序、重复分片和 SW 重启恢复。
+- **短期 done marker** — 收齐并投递后写 done 标记，避免 push service 重投递最后一片导致重复业务事件。
+- **`REI_SW_EVENT.MULTIPART_EXPIRED`** — TTL 到期仍缺片时广播 `rei-amsg-multipart-expired`，payload 为 `{ id, received, total, originalMessageKind }`。
+
+### Changed
+
+- `_multipart` 是 transport layer，不会触发业务事件，也不会 `showNotification`。
+- multipart 收齐后恢复成原始 JSON payload，再递归进入普通 dispatch。应用层只会看到完整的 `content` / `reasoning` / `tool_request` / `error` / 自定义 kind payload。
+- `content` multipart 收齐后照常 `postMessage` + `showNotification`；`reasoning` / `tool_request` / `error` 仍默认不通知。
+
+### Migration
+
+- 应用级 SW 可以删除旧 reasoning `chunkIndex` / `totalChunks` 拼接逻辑。
+- 旧 reasoning chunk wire format 不再由 `@rei-standard/amsg-instant` next 版本发送；接收 oversized reasoning 需要本版本的 generic multipart 支持。
+
 ## 2.1.0-next.1 — 标题 fallback 至 `来自 {contactName}` (pre-release)
 
 Cherry-pick stable `2.0.2` 的标题 fallback 修复到 next 预发布线。`createNotificationFromPayload` 的标题链从

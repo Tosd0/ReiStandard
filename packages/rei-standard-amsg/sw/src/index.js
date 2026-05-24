@@ -8,6 +8,9 @@
  *  - Notification rendering for `messageKind: 'content'` (and legacy
  *    payloads without `messageKind`, for back-compat with 2.0.x
  *    producers).
+ *  - Generic `_multipart` transport reassembly. Multipart chunks are
+ *    stored below the business layer and never dispatched until the
+ *    original payload has been fully restored.
  *  - Offline request queueing and retry with Background Sync.
  *
  * Notes:
@@ -19,6 +22,8 @@
  *  - Blob envelopes (`{ _blob: true, key, url, messageKind? }`) are
  *    dispatched to clients verbatim. The SW never auto-fetches the
  *    blob body — that's the client's job.
+ *  - Multipart is different: it is a transparent transport fallback.
+ *    Apps see only the restored original payload.
  *
  * Usage (inside your sw.js):
  *   import { installReiSW, REI_SW_EVENT, REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-sw';
@@ -32,6 +37,7 @@
  *       case REI_SW_EVENT.REASONING_RECEIVED:    // render thinking UI
  *       case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: // prompt tool exec
  *       case REI_SW_EVENT.ERROR_RECEIVED:        // show error toast
+ *       case REI_SW_EVENT.MULTIPART_EXPIRED:    // observe incomplete transport
  *       case REI_SW_EVENT.UNKNOWN_RECEIVED:      // legacy 2.0.x payload
  *     }
  *   });
@@ -47,8 +53,21 @@
 
 const REI_SW_DB_NAME = 'rei-sw';
 const REI_SW_DB_STORE = 'request-outbox';
-const REI_SW_DB_VERSION = 1;
+const REI_SW_MULTIPART_STORE = 'multipart-pending';
+const REI_SW_MULTIPART_DONE_STORE = 'multipart-done';
+const REI_SW_DB_VERSION = 2;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
+const MULTIPART_MESSAGE_KIND = '_multipart';
+const MULTIPART_ENCODING = 'json-utf8-base64url';
+const DEFAULT_MULTIPART_OPTIONS = Object.freeze({
+  enabled: true,
+  ttlMs: 60_000,
+  maxTotalBytes: 256_000,
+  maxChunks: 128,
+  cleanupIntervalMs: 15 * 60_000,
+});
+const memoryMultipartPending = new Map();
+const memoryMultipartDone = new Map();
 
 /**
  * Wire-level message type for SW → client postMessage envelopes.
@@ -72,6 +91,7 @@ export const REI_SW_EVENT = Object.freeze({
   REASONING_RECEIVED: 'rei-amsg-reasoning-received',
   TOOL_REQUEST_RECEIVED: 'rei-amsg-tool-request-received',
   ERROR_RECEIVED: 'rei-amsg-error-received',
+  MULTIPART_EXPIRED: 'rei-amsg-multipart-expired',
   UNKNOWN_RECEIVED: 'rei-amsg-unknown-received'
 });
 
@@ -85,6 +105,12 @@ export const REI_SW_MESSAGE_TYPE = Object.freeze({
  * @typedef {Object} ReiSWOptions
  * @property {string} [defaultIcon]  - Fallback notification icon URL.
  * @property {string} [defaultBadge] - Fallback notification badge URL.
+ * @property {Object} [multipart]
+ * @property {boolean} [multipart.enabled=true]
+ * @property {number} [multipart.ttlMs=60000]
+ * @property {number} [multipart.maxTotalBytes=256000]
+ * @property {number} [multipart.maxChunks=128]
+ * @property {number} [multipart.cleanupIntervalMs=900000]
  */
 
 /**
@@ -96,30 +122,20 @@ export const REI_SW_MESSAGE_TYPE = Object.freeze({
 export function installReiSW(sw, opts = {}) {
   const defaultIcon = opts.defaultIcon || '/icon-192x192.png';
   const defaultBadge = opts.defaultBadge || '/badge-72x72.png';
+  const multipart = normalizeMultipartOptions(opts.multipart);
+  let lastMultipartCleanupAt = 0;
 
   sw.addEventListener('push', (event) => {
     const payload = readPushPayload(event);
     if (!payload) return;
 
-    const eventName = resolveEventName(payload);
-    const shouldRenderNotification = isNotificationKind(payload);
-
-    /** @type {Array<Promise<unknown>>} */
-    const work = [dispatchPushToClients(sw, eventName, payload)];
-
-    if (shouldRenderNotification) {
-      const notification = createNotificationFromPayload(payload, {
-        defaultIcon,
-        defaultBadge
-      });
-      if (notification) {
-        work.push(
-          sw.registration.showNotification(notification.title, notification.options)
-        );
-      }
-    }
-
-    event.waitUntil(Promise.all(work));
+    event.waitUntil(handlePushPayload(sw, payload, {
+      defaultBadge,
+      defaultIcon,
+      multipart,
+      getLastMultipartCleanupAt: () => lastMultipartCleanupAt,
+      setLastMultipartCleanupAt: (value) => { lastMultipartCleanupAt = value; },
+    }));
   });
 
   sw.addEventListener('message', (event) => {
@@ -142,6 +158,42 @@ export function installReiSW(sw, opts = {}) {
     if (event.tag !== REI_SW_SYNC_TAG) return;
     event.waitUntil(flushQueuedRequests(sw));
   });
+}
+
+async function handlePushPayload(sw, payload, ctx) {
+  await maybeCleanupMultipart(sw, ctx);
+
+  if (isMultipartPush(payload)) {
+    if (!ctx.multipart.enabled) return;
+    const restoredPayload = await acceptMultipartChunk(sw, payload, ctx.multipart);
+    if (!restoredPayload) return;
+    await handlePushPayload(sw, restoredPayload, ctx);
+    return;
+  }
+
+  await dispatchBusinessPayload(sw, payload, {
+    defaultIcon: ctx.defaultIcon,
+    defaultBadge: ctx.defaultBadge,
+  });
+}
+
+async function dispatchBusinessPayload(sw, payload, defaults) {
+  const eventName = resolveEventName(payload);
+  const shouldRenderNotification = isNotificationKind(payload);
+
+  /** @type {Array<Promise<unknown>>} */
+  const work = [dispatchPushToClients(sw, eventName, payload)];
+
+  if (shouldRenderNotification) {
+    const notification = createNotificationFromPayload(payload, defaults);
+    if (notification) {
+      work.push(
+        sw.registration.showNotification(notification.title, notification.options)
+      );
+    }
+  }
+
+  await Promise.all(work);
 }
 
 /**
@@ -280,6 +332,247 @@ function createNotificationFromPayload(payload, defaults) {
       )
     }
   };
+}
+
+function normalizeMultipartOptions(input) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  return {
+    enabled: source.enabled !== false,
+    ttlMs: positiveIntegerOrDefault(source.ttlMs, DEFAULT_MULTIPART_OPTIONS.ttlMs),
+    maxTotalBytes: positiveIntegerOrDefault(
+      source.maxTotalBytes,
+      DEFAULT_MULTIPART_OPTIONS.maxTotalBytes
+    ),
+    maxChunks: positiveIntegerOrDefault(source.maxChunks, DEFAULT_MULTIPART_OPTIONS.maxChunks),
+    cleanupIntervalMs: source.cleanupIntervalMs === 0
+      ? 0
+      : positiveIntegerOrDefault(
+          source.cleanupIntervalMs,
+          DEFAULT_MULTIPART_OPTIONS.cleanupIntervalMs
+        ),
+  };
+}
+
+function positiveIntegerOrDefault(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function isMultipartPush(payload) {
+  return !!payload &&
+    typeof payload === 'object' &&
+    payload.messageKind === MULTIPART_MESSAGE_KIND &&
+    payload.multipart &&
+    typeof payload.multipart === 'object' &&
+    typeof payload.chunk === 'string';
+}
+
+async function acceptMultipartChunk(sw, payload, options) {
+  // State machine:
+  // 1. Validate the transport envelope and reject expired chunks before storage.
+  // 2. Drop already-completed multipart ids using the short-lived done marker.
+  // 3. Expire any stale pending record for this id before accepting a new one.
+  // 4. Store only new chunk indexes, track total received bytes, and wait.
+  // 5. Once all indexes are present, restore original JSON and mark done.
+  const normalized = normalizeMultipartChunk(payload, options);
+  if (!normalized) return null;
+  if (normalized.expiresAt <= Date.now()) {
+    await dispatchMultipartExpired(sw, {
+      id: normalized.id,
+      chunks: {},
+      total: normalized.total,
+      originalMessageKind: normalized.originalMessageKind,
+    });
+    return null;
+  }
+
+  const done = await readMultipartDone(normalized.id);
+  if (done && done.expiresAt > Date.now()) return null;
+  if (done) await deleteMultipartDone(normalized.id);
+
+  const now = Date.now();
+  const existing = await readMultipartPending(normalized.id);
+  if (existing && existing.expiresAt <= now) {
+    await deleteMultipartPending(existing.id);
+    await dispatchMultipartExpired(sw, existing);
+  }
+
+  const base = existing && existing.expiresAt > now
+    ? existing
+    : {
+        id: normalized.id,
+        createdAt: normalized.createdAt,
+        expiresAt: normalized.expiresAt,
+        ttlMs: normalized.ttlMs,
+        total: normalized.total,
+        originalMessageKind: normalized.originalMessageKind,
+        encoding: normalized.encoding,
+        chunks: {},
+        receivedBytes: 0,
+      };
+
+  if (base.total !== normalized.total || base.encoding !== normalized.encoding) {
+    await deleteMultipartPending(normalized.id);
+    return null;
+  }
+
+  if (base.chunks[String(normalized.index)] !== undefined) {
+    return null;
+  }
+
+  base.chunks[String(normalized.index)] = normalized.chunk;
+  base.receivedBytes = positiveIntegerOrDefault(base.receivedBytes, 0) +
+    normalized.chunkBytes.byteLength;
+  if (base.receivedBytes > options.maxTotalBytes) {
+    await deleteMultipartPending(normalized.id);
+    return null;
+  }
+
+  const received = Object.keys(base.chunks).length;
+  if (received < base.total) {
+    await writeMultipartPending(base);
+    return null;
+  }
+
+  await deleteMultipartPending(base.id);
+  let restored;
+  try {
+    restored = restoreMultipartPayload(base, options);
+  } catch (_error) {
+    return null;
+  }
+  // Keep the done marker longer than the pending TTL so push-service
+  // redelivery cannot trigger a second business event after completion.
+  const doneTtlMs = Math.max(base.ttlMs * 2, base.ttlMs + 1);
+  await writeMultipartDone({
+    id: base.id,
+    expiresAt: Date.now() + doneTtlMs,
+  });
+  return restored;
+}
+
+function normalizeMultipartChunk(payload, options) {
+  const meta = payload.multipart;
+  if (!meta || typeof meta !== 'object') return null;
+  if (meta.version !== 1 || meta.encoding !== MULTIPART_ENCODING) return null;
+  if (typeof meta.id !== 'string' || !meta.id) return null;
+  if (!Number.isInteger(meta.index) || !Number.isInteger(meta.total)) return null;
+  if (meta.total <= 0 || meta.total > options.maxChunks) return null;
+  if (meta.index <= 0 || meta.index > meta.total) return null;
+
+  let chunkBytes;
+  try {
+    chunkBytes = base64UrlToBytes(payload.chunk);
+  } catch (_error) {
+    return null;
+  }
+
+  const now = Date.now();
+  const ttlMs = Math.min(
+    positiveIntegerOrDefault(meta.ttlMs, options.ttlMs),
+    options.ttlMs
+  );
+  const createdAt = Number.isFinite(meta.createdAt) ? Number(meta.createdAt) : now;
+  const expiresAt = createdAt + ttlMs;
+
+  return {
+    id: meta.id,
+    createdAt,
+    expiresAt,
+    ttlMs,
+    total: meta.total,
+    index: meta.index,
+    originalMessageKind: typeof meta.originalMessageKind === 'string'
+      ? meta.originalMessageKind
+      : null,
+    encoding: meta.encoding,
+    chunk: payload.chunk,
+    chunkBytes,
+  };
+}
+
+function restoreMultipartPayload(record, options) {
+  /** @type {Uint8Array[]} */
+  const chunks = [];
+  let totalBytes = 0;
+  for (let index = 1; index <= record.total; index++) {
+    const chunk = record.chunks[String(index)];
+    if (typeof chunk !== 'string') {
+      throw new Error('[rei-standard-amsg-sw] multipart missing chunk');
+    }
+    const bytes = base64UrlToBytes(chunk);
+    totalBytes += bytes.byteLength;
+    if (totalBytes > options.maxTotalBytes) {
+      throw new Error('[rei-standard-amsg-sw] multipart payload exceeds maxTotalBytes');
+    }
+    chunks.push(bytes);
+  }
+
+  const json = new TextDecoder('utf-8', { fatal: false }).decode(concatBytes(chunks));
+  return JSON.parse(json);
+}
+
+async function maybeCleanupMultipart(sw, ctx) {
+  if (!ctx.multipart.enabled) return;
+  const now = Date.now();
+  const last = ctx.getLastMultipartCleanupAt();
+  if (last && now - last < ctx.multipart.cleanupIntervalMs) return;
+  ctx.setLastMultipartCleanupAt(now);
+  try {
+    await cleanupMultipartStores(sw, now);
+  } catch (_error) {
+    // Cleanup is observability/housekeeping; never block a fresh push.
+  }
+}
+
+async function cleanupMultipartStores(sw, now) {
+  const pending = await listMultipartPending();
+  for (const record of pending) {
+    if (record.expiresAt > now) continue;
+    await deleteMultipartPending(record.id);
+    await dispatchMultipartExpired(sw, record);
+  }
+
+  const done = await listMultipartDone();
+  for (const record of done) {
+    if (record.expiresAt <= now) {
+      await deleteMultipartDone(record.id);
+    }
+  }
+}
+
+async function dispatchMultipartExpired(sw, record) {
+  await dispatchPushToClients(sw, REI_SW_EVENT.MULTIPART_EXPIRED, {
+    id: record.id,
+    received: record.chunks && typeof record.chunks === 'object'
+      ? Object.keys(record.chunks).length
+      : 0,
+    total: record.total,
+    originalMessageKind: record.originalMessageKind,
+  });
+}
+
+function base64UrlToBytes(input) {
+  const s = String(input).replace(/-/g, '+').replace(/_/g, '/');
+  const pad = (4 - (s.length % 4)) % 4;
+  const padded = s + '='.repeat(pad);
+  const bin = (typeof atob === 'function')
+    ? atob(padded)
+    : Buffer.from(padded, 'base64').toString('binary');
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function concatBytes(chunks) {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 async function enqueueAndFlush(sw, event, requestPayload) {
@@ -423,19 +716,138 @@ function respondToSender(event, message) {
   }
 }
 
+function readMultipartPending(id) {
+  return readStoreRecord(REI_SW_MULTIPART_STORE, id);
+}
+
+function writeMultipartPending(record) {
+  return putStoreRecord(REI_SW_MULTIPART_STORE, record);
+}
+
+function deleteMultipartPending(id) {
+  return deleteStoreRecord(REI_SW_MULTIPART_STORE, id);
+}
+
+function listMultipartPending() {
+  return listStoreRecords(REI_SW_MULTIPART_STORE);
+}
+
+function readMultipartDone(id) {
+  return readStoreRecord(REI_SW_MULTIPART_DONE_STORE, id);
+}
+
+function writeMultipartDone(record) {
+  return putStoreRecord(REI_SW_MULTIPART_DONE_STORE, record);
+}
+
+function deleteMultipartDone(id) {
+  return deleteStoreRecord(REI_SW_MULTIPART_DONE_STORE, id);
+}
+
+function listMultipartDone() {
+  return listStoreRecords(REI_SW_MULTIPART_DONE_STORE);
+}
+
+async function readStoreRecord(storeName, id) {
+  if (!hasIndexedDB()) {
+    return cloneRecord(memoryStoreFor(storeName).get(id));
+  }
+
+  return withDatabaseStore(storeName, 'readonly', (store, resolve, reject) => {
+    const request = store.get(id);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error(`Failed to read ${storeName}`));
+  });
+}
+
+async function putStoreRecord(storeName, record) {
+  if (!hasIndexedDB()) {
+    memoryStoreFor(storeName).set(record.id, cloneRecord(record));
+    return;
+  }
+
+  return withDatabaseStore(storeName, 'readwrite', (store, resolve, reject) => {
+    const request = store.put(record);
+    request.onsuccess = () => resolve(undefined);
+    request.onerror = () => reject(request.error || new Error(`Failed to write ${storeName}`));
+  });
+}
+
+async function deleteStoreRecord(storeName, id) {
+  if (!hasIndexedDB()) {
+    memoryStoreFor(storeName).delete(id);
+    return;
+  }
+
+  return withDatabaseStore(storeName, 'readwrite', (store, resolve, reject) => {
+    const request = store.delete(id);
+    request.onsuccess = () => resolve(undefined);
+    request.onerror = () => reject(request.error || new Error(`Failed to delete ${storeName}`));
+  });
+}
+
+async function listStoreRecords(storeName) {
+  if (!hasIndexedDB()) {
+    return Array.from(memoryStoreFor(storeName).values()).map(cloneRecord);
+  }
+
+  return withDatabaseStore(storeName, 'readonly', (store, resolve, reject) => {
+    const request = store.getAll();
+    request.onsuccess = () => resolve(Array.isArray(request.result) ? request.result : []);
+    request.onerror = () => reject(request.error || new Error(`Failed to list ${storeName}`));
+  });
+}
+
+async function withDatabaseStore(storeName, mode, handler) {
+  const db = await openQueueDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(storeName, mode);
+      const store = transaction.objectStore(storeName);
+      transaction.onerror = () => reject(transaction.error || new Error('Database transaction failed'));
+      Promise.resolve(handler(store, resolve, reject)).catch(reject);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+function hasIndexedDB() {
+  return typeof indexedDB !== 'undefined' &&
+    indexedDB &&
+    typeof indexedDB.open === 'function';
+}
+
+function memoryStoreFor(storeName) {
+  if (storeName === REI_SW_MULTIPART_DONE_STORE) return memoryMultipartDone;
+  if (storeName === REI_SW_MULTIPART_STORE) return memoryMultipartPending;
+  throw new Error(`[rei-standard-amsg-sw] unknown memory store: ${storeName}`);
+}
+
+function cloneRecord(record) {
+  if (record == null) return null;
+  return JSON.parse(JSON.stringify(record));
+}
+
 function openQueueDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(REI_SW_DB_NAME, REI_SW_DB_VERSION);
 
     request.onupgradeneeded = () => {
       const db = request.result;
-      if (db.objectStoreNames.contains(REI_SW_DB_STORE)) return;
-      db.createObjectStore(REI_SW_DB_STORE, { keyPath: 'id', autoIncrement: true });
+      createObjectStoreIfMissing(db, REI_SW_DB_STORE, { keyPath: 'id', autoIncrement: true });
+      createObjectStoreIfMissing(db, REI_SW_MULTIPART_STORE, { keyPath: 'id' });
+      createObjectStoreIfMissing(db, REI_SW_MULTIPART_DONE_STORE, { keyPath: 'id' });
     };
 
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error('Failed to open queue database'));
   });
+}
+
+function createObjectStoreIfMissing(db, name, options) {
+  if (db.objectStoreNames.contains(name)) return;
+  db.createObjectStore(name, options);
 }
 
 async function withQueueStore(mode, handler) {

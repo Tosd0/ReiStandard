@@ -16,6 +16,7 @@ import {
   createFetchRouter,
   decryptCapturedPushBody,
   makeLlmResponse,
+  base64UrlToBytes,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -54,6 +55,19 @@ async function decryptAll(pushCalls) {
     out.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
   }
   return out;
+}
+
+function restoreMultipartPayload(parts) {
+  const sorted = parts.slice().sort((a, b) => a.multipart.index - b.multipart.index);
+  const byteChunks = sorted.map((part) => base64UrlToBytes(part.chunk));
+  const totalBytes = byteChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+  const joined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const bytes of byteChunks) {
+    joined.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(joined));
 }
 
 // ─── Legacy path ────────────────────────────────────────────────────────
@@ -244,9 +258,9 @@ describe('hook path — ReasoningPush auto-emission', () => {
   });
 });
 
-// ─── next.4 — reasoning byte-chunking simplified ───────────────────────
+// ─── next — generic multipart transport ────────────────────────────────
 
-describe('next.4 — reasoning byte-chunking simplified', () => {
+describe('next — generic multipart transport', () => {
   it('short reasoning ships as a single push (no chunkIndex on wire)', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
@@ -263,8 +277,8 @@ describe('next.4 — reasoning byte-chunking simplified', () => {
     assert.equal(r.reasoningContent, 'short thought');
   });
 
-  it('oversized reasoning gets byte-chunked into N pushes with chunkIndex/totalChunks', async () => {
-    const big = 'x'.repeat(5500); // > default 2000 B threshold
+  it('oversized reasoning uses generic _multipart and restores the original ReasoningPush', async () => {
+    const big = 'x'.repeat(5500);
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
       llm: () => makeLlmResponse('hi.', { reasoning_content: big }),
@@ -277,18 +291,20 @@ describe('next.4 — reasoning byte-chunking simplified', () => {
     });
     await handler(makeRequest(basePayload()));
     const decoded = await decryptAll(router.pushCalls);
-    const reasoning = decoded.filter(p => p.messageKind === 'reasoning');
-    assert.ok(reasoning.length >= 3, `expected >= 3 chunks for 5500B reasoning at 2000B threshold, got ${reasoning.length}`);
-    for (let i = 0; i < reasoning.length; i++) {
-      assert.equal(reasoning[i].chunkIndex, i + 1);
-      assert.equal(reasoning[i].totalChunks, reasoning.length);
+    const multipart = decoded.filter(p => p.messageKind === '_multipart');
+    assert.ok(multipart.length >= 3, `expected >= 3 multipart chunks, got ${multipart.length}`);
+    for (const part of multipart) {
+      assert.equal(part.multipart.version, 1);
+      assert.equal(part.multipart.encoding, 'json-utf8-base64url');
+      assert.equal(part.multipart.originalMessageKind, 'reasoning');
+      assert.equal(typeof part.chunk, 'string');
     }
-    // Reassembling yields the original
-    const reassembled = reasoning.map(p => p.reasoningContent).join('');
-    assert.equal(reassembled, big);
-    // reasoning_chunked event fires exactly once
-    const chunkedEvts = events.filter(e => e.type === 'reasoning_chunked');
-    assert.equal(chunkedEvts.length, 1);
-    assert.equal(chunkedEvts[0].totalChunks, reasoning.length);
+    const restored = restoreMultipartPayload(multipart);
+    assert.equal(restored.messageKind, 'reasoning');
+    assert.equal(restored.reasoningContent, big);
+    assert.equal('chunkIndex' in restored, false);
+    assert.equal('totalChunks' in restored, false);
+    assert.equal(events.some(e => e.type === 'multipart_built' && e.originalMessageKind === 'reasoning'), true);
+    assert.equal(events.some(e => e.type === 'reasoning_chunked'), false);
   });
 });

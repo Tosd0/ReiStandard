@@ -38,9 +38,10 @@ npm install @rei-standard/amsg-instant
 | `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
 | `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
 | `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
+| `multipart`         | object    | ❌   | **next+**：通用 multipart transport。超出 inline、且没配 BlobStore 时，任意 JSON-safe payload 都可拆成 `_multipart` 分片。默认 `enabled:true`、`maxChunkBytes:1800`、`ttlMs:60000`、`maxChunks:128`、`maxTotalBytes:256000`。见 [Generic multipart transport](#generic-multipart-transportnext)。 |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
 | `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
-| `reasoningChunkBytes` | number \| null | ❌ | **0.8.0-next.2+**：`ReasoningPush.reasoningContent` 的 UTF-8 字节上限。默认 `2000` — reasoning 超 2 KB 时框架按 codepoint 边界切成 N 份带 `chunkIndex` / `totalChunks` 投递，SW 拼接还原。设 `null` 禁用字节切（超限走 BlobStore 或抛 `PAYLOAD_TOO_LARGE`）。构造期校验范围 `[500, maxInlineBytes - 600]`，不合法抛 `TypeError`。详见 [Reasoning chunking](#reasoning-chunking080-next2)。 |
+| `reasoningChunkBytes` | number \| null | ❌ | **Deprecated in next**：旧 reasoning 专用字节切配置。保留为 `multipart.maxChunkBytes` 的兼容别名；`null` 仅在未显式配置 `multipart` 时禁用 generic multipart。不会再产生 `chunkIndex` / `totalChunks` reasoning wire fields。 |
 
 ### 鉴权策略
 
@@ -228,7 +229,7 @@ curl -X POST https://instant.example.com/instant \
 | `PUSH_SEND_FAILED`                            | 502  | 0.1 | Web Push 派送失败 |
 | `COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH`  | 400  | 0.7 | 配了 `onLLMOutput` 之后 `/instant` 或 `/continue` 还传 `completePrompt`；hook 路径只接受 `messages` 数组 |
 | `HOOK_THREW`                                  | 500  | 0.7 | `onLLMOutput` 抛错或返了非法 decision（`null` / 不识别的 `decision` 值 / `pushPayloads` 不是数组或为空 / 单个 push 不可 JSON-serialize）。同时会推一条诊断 push（payload `{type:'error', code:'HOOK_THREW',...}`） |
-| `PAYLOAD_TOO_LARGE`                           | 500  | 0.7 | hook 返的 `pushPayloads` 中某个 push UTF-8 字节超 `maxInlineBytes` 且没配 `blobStore`。配上 BlobStore 自动走 envelope 转发 |
+| `PAYLOAD_TOO_LARGE`                           | 500  | 0.7 | hook 返的 `pushPayloads` 中某个 push UTF-8 字节超 `maxInlineBytes`，且没有 BlobStore、generic multipart 也被禁用或超过 multipart 上限。配上 BlobStore 会优先走 envelope；没配 BlobStore 时默认走 generic multipart |
 | `CONTINUE_NOT_AVAILABLE`                      | 400  | 0.7 | 往没配 `onLLMOutput` 的 handler POST `/continue`。`/continue` 是 agentic loop 的续跑端点，没钩子就没东西可续，直接拒掉避免误报成 `HOOK_THREW` |
 | `INTERNAL_ERROR`                              | 500  | 0.1 | 其他未分类内部错误 |
 
@@ -515,65 +516,47 @@ POST body（结构与 `/instant` 入口相同 + `sessionId` + `iteration`）：
 
 ---
 
-## Reasoning chunking（0.8.0-next.2+）
+## Generic multipart transport（next）
 
-reasoning-heavy LLM（DeepSeek-R1 / GLM-4.5 / Qwen3-Thinking 等）经常输出 3-10 KB `reasoning_content`，远超 Web Push 单 payload ~2.6 KB 安全线。next.2 内置 transparent 字节切分：framework 在产出 `ReasoningPush` 时自动按 UTF-8 codepoint 边界切成 N 份带 `chunkIndex` / `totalChunks` 投递，SW 拼回完整字符串。**绝大多数 reasoning-heavy 部署不再需要 BlobStore。**
+> **next BREAKING**：旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除。`reasoning`、`tool_request`、`content`、`error`、`emotion_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，超限时都走同一套 generic `_multipart` transport。应用层不应该再监听或拼接 reasoning 半片。
 
-> **0.8.0-next.4 BREAKING**：`reasoningSplitPattern` 已移除（请求 body 带它直接 400）。auto-emit 路径只剩单层字节切；想要句切，自己在 hook 里切完用 `pushPayloads` 返回。下文「两层 cascade」描述的是 next.2 / next.3 历史行为，next.4 起 Layer 1 永远 OFF（且无法开启）。
+发送优先级很简单：
 
-### 两层 cascade（next.2 / next.3 历史；next.4 仅剩 Layer 2）
+1. payload UTF-8 JSON 字节数 `<= maxInlineBytes`：直接 Web Push。
+2. 超限且配置了 `blobStore.adapter`：写 BlobStore，推 `{ _blob:true, key, url, messageKind?, type? }` envelope。
+3. 超限、没有 BlobStore、`multipart.enabled !== false`：推 `_multipart` 分片。
+4. 超限、没有 BlobStore、multipart 禁用或超过上限：抛 `PayloadTooLargeError`。
 
-```
-reasoningContent
-        │
-        ▼
-Layer 1 — 语义切（reasoningSplitPattern，next.4 已移除）
-  • 按 regex 切成 M 段，每段带 messageIndex 1..M / totalMessages M
-        │
-        ▼  对每个 Layer-1 段独立量字节
-Layer 2 — 字节切（reasoningChunkBytes，默认 ON，2000 B）
-  • 段字节 ≤ 阈值：单 push（不写 chunkIndex / totalChunks）
-  • 段字节 > 阈值：codepoint 边界切成 N 份，每片带 chunkIndex 1..N / totalChunks N
-        │
-        ▼
-serial dispatch via sendPushWithMaybeBlob
-  • 同段 Layer-2 chunk 间间隔 100 ms（transport-only）
-  • Layer-1 段间间隔 1500 ms（typing-bubble UX）
-```
-
-### 默认配置 = 透明
-
-零配置就 work：
+### 配置
 
 ```js
 createInstantHandler({
   vapid: { ... },
   onLLMOutput: hook,
-  // reasoningChunkBytes 默认 2000 — 不需要配
+  multipart: {
+    enabled: true,
+    maxChunkBytes: 1800,
+    ttlMs: 60_000,
+    maxChunks: 128,
+    maxTotalBytes: 256_000,
+  },
 });
 ```
 
-- 短 reasoning（< 2000 B）：单 push，wire 跟 next.1 byte-for-byte 一致。
-- 长 reasoning（> 2000 B）：自动切分，老 SW 拿到不带 `chunkIndex` 的单 push 走老路径；新 SW 看到 `chunkIndex` / `totalChunks` 走累积拼接。
-
-### 显式禁用 byte chunking
+`reasoningChunkBytes` 还保留为迁移期别名：
 
 ```js
 createInstantHandler({
   vapid: { ... },
-  onLLMOutput: hook,
-  reasoningChunkBytes: null,  // 关闭 Layer 2
-  blobStore: { adapter: ... }, // 大 reasoning 走 envelope，没配 blobStore 会抛 PAYLOAD_TOO_LARGE
+  reasoningChunkBytes: 1600, // 等价于 multipart.maxChunkBytes: 1600
 });
 ```
 
-`reasoningChunkBytes: null` 关 Layer 2（字节切），等大 reasoning 时走 BlobStore 兜底。
-
-> next.2 / next.3 还有 `reasoningSplitPattern` 控制 Layer 1，next.4 已移除。想要 reasoning 句切的 caller，自己在 hook 里切完用 `pushPayloads` 数组返回（lib 不再做语义切）。
+`reasoningChunkBytes: null` 只在没有显式传 `multipart` 时禁用 generic multipart。想要可靠承载超大 payload，更推荐配 BlobStore；它仍然优先于 multipart。
 
 ### Wire format
 
-#### 单 chunk（≤ 阈值，无 Layer 1） — 跟 next.1 完全一致
+原始业务 payload 是完整 JSON，比如：
 
 ```json
 {
@@ -583,96 +566,38 @@ createInstantHandler({
   "messageId": "msg_<uuid>_iter_0_reasoning",
   "sessionId": "sess_abc",
   "timestamp": "2026-05-20T12:00:00Z",
-  "reasoningContent": "short reasoning…"
+  "reasoningContent": "long reasoning..."
 }
 ```
 
-#### Pure Layer 2（无句切，大 reasoning）
+Web Push 上实际发出的每片是：
 
 ```json
-// Chunk 1 of 3
 {
-  "messageKind": "reasoning",
-  "messageId": "msg_<uuid>_iter_0_reasoning_chunk_1",
-  "sessionId": "sess_abc",
-  "chunkIndex": 1,
-  "totalChunks": 3,
-  "reasoningContent": "first 2000 bytes…"
+  "messageKind": "_multipart",
+  "multipart": {
+    "version": 1,
+    "id": "mp_<uuid>",
+    "index": 1,
+    "total": 4,
+    "encoding": "json-utf8-base64url",
+    "originalMessageKind": "reasoning",
+    "createdAt": 1710000000000,
+    "ttlMs": 60000
+  },
+  "chunk": "base64url..."
 }
 ```
 
-#### Cascade（Layer 1 + Layer 2）
+`chunk` 是原始 JSON 的 UTF-8 byte slice 再 base64url，不按 JS string 切，所以不会切坏中文或 surrogate pair。SW 收齐后按 `index` 排序拼 bytes，decode JSON，再把恢复出的原始 payload 递归交回普通分发逻辑。
 
-```json
-// Layer-1 段 2/3，Layer-2 chunk 1/3
-{
-  "messageKind": "reasoning",
-  "messageId": "msg_<uuid>_iter_0_reasoning_chunk_1",
-  "sessionId": "sess_abc",
-  "messageIndex": 2,
-  "totalMessages": 3,
-  "chunkIndex": 1,
-  "totalChunks": 3,
-  "reasoningContent": "first 2000 bytes of sentence 2…"
-}
-```
+### 迁移说明
 
-### SW 端拼接合约
-
-```js
-// 伪代码 — 在 SW 的 'push' 事件 handler 里
-const buffers = new Map();   // sessionId → { [messageIndex]: { chunks: Map<chunkIndex,text>, total: number } }
-
-function onReasoningPush(p) {
-  // Single-shot — neither axis present. 直接消费。
-  if (p.chunkIndex === undefined && p.messageIndex === undefined) {
-    return deliverComplete(p.sessionId, p.reasoningContent);
-  }
-
-  // 按 (sessionId, messageIndex) 分桶 — messageIndex 不存在视作 0。
-  const segIdx = p.messageIndex ?? 0;
-  const segTotal = p.totalMessages ?? 1;
-  const chunkIdx = p.chunkIndex ?? 1;
-  const chunkTotal = p.totalChunks ?? 1;
-
-  const bySession = buffers.get(p.sessionId) ?? new Map();
-  buffers.set(p.sessionId, bySession);
-  const seg = bySession.get(segIdx) ?? { chunks: new Map(), total: chunkTotal };
-  seg.chunks.set(chunkIdx, p.reasoningContent);
-  bySession.set(segIdx, seg);
-
-  // 检查所有 segIdx 1..segTotal 都到齐 + 每段 chunks 1..total 都到齐 → 拼接消费。
-  if (bySession.size === segTotal &&
-      [...bySession.values()].every(s => s.chunks.size === s.total)) {
-    const full = [...bySession.entries()]
-      .sort(([a],[b]) => a - b)
-      .map(([_, s]) => [...s.chunks.entries()].sort(([a],[b]) => a - b).map(([_, t]) => t).join(''))
-      .join('');
-    deliverComplete(p.sessionId, full);
-    buffers.delete(p.sessionId);
-  }
-}
-```
-
-**关键不变量**：
-- `chunkIndex` / `totalChunks` 仅在 byte 切实际发生（N > 1）时出现，单 chunk 一律省略。
-- `messageIndex` / `totalMessages` 仅在 caller 自己用 `pushPayloads` 数组提交了 M > 1 条 reasoning push 时出现（next.4 起 auto-emit 路径只剩单层字节切，不再加这俩字段）。
-- Web Push 到达顺序**不保证**，SW 必须按 `chunkIndex` 排序。
-- 跨 sessionId 不要混。每个 LLM round 一个 sessionId。
-
-### 事件
-
-framework 在 Layer 2 实际触发时 fire 一次 `reasoning_chunked`：
-
-```js
-onEvent: (e) => {
-  if (e.type === 'reasoning_chunked') {
-    console.log(`session=${e.sessionId} bytes=${e.totalBytes} chunks=${e.totalChunks} iter=${e.iteration}`);
-  }
-}
-```
-
-Layer 1 单独的句切不 fire 此事件（用户自己配的，可观测性走业务日志）。
+- 应用级 SW 可以删除自定义 reasoning 拼接逻辑。`@rei-standard/amsg-sw` 会透明重组，client 只收到完整 `messageKind: 'reasoning'` payload。
+- 不要再依赖 `chunkIndex` / `totalChunks` 判断 reasoning 是否完整；next 版本不会再发这些字段。
+- `_multipart` 是保留的 transport kind，不触发业务事件、不弹通知。
+- `content` multipart 收齐后照常 `postMessage` + `showNotification`；`tool_request` / `reasoning` / `error` 仍默认只 `postMessage` 不通知。
+- 发送端会 emit `multipart_built` / `multipart_sent` 事件用于可观测性。旧 `reasoning_chunked` 事件不再表示 wire 行为。
 
 ---
 
@@ -701,20 +626,20 @@ agentic loop 模式下 payload 大小分布（经验值）：
 | tool-request push（带本轮 LLM 原文） | 0.8–1.8 KB | 2.5 KB | 3.5 KB |
 | tool-request + reasoning | 1.5–3 KB | 4 KB（临界） | 5–6 KB（超） |
 
-→ **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。0.8.0-next.2 引入 [reasoning byte chunking](#reasoning-chunking080-next2) 后，reasoning 超限的场景默认自动切分不再依赖 BlobStore；`BlobStore` 主要是 ContentPush / ToolRequestPush 超限的兜底（以及 reasoning byte chunking 被显式关闭时的 fallback）：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, type? }`，SW 端 `GET ${url}` 拿真 body。
+→ **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。next 阶段引入 [generic multipart transport](#generic-multipart-transportnext) 后，没有 BlobStore 时也能透明拆分任意 JSON-safe payload；`BlobStore` 仍是更可靠方案，且优先级高于 multipart：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, messageKind?, type? }`，SW / client 再按 envelope 约定读取真 body。
 
 ### 何时启用 / 何时跳过
 
 | 场景 | 推荐 |
 |---|---|
 | 不配 `onLLMOutput`（v0.6 legacy 路径） | **不需要配** —— 分句拆出来每段都 < 1 KB |
-| agentic loop，只用 reasoning，不带长 ContentPush | **不需要配** —— next.2 起 reasoning 自动 byte chunking，2 KB / chunk |
+| agentic loop，只用 reasoning，不带长 ContentPush | 可以先不配 —— 默认 generic multipart 会兜底；生产更推荐 BlobStore |
 | agentic loop，ContentPush 偶尔很长（代码块 / 长答案） | 推荐配 |
-| 显式关闭 `reasoningChunkBytes: null` | **强烈推荐** —— 大 reasoning 兜底走 envelope |
+| 显式关闭 `multipart` 或 `reasoningChunkBytes: null` | **强烈推荐** —— 大 payload 兜底走 envelope |
 | 任何 tool-request 流程 | 推荐配（toolCalls + narration 偶尔会撞线） |
 | 一次推完整 history | **必须配** —— 必超 |
 
-**不配 + 超限的行为**：抛 `PayloadTooLargeError` + emit `payload_too_large`，不静默截断。调用方据此决定要不要上 BlobStore。
+**不配 BlobStore + 超限的行为**：默认走 generic multipart；如果 `multipart.enabled:false` 或超过 `maxTotalBytes` / `maxChunks`，才抛 `PayloadTooLargeError`。调用方据此决定要不要上 BlobStore。
 
 ### 包内自带 6 个 adapter
 
@@ -1034,6 +959,7 @@ await client.sendInstant({
 - `normalizeAiApiUrl(apiUrl)` — 0.4.0 新增，幂等地补全 `/v1/chat/completions`
 - `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现
 - `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
+- `buildMultipartPushPayloads(payload, { maxChunkBytes?, id?, ttlMs? })` — next 新增，构造 generic `_multipart` transport payloads
 
 子路径：
 

@@ -19,26 +19,22 @@ import {
   buildContentPush,
   buildReasoningPush,
   buildErrorPush,
-  chunkReasoningByUtf8Bytes,
 } from '@rei-standard/amsg-shared';
 
 import { sendWebPush } from './webpush.js';
 import { randomUUID } from './utils.js';
 import { HookError, LlmCallError, PayloadTooLargeError } from './errors.js';
 import { buildSessionContext, extractAssistantMessage } from './session-context.js';
+import {
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  DEFAULT_MULTIPART_TTL_MS,
+  MULTIPART_MESSAGE_KIND,
+  buildMultipartPushPayloads,
+} from './multipart.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
-// Inter-chunk spacing for reasoning byte chunks. Byte-chunking is a
-// transport-level workaround (Web Push payload limit), NOT a
-// typing-bubble UX axis, so the inter-chunk gap is much smaller than
-// the inter-sentence gap. 100 ms is enough to avoid pummelling the
-// push gateway in a tight loop while keeping perceived latency low.
-const SLEEP_BETWEEN_REASONING_CHUNKS_MS = 100;
-// Mirrors `DEFAULT_REASONING_CHUNK_BYTES` in `index.js` — kept in sync
-// so `processInstantMessage` callers that bypass `createInstantHandler`
-// (tests, direct programmatic use) still get the same default.
-const DEFAULT_REASONING_CHUNK_BYTES = 2000;
-
 const DEFAULT_MAX_LOOP_ITERATIONS = 10;
 const DEFAULT_MAX_INLINE_BYTES = 2600;
 const DEFAULT_BLOB_TTL_SECONDS = 60;
@@ -102,98 +98,23 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
   return total;
 }
 
-// ─── Reasoning byte chunking ────────────────────────────────────────────
+// ─── Reasoning emission ─────────────────────────────────────────────────
 
 /**
- * Slice a ReasoningPush into one or more byte-bounded pushes. When
- * `reasoningContent` UTF-8 length exceeds `reasoningChunkBytes`, the
- * lib chunks at UTF-8 codepoint boundaries via
- * `chunkReasoningByUtf8Bytes` and ships each chunk as its own push
- * with `chunkIndex` / `totalChunks`. Otherwise ships as one.
- *
- * `null` for `reasoningChunkBytes` disables chunking entirely —
- * oversized reasoning then either flows through `sendPushWithMaybeBlob`
- * (and BlobStore) or throws `PayloadTooLargeError`.
- *
- * `messageId` is regenerated per leaf so each push has a unique id:
- *   `msg_<uuid>_iter_<iteration>_reasoning_chunk_<chunkIndex>`
- *
- * @param {Object} reasoningPush
- * @param {number | null | undefined} reasoningChunkBytes
- * @param {number | undefined} iteration  - Legacy path passes `undefined`;
- *   the messageId template falls back to `iter_0` in that case. Hook path
- *   always passes an integer iteration counter.
- * @returns {Array<Object>}
- */
-function sliceReasoningPush(reasoningPush, reasoningChunkBytes, iteration) {
-  if (reasoningChunkBytes === null) return [reasoningPush];
-  // `chunkReasoningByUtf8Bytes` from @rei-standard/amsg-shared requires
-  // maxBytes >= 4 (UTF-8 max codepoint width); honour that floor here so a
-  // pathological ctx.reasoningChunkBytes injection falls back to the default
-  // instead of crashing inside the shared lib.
-  const threshold = (Number.isInteger(reasoningChunkBytes) && reasoningChunkBytes >= 4)
-    ? reasoningChunkBytes
-    : DEFAULT_REASONING_CHUNK_BYTES;
-
-  const text = typeof reasoningPush.reasoningContent === 'string'
-    ? reasoningPush.reasoningContent
-    : '';
-  if (!text) return [reasoningPush];
-
-  const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(text).byteLength;
-  if (byteLen <= threshold) return [reasoningPush];
-
-  const pieces = chunkReasoningByUtf8Bytes(text, threshold);
-  const totalChunks = pieces.length;
-  const iterTag = Number.isInteger(iteration) ? iteration : 0;
-  return pieces.map((piece, i) => ({
-    ...reasoningPush,
-    messageId: `msg_${randomUUID()}_iter_${iterTag}_reasoning_chunk_${i + 1}`,
-    reasoningContent: piece,
-    chunkIndex: i + 1,
-    totalChunks,
-  }));
-}
-
-/**
- * Ship a ReasoningPush, byte-chunking if oversized. Fires a single
- * `reasoning_chunked` event when chunking actually splits the push.
- * No event fires when chunking is a no-op (single push) — the event is
- * meant to signal Layer-2 byte chunking actually triggered, not just
- * normal reasoning emission.
- * Serial delivery with `SLEEP_BETWEEN_REASONING_CHUNKS_MS` (100 ms)
- * between chunks — byte chunking is a transport-level workaround, not
- * a typing-bubble UX axis, so the inter-chunk gap is much smaller than
- * the inter-sentence gap.
+ * Ship a ReasoningPush through the same transport path as every other
+ * payload. Oversized reasoning no longer uses the old reasoning-only
+ * `chunkIndex` / `totalChunks` wire format; `sendPushWithMaybeBlob`
+ * decides direct push, BlobStore envelope, or generic `_multipart`.
  *
  * @param {Object} reasoningPush
  * @param {Object} payload
  * @param {Object} ctx
  * @param {string} sessionId
- * @param {(ms: number) => Promise<void>} sleep
- * @param {number | undefined} iteration
  * @returns {Promise<number>}  Total leaves shipped.
  */
-async function emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iteration) {
-  const leaves = sliceReasoningPush(reasoningPush, ctx.reasoningChunkBytes, iteration);
-
-  if (leaves.length > 1) {
-    const onEvent = typeof ctx.onEvent === 'function' ? ctx.onEvent : () => {};
-    const totalBytes = typeof reasoningPush.reasoningContent === 'string'
-      ? PUSH_PAYLOAD_BYTE_ENCODER.encode(reasoningPush.reasoningContent).byteLength
-      : 0;
-    const evt = { type: 'reasoning_chunked', sessionId, totalChunks: leaves.length, totalBytes };
-    if (Number.isInteger(iteration)) evt.iteration = iteration;
-    onEvent(evt);
-  }
-
-  for (let i = 0; i < leaves.length; i++) {
-    await sendPushWithMaybeBlob(leaves[i], payload, ctx, sessionId);
-    if (i < leaves.length - 1) {
-      await sleep(SLEEP_BETWEEN_REASONING_CHUNKS_MS);
-    }
-  }
-  return leaves.length;
+async function emitReasoning(reasoningPush, payload, ctx, sessionId) {
+  await sendPushWithMaybeBlob(reasoningPush, payload, ctx, sessionId);
+  return 1;
 }
 
 /**
@@ -398,6 +319,8 @@ function readReasoningContent(llmResponse) {
  *   invoking the hook — callers wanting reasoning emission must build
  *   it themselves with `buildReasoningPush` and push it via their own
  *   `pushPayload`.
+ * @param {Object} [ctx.multipart] - Generic multipart transport fallback
+ *   for oversized JSON-safe payloads when BlobStore is not configured.
  * @returns {Promise<object>}
  */
 export async function processInstantMessage(payload, ctx) {
@@ -441,7 +364,6 @@ async function runLegacyInstant(payload, ctx) {
     throw error;
   }
 
-  const pushSubscription = payload.pushSubscription;
   const contactName = payload.contactName;
   const avatarUrl = payload.avatarUrl || null;
   const messageSubtype = payload.messageSubtype || 'chat';
@@ -470,16 +392,12 @@ async function runLegacyInstant(payload, ctx) {
     // user-facing content burst. Mirrors the hook path's
     // `reasoning_push_failed` event (runAgenticLoop).
     //
-    // `emitReasoning` byte-chunks via `ctx.reasoningChunkBytes`
-    // (default 2000 B): short reasoning ships as a single push;
-    // oversized reasoning is sliced into N chunks at UTF-8 codepoint
-    // boundaries with `chunkIndex` / `totalChunks`.
+    // Generic transport handles oversized reasoning now: direct push,
+    // BlobStore envelope, or `_multipart`, never the old
+    // reasoning-only `chunkIndex` / `totalChunks` wire format.
     let reasoningShipped = false;
     try {
-      // Legacy path has no "iteration" — pass undefined so messageId
-      // template falls back to `iter_0` and the `reasoning_chunked`
-      // event omits the field.
-      await emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, undefined);
+      await emitReasoning(reasoningPush, payload, ctx, sessionId);
       reasoningShipped = true;
       onEvent({ type: 'reasoning_pushed', sessionId });
     } catch (err) {
@@ -530,14 +448,10 @@ async function runLegacyInstant(payload, ctx) {
     });
 
     try {
-      await sendWebPush({
-        subscription: pushSubscription,
-        payload: JSON.stringify(contentPush),
-        vapid: ctx.vapid,
-        fetch: fetchImpl,
-      });
+      await sendPushWithMaybeBlob(contentPush, payload, ctx, sessionId);
       onEvent({ type: 'push_sent', messageIndex: i + 1, totalMessages: messages.length, sessionId });
     } catch (err) {
+      if (err && err.code === 'PAYLOAD_TOO_LARGE') throw err;
       const error = new Error(err?.message || 'Web Push delivery failed');
       error.code = 'PUSH_SEND_FAILED';
       error.statusCode = err?.statusCode;
@@ -633,10 +547,7 @@ async function runAgenticLoop(payload, ctx) {
           metadata: payload.metadata || {},
         });
         try {
-          // Byte-chunk via `ctx.reasoningChunkBytes` (default 2000 B):
-          // short reasoning ships as one push; oversized reasoning is
-          // sliced into N chunks with `chunkIndex`/`totalChunks`.
-          await emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iteration);
+          await emitReasoning(reasoningPush, payload, ctx, sessionId);
           onEvent({ type: 'reasoning_pushed', sessionId, iteration });
         } catch (err) {
           // Don't fail the whole turn for a reasoning instrumentation
@@ -675,12 +586,7 @@ async function runAgenticLoop(payload, ctx) {
         timestamp: new Date().toISOString(),
       });
       try {
-        await sendWebPush({
-          subscription: payload.pushSubscription,
-          payload: JSON.stringify(diagnostic),
-          vapid: ctx.vapid,
-          fetch: fetchImpl,
-        });
+        await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
       } catch (pushErr) {
         onEvent({ type: 'diagnostic_push_failed', code: 'HOOK_THREW', sessionId, cause: pushErr });
       }
@@ -706,10 +612,9 @@ async function runAgenticLoop(payload, ctx) {
     // Reasoning pushes coming from the hook flow through the same
     // delivery path. `autoEmitReasoning` (default on) handles the
     // framework-emitted ReasoningPush that comes from the LLM's
-    // `reasoning_content` field BEFORE the hook fires; `emitReasoning`
-    // is a single-layer byte-chunker. Hooks wanting custom reasoning
-    // chunking slice themselves and pass the pieces as individual
-    // `pushPayloads` entries.
+    // `reasoning_content` field BEFORE the hook fires. Oversized
+    // payloads, reasoning included, are transport-wrapped by generic
+    // `_multipart` only after normal BlobStore priority is checked.
     const messagesSent = await sendPushesSequentially(
       decision.pushPayloads,
       payload,
@@ -880,8 +785,23 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
   }
 
   if (!ctx.blobStore || !ctx.blobStore.adapter) {
-    onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
-    throw new PayloadTooLargeError(byteLen, maxInline);
+    const multipart = resolveRuntimeMultipartOptions(ctx);
+    if (!multipart.enabled) {
+      onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
+      throw new PayloadTooLargeError(byteLen, maxInline);
+    }
+    await sendMultipartPushes(pushPayload, {
+      byteLen,
+      fetchImpl,
+      maxInline,
+      multipart,
+      onEvent,
+      payload,
+      serialized,
+      sessionId,
+      vapid: ctx.vapid,
+    });
+    return;
   }
 
   const adapter = ctx.blobStore.adapter;
@@ -922,6 +842,109 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
     onEvent({ type: 'blob_orphaned', key, size: byteLen, sessionId, cause: err });
     throw err;
   }
+}
+
+function resolveRuntimeMultipartOptions(ctx) {
+  const hasMultipart = ctx && ctx.multipart !== undefined;
+  const raw = hasMultipart ? ctx.multipart : {};
+  const config = raw && typeof raw === 'object' ? raw : {};
+  let enabled = config.enabled !== false;
+  let maxChunkBytes = config.maxChunkBytes;
+
+  if (ctx && ctx.reasoningChunkBytes !== undefined && maxChunkBytes === undefined) {
+    if (ctx.reasoningChunkBytes === null) {
+      if (!hasMultipart) enabled = false;
+    } else {
+      maxChunkBytes = ctx.reasoningChunkBytes;
+    }
+  }
+
+  return {
+    enabled,
+    maxChunkBytes: positiveIntegerOrDefault(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES),
+    ttlMs: positiveIntegerOrDefault(config.ttlMs, DEFAULT_MULTIPART_TTL_MS),
+    maxChunks: positiveIntegerOrDefault(config.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS),
+    maxTotalBytes: positiveIntegerOrDefault(config.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES),
+  };
+}
+
+async function sendMultipartPushes(pushPayload, args) {
+  const {
+    byteLen,
+    fetchImpl,
+    maxInline,
+    multipart,
+    onEvent,
+    payload,
+    serialized,
+    sessionId,
+    vapid,
+  } = args;
+  const originalMessageKind = getOriginalMessageKind(pushPayload);
+
+  if (originalMessageKind === MULTIPART_MESSAGE_KIND) {
+    onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  if (byteLen > multipart.maxTotalBytes) {
+    onEvent({
+      type: 'multipart_too_large',
+      byteLen,
+      maxTotalBytes: multipart.maxTotalBytes,
+      originalMessageKind,
+      sessionId,
+    });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  const parts = buildMultipartPushPayloads(pushPayload, {
+    maxChunkBytes: multipart.maxChunkBytes,
+    serializedPayload: serialized,
+    ttlMs: multipart.ttlMs,
+  });
+  if (parts.length > multipart.maxChunks) {
+    onEvent({
+      type: 'multipart_too_many_chunks',
+      byteLen,
+      maxChunks: multipart.maxChunks,
+      totalChunks: parts.length,
+      originalMessageKind,
+      sessionId,
+    });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  const firstPart = /** @type {{ multipart?: { id?: unknown } }} */ (parts[0] || {});
+  const id = firstPart.multipart?.id;
+  onEvent({
+    type: 'multipart_built',
+    id,
+    byteLen,
+    totalChunks: parts.length,
+    originalMessageKind,
+    sessionId,
+  });
+
+  for (const part of parts) {
+    await sendWebPush({
+      subscription: payload.pushSubscription,
+      payload: JSON.stringify(part),
+      vapid,
+      fetch: fetchImpl,
+    });
+  }
+  onEvent({ type: 'multipart_sent', id, totalChunks: parts.length, originalMessageKind, sessionId });
+}
+
+function getOriginalMessageKind(pushPayload) {
+  return pushPayload && typeof pushPayload === 'object'
+    ? /** @type {{ messageKind?: unknown }} */ (pushPayload).messageKind
+    : undefined;
+}
+
+function positiveIntegerOrDefault(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 /**

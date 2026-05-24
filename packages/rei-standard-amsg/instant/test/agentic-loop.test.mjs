@@ -36,6 +36,7 @@ import {
   generateTestSubscription,
   createFetchRouter,
   decryptCapturedPushBody,
+  base64UrlToBytes,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -79,6 +80,27 @@ function makeRequest(url, body, headers = {}) {
     headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body),
   });
+}
+
+async function decryptAll(pushCalls) {
+  const out = [];
+  for (const call of pushCalls) {
+    out.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
+  }
+  return out;
+}
+
+function restoreMultipartPayload(parts) {
+  const sorted = parts.slice().sort((a, b) => a.multipart.index - b.multipart.index);
+  const byteChunks = sorted.map((part) => base64UrlToBytes(part.chunk));
+  const totalBytes = byteChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+  const joined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const bytes of byteChunks) {
+    joined.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(joined));
 }
 
 // ─── decision: finish ───────────────────────────────────────────────────
@@ -412,7 +434,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
     assert.equal(JSON.parse(decrypted)._blob, true);
   });
 
-  it('no blobStore + oversize payload → PayloadTooLargeError', async () => {
+  it('no blobStore + multipart enabled → generic multipart fallback', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
       llm: () => makeLlmResponse('x'),
@@ -423,6 +445,43 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       fetch: router.fetch,
       onEvent: (e) => events.push(e),
       onLLMOutput: () => ({
+        decision: 'tool-request',
+        pushPayloads: [{
+          messageKind: 'tool_request',
+          message: 'need a large tool request',
+          toolCalls: [{
+            id: 'call_big',
+            type: 'function',
+            function: { name: 'bulk', arguments: JSON.stringify({ data: 'a'.repeat(5000) }) },
+          }],
+        }],
+      }),
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+
+    const decoded = await decryptAll(router.pushCalls);
+    assert.ok(decoded.length > 1);
+    assert.equal(decoded.every((p) => p.messageKind === '_multipart'), true);
+    assert.equal(decoded.every((p) => p.multipart.originalMessageKind === 'tool_request'), true);
+    const restored = restoreMultipartPayload(decoded);
+    assert.equal(restored.messageKind, 'tool_request');
+    assert.equal(restored.toolCalls[0].function.name, 'bulk');
+    assert.equal(events.some((e) => e.type === 'multipart_built' && e.originalMessageKind === 'tool_request'), true);
+  });
+
+  it('no blobStore + multipart disabled + oversize payload → PayloadTooLargeError', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('x'),
+    });
+    const events = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onEvent: (e) => events.push(e),
+      multipart: { enabled: false },
+      onLLMOutput: () => ({
         decision: 'finish',
         pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
       }),
@@ -432,6 +491,26 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
     const body = await res.json();
     assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE');
     assert.ok(events.find((e) => e.type === 'payload_too_large'));
+  });
+
+  it('deprecated reasoningChunkBytes:null disables generic multipart when multipart is not explicit', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('x'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      reasoningChunkBytes: null,
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
+      }),
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE');
   });
 });
 

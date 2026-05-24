@@ -30,6 +30,12 @@ import {
   hmacSha256,
   timingSafeEqualBytes,
 } from './utils.js';
+import {
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  DEFAULT_MULTIPART_TTL_MS,
+} from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -111,25 +117,22 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *             read `ctx.llmResponse.choices[0].message.reasoning_content`
  *             and produce its own `buildReasoningPush(...)` envelope.
  *             Legacy (non-hook) path always auto-emits regardless.
- * @property {number | null} [reasoningChunkBytes=2000]
- *           - **next.2 transport knob.** Cap on the UTF-8 byte size
- *             of a single `ReasoningPush.reasoningContent`. When the
- *             auto-emitted (or hook-returned) reasoning exceeds this
- *             threshold, the framework slices it at UTF-8 codepoint
- *             boundaries via `chunkReasoningByUtf8Bytes` and ships N
- *             ReasoningPushes with `chunkIndex` / `totalChunks` set;
- *             the SW reassembles by sorting chunks within a
- *             `(sessionId, messageIndex)` bucket. Default 2000 keeps
- *             each full push payload (incl. envelope overhead) safely
- *             under the 2.6 KB Web Push limit without BlobStore.
- *             Set to `null` to disable byte chunking entirely —
- *             oversized reasoning then falls back to BlobStore (if
- *             configured) or throws `PayloadTooLargeError`.
- *             Layered with `reasoningSplitPattern` (sentence regex,
- *             request-payload field): sentence-split runs first, then
- *             oversized sentences cascade-chunk by byte. Throws
- *             `TypeError` at handler construction when not in
- *             `[500, maxInlineBytes - 600]` (or `null`).
+ * @property {Object} [multipart]
+ *           - **next transport knob.** Generic multipart fallback for
+ *             oversized JSON-safe push payloads when no BlobStore is
+ *             configured. Applies to every `messageKind` (including
+ *             reasoning, tool_request, content, error, and custom
+ *             kinds). Defaults to enabled.
+ * @property {boolean} [multipart.enabled=true]
+ * @property {number} [multipart.maxChunkBytes=1800]
+ * @property {number} [multipart.ttlMs=60000]
+ * @property {number} [multipart.maxChunks=128]
+ * @property {number} [multipart.maxTotalBytes=256000]
+ * @property {number | null} [reasoningChunkBytes]
+ *           - Deprecated alias for `multipart.maxChunkBytes`.
+ *             `null` disables generic multipart only when `multipart`
+ *             is not explicitly configured. It no longer produces
+ *             reasoning-only `chunkIndex` / `totalChunks` wire fields.
  */
 
 /**
@@ -169,10 +172,9 @@ export function createInstantHandler(options) {
   // most hook callers. The legacy path ignores this setting and
   // always auto-emits.
   const autoEmitReasoning = options.autoEmitReasoning !== false;
-  // Eager validation: `reasoningChunkBytes` throws at handler
-  // construction (not on the first request) so misconfiguration
-  // surfaces in startup logs / unit tests, not in production traffic.
-  const reasoningChunkBytes = resolveReasoningChunkBytes(options, blobStore);
+  // Eager validation keeps transport misconfiguration in startup logs /
+  // unit tests instead of surprising the first oversized push.
+  const multipart = resolveMultipartOptions(options);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -308,7 +310,7 @@ export function createInstantHandler(options) {
         blobStore,
         maxLoopIterations,
         autoEmitReasoning,
-        reasoningChunkBytes,
+        multipart,
         requestUrl: request.url,
         isResume: isContinue,
       });
@@ -332,53 +334,40 @@ export function createInstantHandler(options) {
   };
 }
 
-// Defaults pinned at module scope so the validator and the resolver
-// agree without a second source of truth.
-const DEFAULT_REASONING_CHUNK_BYTES = 2000;
-const DEFAULT_MAX_INLINE_BYTES_FOR_OVERHEAD_CHECK = 2600;
-const REASONING_CHUNK_BYTES_MIN = 500;
-const REASONING_CHUNK_OVERHEAD_MARGIN = 600;
-
-/**
- * Resolve and validate `options.reasoningChunkBytes`. Returns the
- * resolved sentinel value to pass into `processInstantMessage`'s ctx:
- *   - positive integer when chunking is enabled (caller-provided or default 2000)
- *   - `null` when chunking is explicitly disabled
- *
- * Throws `TypeError` at handler construction (NOT at request time) so
- * deploys with bad config fail fast in their startup logs / CI rather
- * than ship a worker that crashes on the first reasoning-heavy LLM
- * response.
- *
- * The acceptable range is `[REASONING_CHUNK_BYTES_MIN,
- * maxInlineBytes - REASONING_CHUNK_OVERHEAD_MARGIN]`. The 600 B
- * overhead margin reserves space for a chunk's push-payload metadata
- * (messageKind / sessionId / messageId / chunkIndex / totalChunks /
- * timestamp / contactName / avatarUrl / messageSubtype) so a chunk
- * sized exactly at `reasoningChunkBytes` still fits inline.
- *
- * @param {Object} options
- * @param {import('./blob-store/interface.js').BlobStoreConfig | null} blobStore
- * @returns {number | null}
- */
-function resolveReasoningChunkBytes(options, blobStore) {
-  const raw = options.reasoningChunkBytes;
-  if (raw === undefined) return DEFAULT_REASONING_CHUNK_BYTES;
-  if (raw === null) return null;
-  const maxInline = (blobStore && Number.isInteger(blobStore.maxInlineBytes) && blobStore.maxInlineBytes > 0)
-    ? blobStore.maxInlineBytes
-    : DEFAULT_MAX_INLINE_BYTES_FOR_OVERHEAD_CHECK;
-  const upperBound = maxInline - REASONING_CHUNK_OVERHEAD_MARGIN;
-  if (
-    !Number.isInteger(raw) ||
-    raw < REASONING_CHUNK_BYTES_MIN ||
-    raw > upperBound
-  ) {
-    throw new TypeError(
-      `[amsg-instant] reasoningChunkBytes must be a positive integer in [${REASONING_CHUNK_BYTES_MIN}, ${upperBound}] (= maxInlineBytes ${maxInline} − ${REASONING_CHUNK_OVERHEAD_MARGIN} overhead margin), or null to disable. Got: ${raw}`
-    );
+function resolveMultipartOptions(options) {
+  const hasMultipart = options.multipart !== undefined;
+  const raw = hasMultipart ? options.multipart : {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('[amsg-instant] multipart must be a plain object when set');
   }
-  return raw;
+
+  const multipart = /** @type {Record<string, unknown>} */ (raw);
+  let enabled = multipart.enabled !== false;
+  let maxChunkBytes = multipart.maxChunkBytes;
+
+  if (options.reasoningChunkBytes !== undefined && maxChunkBytes === undefined) {
+    if (options.reasoningChunkBytes === null) {
+      if (!hasMultipart) enabled = false;
+    } else {
+      maxChunkBytes = options.reasoningChunkBytes;
+    }
+  }
+
+  return {
+    enabled,
+    maxChunkBytes: resolvePositiveInt(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES, 'multipart.maxChunkBytes'),
+    ttlMs: resolvePositiveInt(multipart.ttlMs, DEFAULT_MULTIPART_TTL_MS, 'multipart.ttlMs'),
+    maxChunks: resolvePositiveInt(multipart.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS, 'multipart.maxChunks'),
+    maxTotalBytes: resolvePositiveInt(multipart.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES, 'multipart.maxTotalBytes'),
+  };
+}
+
+function resolvePositiveInt(value, fallback, fieldName) {
+  if (value === undefined || value === null) return fallback;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError(`[amsg-instant] ${fieldName} must be a positive integer. Got: ${value}`);
+  }
+  return value;
 }
 
 /**
@@ -616,6 +605,7 @@ export {
   sendPushWithMaybeBlob,
   readReasoningContent,
 } from './message-processor.js';
+export { buildMultipartPushPayloads } from './multipart.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
 export { HookError, PayloadTooLargeError, LlmCallError, MemoryStoreFullError } from './errors.js';
 export { buildSessionContext, extractAssistantMessage } from './session-context.js';

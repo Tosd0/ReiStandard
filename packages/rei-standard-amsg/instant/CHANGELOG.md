@@ -1,5 +1,35 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.0-next.6 — BREAKING: generic multipart transport (pre-release)
+
+next 阶段把 oversized push 的 transport 收敛成一套通用 multipart 协议。旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除；`reasoning`、`tool_request`、`content`、`error`、`emotion_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，都可以被 `_multipart` 包装。
+
+### New
+
+- **`buildMultipartPushPayloads(payload, { maxChunkBytes?, id?, ttlMs? })`** — 构造 generic `_multipart` Web Push payloads。原始 JSON 先 UTF-8 编码，再按 byte 切片并 base64url 编码，避免 Unicode 边界问题。
+- **`multipart` handler option** — 默认开启。配置项：`enabled`、`maxChunkBytes`、`ttlMs`、`maxChunks`、`maxTotalBytes`。
+- **`multipart_built` / `multipart_sent` events** — 发送端可观测 multipart fallback 何时触发、原始 `messageKind` 是什么、共拆了几片。
+
+### Changed
+
+- `sendPushWithMaybeBlob` 发送优先级现在是：
+  1. 小 payload：直接 Web Push。
+  2. oversized + 有 BlobStore：仍优先走 BlobStore envelope。
+  3. oversized + 无 BlobStore + multipart enabled：走 generic `_multipart`。
+  4. oversized + 无 BlobStore + multipart disabled / 超 multipart 上限：抛 `PayloadTooLargeError`。
+- legacy content push、HOOK_THREW diagnostic、LOOP_EXCEEDED diagnostic 现在也走同一个 `sendPushWithMaybeBlob` 路径，因此 oversized payload 策略一致。
+- `reasoningChunkBytes` 保留为 deprecated alias：设置数字时等价于 `multipart.maxChunkBytes`；设置 `null` 且未显式配置 `multipart` 时禁用 generic multipart。它不再产生旧 reasoning chunk fields。
+
+### Removed
+
+- Removed old reasoning-only `chunkIndex` / `totalChunks` wire format from producer output.
+- Removed `reasoning_chunked` as the transport signal for oversized reasoning. 迁移到 `multipart_built` / `multipart_sent`。
+
+### Migration
+
+- 应用级 SW 不应再依赖 `chunkIndex` / `totalChunks` 拼 reasoning。请升级 `@rei-standard/amsg-sw` 到支持 generic multipart 的 next 版本，让 SW 透明还原完整 payload。
+- 如果生产环境不想依赖 multipart fallback，继续配置 BlobStore；BlobStore 仍然优先于 multipart。
+
 ## 0.8.0-next.5 — `validateMessagesArray` 放宽 OpenAI tool-call 形态 (pre-release)
 
 非破坏性修复。`validateMessagesArray` 此前过严，会拒绝合法的 OpenAI 工具调用消息：

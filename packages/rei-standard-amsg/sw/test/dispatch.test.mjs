@@ -81,6 +81,34 @@ const COMMON = Object.freeze({
   timestamp: '2026-05-19T00:00:00.000Z'
 });
 
+function buildMultipartPayloads(payload, {
+  id = `mp_test_${Math.random().toString(16).slice(2)}`,
+  maxChunkBytes = 80,
+  ttlMs = 60_000,
+  createdAt = Date.now(),
+} = {}) {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const total = Math.ceil(bytes.byteLength / maxChunkBytes);
+  return Array.from({ length: total }, (_, index) => {
+    const start = index * maxChunkBytes;
+    const chunk = bytes.subarray(start, Math.min(start + maxChunkBytes, bytes.byteLength));
+    return {
+      messageKind: '_multipart',
+      multipart: {
+        version: 1,
+        id,
+        index: index + 1,
+        total,
+        encoding: 'json-utf8-base64url',
+        originalMessageKind: typeof payload.messageKind === 'string' ? payload.messageKind : null,
+        createdAt,
+        ttlMs,
+      },
+      chunk: Buffer.from(chunk).toString('base64url'),
+    };
+  });
+}
+
 test('installReiSW registers the push listener', () => {
   const { sw, listeners } = createSwMock();
   installReiSW(sw);
@@ -237,6 +265,128 @@ test('blob envelope with messageKind: "tool_request" dispatches TOOL_REQUEST_REC
   assert.equal(notifications.length, 0, 'non-content blob envelopes do not render');
   assert.equal(postedMessages.length, 1);
   assert.equal(postedMessages[0].message.event, REI_SW_EVENT.TOOL_REQUEST_RECEIVED);
+});
+
+test('generic multipart content restores payload before dispatch and notification', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'content',
+    message: 'oversized content '.repeat(20),
+    title: 'Multipart Rei'
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_content', maxChunkBytes: 90 });
+
+  for (const part of parts.slice().reverse()) {
+    await triggerPush(part);
+  }
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, 'Multipart Rei');
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.CONTENT_RECEIVED);
+  assert.deepEqual(postedMessages[0].message.payload, payload);
+});
+
+test('generic multipart tool_request restores silently without notification', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'tool_request',
+    message: 'call a large tool',
+    toolCalls: [{ id: 'call_0', type: 'function', function: { name: 'bulk', arguments: 'x'.repeat(500) } }]
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_tool', maxChunkBytes: 100 });
+
+  for (const part of parts) {
+    await triggerPush(part);
+  }
+
+  assert.equal(notifications.length, 0);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.TOOL_REQUEST_RECEIVED);
+  assert.deepEqual(postedMessages[0].message.payload, payload);
+});
+
+test('generic multipart custom messageKind restores and dispatches UNKNOWN_RECEIVED', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'emotion_update',
+    mood: 'curious',
+    detail: 'x'.repeat(400)
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_emotion', maxChunkBytes: 90 });
+
+  for (const part of parts) {
+    await triggerPush(part);
+  }
+
+  assert.equal(notifications.length, 0);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.UNKNOWN_RECEIVED);
+  assert.deepEqual(postedMessages[0].message.payload, payload);
+});
+
+test('generic multipart ignores duplicate chunks and duplicate completion', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'reasoning',
+    reasoningContent: 'thinking '.repeat(80)
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_dedupe', maxChunkBytes: 100 });
+
+  await triggerPush(parts[0]);
+  await triggerPush(parts[0]);
+  assert.equal(postedMessages.length, 0);
+
+  for (const part of parts.slice(1)) {
+    await triggerPush(part);
+  }
+  assert.equal(notifications.length, 0);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.REASONING_RECEIVED);
+
+  await triggerPush(parts[parts.length - 1]);
+  assert.equal(postedMessages.length, 1, 'done marker prevents duplicate business dispatch');
+});
+
+test('generic multipart missing chunks do not dispatch and expire observably', async () => {
+  const { sw, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'reasoning',
+    reasoningContent: 'partial '.repeat(50)
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_expire', maxChunkBytes: 80, ttlMs: 1 });
+
+  await triggerPush(parts[0]);
+  assert.equal(postedMessages.length, 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await triggerPush({ ...COMMON, messageKind: 'error', code: 'NOOP', message: 'tick cleanup' });
+
+  const expired = postedMessages.find((entry) =>
+    entry.message.event === REI_SW_EVENT.MULTIPART_EXPIRED
+  );
+  assert.ok(expired, 'expected multipart expired event');
+  assert.deepEqual(expired.message.payload, {
+    id: 'mp_sw_expire',
+    received: 1,
+    total: parts.length,
+    originalMessageKind: 'reasoning'
+  });
 });
 
 test('clients.matchAll is called with type:"window" and includeUncontrolled:true', async () => {
