@@ -1,5 +1,5 @@
 /**
- * next.4 — pushPayloads-only hook decision API contract matrix.
+ * 0.8.0 — pushPayloads-only hook decision API contract matrix.
  *
  * Pins the 13 fixtures from spec §测试要求.
  */
@@ -213,7 +213,7 @@ describe('7) per-push splitPattern → HookError', () => {
     });
     assert.equal(res.status, 500);
     assert.equal(body.error.code, 'HOOK_THREW');
-    assert.match(body.error.message, /splitPattern is removed in next\.4/);
+    assert.match(body.error.message, /splitPattern is removed in 0\.8\.0/);
   });
 });
 
@@ -230,7 +230,7 @@ describe('8) request body splitPattern → 400', () => {
     assert.equal(res.status, 400);
     const body = await res.json();
     assert.equal(body.error.code, 'INVALID_PAYLOAD_FORMAT');
-    assert.match(body.error.message, /splitPattern is removed in next\.4/);
+    assert.match(body.error.message, /splitPattern is removed in 0\.8\.0/);
   });
 });
 

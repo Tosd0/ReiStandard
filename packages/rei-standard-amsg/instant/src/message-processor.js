@@ -299,8 +299,8 @@ function readReasoningContent(llmResponse) {
  *     ReasoningPush BEFORE invoking the hook when the LLM response
  *     includes `reasoning_content` (skippable via
  *     `autoEmitReasoning: false`). The hook then decides via the
- *     same 4-decision contract; the hook's `pushPayload` is what
- *     `sw` will route as the kind-specific content push.
+ *     same 4-decision contract; the hook's `pushPayloads` array is
+ *     what `sw` will route as kind-specific pushes.
  *
  * @param {Object} payload  - Validated request body.
  * @param {Object} ctx
@@ -317,8 +317,8 @@ function readReasoningContent(llmResponse) {
  * @param {boolean} [ctx.autoEmitReasoning=true] - Hook path only. When
  *   `false`, the framework will not auto-emit ReasoningPush before
  *   invoking the hook — callers wanting reasoning emission must build
- *   it themselves with `buildReasoningPush` and push it via their own
- *   `pushPayload`.
+ *   it themselves with `buildReasoningPush` and include it in their
+ *   own `pushPayloads`.
  * @param {Object} [ctx.multipart] - Generic multipart transport fallback
  *   for oversized JSON-safe payloads when BlobStore is not configured.
  * @returns {Promise<object>}
@@ -417,7 +417,7 @@ async function runLegacyInstant(payload, ctx) {
   // regex matches Chinese full-stop family + ASCII ./!/? clusters; the
   // reduce reattaches the matched delimiter to the preceding segment
   // (split returns interleaved [segment, delim, segment, delim, ...]).
-  // No caller knob — the public `splitPattern` field is gone in next.4.
+  // No caller knob — the public `splitPattern` field is gone in 0.8.0.
   const splitOutput = messageContent
     .split(/([。！？!?]+)/)
     .reduce((acc, part, i, arr) => {
@@ -677,8 +677,8 @@ function assertValidDecision(decision) {
   if (hasSingular) {
     throw new TypeError(
       hasPlural
-        ? 'pushPayload (singular) is removed in next.4, use pushPayloads'
-        : 'pushPayload (singular) is removed in next.4, use pushPayloads: [yourPayload]'
+        ? 'pushPayload (singular) is removed in 0.8.0, use pushPayloads'
+        : 'pushPayload (singular) is removed in 0.8.0, use pushPayloads: [yourPayload]'
     );
   }
 
@@ -707,7 +707,7 @@ function assertValidDecision(decision) {
       throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyForError(p)}`);
     }
     if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
-      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in next.4; caller is responsible for splitting`);
+      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in 0.8.0; caller is responsible for splitting`);
     }
     if (Object.prototype.hasOwnProperty.call(p, 'messageId')) {
       const id = p.messageId;
@@ -732,8 +732,8 @@ function stringifyForError(value) {
  *   - With a `blobStore` configured → write body to the store, push
  *     a small envelope `{ _blob:true, key, url, messageKind?, type? }`
  *     instead.
- *   - Without → emit `payload_too_large` and throw
- *     `PayloadTooLargeError`.
+ *   - Without a `blobStore` → use generic `_multipart` when enabled;
+ *     otherwise emit `payload_too_large` and throw `PayloadTooLargeError`.
  *
  * The envelope's `messageKind` (and legacy `type`) field is lifted
  * from the original payload when present, so the SW can dispatch on

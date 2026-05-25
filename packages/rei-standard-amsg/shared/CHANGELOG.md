@@ -1,6 +1,6 @@
 # @rei-standard/amsg-shared
 
-## 0.1.0-next.4 — NotificationDirective 与 Shared utilities (pre-release)
+## 0.1.0 — NotificationDirective 与 Shared utilities
 
 ### New
 - **Shared Utilities**：新增并导出了底层工具函数 `base64UrlToBytes`, `toUint8`, 和 `concatBytes`，统一了底层依赖。

@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@rei-standard/amsg-shared':
-        specifier: 0.1.0-next.3
-        version: 0.1.0-next.3
+        specifier: 0.1.0
+        version: 0.1.0
     devDependencies:
       tsup:
         specifier: ^8.0.0
@@ -190,8 +190,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@rei-standard/amsg-shared@0.1.0-next.3':
-    resolution: {integrity: sha512-w9x2x1ZT9+l/864z+pSlAx6WiujNolpEsVhGYWFGJweW6XVoS4bgYzKfSkTscXzjgFsv/+qmAnywULX0SDKbtw==}
+  '@rei-standard/amsg-shared@0.1.0':
+    resolution: {integrity: sha512-HyA60hLHFQTo3AY2ay0JjF2EHjimk2oToNhhuOmRRWZwk4Pu7EF3lcTa0O9b69KY4oOKdPq2qKeY7zL/RMR5lg==}
     engines: {node: '>=20'}
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
@@ -629,7 +629,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@rei-standard/amsg-shared@0.1.0-next.3': {}
+  '@rei-standard/amsg-shared@0.1.0': {}
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
     optional: true

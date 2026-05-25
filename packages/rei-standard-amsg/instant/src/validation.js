@@ -311,7 +311,7 @@ export function validateInstantPayload(payload, opts) {
     return {
       valid: false,
       errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      errorMessage: `${removedField} is removed in 0.8.0; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
       details: { invalidFields: [removedField] },
     };
   }
@@ -457,7 +457,7 @@ export function validateContinuePayload(payload, opts) {
     return {
       valid: false,
       errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      errorMessage: `${removedField} is removed in 0.8.0; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
       details: { invalidFields: [removedField] },
     };
   }

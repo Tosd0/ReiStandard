@@ -92,9 +92,9 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
 
-### Generic multipart transport（next）
+### Generic multipart transport（2.1.0+）
 
-next 阶段移除了旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format。现在 `_multipart` 是统一 transport kind，任何原始 payload 都可以被包起来：
+2.1.0 移除了旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format。现在 `_multipart` 是统一 transport kind，任何原始 payload 都可以被包起来：
 
 ```json
 {
@@ -128,7 +128,7 @@ installReiSW(self, {
     maxChunks: 128,
     cleanupIntervalMs: 15 * 60_000
   },
-  // （新增于 2.1.0-next.3）离线持久化等业务拦截钩子：
+  // （新增于 2.1.0）离线持久化等业务拦截钩子：
   onBusinessPayload: async (payload) => {
     // 收到完整 payload 时触发，由于内置在 event.waitUntil 中，能够确保离线写库完毕再允许 SW 休眠
     // await db.saveIncomingMessage(payload);
@@ -151,7 +151,7 @@ TTL 到期仍未收齐时，SW 会清理 pending 并广播：
 ### 升级注意事项
 
 - 想给 `reasoning` / `tool_request` / `error` 弹通知的业务：SW 默认不再为它们弹通知，但可以通过设置 `payload.notification.show = "always"` 或 `"when-hidden"` 来让 SW 在包层直接弹通知。无需再强求在 app 内自绘。
-- 应用级 SW 可以删除旧 reasoning `chunkIndex` / `totalChunks` 拼接逻辑；next 版本只会把完整还原后的 reasoning payload 发给 client。
+- 应用级 SW 可以删除旧 reasoning `chunkIndex` / `totalChunks` 拼接逻辑；2.1.0+ 版本只会把完整还原后的 reasoning payload 发给 client。
 - 客户端代码继续兼容只有 `installReiSW` + `REI_SW_MESSAGE_TYPE`（队列）的 2.0.x 写法——新增导出不破坏既有 API。
 - 想拿到 push 类型相关的 TS 类型：从 `@rei-standard/amsg-shared` 引 `AmsgPush` 等类型（本包通过 JSDoc 引用同一份类型）。
 

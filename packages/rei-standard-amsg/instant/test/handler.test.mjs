@@ -329,22 +329,22 @@ describe('validateInstantPayload', () => {
   });
 });
 
-describe('next.4 — split-pattern fields removed', () => {
+describe('0.8.0 — split-pattern fields removed', () => {
   it('rejects request body splitPattern with INVALID_PAYLOAD_FORMAT', () => {
     const r = validateInstantPayload(makeValidPayload({ splitPattern: '([。！？!?]+)' }));
     assert.equal(r.valid, false);
     assert.equal(r.errorCode, 'INVALID_PAYLOAD_FORMAT');
-    assert.match(r.errorMessage, /splitPattern is removed in next\.4/);
+    assert.match(r.errorMessage, /splitPattern is removed in 0\.8\.0/);
   });
   it('rejects request body reasoningSplitPattern', () => {
     const r = validateInstantPayload(makeValidPayload({ reasoningSplitPattern: '([。！？!?]+)' }));
     assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /reasoningSplitPattern is removed in next\.4/);
+    assert.match(r.errorMessage, /reasoningSplitPattern is removed in 0\.8\.0/);
   });
   it('rejects request body errorSplitPattern', () => {
     const r = validateInstantPayload(makeValidPayload({ errorSplitPattern: '([。！？!?]+)' }));
     assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /errorSplitPattern is removed in next\.4/);
+    assert.match(r.errorMessage, /errorSplitPattern is removed in 0\.8\.0/);
   });
 });
 

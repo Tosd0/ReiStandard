@@ -1,8 +1,8 @@
 # Changelog — @rei-standard/amsg-client
 
-## 2.3.0-next.2 — Dependency bump (pre-release)
+## 2.3.0 — Dependency bump
 
-- 依赖更新：同步升级 `@rei-standard/amsg-shared` 至 `0.1.0-next.4`。
+- 依赖更新：同步升级 `@rei-standard/amsg-shared` 至稳定版 `0.1.0`。
 
 ## 2.3.0-next.1 — avatarUrl 本地软清空 (pre-release)
 

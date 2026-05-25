@@ -1,9 +1,10 @@
 # Changelog — @rei-standard/amsg-instant
 
-## 0.8.0-next.8 — waitUntil lifecycle support (pre-release)
+## 0.8.0 — waitUntil lifecycle support
 
+- 稳定版发布：`0.8.0-next.*` 能力毕业到 latest，依赖收敛到 `@rei-standard/amsg-shared@0.1.0`。
 - `waitUntil` 注册的是后台生命周期保护 promise；主流程失败仍由 handler 转成原有 HTTP 错误响应，同时通过 `wait_until_rejected` 事件记录，不额外制造 rejected background promise。
-- Cloudflare Workers：`createCloudflareWorker.fetch` 现在接收第三个 `ExecutionContext` 参数，并把主回复链路（LLM 生成、切段、逐条 Web Push）交给 `ctx.waitUntil` 保护。直接把 `createInstantHandler(...)` 挂成 Worker module `fetch` 时，也会识别 Cloudflare 传入的 `(request, env, ctx)`。
+- Cloudflare Workers：`createCloudflareWorker.fetch` 现在接收第三个 `ExecutionContext` 参数，并把主回复链路（LLM 生成、构造/切段 push payloads、逐条 Web Push）交给 `ctx.waitUntil` 保护。直接把 `createInstantHandler(...)` 挂成 Worker module `fetch` 时，也会识别 Cloudflare 传入的 `(request, env, ctx)`。
 - 其他运行时：`createInstantHandler` 新增通用 `waitUntil` 生命周期入口；Netlify / Vercel Edge adapters 会透传第二个 context 参数；Node adapter 新增可选 `toNodeHandler(fetchHandler, { waitUntil | runtime | getRuntime })`，方便宿主有生命周期钩子时统一保护主回复链路。
 
 ## 0.8.0-next.7 — Dependency bump (pre-release)

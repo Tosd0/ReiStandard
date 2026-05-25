@@ -6,35 +6,33 @@
 
 | 包 | 版本 | 用途 |
 |---|---|---|
-| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | `0.1.0-next.0` | 三轴推送契约（`AmsgPush` 判别联合 + builders + 类型守卫） |
-| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | `0.8.0-next.0` | 一次性即时推送（无 DB、无 cron、无租户） |
-| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | `2.4.0-next.0` | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
-| [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | `2.3.0-next.0` | 浏览器 SDK：加密、请求封装、Push 订阅 |
-| [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | `2.1.0-next.0` | Service Worker：推送展示、离线队列 |
+| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | `0.1.0` | 三轴推送契约（`AmsgPush` 判别联合 + builders + 类型守卫） |
+| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | `0.8.0` | 一次性即时推送（无 DB、无 cron、无租户） |
+| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | `2.4.0` | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
+| [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | `2.3.0` | 浏览器 SDK：加密、请求封装、Push 订阅 |
+| [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | `2.1.0` | Service Worker：推送展示、离线队列 |
 
 `amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
 
 **怎么挑服务端包**：只发"按钮点了就立刻推一条" → `amsg-instant`；要定时或周期任务 → `amsg-server`；两种都要就都装，共用同一套 VAPID 与 masterKey。
 
-### 协调发布说明：next pre-release（shared 0.1.0-next.0 / instant 0.8.0-next.0 / sw 2.1.0-next.0 / client 2.3.0-next.0 / server 2.4.0-next.0）
+### 协调发布说明：稳定版发布（shared 0.1.0 / instant 0.8.0 / sw 2.1.0 / client 2.3.0 / server 2.4.0）
 
-本轮是一次跨包协调的 minor 升级，统一 push wire shape 到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器）。所有 amsg 子包同时上调一个 minor，并以 `-next.0` 形式预发布。仓库的 `scripts/publish-workspaces.mjs` 自动识别 prerelease 版本号并把发布打到 `next` dist-tag（不进 `latest`）。
+本轮是一次跨包协调的 minor 升级，统一 push wire shape 到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器）。所有 amsg 子包同时上调一个 minor 并正式发布。
 
-- `@rei-standard/amsg-shared` 新增 → `0.1.0-next.0`
-- `@rei-standard/amsg-instant`：`0.7.0` → `0.8.0-next.0`
-- `@rei-standard/amsg-server`：`2.3.2` → `2.4.0-next.0`
-- `@rei-standard/amsg-sw`：`2.0.1` → `2.1.0-next.0`
-- `@rei-standard/amsg-client`：`2.2.3` → `2.3.0-next.0`
+- `@rei-standard/amsg-shared` 新增 → `0.1.0`
+- `@rei-standard/amsg-instant`：`0.7.0` → `0.8.0`
+- `@rei-standard/amsg-server`：`2.3.2` → `2.4.0`
+- `@rei-standard/amsg-sw`：`2.0.1` → `2.1.0`
+- `@rei-standard/amsg-client`：`2.2.3` → `2.3.0`
 
-包间依赖一律使用**精确版本**（不带 `^`），所有 `dependencies` 字段都钉死在对应的 `*-next.0` 版本，避免 npm 在生态系统里解析出混版本图。同时本轮移除了旧的 `{ type: 'error', code: '...' }` 错误信封——错误推送统一走 `ErrorPush`（`messageKind: 'error'`）。
+包间依赖一律使用**精确版本**（不带 `^`），所有 `dependencies` 字段都钉死在对应的版本，避免 npm 在生态系统里解析出混版本图。同时本轮移除了旧的 `{ type: 'error', code: '...' }` 错误信封——错误推送统一走 `ErrorPush`（`messageKind: 'error'`）。
 
-**安装预发布版（`next` dist-tag）**：
+**安装最新版（`latest` dist-tag）**：
 
 ```bash
-npm install @rei-standard/amsg-shared@next @rei-standard/amsg-instant@next @rei-standard/amsg-server@next @rei-standard/amsg-sw@next @rei-standard/amsg-client@next
+npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
 ```
-
-`next` 期间欢迎下游集成方反馈契约问题；契约稳定后会发对应的 `1.0` / `2.x` 正式 minor（去掉 `-next.N` 后缀，走默认 `latest` dist-tag）。
 
 ## 三轴推送语义（Three-axis push schema）
 

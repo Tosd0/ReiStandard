@@ -5,8 +5,8 @@
 
 ## 版本信息
 
-- **版本号**: v2.0.1
-- **最后更新**: 2026-02-23
+- **版本号**: v2.1.0
+- **最后更新**: 2026-05-25
 - **状态**: Stable
 - **关联标准**: [主动消息API端点标准](./active-messaging-api.md)
 
@@ -341,27 +341,43 @@ self.addEventListener('push', event => {
     };
   }
 
-  // 构建通知选项
-  const options = buildNotificationOptions(notificationData);
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    }).catch(() => []);
 
-  // 显示通知
-  event.waitUntil(
-    self.registration.showNotification(options.title, options)
-      .then(() => {
-        console.log('[SW] 通知已显示:', options.title);
-      })
-      .catch(error => {
-        console.error('[SW] 通知显示失败:', error);
-      })
-  );
+    // 根据 messageKind 和 notification.show 判断是否显示通知
+    const kind = notificationData.messageKind || 'content';
+    const showPolicy = notificationData.notification?.show || 'auto';
+    const hasVisibleClient = clients.some(client => client.visibilityState === 'visible');
+    const shouldShow =
+      showPolicy === 'always' ||
+      (showPolicy === 'when-hidden' && !hasVisibleClient) ||
+      (showPolicy === 'auto' && kind === 'content');
+
+    if (!shouldShow || showPolicy === false) return;
+
+    // 构建通知选项
+    const options = buildNotificationOptions(notificationData);
+
+    // 如果需要显示通知，则调用 showNotification
+    try {
+      await self.registration.showNotification(options.title, options);
+      console.log('[SW] 通知已显示:', options.title);
+    } catch (error) {
+      console.error('[SW] 通知显示失败:', error);
+    }
+  })());
 });
 
 // 辅助函数：构建通知选项
 function buildNotificationOptions(data) {
+  const notif = data.notification || {};
   return {
-    title: data.title || `来自 ${data.contactName}`,
-    body: data.message || '您有一条新消息',
-    icon: data.avatarUrl || '/icons/default-avatar.png',
+    title: notif.title || data.title || `来自 ${data.contactName}`,
+    body: notif.body || data.message || '您有一条新消息',
+    icon: notif.icon || data.avatarUrl || '/icons/default-avatar.png',
     badge: '/icons/badge.png',
     tag: data.messageId || `msg-${Date.now()}`,
     data: {
@@ -417,7 +433,7 @@ function buildNotificationOptions(data) {
 
 **核心原则**:
 - **后台状态**: 用户未打开应用或切换到其他应用时，显示系统通知
-- **前台状态**: 用户正在使用应用时，直接在 UI 中渲染消息，不显示系统通知
+- **前台状态**: 用户正在使用应用时，建议直接在 UI 中渲染消息；若希望前台不弹系统通知，请让 payload 设置 `notification.show = "when-hidden"` 或 `false`
 - **渲染一致性**: 前台接收的消息应与实时收到的消息在视觉和交互上完全一致
 
 #### 实现方式
@@ -453,7 +469,7 @@ self.addEventListener('push', async event => {
         return client.visibilityState === 'visible' && client.focused;
       });
 
-      // 2. 如果用户在前台，直接发送消息给页面，不弹通知
+      // 2. 如果用户在前台，直接发送消息给页面
       if (visibleClients.length > 0) {
         console.log('[SW] 用户在前台，发送消息到页面');
 
@@ -466,14 +482,23 @@ self.addEventListener('push', async event => {
           });
         });
 
-        // 不显示系统通知
-        return;
+        // 如果希望前台不弹系统通知，请让 payload.notification.show = "when-hidden" 或 false
       }
 
-      // 3. 如果用户在后台，显示系统通知
-      console.log('[SW] 用户在后台，显示系统通知');
-      const options = buildNotificationOptions(notificationData);
-      await self.registration.showNotification(options.title, options);
+      // 3. 检查 messageKind 和 notification.show 判断是否要在后台弹系统通知
+      const kind = notificationData.messageKind || 'content';
+      const showPolicy = notificationData.notification?.show || 'auto';
+      const hasVisibleClient = allClients.some(client => client.visibilityState === 'visible');
+      const shouldShow =
+        showPolicy === 'always' ||
+        (showPolicy === 'when-hidden' && !hasVisibleClient) ||
+        (showPolicy === 'auto' && kind === 'content');
+
+      if (showPolicy !== false && shouldShow) {
+        console.log('[SW] 显示系统通知');
+        const options = buildNotificationOptions(notificationData);
+        await self.registration.showNotification(options.title, options);
+      }
     })()
   );
 });
@@ -1313,14 +1338,29 @@ self.addEventListener('push', (event) => {
     data = { title: '新消息', message: '您有一条新消息' };
   }
 
-  event.waitUntil(
-    self.registration.showNotification(data.title || '新消息', {
-      body: data.message || '您有一条新消息',
-      icon: data.avatarUrl || '/icons/icon-192.png',
-      badge: '/icons/badge.png',
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    }).catch(() => []);
+    const kind = data.messageKind || 'content';
+    const notif = data.notification || {};
+    const showPolicy = notif.show || 'auto';
+    const hasVisibleClient = clients.some(client => client.visibilityState === 'visible');
+    const shouldShow =
+      showPolicy === 'always' ||
+      (showPolicy === 'when-hidden' && !hasVisibleClient) ||
+      (showPolicy === 'auto' && kind === 'content');
+
+    if (!shouldShow || showPolicy === false) return;
+
+    await self.registration.showNotification(notif.title || data.title || '新消息', {
+      body: notif.body || data.message || '您有一条新消息',
+      icon: notif.icon || data.avatarUrl || '/icons/icon-192.png',
+      badge: notif.badge || '/icons/badge.png',
       data
-    })
-  );
+    });
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {
@@ -1334,6 +1374,24 @@ self.addEventListener('notificationclick', (event) => {
 ---
 
 ## 15. 变更日志
+
+### v2.1.0 (2026-05-25)
+
+#### 🔧 改进优化
+
+**1. 三轴 Push Schema 与 `messageKind`**
+- 引入了 `messageKind` 属性，区分 `content`、`reasoning`、`tool_request`、`error` 类型的推送。
+- Service Worker 默认仅在 `messageKind === 'content'` 时显示系统通知，其他类型默认不弹窗，需业务前端接收处理。
+
+**2. 通知显示策略 (`notification.show`)**
+- 支持通过 `notification.show` 显式控制系统通知行为（`auto`, `always`, `when-hidden`, `false`）。
+- 进一步提升前台应用接管消息的自由度，免除不必要的通知打扰。
+
+**3. `onBusinessPayload` 与 Generic Multipart（SDK 功能）**
+- 统一了分片数据还原逻辑，移除了老的 `chunkIndex` 专属逻辑，改为基于 `_multipart` 进行可靠重组。
+- 提供了 `onBusinessPayload` 钩子能力，安全拦截落地完整业务负载。
+
+---
 
 ### v2.0.1 (2026-02-23)
 

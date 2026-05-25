@@ -797,9 +797,9 @@ describe('validateInstantPayload hookPath flag', () => {
   });
 });
 
-// ─── next.4 — decision contract: pushPayloads ──────────────────────────
+// ─── 0.8.0 — decision contract: pushPayloads ───────────────────────────
 
-describe('next.4 — decision contract: pushPayloads', () => {
+describe('0.8.0 — decision contract: pushPayloads', () => {
   async function dispatchHookReturn(hookReturn) {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
@@ -821,7 +821,7 @@ describe('next.4 — decision contract: pushPayloads', () => {
     });
     assert.equal(res.status, 500);
     assert.equal(body.error.code, 'HOOK_THREW');
-    assert.match(body.error.message, /pushPayload \(singular\) is removed in next\.4, use pushPayloads: \[yourPayload\]/);
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in 0\.8\.0, use pushPayloads: \[yourPayload\]/);
   });
 
   it('rejects when BOTH pushPayload and pushPayloads are set', async () => {
@@ -832,7 +832,7 @@ describe('next.4 — decision contract: pushPayloads', () => {
     });
     assert.equal(res.status, 500);
     assert.equal(body.error.code, 'HOOK_THREW');
-    assert.match(body.error.message, /pushPayload \(singular\) is removed in next\.4, use pushPayloads/);
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in 0\.8\.0, use pushPayloads/);
   });
 
   it('rejects pushPayloads: [] (empty array)', async () => {
@@ -852,13 +852,13 @@ describe('next.4 — decision contract: pushPayloads', () => {
     });
     assert.equal(res.status, 500);
     assert.equal(body.error.code, 'HOOK_THREW');
-    assert.match(body.error.message, /splitPattern is removed in next\.4/);
+    assert.match(body.error.message, /splitPattern is removed in 0\.8\.0/);
   });
 });
 
-// ─── next.4 — pushPayloads happy paths ─────────────────────────────────
+// ─── 0.8.0 — pushPayloads happy paths ──────────────────────────────────
 
-describe('next.4 — pushPayloads happy paths', () => {
+describe('0.8.0 — pushPayloads happy paths', () => {
   it('sends N pushes from a 3-element pushPayloads array with messageIndex/totalMessages auto-fill', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,

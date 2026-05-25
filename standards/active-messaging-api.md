@@ -4,9 +4,9 @@
 >
 > 版本日期：2026-05-19
 >
-> 对齐实现（**prerelease**，仓库 `publish-workspaces.mjs` 自动按 prerelease 版本号路由到 `next` dist-tag，不进 `latest`）：`@rei-standard/amsg-shared` 0.1.0-next.0、`@rei-standard/amsg-server` 2.4.0-next.0、`@rei-standard/amsg-instant` 0.8.0-next.0、`@rei-standard/amsg-client` 2.3.0-next.0、`@rei-standard/amsg-sw` 2.1.0-next.0。安装：`npm install @rei-standard/amsg-shared@next`（其余同理）。规范条款在 prerelease 期不再改，`next` 窗口是给下游集成方端到端验证用的；契约通过后会发对应正式 minor（去掉 `-next.N` 后缀）。
+> 对齐实现（稳定版）：`@rei-standard/amsg-shared` 0.1.0、`@rei-standard/amsg-server` 2.4.0、`@rei-standard/amsg-instant` 0.8.0、`@rei-standard/amsg-client` 2.3.0、`@rei-standard/amsg-sw` 2.1.0。
 >
-> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。包间依赖一律使用精确版本（不带 `^`），所有 `dependencies` 字段都钉死在对应的 `*-next.0`。
+> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。包间依赖一律使用精确版本（不带 `^`），所有 `dependencies` 字段都钉死在对应的稳定版本。
 
 ## 1. 目标与范围
 
@@ -35,9 +35,9 @@
 **v2.x 后续增量**（端点与鉴权未变，均为 payload 层向后兼容扩展）：
 
 - `messages` 数组提示词（互斥替代 `completePrompt`），见 §6.1。`amsg-server` 2.2.0+ 与 `amsg-instant` 0.5.0+ 实装。
-- `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 与 `amsg-instant` 0.6.0+ 实装。
-- `avatarUrl` 软清空策略（不合法值仅 `console.warn` 并置空，不再 400 整个任务），见 §6.2。`amsg-server` 2.3.3+ / 2.4.0-next.1+、`amsg-instant` 0.7.1+ / 0.8.0-next.1+、`amsg-client` 2.2.4+ / 2.3.0-next.1+ 实装；2.3.1 ~ 2.3.2 / 0.6.1 ~ 0.7.0 / 2.2.3 ~ 2.3.0-next.0 走老版"严格 400"。
-- **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0-next.0、`amsg-server` 2.4.0-next.0、`amsg-instant` 0.8.0-next.0、`amsg-sw` 2.1.0-next.0、`amsg-client` 2.3.0-next.0 协同实装（`next` dist-tag 预发布）。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
+- `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 继续支持；`amsg-instant` 0.6.0 ~ 0.7.x 曾支持，0.8.0 起移除公共旋钮，改为 hook 内自定义 split 函数 + `pushPayloads`。
+- `avatarUrl` 软清空策略（不合法值仅 `console.warn` 并置空，不再 400 整个任务），见 §6.2。`amsg-server` 2.3.3+ / 2.4.0+、`amsg-instant` 0.7.1+ / 0.8.0+、`amsg-client` 2.2.4+ / 2.3.0+ 实装；2.3.1 ~ 2.3.2 / 0.6.1 ~ 0.7.0 / 2.2.3 走老版"严格 400"。
+- **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0、`amsg-server` 2.4.0、`amsg-instant` 0.8.0、`amsg-sw` 2.1.0、`amsg-client` 2.3.0 协同实装。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
 
 ## 3. 角色与职责
 
@@ -155,7 +155,7 @@ export const config = {
 
 ### 6.1 AI 消息字段约束
 
-当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束统一适用于 `schedule-message`、`update-message`、`amsg-instant` handler。
+当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束适用于 `schedule-message`、`update-message`、`amsg-instant` handler；其中 `splitPattern` 仅适用于 `amsg-server` 的调度任务，`amsg-instant` 0.8.0 的替代方式见本节末尾。
 
 **`apiUrl`（必填，字符串）** — 完整聊天端点 URL（例：`https://api.openai.com/v1/chat/completions`）。实现方可做最小规范化（去首尾空白、去路径尾部多余 `/`），但**不应**自动补全版本路径（`/v1`）或聊天路径（`/chat/completions`）。若上游返回 `405 Method Not Allowed`，应优先判定为 URL 指向错误端点。
 
@@ -170,7 +170,7 @@ export const config = {
 
 **`maxTokens`（可选正整数）** — 映射到上游 `max_tokens`；不传则不指定。
 
-**`splitPattern`（可选，`string | string[] | null`）** — 自定义 LLM 返回文本的分句正则；默认 `/([。！？!?]+)/`。
+**`splitPattern`（仅 `amsg-server` 调度任务，可选，`string | string[] | null`）** — 自定义 LLM 返回文本的分句正则；默认 `/([。！？!?]+)/`。
 
 字段写的是**正则 source 字符串**，不带 `/.../` 包裹、不带尾部 flag。库内部 `new RegExp(source)` 编译，**零 flags**。要替代常用 flag 效果请改写 pattern 本身：
 
@@ -192,11 +192,43 @@ export const config = {
 
 **级联中的 no-match 兜底**：某一项 pattern 在某段上没匹配 → 该段原样传给下一项，不会被吃掉。
 
-**输入大小限制**：每项 ≤ 200 字符、数组 ≤ 10 项、每项必须能 `new RegExp(...)` 通过。违规 → `400 INVALID_PARAMETERS`（schedule）/ `400 INVALID_UPDATE_DATA`（update）/ `400 INVALID_PAYLOAD_FORMAT`（amsg-instant）。
+**输入大小限制**：每项 ≤ 200 字符、数组 ≤ 10 项、每项必须能 `new RegExp(...)` 通过。违规 → `400 INVALID_PARAMETERS`（schedule）/ `400 INVALID_UPDATE_DATA`（update）。
 
 > 这些上限是**输入大小护栏**，不是 ReDoS 防御——6 字符的 `(a+)+$` 就能触发回溯爆炸。真正兜底的是 Worker / 运行时的 CPU 限额，加上 splitPattern 存在调用方自己的加密任务里、跑在调用方自己 LLM key 的输出上，自爆不跨租户。
 
-`amsg-server` 与 `amsg-instant` 两端独立实现但行为字节级一致；预校验工具：`validateLlmMessagesArray(messages)`、`validateSplitPattern(value)`。
+`amsg-server` 预校验工具：`validateLlmMessagesArray(messages)`、`validateSplitPattern(value)`。
+
+**`amsg-instant` 0.8.0 的替代方式**：请求 body 上的 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern` 都会返回 `400 INVALID_PAYLOAD_FORMAT`；hook 返回的单个 push 上也不得携带 `splitPattern`，否则走 `HOOK_THREW`。新方法不是 handler 级 `splitFn` 配置，而是在 `onLLMOutput` 内调用业务自己的 split 函数，并返回完整 `pushPayloads`：
+
+```js
+function splitForPush(text) {
+  const segments = text.split(/([。！？!?]+)/)
+    .reduce((acc, part, i, arr) => {
+      if (i % 2 === 0 && part.trim()) acc.push(part.trim() + (arr[i + 1] || ''));
+      return acc;
+    }, [])
+    .filter((s) => s.length > 0);
+  return segments.length > 0 ? segments : [text];
+}
+
+createInstantHandler({
+  vapid,
+  onLLMOutput(ctx) {
+    const segments = splitForPush(ctx.llmOutputText);
+    return {
+      decision: 'finish',
+      pushPayloads: segments.map((message) => ({
+        messageKind: 'content',
+        sessionId: ctx.sessionId,
+        message,
+        notification: { title: `来自 ${ctx.contactName}`, body: message }
+      }))
+    };
+  }
+});
+```
+
+`amsg-instant` 的非 hook legacy 路径仍保留内部默认句切 `/([。！？!?]+)/`，用于保持 0.6/0.7 时代的 completePrompt 行为；只是这个内部切分不再暴露请求级配置。
 
 ### 6.2 `avatarUrl` 软清空策略
 
@@ -207,13 +239,13 @@ export const config = {
 - **不接受** 长度 > 2048 字符的 URL。
 - `undefined` / `null` 视为"未传"，零行为变化。
 
-**处理方式（amsg-server 2.3.3+ / 2.4.0-next.1+，amsg-instant 0.7.1+ / 0.8.0-next.1+，amsg-client 2.2.4+ / 2.3.0-next.1+）**：头像是装饰性字段，单独一个不合法 URL 不应该把整条推送 fail 掉。所以服务端 / 客户端遇到上面任何不合法情形，**不返回 4xx**，而是：
+**处理方式（amsg-server 2.3.3+ / 2.4.0+，amsg-instant 0.7.1+ / 0.8.0+，amsg-client 2.2.4+ / 2.3.0+）**：头像是装饰性字段，单独一个不合法 URL 不应该把整条推送 fail 掉。所以服务端 / 客户端遇到上面任何不合法情形，**不返回 4xx**，而是：
 
 1. 把 `avatarUrl` 在 payload 上**置为 `null`**（schedule / instant 路径）；`update-message` 路径则**从 patch 里删掉**该字段，已存储的旧头像保持不变。
 2. 在控制台 `console.warn` 出原因（含建议，如"请改为公网可访问的 https:// 图片 URL"）。
 3. 继续处理 payload 其它字段。
 
-老版本（`amsg-server` 2.3.1 ~ 2.3.2 / 2.4.0-next.0、`amsg-instant` 0.6.1 ~ 0.7.0 / 0.8.0-next.0、`amsg-client` 2.2.3 / 2.3.0-next.0）走严格 400：
+老版本（`amsg-server` 2.3.1 ~ 2.3.2、`amsg-instant` 0.6.1 ~ 0.7.0、`amsg-client` 2.2.3）走严格 400：
 - `amsg-server.schedule-message` → `400 INVALID_PARAMETERS`
 - `amsg-server.update-message` → `400 INVALID_UPDATE_DATA`
 - `amsg-instant` → `400 INVALID_PAYLOAD_FORMAT`
@@ -277,7 +309,7 @@ LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
 
 #### 6.3.4 `ToolRequestPush`（`messageKind: 'tool_request'`）
 
-由 agentic-loop 钩子返回 `{ decision: 'tool-request', pushPayload }` 触发。
+由 agentic-loop 钩子返回 `{ decision: 'tool-request', pushPayloads }` 触发。`pushPayloads` 可以是一条或多条 push，框架会按数组顺序依次发送。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -459,9 +491,9 @@ v2.0.1（破坏性）：
 v2.x 后续增量（向后兼容，无需迁移）：
 
 - `messages` 数组（2.2.0+）：未使用此字段的调用方零修改。
-- `splitPattern`（2.3.0+）：未传时走默认正则，老库存任务字段缺失也按默认处理。
+- `splitPattern`（server 2.3.0+）：未传时走默认正则，老库存任务字段缺失也按默认处理。`amsg-instant` 0.8.0 起移除请求级 `splitPattern`，迁移到 `onLLMOutput` 内自定义 split 函数 + `pushPayloads`。
 - `avatarUrl` 严格校验（2.3.1 ~ 2.3.2）：之前传 `data:` URI 当 avatarUrl 实际上一直推不出来（触发下游 4KB / 413），收紧到入口立即报错而已；从未推成功的调用者无感升级。
-- `avatarUrl` 软清空（server 2.3.3+ / 2.4.0-next.1+，instant 0.7.1+ / 0.8.0-next.1+，client 2.2.4+ / 2.3.0-next.1+）：把"严格 400"放宽为"`console.warn` + 置空 + 继续"。整条推送不再因为一个装饰性字段挂掉；之前依赖 400 报错的调用方只需改成观察 `console.warn`。详见 §6.2。
+- `avatarUrl` 软清空（server 2.3.3+ / 2.4.0+，instant 0.7.1+ / 0.8.0+，client 2.2.4+ / 2.3.0+）：把"严格 400"放宽为"`console.warn` + 置空 + 继续"。整条推送不再因为一个装饰性字段挂掉；之前依赖 400 报错的调用方只需改成观察 `console.warn`。详见 §6.2。
 
 ## 12. 实现一致性要求（DoD）
 
@@ -470,7 +502,7 @@ v2.x 后续增量（向后兼容，无需迁移）：
 1. 租户初始化为一步（`init-tenant`）。
 2. 业务端点不可仅依赖 `X-User-Id` 调用成功。
 3. `tenantToken` 与 `cronToken` 权限分离。
-4. `amsg-server` 与 `amsg-instant` 在共有字段（§6.1 / §6.2）上行为字节级一致。`examples/` 是教学示例，可能滞后于最新 SDK 字段，不在一致性约束内。
+4. `amsg-server` 与 `amsg-instant` 在共有字段（§6.1 / §6.2）上行为字节级一致；`splitPattern` 不是 0.8.0 instant 的共有字段。`examples/` 是教学示例，可能滞后于最新 SDK 字段，不在一致性约束内。
 5. 文档明确管理员一次性与租户一次性职责。
 6. 若实现推荐调度模式，必须实现 Blob 租户调度索引，并对索引中的 `cronToken` 加密存储。
 7. 若同时启用兼容模式与推荐模式，必须实现调度防重入机制（入口互斥或任务原子领取）。

@@ -1,6 +1,6 @@
 # Changelog — @rei-standard/amsg-sw
 
-## 2.1.0-next.4 — notification.show 及 Multipart chunk store (pre-release)
+## 2.1.0 — notification.show 及 Multipart chunk store
 
 ### New
 - **`notification.show`** 通知显示策略: 支持 `"auto"` | `"always"` | `"when-hidden"` | `false`。现在可以直接通过包级策略实现 "有可见窗口时静默，无可见窗口时弹通知" (`"when-hidden"`) 等应用场景。

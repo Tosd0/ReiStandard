@@ -180,7 +180,7 @@ await client.sendInstant({
 - 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
 - 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
 
-### 本地软清空：`avatarUrl` 与 payload 体积（2.2.4+ / 2.3.0-next.1+）
+### 本地软清空：`avatarUrl` 与 payload 体积（2.2.4+ / 2.3.0+）
 
 `scheduleMessage` / `sendInstant` / `updateMessage` 在发请求**之前**会在本地做两项保护：
 
@@ -205,7 +205,7 @@ try {
 }
 ```
 
-服务端（`@rei-standard/amsg-instant` 0.7.1+ / 0.8.0-next.1+，`@rei-standard/amsg-server` 2.3.3+ / 2.4.0-next.1+）有同样的软清空二道防线，client 这一道主要省一次远端往返。
+服务端（`@rei-standard/amsg-instant` 0.7.1+ / 0.8.0+，`@rei-standard/amsg-server` 2.3.3+ / 2.4.0+）有同样的软清空二道防线，client 这一道主要省一次远端往返。
 
 ## 导出 API（Exports）
 

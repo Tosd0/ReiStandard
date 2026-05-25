@@ -157,8 +157,8 @@ describe('hook path — ReasoningPush auto-emission', () => {
       fetch: router.fetch,
       onEvent: (e) => events.push(e),
       // The hook is responsible for propagating ctx.sessionId into its
-      // own pushPayload — the framework does NOT auto-inject (the hook
-      // contract is `pushPayload: unknown`, fully caller-controlled).
+      // own pushPayloads — the framework does NOT auto-inject (the hook
+      // contract is `pushPayloads: unknown[]`, fully caller-controlled).
       // ctx.sessionId is exposed for exactly this purpose.
       onLLMOutput: (ctx) => ({
         decision: 'finish',
@@ -258,9 +258,9 @@ describe('hook path — ReasoningPush auto-emission', () => {
   });
 });
 
-// ─── next — generic multipart transport ────────────────────────────────
+// ─── 0.8.0 — generic multipart transport ───────────────────────────────
 
-describe('next — generic multipart transport', () => {
+describe('0.8.0 — generic multipart transport', () => {
   it('short reasoning ships as a single push (no chunkIndex on wire)', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,

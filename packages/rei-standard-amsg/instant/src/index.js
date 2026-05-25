@@ -3,7 +3,7 @@
  *
  * Stateless one-shot instant push handler. The entire lifecycle of an
  * instant request lives inside a single function invocation:
- *   parse → call LLM → split sentences → deliver Web Push → 200 OK.
+ *   parse → call LLM → build push payloads → deliver Web Push → 200 OK.
  * No DB, no cron, no tenant init. Zero runtime dependencies. Pure Web
  * Crypto under the hood, so the same handler runs unchanged on Cloudflare
  * Workers (no `nodejs_compat` flag), Vercel Edge, Netlify Edge, Deno,
@@ -55,33 +55,17 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
  *
- * Note on per-kind split-pattern fields (request-payload, not handler options):
+ * Note on splitting:
  *
- *   Each `messageKind` reads its own pattern field with its own default:
+ *   0.8.0 removes the public `splitPattern` / `reasoningSplitPattern`
+ *   / `errorSplitPattern` request fields. Hook callers own semantic
+ *   splitting now: implement any custom split function inside
+ *   `onLLMOutput`, then return the exact `pushPayloads` array to send.
  *
- *     | messageKind    | field on payload          | default                     |
- *     |----------------|---------------------------|-----------------------------|
- *     | `content`      | `splitPattern`            | `/([。！？!?]+)/` (split-on) |
- *     | `tool_request` | `splitPattern`            | `/([。！？!?]+)/` (split-on) |
- *     | `reasoning`    | `reasoningSplitPattern`   | **not split**               |
- *     | `error`        | `errorSplitPattern`       | **not split**               |
- *     | free-form      | —                         | not split                   |
- *
- *   Disable semantics: an explicit `null` or `[]` disables splitting
- *   for that kind. The asymmetry sits in `undefined` (field absent):
- *   `content` / `tool_request` fall back to the default sentence
- *   regex; `reasoning` / `error` stay unsplit. This makes the
- *   default-on / default-off bucket explicit in the wire format.
- *
- *   ToolRequestPush splitting demotes prefix chunks to `content`
- *   (without `toolCalls`) and binds `toolCalls` to the LAST prefix
- *   segment (kept as `tool_request`), so narration finishes before
- *   the client starts executing tools.
- *
- *   Auto-emitted ReasoningPush (from `choices[0].message.reasoning_content`)
- *   and framework-built ErrorPush diagnostics (`LOOP_EXCEEDED`) both
- *   read the same kind-specific fields. `HOOK_THREW` is a
- *   special-case single-shot diagnostic and bypasses the splitter.
+ *   The legacy non-hook path still keeps its v0.6-compatible internal
+ *   sentence splitter (`/([。！？!?]+)/`) so old completePrompt-style
+ *   callers retain the same burst behaviour. There is no handler-level
+ *   `splitFn` option.
  * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Weak by design: the token is visible in any frontend bundle that uses it. Use `tokenSigningKey` for real auth.
  * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
  * @property {CorsConfig} [cors]              - CORS configuration. Defaults to `{ allowOrigin: '*' }`. Every response (including the 204 preflight short-circuit) carries the matching `Access-Control-Allow-*` headers.
@@ -97,18 +81,19 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *           - **v0.7 hook.** When provided, the handler switches from
  *             the legacy one-shot path to a per-turn agentic loop.
  *             The hook returns one of:
- *               `{ decision: 'finish',       pushPayload }`
- *               `{ decision: 'tool-request', pushPayload }`
+ *               `{ decision: 'finish',       pushPayloads }`
+ *               `{ decision: 'tool-request', pushPayloads }`
  *               `{ decision: 'continue',     nextHistory }`
  *               `{ decision: 'skip-push' }`
  *             See README §Agentic Loop.
  * @property {import('./blob-store/interface.js').BlobStoreConfig} [blobStore]
- *           - Optional. When the hook returns a pushPayload whose
+ *           - Optional. When a push payload's
  *             UTF-8 byte length exceeds `maxInlineBytes` (default
  *             2600), the body is written to the adapter and the SW
- *             receives a small `{ _blob, key, url, type? }` envelope
- *             instead. Without `blobStore` the over-sized payload
- *             throws `PayloadTooLargeError`.
+ *             receives a small `{ _blob, key, url, messageKind?, type? }`
+ *             envelope instead. Without `blobStore`, the default
+ *             generic multipart transport handles JSON-safe oversized
+ *             payloads unless disabled or over its limits.
  * @property {number} [maxLoopIterations=10]  - Hard ceiling on in-loop `decision:'continue'` rounds within a single worker invocation. Cross-invocation `/continue` floods are the deployer's auth/rate-limit concern.
  * @property {boolean} [autoEmitReasoning=true]
  *           - **v0.8 hook-path config.** When `true` (default), the
@@ -123,7 +108,7 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *             and produce its own `buildReasoningPush(...)` envelope.
  *             Legacy (non-hook) path always auto-emits regardless.
  * @property {Object} [multipart]
- *           - **next transport knob.** Generic multipart fallback for
+ *           - **0.8.0 transport knob.** Generic multipart fallback for
  *             oversized JSON-safe push payloads when no BlobStore is
  *             configured. Applies to every `messageKind` (including
  *             reasoning, tool_request, content, error, and custom
