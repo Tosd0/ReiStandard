@@ -13,6 +13,6 @@ function updatePkg(pkgPath, version, sharedDep) {
 
 updatePkg('packages/rei-standard-amsg/shared/package.json', '0.1.0-next.4', null);
 updatePkg('packages/rei-standard-amsg/sw/package.json', '2.1.0-next.4', '0.1.0-next.4');
-updatePkg('packages/rei-standard-amsg/instant/package.json', '0.8.0-next.7', '0.1.0-next.4');
+updatePkg('packages/rei-standard-amsg/instant/package.json', '0.8.0-next.8', '0.1.0-next.4');
 updatePkg('packages/rei-standard-amsg/client/package.json', '2.3.0-next.2', '0.1.0-next.4');
 updatePkg('packages/rei-standard-amsg/server/package.json', '2.4.0-next.2', '0.1.0-next.4');

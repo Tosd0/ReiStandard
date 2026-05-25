@@ -87,6 +87,11 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  * @property {CorsConfig} [cors]              - CORS configuration. Defaults to `{ allowOrigin: '*' }`. Every response (including the 204 preflight short-circuit) carries the matching `Access-Control-Allow-*` headers.
  * @property {Object} [webpush]               - **Deprecated since 0.3.0.** Ignored. amsg-instant now implements RFC 8291 + RFC 8292 natively on Web Crypto. Tests should intercept the push HTTP request via `options.fetch` instead.
  * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy). Used for BOTH the LLM call and the outgoing Web Push POST.
+ * @property {(work: Promise<unknown>) => void} [waitUntil]
+ *           - Optional lifecycle extender for runtimes with a background
+ *             completion hook. Prefer passing it per request when the
+ *             platform provides a request-scoped context (for example
+ *             Cloudflare Workers' `ctx.waitUntil`).
  * @property {(e: { type: string }) => void} [onEvent]
  * @property {(ctx: import('./session-context.js').SessionContext) => Promise<object> | object} [onLLMOutput]
  *           - **v0.7 hook.** When provided, the handler switches from
@@ -141,9 +146,12 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  * The handler is the same shape used by Cloudflare Workers, Deno Deploy,
  * Vercel Edge, and Bun. Wrap it with one of the platform adapters if you
  * are on Node/Express, Netlify Functions, or Vercel Serverless Functions.
+ * When used directly as a Cloudflare Workers module `fetch`, the extra
+ * `(env, ctx)` arguments are accepted so the main LLM → split → push
+ * pipeline can be protected by `ctx.waitUntil`.
  *
  * @param {InstantHandlerOptions} options
- * @returns {(request: Request) => Promise<Response>}
+ * @returns {(request: Request, envOrRuntime?: unknown, runtime?: unknown) => Promise<Response>}
  */
 export function createInstantHandler(options) {
   if (!options) throw new Error('[amsg-instant] options is required');
@@ -182,7 +190,7 @@ export function createInstantHandler(options) {
 
   const respond = (status, body) => jsonResponse(status, body, corsHeaders);
 
-  return async function handler(request) {
+  return async function handler(request, envOrRuntime, runtime) {
     onEvent({ type: 'request' });
 
     // CORS preflight short-circuit. Browsers fire OPTIONS before any
@@ -302,7 +310,7 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const result = await processInstantMessage(payload, {
+      const work = processInstantMessage(payload, {
         vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
         onEvent,
@@ -314,6 +322,8 @@ export function createInstantHandler(options) {
         requestUrl: request.url,
         isResume: isContinue,
       });
+      registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+      const result = await work;
       return respond(200, { success: true, data: result });
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
@@ -332,6 +342,31 @@ export function createInstantHandler(options) {
       });
     }
   };
+}
+
+function resolveWaitUntil(envOrRuntime, runtime, options) {
+  if (runtime && typeof runtime.waitUntil === 'function') {
+    return { waitUntil: runtime.waitUntil, target: runtime };
+  }
+  if (envOrRuntime && typeof envOrRuntime.waitUntil === 'function') {
+    return { waitUntil: envOrRuntime.waitUntil, target: envOrRuntime };
+  }
+  if (options && typeof options.waitUntil === 'function') {
+    return { waitUntil: options.waitUntil, target: undefined };
+  }
+  return null;
+}
+
+function registerWaitUntil(work, lifecycle, onEvent) {
+  if (!lifecycle) return;
+  const backgroundWork = work.catch((err) => {
+    onEvent({ type: 'wait_until_rejected', code: err?.code, message: err?.message });
+  });
+  try {
+    lifecycle.waitUntil.call(lifecycle.target, backgroundWork);
+  } catch (err) {
+    onEvent({ type: 'wait_until_failed', cause: err });
+  }
 }
 
 function resolveMultipartOptions(options) {

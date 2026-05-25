@@ -77,9 +77,11 @@ createInstantHandler({
 
 ## API
 
-### `createInstantHandler(options) → (request: Request) => Promise<Response>`
+### `createInstantHandler(options) → (request: Request, env?, ctx?) => Promise<Response>`
 
 返回标准 Web Fetch API handler。直接挂到 Cloudflare Workers / Deno Deploy / Vercel Edge / Bun，或用下方四个 adapter 接到 Node / Netlify。
+如果运行时提供 `waitUntil`，可以通过请求 context 或 `options.waitUntil` 交给 handler，
+主回复链路（LLM 生成 → 切段 → 逐条 Web Push）会被注册进去。
 
 ```js
 import { createInstantHandler } from '@rei-standard/amsg-instant';
@@ -845,6 +847,12 @@ export default createCloudflareWorker((env) => ({
 }));
 ```
 
+`createCloudflareWorker` 会接住 Workers 的第三个参数 `ctx`，并把主回复链路
+（LLM 生成 → 切段 → 逐条 Web Push）注册到 `ctx.waitUntil`。这样浏览器关掉、
+页面切后台导致 HTTP 连接断开时，Worker 仍会尽力把这一轮推送跑完。直接把
+`createInstantHandler(...)` 挂成 Worker module `fetch` 也支持同样的 `(request, env, ctx)`
+形态。
+
 ```toml
 # wrangler.toml
 name = "amsg-instant"
@@ -882,6 +890,10 @@ app.post('/instant', toNodeHandler(instantHandler));
 app.listen(3000);
 ```
 
+Node / Express 本身没有标准 `waitUntil`。如果你的宿主环境额外提供了生命周期钩子，
+可以用 `toNodeHandler(instantHandler, { waitUntil })`，或在需要按请求动态取 context 时
+用 `{ getRuntime(req, res) { return { waitUntil }; } }`。
+
 ### Netlify Functions
 
 > Netlify Functions 默认仍是 Node 18，0.3.0 起 `adapters/node` 在请求入口处自动检测并 polyfill `globalThis.crypto`，无需 caller 做任何事。如果想原生 Web Crypto，把 Function 切到 Netlify Edge 即可。
@@ -904,6 +916,9 @@ export default toNetlifyHandler(handler);
 export const config = { path: '/api/v1/instant' };
 ```
 
+`toNetlifyHandler` 会把 Netlify 的第二个 `context` 参数透传给 handler；当平台提供
+`context.waitUntil` 时，主回复链路会自动挂进去。
+
 ### Vercel Functions（Edge Runtime）
 
 ```js
@@ -924,6 +939,10 @@ const handler = createInstantHandler({
 
 export default toVercelEdgeHandler(handler);
 ```
+
+`toVercelEdgeHandler` 会透传第二个 context 参数，适配暴露 `context.waitUntil` 的运行时形态。
+如果你使用 Vercel 的 `@vercel/functions` helper，则直接把它传给
+`createInstantHandler({ ..., waitUntil })` 即可，库本身不会强依赖这个包。
 
 ## 浏览器端调用
 
@@ -964,7 +983,7 @@ await client.sendInstant({
 子路径：
 
 - `@rei-standard/amsg-instant/adapters/cloudflare` — `createCloudflareWorker(optionsBuilder)`
-- `@rei-standard/amsg-instant/adapters/node`       — `toNodeHandler(fetchHandler)`
+- `@rei-standard/amsg-instant/adapters/node`       — `toNodeHandler(fetchHandler, options?)`
 - `@rei-standard/amsg-instant/adapters/netlify`    — `toNetlifyHandler(fetchHandler)`
 - `@rei-standard/amsg-instant/adapters/vercel`     — `toVercelEdgeHandler(fetchHandler)` / `toVercelNodeHandler`
 
