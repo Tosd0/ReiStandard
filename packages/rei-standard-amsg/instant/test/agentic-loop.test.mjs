@@ -26,6 +26,7 @@ import {
   HookError,
   PayloadTooLargeError,
   MemoryStoreFullError,
+  processInstantMessage,
   validateContinuePayload,
   validateInstantPayload,
 } from '../src/index.js';
@@ -35,6 +36,7 @@ import {
   generateTestSubscription,
   createFetchRouter,
   decryptCapturedPushBody,
+  base64UrlToBytes,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -80,6 +82,27 @@ function makeRequest(url, body, headers = {}) {
   });
 }
 
+async function decryptAll(pushCalls) {
+  const out = [];
+  for (const call of pushCalls) {
+    out.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
+  }
+  return out;
+}
+
+function restoreMultipartPayload(parts) {
+  const sorted = parts.slice().sort((a, b) => a.multipart.index - b.multipart.index);
+  const byteChunks = sorted.map((part) => base64UrlToBytes(part.chunk));
+  const totalBytes = byteChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+  const joined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const bytes of byteChunks) {
+    joined.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(joined));
+}
+
 // ─── decision: finish ───────────────────────────────────────────────────
 
 describe('agentic loop — decision: finish', () => {
@@ -93,7 +116,7 @@ describe('agentic loop — decision: finish', () => {
       fetch: router.fetch,
       onLLMOutput: (ctx) => ({
         decision: 'finish',
-        pushPayload: { type: 'custom', text: ctx.llmOutputText },
+        pushPayloads: [{ type: 'custom', text: ctx.llmOutputText }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -102,7 +125,13 @@ describe('agentic loop — decision: finish', () => {
     assert.equal(body.data.status, 'finished');
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
-    assert.deepEqual(JSON.parse(decrypted), { type: 'custom', text: 'hi there' });
+    const decoded = JSON.parse(decrypted);
+    assert.equal(decoded.type, 'custom');
+    assert.equal(decoded.text, 'hi there');
+    // sendPushesSequentially auto-fills these on every push.
+    assert.equal(decoded.messageIndex, 1);
+    assert.equal(decoded.totalMessages, 1);
+    assert.match(decoded.messageId, /^msg_[0-9a-f-]+_chunk_0$/);
   });
 });
 
@@ -119,7 +148,7 @@ describe('agentic loop — decision: tool-request', () => {
       fetch: router.fetch,
       onLLMOutput: () => ({
         decision: 'tool-request',
-        pushPayload: { type: 'tool-request', tool: 'get_weather' },
+        pushPayloads: [{ type: 'tool-request', tool: 'get_weather' }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -153,7 +182,7 @@ describe('agentic loop — decision: continue → finish', () => {
           };
         }
         observedHistory = ctx.messages;
-        return { decision: 'finish', pushPayload: { type: 'done' } };
+        return { decision: 'finish', pushPayloads: [{ type: 'done' }] };
       },
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -216,8 +245,10 @@ describe('agentic loop — loop-exceeded', () => {
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
     const decoded = JSON.parse(decrypted);
-    assert.equal(decoded.type, 'error');
+    assert.equal(decoded.messageKind, 'error');
     assert.equal(decoded.code, 'LOOP_EXCEEDED');
+    // Legacy {type:'error'} envelope is gone in 0.8.0.
+    assert.equal('type' in decoded, false);
   });
 });
 
@@ -243,7 +274,10 @@ describe('agentic loop — hook contract violations', () => {
     assert.ok(events.find((e) => e.type === 'hook_threw'));
     assert.equal(router.pushCalls.length, 1);
     const decrypted = await decryptCapturedPushBody(router.pushCalls[0].body, subKit);
-    assert.equal(JSON.parse(decrypted).code, 'HOOK_THREW');
+    const decoded = JSON.parse(decrypted);
+    assert.equal(decoded.code, 'HOOK_THREW');
+    assert.equal(decoded.messageKind, 'error');
+    assert.equal('type' in decoded, false);
   });
 
   it('hook returns null → HookError path', async () => {
@@ -288,7 +322,7 @@ describe('agentic loop — hook contract violations', () => {
       fetch: router.fetch,
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'finish', big: 1n },
+        pushPayloads: [{ type: 'finish', big: 1n }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -312,7 +346,7 @@ describe('agentic loop — SessionContext does not expose credentials', () => {
       fetch: router.fetch,
       onLLMOutput: (ctx) => {
         captured = ctx;
-        return { decision: 'finish', pushPayload: { ok: true } };
+        return { decision: 'finish', pushPayloads: [{ ok: true }] };
       },
     });
     await handler(makeRequest('http://h/instant', basePayload()));
@@ -338,9 +372,18 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
         llm: () => makeLlmResponse('x'),
       });
       const blobAdapter = createMemoryBlobStore();
-      // Build a JSON string of *exactly* `len` UTF-8 bytes:
-      //   `{"type":"x","p":"...payload..."}` — fixed overhead 17 chars.
-      const overhead = '{"type":"x","p":""}'.length;
+      // Build a JSON string of *exactly* `len` UTF-8 bytes after the
+      // sendPushesSequentially auto-fill enriches the transport copy.
+      // Final shape: {"type":"x","p":"...","messageId":"msg_<uuid>_chunk_0","messageIndex":1,"totalMessages":1}
+      // messageId is the only variable-width field; its UUID is 36 chars,
+      // so messageId value length is `msg_`.length + 36 + `_chunk_0`.length = 48.
+      const overhead = JSON.stringify({
+        type: 'x',
+        p: '',
+        messageId: 'm'.repeat(48),
+        messageIndex: 1,
+        totalMessages: 1,
+      }).length;
       const filler = 'a'.repeat(len - overhead);
       const handler = createInstantHandler({
         vapid,
@@ -348,7 +391,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
         blobStore: { adapter: blobAdapter },
         onLLMOutput: () => ({
           decision: 'finish',
-          pushPayload: { type: 'x', p: filler },
+          pushPayloads: [{ type: 'x', p: filler }],
         }),
       });
       const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -382,7 +425,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       blobStore: { adapter: blobAdapter },
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'cjk', p: cjk },
+        pushPayloads: [{ type: 'cjk', p: cjk }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -391,7 +434,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
     assert.equal(JSON.parse(decrypted)._blob, true);
   });
 
-  it('no blobStore + oversize payload → PayloadTooLargeError', async () => {
+  it('no blobStore + multipart enabled → generic multipart fallback', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
       llm: () => makeLlmResponse('x'),
@@ -402,8 +445,45 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       fetch: router.fetch,
       onEvent: (e) => events.push(e),
       onLLMOutput: () => ({
+        decision: 'tool-request',
+        pushPayloads: [{
+          messageKind: 'tool_request',
+          message: 'need a large tool request',
+          toolCalls: [{
+            id: 'call_big',
+            type: 'function',
+            function: { name: 'bulk', arguments: JSON.stringify({ data: 'a'.repeat(5000) }) },
+          }],
+        }],
+      }),
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+
+    const decoded = await decryptAll(router.pushCalls);
+    assert.ok(decoded.length > 1);
+    assert.equal(decoded.every((p) => p.messageKind === '_multipart'), true);
+    assert.equal(decoded.every((p) => p.multipart.originalMessageKind === 'tool_request'), true);
+    const restored = restoreMultipartPayload(decoded);
+    assert.equal(restored.messageKind, 'tool_request');
+    assert.equal(restored.toolCalls[0].function.name, 'bulk');
+    assert.equal(events.some((e) => e.type === 'multipart_built' && e.originalMessageKind === 'tool_request'), true);
+  });
+
+  it('no blobStore + multipart disabled + oversize payload → PayloadTooLargeError', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('x'),
+    });
+    const events = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onEvent: (e) => events.push(e),
+      multipart: { enabled: false },
+      onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'big', p: 'a'.repeat(5000) },
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
       }),
     });
     const res = await handler(makeRequest('http://h/instant', basePayload()));
@@ -411,6 +491,26 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
     const body = await res.json();
     assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE');
     assert.ok(events.find((e) => e.type === 'payload_too_large'));
+  });
+
+  it('deprecated reasoningChunkBytes:null disables generic multipart when multipart is not explicit', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('x'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      reasoningChunkBytes: null,
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
+      }),
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE');
   });
 });
 
@@ -429,7 +529,7 @@ describe('/blob/:key endpoint', () => {
       blobStore: { adapter: blobAdapter },
       onLLMOutput: () => ({
         decision: 'finish',
-        pushPayload: { type: 'big', p: 'a'.repeat(5000) },
+        pushPayloads: [{ type: 'big', p: 'a'.repeat(5000) }],
       }),
     });
     await handler(makeRequest('http://h/instant', basePayload()));
@@ -542,12 +642,12 @@ describe('/continue endpoint', () => {
         if (ctx.iteration === 0) {
           return {
             decision: 'tool-request',
-            pushPayload: { type: 'tool-request', tool: 'fetch_x' },
+            pushPayloads: [{ type: 'tool-request', tool: 'fetch_x' }],
           };
         }
         return {
           decision: 'finish',
-          pushPayload: { type: 'finish', text: ctx.llmOutputText },
+          pushPayloads: [{ type: 'finish', text: ctx.llmOutputText }],
         };
       },
     });
@@ -694,5 +794,171 @@ describe('validateInstantPayload hookPath flag', () => {
       pushSubscription: { endpoint: 'https://p/x' },
     });
     assert.equal(r.valid, true);
+  });
+});
+
+// ─── 0.8.0 — decision contract: pushPayloads ───────────────────────────
+
+describe('0.8.0 — decision contract: pushPayloads', () => {
+  async function dispatchHookReturn(hookReturn) {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('llm answer'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => hookReturn,
+    });
+    const res = await handler(makeRequest('http://h/instant', basePayload()));
+    return { res, body: await res.json(), router };
+  }
+
+  it('rejects singular pushPayload field with HookError + migration message', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayload: { messageKind: 'content', message: 'hi' },
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in 0\.8\.0, use pushPayloads: \[yourPayload\]/);
+  });
+
+  it('rejects when BOTH pushPayload and pushPayloads are set', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayload: { messageKind: 'content', message: 'a' },
+      pushPayloads: [{ messageKind: 'content', message: 'b' }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /pushPayload \(singular\) is removed in 0\.8\.0, use pushPayloads/);
+  });
+
+  it('rejects pushPayloads: [] (empty array)', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayloads: [],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /use decision: skip-push to skip notification entirely/);
+  });
+
+  it('rejects a push that carries splitPattern', async () => {
+    const { res, body } = await dispatchHookReturn({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'hi', splitPattern: '([。！？!?]+)' }],
+    });
+    assert.equal(res.status, 500);
+    assert.equal(body.error.code, 'HOOK_THREW');
+    assert.match(body.error.message, /splitPattern is removed in 0\.8\.0/);
+  });
+});
+
+// ─── 0.8.0 — pushPayloads happy paths ──────────────────────────────────
+
+describe('0.8.0 — pushPayloads happy paths', () => {
+  it('sends N pushes from a 3-element pushPayloads array with messageIndex/totalMessages auto-fill', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    const sleeps = [];
+    const result = await processInstantMessage(basePayload(), {
+      vapid,
+      fetch: router.fetch,
+      sleep: (ms) => { sleeps.push(ms); return Promise.resolve(); },
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'first' },
+          { messageKind: 'content', message: 'second' },
+          { messageKind: 'content', message: 'third' },
+        ],
+      }),
+      autoEmitReasoning: false,
+      requestUrl: 'http://localhost/instant',
+    });
+    assert.equal(result.status, 'finished');
+    assert.equal(router.pushCalls.length, 3);
+    const decoded = [];
+    for (const c of router.pushCalls) decoded.push(JSON.parse(await decryptCapturedPushBody(c.body, subKit)));
+    assert.deepEqual(decoded.map(p => p.message), ['first', 'second', 'third']);
+    assert.deepEqual(decoded.map(p => p.messageIndex), [1, 2, 3]);
+    assert.deepEqual(decoded.map(p => p.totalMessages), [3, 3, 3]);
+    // 1500 between push 1↔2 and 2↔3
+    assert.deepEqual(sleeps, [1500, 1500]);
+  });
+
+  it('preserves hook-set messageId, overwrites caller-set messageIndex/totalMessages', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    await processInstantMessage(basePayload(), {
+      vapid,
+      fetch: router.fetch,
+      sleep: () => Promise.resolve(),
+      onLLMOutput: () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'a', messageId: 'custom-id-1', messageIndex: 99, totalMessages: 99 },
+          { messageKind: 'content', message: 'b' },
+        ],
+      }),
+      autoEmitReasoning: false,
+      requestUrl: 'http://localhost/instant',
+    });
+    const decoded = [];
+    for (const c of router.pushCalls) decoded.push(JSON.parse(await decryptCapturedPushBody(c.body, subKit)));
+    assert.equal(decoded[0].messageId, 'custom-id-1', 'caller messageId kept');
+    assert.notEqual(decoded[1].messageId, decoded[0].messageId, 'auto messageId distinct');
+    assert.equal(decoded[0].messageIndex, 1, 'lib overwrites caller messageIndex');
+    assert.equal(decoded[0].totalMessages, 2, 'lib overwrites caller totalMessages');
+    assert.equal(decoded[1].messageIndex, 2);
+    assert.equal(decoded[1].totalMessages, 2);
+  });
+
+  it('mid-array push failure aborts remaining pushes, no final_pushed event', async () => {
+    let pushIdx = 0;
+    const events = [];
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+      pushHandler: () => {
+        pushIdx++;
+        if (pushIdx === 2) {
+          return { ok: false, status: 502, statusText: 'Bad Gateway', async text() { return 'fail'; } };
+        }
+        return { ok: true, status: 201, async text() { return ''; } };
+      },
+    });
+    let caught;
+    try {
+      await processInstantMessage(basePayload(), {
+        vapid,
+        fetch: router.fetch,
+        sleep: () => Promise.resolve(),
+        onEvent: (e) => events.push(e),
+        onLLMOutput: () => ({
+          decision: 'finish',
+          pushPayloads: [
+            { messageKind: 'content', message: 'one' },
+            { messageKind: 'content', message: 'two' },
+            { messageKind: 'content', message: 'three' },
+          ],
+        }),
+        autoEmitReasoning: false,
+        requestUrl: 'http://localhost/instant',
+      });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught, 'mid-array failure should propagate');
+    assert.equal(caught.code, 'PUSH_SEND_FAILED');
+    assert.equal(caught.messageIndex, 2);
+    assert.equal(pushIdx, 2, 'second push attempted, third skipped');
+    assert.equal(events.some(e => e.type === 'final_pushed'), false, 'no final_pushed on partial delivery');
   });
 });

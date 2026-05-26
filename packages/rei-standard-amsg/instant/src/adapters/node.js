@@ -18,6 +18,10 @@
  *     `express.json()` on this route. Conversely, ensure no body parser
  *     has already consumed the stream before this middleware runs.
  *   - Headers are forwarded case-insensitively via the Fetch API.
+ *   - Plain Node / Express does not define a standard `waitUntil`
+ *     lifecycle. If your host exposes one, pass it through the optional
+ *     adapter options so `createInstantHandler` can protect the main
+ *     LLM → split → push pipeline.
  */
 
 /**
@@ -45,15 +49,23 @@ async function ensureWebCryptoPolyfill() {
 }
 
 /**
- * @param {(request: Request) => Promise<Response>} fetchHandler
+ * @typedef {Object} NodeAdapterOptions
+ * @property {(work: Promise<unknown>) => void} [waitUntil]
+ * @property {{ waitUntil?: (work: Promise<unknown>) => void }} [runtime]
+ * @property {(req: import('http').IncomingMessage, res: import('http').ServerResponse) => { waitUntil?: (work: Promise<unknown>) => void } | undefined | null} [getRuntime]
+ */
+
+/**
+ * @param {(request: Request, runtime?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response>} fetchHandler
+ * @param {NodeAdapterOptions} [options]
  * @returns {(req: import('http').IncomingMessage, res: import('http').ServerResponse) => Promise<void>}
  */
-export function toNodeHandler(fetchHandler) {
+export function toNodeHandler(fetchHandler, options = {}) {
   return async function nodeHandler(req, res) {
     try {
       await ensureWebCryptoPolyfill();
       const fetchRequest = await nodeRequestToFetchRequest(req);
-      const fetchResponse = await fetchHandler(fetchRequest);
+      const fetchResponse = await fetchHandler(fetchRequest, resolveNodeRuntime(options, req, res));
       await writeFetchResponseToNode(fetchResponse, res);
     } catch (err) {
       if (!res.headersSent) {
@@ -68,6 +80,19 @@ export function toNodeHandler(fetchHandler) {
       );
     }
   };
+}
+
+function resolveNodeRuntime(options, req, res) {
+  if (options && typeof options.getRuntime === 'function') {
+    return options.getRuntime(req, res) || undefined;
+  }
+  if (options && options.runtime && typeof options.runtime === 'object') {
+    return options.runtime;
+  }
+  if (options && typeof options.waitUntil === 'function') {
+    return { waitUntil: options.waitUntil };
+  }
+  return undefined;
 }
 
 async function nodeRequestToFetchRequest(req) {

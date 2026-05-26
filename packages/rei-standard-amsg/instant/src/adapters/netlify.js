@@ -2,10 +2,10 @@
  * Netlify Functions adapter for @rei-standard/amsg-instant.
  *
  * Netlify Functions (v2, Fetch-API-style) accept a handler of the
- * shape `(req: Request) => Response | Promise<Response>`, which is
- * exactly the shape produced by `createInstantHandler`. This file is
- * a thin pass-through for symmetry with the other adapters and to
- * give downstream a consistent import path.
+ * shape `(req: Request, context: Context) => Response | Promise<Response>`,
+ * which is compatible with the shape produced by `createInstantHandler`.
+ * This adapter forwards the Netlify context so `context.waitUntil` can
+ * protect the main LLM → split → push pipeline when the platform provides it.
  *
  * Usage:
  *   // netlify/functions/instant.js
@@ -18,12 +18,12 @@
  */
 
 /**
- * @param {(request: Request) => Promise<Response>} fetchHandler
- * @returns {(req: Request) => Promise<Response>}
+ * @param {(request: Request, runtime?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response>} fetchHandler
+ * @returns {(req: Request, context?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response>}
  */
 export function toNetlifyHandler(fetchHandler) {
-  return async function netlifyHandler(req) {
-    return fetchHandler(req);
+  return async function netlifyHandler(req, context) {
+    return fetchHandler(req, context);
   };
 }
 

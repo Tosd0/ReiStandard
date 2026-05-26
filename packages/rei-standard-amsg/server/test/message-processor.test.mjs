@@ -585,6 +585,239 @@ describe('splitPattern support', () => {
     }
   });
 
+  it('processSingleMessage: emits ContentPush with messageKind/sessionId (v2.4.0 schema)', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const pushed = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { choices: [{ message: { content: '一句。二句！' } }] }; },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushed.push(JSON.parse(payload));
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(result.messagesSent, 2);
+      assert.equal(pushed.length, 2);
+      for (const p of pushed) {
+        assert.equal(p.messageKind, 'content');
+        assert.equal(p.source, 'scheduled');
+        assert.equal(p.messageType, 'prompted');
+        assert.match(p.sessionId, /^sess_task_/);
+        // Legacy 0.7.x fields still present.
+        assert.ok('title' in p);
+        assert.ok('message' in p);
+        assert.ok('messageIndex' in p);
+        assert.ok('totalMessages' in p);
+        assert.ok('messageId' in p);
+        assert.ok('messageSubtype' in p);
+        assert.ok('avatarUrl' in p);
+        assert.ok('metadata' in p);
+        assert.ok('taskId' in p);
+      }
+      // Same sessionId across both sentences from one LLM round.
+      assert.equal(pushed[0].sessionId, pushed[1].sessionId);
+      assert.equal(pushed[0].messageIndex, 1);
+      assert.equal(pushed[1].messageIndex, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('processSingleMessage: auto-emits ReasoningPush before ContentPush when LLM returns reasoning_content', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const pushed = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return {
+          choices: [{
+            message: {
+              content: '回答。',
+              reasoning_content: '先想想再回答',
+            },
+          }],
+        };
+      },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushed.push(JSON.parse(payload));
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      // messagesSent reflects sentence count, NOT reasoning + sentences.
+      assert.equal(result.messagesSent, 1);
+      // But on the wire there are 2 pushes: reasoning + content.
+      assert.equal(pushed.length, 2);
+      assert.equal(pushed[0].messageKind, 'reasoning');
+      assert.equal(pushed[0].reasoningContent, '先想想再回答');
+      assert.equal('messageIndex' in pushed[0], false, 'reasoning must not carry messageIndex');
+      assert.equal('totalMessages' in pushed[0], false, 'reasoning must not carry totalMessages');
+      assert.equal(pushed[1].messageKind, 'content');
+      // Same sessionId across reasoning + content.
+      assert.equal(pushed[0].sessionId, pushed[1].sessionId);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('processSingleMessage: does NOT emit ReasoningPush for fixed messageType (no LLM call)', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'fixed',
+      userMessage: '固定消息',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const pushed = [];
+    const ctx = createContext(async (_sub, payload) => {
+      pushed.push(JSON.parse(payload));
+    });
+
+    const result = await processSingleMessage(task, ctx);
+    assert.equal(result.success, true);
+    assert.equal(pushed.length, 1, 'fixed path → no reasoning, only the content push');
+    assert.equal(pushed[0].messageKind, 'content');
+    assert.equal(pushed[0].messageType, 'fixed');
+    assert.equal(pushed[0].source, 'scheduled');
+  });
+
+  it('processSingleMessage: messageType:"instant" routes to source:"instant" (via-server instant path)', async () => {
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'instant',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    const pushed = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { choices: [{ message: { content: 'reply' } }] }; },
+    });
+
+    const ctx = createContext(async (_sub, payload) => {
+      pushed.push(JSON.parse(payload));
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(pushed[0].source, 'instant');
+      assert.equal(pushed[0].messageType, 'instant');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('processSingleMessage: messageId is deterministic across retries when task.id is present', async () => {
+    // Pin the v2.4.0 messageId format: `msg_task_<id>_<i>` for scheduled
+    // rows, so a retry produces the same id for the same (task, sentence)
+    // pair and downstream dedupers can key on it.
+    const task = createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    });
+
+    async function runOnce() {
+      const pushed = [];
+      const ctx = createContext(async (_sub, payload) => {
+        pushed.push(JSON.parse(payload));
+      });
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        async json() { return { choices: [{ message: { content: '一句。二句！' } }] }; },
+      });
+      try {
+        await processSingleMessage(task, ctx);
+        return pushed;
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+
+    const a = await runOnce();
+    const b = await runOnce();
+
+    assert.equal(a[0].messageId, `msg_task_${task.id}_0`);
+    assert.equal(a[1].messageId, `msg_task_${task.id}_1`);
+    // Same task → same messageIds across retries.
+    assert.equal(a[0].messageId, b[0].messageId);
+    assert.equal(a[1].messageId, b[1].messageId);
+  });
+
+  it('processSingleMessage: sessionId/messageId use UUID fallback when task.id is null', async () => {
+    // The legacy in-server instant path can receive a task row with
+    // `id == null`. In that case there's no stable key to derive the
+    // sessionId/messageId from, so we fall back to UUIDs.
+    const userKey = deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
+    const encryptedPayload = encryptForStorage(JSON.stringify({
+      contactName: 'Rei',
+      messageType: 'instant',
+      completePrompt: 'x',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 's',
+      primaryModel: 'm',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' },
+    }), userKey);
+    const taskWithoutId = { id: null, user_id: TEST_USER_ID, encrypted_payload: encryptedPayload };
+
+    const pushed = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { choices: [{ message: { content: 'reply' } }] }; },
+    });
+    const ctx = createContext(async (_sub, payload) => {
+      pushed.push(JSON.parse(payload));
+    });
+
+    try {
+      const result = await processSingleMessage(taskWithoutId, ctx);
+      assert.equal(result.success, true);
+      assert.match(pushed[0].sessionId, /^sess_[0-9a-f-]{36}$/);
+      assert.match(pushed[0].messageId, /^msg_[0-9a-f-]{36}_instant_0$/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('processSingleMessage: cascades string[] splitPattern in order', async () => {
     const task = createEncryptedTask({
       contactName: 'Rei',
@@ -670,25 +903,26 @@ describe('avatarUrl validation', () => {
     assert.match(validateAvatarUrl('not a url'), /URL/);
   });
 
-  it('schedule payload: rejects data: avatarUrl with INVALID_PARAMETERS', () => {
-    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'data:image/png;base64,xxx' }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
-    assert.deepEqual(r.details.invalidFields, ['avatarUrl']);
-    assert.match(r.errorMessage, /data:/);
+  it('schedule payload: soft-strips data: avatarUrl (v2.3.3+)', () => {
+    const payload = basePayload({ avatarUrl: 'data:image/png;base64,xxx' });
+    const r = validateScheduleMessagePayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('schedule payload: rejects oversized avatarUrl', () => {
-    const r = validateScheduleMessagePayload(basePayload({
+  it('schedule payload: soft-strips oversized avatarUrl', () => {
+    const payload = basePayload({
       avatarUrl: 'https://example.com/' + 'a'.repeat(2048),
-    }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PARAMETERS');
-    assert.match(r.errorMessage, /2048/);
+    });
+    const r = validateScheduleMessagePayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
   it('schedule payload: accepts a normal https avatarUrl', () => {
-    const r = validateScheduleMessagePayload(basePayload({ avatarUrl: 'https://example.com/a.png' }));
+    const payload = basePayload({ avatarUrl: 'https://example.com/a.png' });
+    const r = validateScheduleMessagePayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, 'https://example.com/a.png');
   });
 });

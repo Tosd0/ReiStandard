@@ -16,7 +16,11 @@
  * own `worker.js` — not imported as a library.
  */
 
-import { createInstantHandler, buildInstantPushPayload } from '@rei-standard/amsg-instant';
+import {
+  createInstantHandler,
+  buildContentPush,
+  buildToolRequestPush,
+} from '@rei-standard/amsg-instant';
 import { createMemoryBlobStore } from '@rei-standard/amsg-instant/blob/memory';
 
 export default {
@@ -49,15 +53,21 @@ async function onLLMOutput(ctx) {
   if (text.includes('NEED_TOOL')) {
     return {
       decision: 'tool-request',
-      pushPayload: {
-        type: 'tool-request',
+      pushPayloads: [buildToolRequestPush({
+        messageType: 'instant',
+        source: 'instant',
+        messageId: `msg_${crypto.randomUUID()}_tool`,
         sessionId: ctx.sessionId,
-        iteration: ctx.iteration,
-        // Pass enough state for the SW to re-POST /continue
-        messages: ctx.messages,
-        tool: parseToolName(text),
-        // Anything else the SW needs — keep it JSON-safe.
-      },
+        // OpenAI-compatible tool_calls passthrough — replace with your
+        // own protocol shape (custom marker / XML / NL classification)
+        // if you don't speak OpenAI tool-call JSON.
+        toolCalls: [
+          { id: 'call_0', type: 'function', function: { name: parseToolName(text), arguments: '{}' } },
+        ],
+        contactName: ctx.contactName,
+        // SW can include arbitrary client routing state in metadata.
+        metadata: { iteration: ctx.iteration, messages: ctx.messages },
+      })],
     };
   }
 
@@ -81,18 +91,25 @@ async function onLLMOutput(ctx) {
 
   // ─── (C) Plain answer: deliver and finish ──────────────────────────
   //
-  // The 13-field v0.6 default push payload still works fine — call
-  // `buildInstantPushPayload` if you want it. Or build your own; the
-  // SW is yours.
+  // The hook returns a ContentPush (from @rei-standard/amsg-shared) so
+  // the SW can dispatch on `messageKind === 'content'`. Build your own
+  // free-form pushPayload object if you don't want shared types — the
+  // hook contract is `pushPayload: unknown`.
   return {
     decision: 'finish',
-    pushPayload: buildInstantPushPayload({
+    pushPayloads: [buildContentPush({
+      messageType: 'instant',
+      source: 'instant',
+      messageId: `msg_${crypto.randomUUID()}_content_0`,
+      sessionId: ctx.sessionId,
       message: text,
-      index: 0,
-      total: 1,
+      title: `来自 ${ctx.contactName}`,
       contactName: ctx.contactName,
       avatarUrl: ctx.avatarUrl ?? null,
-    }),
+      messageIndex: 1,
+      totalMessages: 1,
+      taskId: null,
+    })],
   };
 }
 

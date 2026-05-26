@@ -145,6 +145,13 @@ async function hkdf(salt, ikm, info, length) {
  * @param {(url: string, init: RequestInit) => Promise<Response | { ok: boolean, status?: number, statusText?: string, json?: () => Promise<any>, text?: () => Promise<string> }>} [routes.llm]
  * @param {string} routes.pushEndpoint           - Subscription endpoint to intercept.
  * @param {(url: string, init: RequestInit, captured: { body: Uint8Array, headers: Record<string, string> }) => any} [routes.onPush]
+ * @param {(captured: { url: string, body: Uint8Array, headers: Record<string, string>, callIndex: number }) => any} [routes.pushHandler]
+ *   Per-call response override for the push endpoint. Called with a
+ *   captured object that includes `callIndex` (1-based) so the handler
+ *   can inject mid-array failures. Return a Response-like object (with
+ *   `ok`/`status`/`statusText`/`text()`) to override the default 201;
+ *   return falsy to fall through to the default. Takes precedence over
+ *   `onPush` when both are supplied.
  * @returns {{ fetch: Function, pushCalls: Array<{ url: string, body: Uint8Array, headers: Record<string, string> }> }}
  */
 export function createFetchRouter(routes) {
@@ -159,6 +166,10 @@ export function createFetchRouter(routes) {
       );
       const captured = { url, body: bodyBytes, headers };
       pushCalls.push(captured);
+      if (typeof routes.pushHandler === 'function') {
+        const r = await routes.pushHandler({ ...captured, callIndex: pushCalls.length });
+        if (r) return r;
+      }
       if (typeof routes.onPush === 'function') {
         const r = await routes.onPush(url, init, captured);
         if (r) return r;
@@ -173,14 +184,19 @@ export function createFetchRouter(routes) {
   return { fetch: fetchImpl, pushCalls };
 }
 
-/** Convenience: build a fake LLM response with the given content. */
-export function makeLlmResponse(content) {
+/**
+ * Convenience: build a fake LLM response with the given content. Any
+ * `extra` keys are merged onto `choices[0].message`, so callers can
+ * inject `reasoning_content` / `tool_calls` / `refusal` without
+ * needing a second helper.
+ */
+export function makeLlmResponse(content, extra = {}) {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
     async json() {
-      return { choices: [{ message: { content } }] };
+      return { choices: [{ message: { content, ...extra } }] };
     },
   };
 }

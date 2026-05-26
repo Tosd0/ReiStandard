@@ -12,6 +12,9 @@
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder('utf-8', { fatal: false });
 
+import { toUint8, concatBytes, base64UrlToBytes } from '@rei-standard/amsg-shared';
+export { toUint8, concatBytes, base64UrlToBytes };
+
 /** UTF-8 encode a string into a Uint8Array. */
 export function utf8(str) {
   return TEXT_ENCODER.encode(String(str));
@@ -22,26 +25,6 @@ export function utf8Decode(buf) {
   return TEXT_DECODER.decode(toUint8(buf));
 }
 
-/** Coerce ArrayBuffer | Uint8Array | view → Uint8Array (no copy when possible). */
-export function toUint8(buf) {
-  if (buf instanceof Uint8Array) return buf;
-  if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
-  if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-  throw new TypeError('Expected ArrayBuffer / Uint8Array');
-}
-
-/** Concatenate Uint8Arrays into a single Uint8Array. */
-export function concatBytes(...chunks) {
-  let total = 0;
-  for (const c of chunks) total += c.byteLength;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c), offset);
-    offset += c.byteLength;
-  }
-  return out;
-}
 
 /** Encode bytes as base64url (no padding). */
 export function bytesToBase64Url(buf) {
@@ -57,18 +40,6 @@ export function bytesToBase64Url(buf) {
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-/** Decode base64url (with or without padding) → Uint8Array. */
-export function base64UrlToBytes(input) {
-  const s = String(input).replace(/-/g, '+').replace(/_/g, '/');
-  const pad = (4 - (s.length % 4)) % 4;
-  const padded = s + '='.repeat(pad);
-  const bin = (typeof atob === 'function')
-    ? atob(padded)
-    : Buffer.from(padded, 'base64').toString('binary');
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
 
 /** Encode a JSON-serializable value as base64url (UTF-8 JSON). */
 export function jsonToBase64Url(value) {

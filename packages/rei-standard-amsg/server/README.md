@@ -9,7 +9,7 @@
 - 业务端点统一使用 `Authorization: Bearer <tenantToken>`
 - `send-notifications` 支持 `cronToken`（Header 或 query token）
 
-2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 严格校验）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-严格校验)；行为已对齐 `amsg-instant`，向后兼容。
+2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)。其中 `splitPattern` 是 server 调度任务的持久化配置；`amsg-instant` 0.8.0 起改为 hook 内自定义 split 函数 + `pushPayloads`。
 
 ## 安装
 
@@ -78,7 +78,7 @@ AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
 
 可选 `temperature?: number` 透传给 LLM：`completePrompt` 路径未传时默认 0.8（保持旧行为）；`messages` 路径未传时**不发**，让上游主路径自己决定。
 
-## 自定义分句正则 `splitPattern`（2.3.0+）
+## 自定义分句正则 `splitPattern`（server 2.3.0+）
 
 `processSingleMessage` 默认按 `/([。！？!?]+)/` 把 LLM 返回的整段文本切成多条推送（每条间隔 1.5s）。`splitPattern` 让调用方覆盖这个正则：
 

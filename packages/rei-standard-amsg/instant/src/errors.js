@@ -31,10 +31,11 @@ export class HookError extends Error {
 }
 
 /**
- * Thrown when a push payload exceeds `maxInlineBytes` and no blob store
- * is configured (or the configured store's `put` failed). Tells the
- * caller exactly how big the payload was vs the cap, so they can
- * decide whether to shorten the body or wire up a blob adapter.
+ * Thrown when a push payload exceeds `maxInlineBytes` and cannot be
+ * delivered through BlobStore or generic multipart (for example,
+ * multipart is disabled, its limits are exceeded, or BlobStore `put`
+ * failed). Tells the caller exactly how big the payload was vs the cap,
+ * so they can decide whether to shorten the body or wire up storage.
  */
 export class PayloadTooLargeError extends Error {
   /**

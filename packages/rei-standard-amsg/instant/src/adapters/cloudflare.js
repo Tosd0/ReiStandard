@@ -48,19 +48,21 @@ import { createInstantHandler } from '../index.js';
  * handler the first time a request arrives. The factory receives the
  * Workers `env` binding so secrets can be read at request time rather
  * than at module-init time (which is required by Workers when secrets
- * are scoped per environment).
+ * are scoped per environment). The request-scoped `ExecutionContext`
+ * is forwarded into the handler so the main LLM → split → push pipeline
+ * is registered with `ctx.waitUntil` when Cloudflare provides it.
  *
  * @param {(env: Record<string, string>) => import('../index.js').InstantHandlerOptions} optionsBuilder
- * @returns {{ fetch: (request: Request, env: Record<string, string>) => Promise<Response> }}
+ * @returns {{ fetch: (request: Request, env: Record<string, string>, ctx?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response> }}
  */
 export function createCloudflareWorker(optionsBuilder) {
   let handler = null;
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       if (!handler) {
         handler = createInstantHandler(optionsBuilder(env || {}));
       }
-      return handler(request);
+      return handler(request, ctx);
     }
   };
 }

@@ -27,15 +27,18 @@
 import { toNodeHandler } from './node.js';
 
 /**
- * Edge runtime is already Fetch-API native, so this is a pass-through
- * that keeps a uniform import path with the other adapters.
+ * Edge runtime is already Fetch-API native, so this is mostly a pass-through
+ * that keeps a uniform import path with the other adapters. The optional
+ * second argument is forwarded for runtimes that expose a request-scoped
+ * `waitUntil` on context-like objects. For Vercel's `@vercel/functions`
+ * helper, pass `waitUntil` directly to `createInstantHandler({ waitUntil })`.
  *
- * @param {(request: Request) => Promise<Response>} fetchHandler
- * @returns {(request: Request) => Promise<Response>}
+ * @param {(request: Request, runtime?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response>} fetchHandler
+ * @returns {(request: Request, context?: { waitUntil?: (work: Promise<unknown>) => void }) => Promise<Response>}
  */
 export function toVercelEdgeHandler(fetchHandler) {
-  return async function vercelEdgeHandler(request) {
-    return fetchHandler(request);
+  return async function vercelEdgeHandler(request, context) {
+    return fetchHandler(request, context);
   };
 }
 

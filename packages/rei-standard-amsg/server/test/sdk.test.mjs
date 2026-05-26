@@ -664,9 +664,9 @@ describe('update-message splitPattern round-trip', () => {
     assert.deepEqual(result.body.error.details.invalidFields, ['splitPattern']);
   });
 
-  it('PUT rejects data: avatarUrl with INVALID_UPDATE_DATA (v2.3.1)', async () => {
+  it('PUT soft-strips data: avatarUrl, preserves stored avatar (v2.3.3+)', async () => {
     globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
-    const { server } = await buildServerAndAdapter();
+    const { server, adapter } = await buildServerAndAdapter();
     const { tenantToken, userKey } = await bootstrapTenant(server);
 
     const taskUuid = '33333333-2222-4333-8444-777777777777';
@@ -677,7 +677,8 @@ describe('update-message splitPattern round-trip', () => {
         messageType: 'fixed',
         firstSendTime: new Date(Date.now() + 60_000).toISOString(),
         pushSubscription: { endpoint: 'https://push.example.com' },
-        userMessage: 'hi'
+        userMessage: 'hi',
+        avatarUrl: 'https://example.com/original.png'
       },
       userKey
     );
@@ -691,7 +692,12 @@ describe('update-message splitPattern round-trip', () => {
       scheduleBody
     );
 
-    const badBody = encryptPayload({ avatarUrl: 'data:image/png;base64,xxx' }, userKey);
+    // Update with a bad avatarUrl AND a valid userMessage change. The bad
+    // avatar is silently dropped; the other field still gets written.
+    const patchBody = encryptPayload(
+      { avatarUrl: 'data:image/png;base64,xxx', userMessage: 'updated' },
+      userKey
+    );
     const result = await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -700,12 +706,13 @@ describe('update-message splitPattern round-trip', () => {
         'x-payload-encrypted': 'true',
         'x-encryption-version': '1'
       },
-      badBody
+      patchBody
     );
 
-    assert.equal(result.status, 400);
-    assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
-    assert.deepEqual(result.body.error.details.invalidFields, ['avatarUrl']);
-    assert.match(result.body.error.message, /data:/);
+    assert.equal(result.status, 200);
+    const after = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const afterData = JSON.parse(decryptFromStorage(after.encrypted_payload, userKey));
+    assert.equal(afterData.avatarUrl, 'https://example.com/original.png', 'bad avatar stripped → original preserved');
+    assert.equal(afterData.userMessage, 'updated', 'sibling field still applied');
   });
 });

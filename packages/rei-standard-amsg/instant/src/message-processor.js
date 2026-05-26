@@ -3,129 +3,118 @@
  * ReiStandard amsg-instant
  *
  * Lifecycle of a single instant request:
- *   call LLM (OpenAI-compatible) → split into sentences →
- *   send each sentence as its own Web Push notification (1500ms spacing) →
- *   return success.
+ *   call LLM (OpenAI-compatible) →
+ *     [if reasoning_content present] emit a ReasoningPush →
+ *     split into sentences → send each sentence as its own ContentPush
+ *     (1500ms spacing) → return success.
  *
- * Push payload field shape MUST stay identical to
- * `server/src/server/lib/message-processor.js:78-93` so the same SW
- * (`@rei-standard/amsg-sw`) handles both scheduled and instant pushes
- * uniformly via the `source` discriminator.
+ * Push wire shape comes from `@rei-standard/amsg-shared`'s discriminated
+ * union (`AmsgPush`). The same `messageKind` switch is consumed by
+ * `@rei-standard/amsg-sw` regardless of whether the push originated
+ * here (`source: 'instant'`) or in `@rei-standard/amsg-server`
+ * (`source: 'scheduled'`).
  */
+
+import {
+  buildContentPush,
+  buildReasoningPush,
+  buildErrorPush,
+} from '@rei-standard/amsg-shared';
 
 import { sendWebPush } from './webpush.js';
 import { randomUUID } from './utils.js';
 import { HookError, LlmCallError, PayloadTooLargeError } from './errors.js';
 import { buildSessionContext, extractAssistantMessage } from './session-context.js';
+import {
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  DEFAULT_MULTIPART_TTL_MS,
+  MULTIPART_MESSAGE_KIND,
+  buildMultipartPushPayloads,
+} from './multipart.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
-
 const DEFAULT_MAX_LOOP_ITERATIONS = 10;
 const DEFAULT_MAX_INLINE_BYTES = 2600;
 const DEFAULT_BLOB_TTL_SECONDS = 60;
 const VALID_DECISIONS = new Set(['finish', 'tool-request', 'continue', 'skip-push']);
 const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 
-const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
-
-function splitOnceByRegex(chunk, regex) {
-  const out = chunk
-    .split(regex)
-    .reduce((acc, part, i, arr) => {
-      if (i % 2 === 0 && part.trim()) {
-        const punctuation = arr[i + 1] || '';
-        acc.push(part.trim() + punctuation);
+/**
+ * Deliver `pushPayloads` sequentially via `sendPushWithMaybeBlob`,
+ * spacing `SLEEP_BETWEEN_MESSAGES_MS` (1500 ms) between consecutive
+ * pushes. Each push goes through `sendPushWithMaybeBlob` so the blob
+ * detour still applies per-push.
+ *
+ * Per-push auto-fill (copies each hook-returned object before enriching
+ * the transport payload):
+ *   - `messageId`     — only when the hook didn't set one (auto-fill
+ *                       with `msg_<uuid>_chunk_<i>` so deduplication
+ *                       on the SW side works across retries).
+ *   - `messageIndex`  — always overwritten (1-based) with the array index.
+ *   - `totalMessages` — always overwritten with `pushPayloads.length`.
+ *
+ * Throws on the first failed push; subsequent pushes are not attempted.
+ * Callers decide whether to surface the throw or treat the partial
+ * delivery as best-effort.
+ *
+ * @param {Array<Record<string, unknown>>} pushPayloads
+ * @param {Record<string, unknown>} payload
+ * @param {Object} ctx
+ * @param {string} sessionId
+ * @param {(ms: number) => Promise<void>} sleep
+ * @returns {Promise<number>}
+ */
+async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sleep) {
+  const total = pushPayloads.length;
+  for (let i = 0; i < total; i++) {
+    const push = { ...pushPayloads[i] };
+    if (push.messageId === undefined) {
+      push.messageId = `msg_${randomUUID()}_chunk_${i}`;
+    }
+    push.messageIndex = i + 1;
+    push.totalMessages = total;
+    try {
+      await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+    } catch (err) {
+      // HookError / PayloadTooLargeError already carry their own .code and
+      // should propagate unwrapped — those are caller-shape contract
+      // violations, not transport failures.
+      if (err && (err.code === 'HOOK_THREW' || err.code === 'PAYLOAD_TOO_LARGE')) {
+        throw err;
       }
-      return acc;
-    }, [])
-    .filter(s => s.length > 0);
-  // No-match fallback: pass the chunk through untouched so a later regex in
-  // a cascade can still take a swing at it.
-  return out.length > 0 ? out : [chunk];
-}
-
-/**
- * Split a message into individual sentences for sequential delivery.
- * Mirrors amsg-server message-processor.js:59-70 (do not drift).
- *
- * `splitPattern` is an optional caller-provided override:
- *   - `string`              → single regex source, used in place of the default
- *   - `string[]`            → applied as a cascade: split by patterns[0], then
- *                             split each resulting chunk by patterns[1], etc.
- *   - omitted / null / [] / undefined → default /([。！？!?]+)/
- *
- * Capture-group convention: if you want the delimiter re-attached to the
- * preceding chunk (matches default behavior), wrap your delimiter in `(...)`
- * — e.g. `"([\\n]+)"` not `"[\\n]+"`. We don't auto-wrap; that would require
- * parsing escaped/character-class/non-capturing groups.
- *
- * Validation (length cap, regex compilability, array size) is enforced by
- * `validateSplitPattern` upstream — this function trusts its inputs.
- *
- * @param {string} messageContent
- * @param {string | string[] | null} [splitPattern=null]
- * @returns {string[]}
- */
-export function splitMessageIntoSentences(messageContent, splitPattern = null) {
-  const sources =
-    splitPattern == null ? null :
-    Array.isArray(splitPattern) ? splitPattern :
-    [splitPattern];
-
-  const regexes = (sources && sources.length > 0)
-    ? sources.map(s => new RegExp(s))
-    : [DEFAULT_SPLIT_REGEX];
-
-  let chunks = [messageContent];
-  for (const regex of regexes) {
-    chunks = chunks.flatMap(c => splitOnceByRegex(c, regex));
+      const wrapped = new Error(err?.message || 'Web Push delivery failed');
+      wrapped.code = 'PUSH_SEND_FAILED';
+      wrapped.statusCode = err?.statusCode;
+      wrapped.messageIndex = i + 1;
+      wrapped.cause = err;
+      throw wrapped;
+    }
+    if (i < total - 1) {
+      await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    }
   }
-
-  return chunks.length > 0 ? chunks : [messageContent];
+  return total;
 }
 
+// ─── Reasoning emission ─────────────────────────────────────────────────
+
 /**
- * Build the SW-facing JSON payload for a single sentence in an instant
- * burst. Exported so test suites can verify the wire shape without having
- * to decrypt RFC 8291 ciphertext.
+ * Ship a ReasoningPush through the same transport path as every other
+ * payload. Oversized reasoning no longer uses the old reasoning-only
+ * `chunkIndex` / `totalChunks` wire format; `sendPushWithMaybeBlob`
+ * decides direct push, BlobStore envelope, or generic `_multipart`.
  *
- * Field-for-field parity with `amsg-server/src/server/lib/message-processor.js:78-93`
- * is the contract — drift here will break the shared SW.
- *
- * @param {Object} args
- * @param {string} args.message
- * @param {number} args.index           - 0-based.
- * @param {number} args.total
- * @param {string} args.contactName
- * @param {string|null} [args.avatarUrl]
- * @param {string} [args.messageSubtype='chat']
- * @param {Object} [args.metadata={}]
- * @returns {Object}
+ * @param {Object} reasoningPush
+ * @param {Object} payload
+ * @param {Object} ctx
+ * @param {string} sessionId
+ * @returns {Promise<number>}  Total leaves shipped.
  */
-export function buildInstantPushPayload({
-  message,
-  index,
-  total,
-  contactName,
-  avatarUrl = null,
-  messageSubtype = 'chat',
-  metadata = {},
-}) {
-  return {
-    title: `来自 ${contactName}`,
-    message,
-    contactName,
-    messageId: `msg_${randomUUID()}_instant_${index}`,
-    messageIndex: index + 1,
-    totalMessages: total,
-    messageType: 'instant',
-    messageSubtype,
-    taskId: null,
-    timestamp: new Date().toISOString(),
-    source: 'instant',
-    avatarUrl,
-    metadata,
-  };
+async function emitReasoning(reasoningPush, payload, ctx, sessionId) {
+  await sendPushWithMaybeBlob(reasoningPush, payload, ctx, sessionId);
+  return 1;
 }
 
 /**
@@ -222,17 +211,10 @@ function buildAiRequestBody(payload) {
   return body;
 }
 
-async function callLlm(payload, fetchImpl) {
-  const { content } = await callLlmRaw(payload, fetchImpl, /*requireContent=*/true);
-  return content.trim();
-}
-
 /**
- * Raw LLM call shared by the legacy path and the v0.7 hook loop. The
- * legacy path uses {@link callLlm} which trims the content string;
- * the hook loop calls this directly so it can append the full
- * `choices[0].message` object (preserving `tool_calls` /
- * `reasoning_content`) to its rolling history.
+ * Raw LLM call. Returns the full response object so callers can read
+ * `choices[0].message.reasoning_content` and `tool_calls` along with
+ * the content string.
  *
  * When `requireContent` is true (legacy path), a missing /
  * empty-string `choices[0].message.content` is a hard error — that
@@ -283,40 +265,62 @@ async function callLlmRaw(payload, fetchImpl, requireContent) {
 }
 
 /**
+ * Read `choices[0].message.reasoning_content` as a non-empty trimmed
+ * string, or null when absent / empty. Many providers return an
+ * empty string instead of omitting the field — treat that the same
+ * as missing so we don't emit an empty ReasoningPush.
+ *
+ * @param {unknown} llmResponse
+ * @returns {string | null}
+ */
+function readReasoningContent(llmResponse) {
+  if (!llmResponse || typeof llmResponse !== 'object') return null;
+  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const message = /** @type {{ message?: { reasoning_content?: unknown } }} */ (choices[0])?.message;
+  const raw = message?.reasoning_content;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
  * Process one instant request. Dispatches between two **independent**
  * paths based on whether the caller provided an `onLLMOutput` hook:
  *
- *   - No hook + not a `/continue` resume → **legacy v0.6 path**
- *     (`runLegacyInstant`): byte-for-byte equivalent to v0.6
- *     — single LLM call, sentence-split, sequential pushes with
- *     1500 ms spacing. `splitPattern`, `messageSubtype`,
- *     `buildInstantPushPayload`'s 13 fields all preserved.
+ *   - No hook + not a `/continue` resume → **legacy path**
+ *     (`runLegacyInstant`): single LLM call, sentence-split, sequential
+ *     pushes with 1500 ms spacing. v0.8 emits an additional
+ *     ReasoningPush before the content burst when the LLM response
+ *     includes a non-empty `reasoning_content`.
  *
- *   - Hook provided (or `isResume === true`) → **v0.7 agentic loop**
- *     (`runAgenticLoop`): per-turn LLM call, hand `SessionContext` to
- *     the hook, dispatch on `decision` (finish / tool-request /
- *     continue / skip-push). Blob envelope kicks in when the hook's
- *     pushPayload exceeds `blobStore.maxInlineBytes`.
+ *   - Hook provided (or `isResume === true`) → **agentic loop**
+ *     (`runAgenticLoop`): per-turn LLM call. v0.8 emits a
+ *     ReasoningPush BEFORE invoking the hook when the LLM response
+ *     includes `reasoning_content` (skippable via
+ *     `autoEmitReasoning: false`). The hook then decides via the
+ *     same 4-decision contract; the hook's `pushPayloads` array is
+ *     what `sw` will route as kind-specific pushes.
  *
- * The two paths intentionally do NOT share schema: hooked callers
- * speak in custom pushPayload objects, legacy callers speak in
- * sentence-split bursts of 13-field default payloads. Trying to
- * unify the two would force one of them into the other's contract.
- *
- * @param {Object} payload  - Validated request body. For legacy:
- *   identical to v0.6. For hook path: same plus `sessionId`,
- *   `iteration?`, and `messages` (not `completePrompt`).
+ * @param {Object} payload  - Validated request body.
  * @param {Object} ctx
  * @param {{ email: string, publicKey: string, privateKey: string }} ctx.vapid
- * @param {Function} [ctx.fetch]      - fetch impl (globalThis.fetch). Both LLM and push share it.
- * @param {Function} [ctx.sleep]      - sleep impl (testability, legacy path only).
+ * @param {Function} [ctx.fetch]
+ * @param {Function} [ctx.sleep]
  * @param {(e: object) => void} [ctx.onEvent]
  * @param {(c: import('./session-context.js').SessionContext) =>
  *   Promise<object> | object} [ctx.onLLMOutput]
  * @param {import('./blob-store/interface.js').BlobStoreConfig} [ctx.blobStore]
  * @param {number} [ctx.maxLoopIterations]
- * @param {string} [ctx.requestUrl]   - Inbound `request.url`; used to derive blob envelope URLs.
- * @param {boolean} [ctx.isResume]    - True when entered via `/continue`.
+ * @param {string} [ctx.requestUrl]
+ * @param {boolean} [ctx.isResume]
+ * @param {boolean} [ctx.autoEmitReasoning=true] - Hook path only. When
+ *   `false`, the framework will not auto-emit ReasoningPush before
+ *   invoking the hook — callers wanting reasoning emission must build
+ *   it themselves with `buildReasoningPush` and include it in their
+ *   own `pushPayloads`.
+ * @param {Object} [ctx.multipart] - Generic multipart transport fallback
+ *   for oversized JSON-safe payloads when BlobStore is not configured.
  * @returns {Promise<object>}
  */
 export async function processInstantMessage(payload, ctx) {
@@ -327,57 +331,127 @@ export async function processInstantMessage(payload, ctx) {
 }
 
 /**
- * v0.6 legacy path — extracted verbatim so the hook-path branch
- * cannot disturb its semantics. Byte-for-byte identical output to
- * v0.6: sentence split, sequential push with 1500 ms spacing,
- * 13-field default push payload.
+ * Legacy path — single LLM call, sentence-split, sequential push.
+ * v0.8: emits a ReasoningPush before the content burst when
+ * `reasoning_content` is present in the LLM response.
  *
  * @param {Object} payload
  * @param {Object} ctx
- * @returns {Promise<{ messagesSent: number, sentAt: string }>}
+ * @returns {Promise<{ messagesSent: number, sentAt: string, sessionId: string }>}
  */
 async function runLegacyInstant(payload, ctx) {
   const fetchImpl = ctx.fetch || globalThis.fetch;
   const sleep = ctx.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const onEvent = typeof ctx.onEvent === 'function' ? ctx.onEvent : () => {};
 
+  // sessionId is shared across all pushes from this legacy invocation:
+  // an optional ReasoningPush + N ContentPush sentences. Callers can
+  // pass `sessionId` to pin it across retries; otherwise mint one.
+  const sessionId = typeof payload.sessionId === 'string' && payload.sessionId
+    ? payload.sessionId
+    : `sess_${randomUUID()}`;
+
+  let llmResponse;
   let messageContent;
   try {
-    messageContent = await callLlm(payload, fetchImpl);
-    onEvent({ type: 'llm_done' });
+    const { response, content } = await callLlmRaw(payload, fetchImpl, /*requireContent=*/true);
+    llmResponse = response;
+    messageContent = content.trim();
+    onEvent({ type: 'llm_done', sessionId });
   } catch (err) {
     const error = new Error(err?.message || 'LLM call failed');
     error.code = 'LLM_CALL_FAILED';
     throw error;
   }
 
-  const messages = splitMessageIntoSentences(messageContent, payload.splitPattern ?? null);
-  const pushSubscription = payload.pushSubscription;
   const contactName = payload.contactName;
   const avatarUrl = payload.avatarUrl || null;
   const messageSubtype = payload.messageSubtype || 'chat';
   const metadata = payload.metadata || {};
 
-  for (let i = 0; i < messages.length; i++) {
-    const notificationPayload = buildInstantPushPayload({
-      message: messages[i],
-      index: i,
-      total: messages.length,
+  // Step 1: ReasoningPush if reasoning_content present. Emitted before
+  // the content burst so clients can render a "thinking…" UI ahead of
+  // the actual reply.
+  const reasoning = readReasoningContent(llmResponse);
+  if (reasoning) {
+    const reasoningPush = buildReasoningPush({
+      messageType: 'instant',
+      source: 'instant',
+      messageId: `msg_${randomUUID()}_instant_reasoning`,
+      sessionId,
+      reasoningContent: reasoning,
+      timestamp: new Date().toISOString(),
+      title: `来自 ${contactName}`,
       contactName,
       avatarUrl,
       messageSubtype,
       metadata,
     });
 
+    // Best-effort: a failed reasoning push must NOT eclipse the
+    // user-facing content burst. Mirrors the hook path's
+    // `reasoning_push_failed` event (runAgenticLoop).
+    //
+    // Generic transport handles oversized reasoning now: direct push,
+    // BlobStore envelope, or `_multipart`, never the old
+    // reasoning-only `chunkIndex` / `totalChunks` wire format.
+    let reasoningShipped = false;
     try {
-      await sendWebPush({
-        subscription: pushSubscription,
-        payload: JSON.stringify(notificationPayload),
-        vapid: ctx.vapid,
-        fetch: fetchImpl,
-      });
-      onEvent({ type: 'push_sent', messageIndex: i + 1, totalMessages: messages.length });
+      await emitReasoning(reasoningPush, payload, ctx, sessionId);
+      reasoningShipped = true;
+      onEvent({ type: 'reasoning_pushed', sessionId });
     } catch (err) {
+      onEvent({ type: 'reasoning_push_failed', sessionId, cause: err });
+    }
+
+    // Only space the burst when the reasoning push actually shipped —
+    // skipping the sleep when it failed shaves 1.5s off the perceived
+    // latency for that case.
+    if (reasoningShipped) {
+      await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    }
+  }
+
+  // Step 2: ContentPush burst.
+  // Sentence split — legacy path's v0.6-compat behaviour. The default
+  // regex matches Chinese full-stop family + ASCII ./!/? clusters; the
+  // reduce reattaches the matched delimiter to the preceding segment
+  // (split returns interleaved [segment, delim, segment, delim, ...]).
+  // No caller knob — the public `splitPattern` field is gone in 0.8.0.
+  const splitOutput = messageContent
+    .split(/([。！？!?]+)/)
+    .reduce((acc, part, i, arr) => {
+      if (i % 2 === 0 && part.trim()) acc.push(part.trim() + (arr[i + 1] || ''));
+      return acc;
+    }, [])
+    .filter((s) => s.length > 0);
+  // Fallback preserves no-punctuation messages as a single push (matches
+  // the deleted helper's behaviour when the regex didn't match).
+  const messages = splitOutput.length > 0 ? splitOutput : [messageContent];
+
+  for (let i = 0; i < messages.length; i++) {
+    const contentPush = buildContentPush({
+      messageType: 'instant',
+      source: 'instant',
+      messageId: `msg_${randomUUID()}_instant_${i}`,
+      sessionId,
+      message: messages[i],
+      timestamp: new Date().toISOString(),
+      title: `来自 ${contactName}`,
+      contactName,
+      avatarUrl,
+      messageSubtype,
+      messageIndex: i + 1,
+      totalMessages: messages.length,
+      taskId: null,
+      metadata,
+    });
+
+    try {
+      await sendPushWithMaybeBlob(contentPush, payload, ctx, sessionId);
+      onEvent({ type: 'push_sent', messageIndex: i + 1, totalMessages: messages.length, sessionId });
+    } catch (err) {
+      if (err && err.code === 'PAYLOAD_TOO_LARGE') throw err;
       const error = new Error(err?.message || 'Web Push delivery failed');
       error.code = 'PUSH_SEND_FAILED';
       error.statusCode = err?.statusCode;
@@ -392,20 +466,21 @@ async function runLegacyInstant(payload, ctx) {
 
   return {
     messagesSent: messages.length,
-    sentAt: new Date().toISOString()
+    sentAt: new Date().toISOString(),
+    sessionId,
   };
 }
 
 /**
- * v0.7 agentic-loop path. Repeats:
- *   call LLM → build SessionContext → onLLMOutput(ctx) → dispatch.
+ * Agentic-loop path. Repeats:
+ *   call LLM → [auto-emit ReasoningPush if configured] → buildSessionContext →
+ *   onLLMOutput(ctx) → dispatch.
  *
  * Hard cap at `maxLoopIterations` (default 10): once exceeded, the
- * worker emits `loop_exceeded`, pushes a diagnostic envelope to the
- * SW, and returns HTTP 200 with `{ status: 'loop_exceeded', ... }`.
+ * worker emits `loop_exceeded`, pushes an ErrorPush diagnostic, and
+ * returns HTTP 200 with `{ status: 'loop_exceeded', ... }`.
  * Loop-exceeded is NOT thrown — the worker has completed its
- * "deliver a diagnostic" contract, and a non-2xx would make clients
- * mis-treat it as retryable.
+ * "deliver a diagnostic" contract.
  *
  * @param {Object} payload
  * @param {Object} ctx
@@ -413,6 +488,7 @@ async function runLegacyInstant(payload, ctx) {
  */
 async function runAgenticLoop(payload, ctx) {
   const fetchImpl = ctx.fetch || globalThis.fetch;
+  const sleep = ctx.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const onEvent = typeof ctx.onEvent === 'function' ? ctx.onEvent : () => {};
   const maxLoopIterations = Number.isInteger(ctx.maxLoopIterations) && ctx.maxLoopIterations > 0
     ? ctx.maxLoopIterations
@@ -420,6 +496,10 @@ async function runAgenticLoop(payload, ctx) {
   const sessionId = typeof payload.sessionId === 'string' && payload.sessionId
     ? payload.sessionId
     : randomUUID();
+  // Default true: most hook callers want reasoning emission to "just
+  // work". Set false when the hook caller wants total control over
+  // every push that leaves the worker.
+  const autoEmitReasoning = ctx.autoEmitReasoning !== false;
 
   if (ctx.isResume) {
     onEvent({ type: 'continue_received', sessionId, iteration: payload.iteration ?? 0 });
@@ -445,6 +525,39 @@ async function runAgenticLoop(payload, ctx) {
     const assistantMessage = extractAssistantMessage(llmResponse);
     messages = [...messages, assistantMessage];
 
+    // Auto-emit ReasoningPush BEFORE the hook so the hook can still
+    // `skip-push` its own content push without losing the reasoning
+    // signal. Best-effort: if the auto-push throws, the loop turns it
+    // into a `reasoning_push_failed` event and continues — never let
+    // an instrumentation push eclipse the user-facing path.
+    if (autoEmitReasoning) {
+      const reasoning = readReasoningContent(llmResponse);
+      if (reasoning) {
+        const reasoningPush = buildReasoningPush({
+          messageType: 'instant',
+          source: 'instant',
+          messageId: `msg_${randomUUID()}_iter_${iteration}_reasoning`,
+          sessionId,
+          reasoningContent: reasoning,
+          timestamp: new Date().toISOString(),
+          title: payload.contactName ? `来自 ${payload.contactName}` : undefined,
+          contactName: payload.contactName,
+          avatarUrl: payload.avatarUrl || null,
+          messageSubtype: payload.messageSubtype || 'chat',
+          metadata: payload.metadata || {},
+        });
+        try {
+          await emitReasoning(reasoningPush, payload, ctx, sessionId);
+          onEvent({ type: 'reasoning_pushed', sessionId, iteration });
+        } catch (err) {
+          // Don't fail the whole turn for a reasoning instrumentation
+          // push — log it and continue. The user-facing content/tool
+          // path is still going to run.
+          onEvent({ type: 'reasoning_push_failed', sessionId, iteration, cause: err });
+        }
+      }
+    }
+
     const sessionCtx = buildSessionContext({
       sessionId,
       messages,
@@ -461,24 +574,19 @@ async function runAgenticLoop(payload, ctx) {
       decision = await ctx.onLLMOutput(sessionCtx);
       assertValidDecision(decision);
     } catch (err) {
-      // Hook contract violation: emit event, try to push a diagnostic,
-      // then throw HookError. The diagnostic push is best-effort —
-      // its failure must not eclipse the original hook error.
       onEvent({ type: 'hook_threw', sessionId, iteration, cause: err });
-      const diagnostic = {
-        type: 'error',
-        code: 'HOOK_THREW',
+      const diagnostic = buildErrorPush({
+        messageType: 'instant',
+        source: 'instant',
+        messageId: `msg_${randomUUID()}_iter_${iteration}_error`,
         sessionId,
-        iteration,
+        code: 'HOOK_THREW',
         message: err?.message ?? 'onLLMOutput hook threw',
-      };
+        iteration,
+        timestamp: new Date().toISOString(),
+      });
       try {
-        await sendWebPush({
-          subscription: payload.pushSubscription,
-          payload: JSON.stringify(diagnostic),
-          vapid: ctx.vapid,
-          fetch: fetchImpl,
-        });
+        await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
       } catch (pushErr) {
         onEvent({ type: 'diagnostic_push_failed', code: 'HOOK_THREW', sessionId, cause: pushErr });
       }
@@ -499,26 +607,45 @@ async function runAgenticLoop(payload, ctx) {
       return { status: 'skipped', sessionId, iteration };
     }
 
-    // 'finish' or 'tool-request' — both deliver a push.
-    await sendPushWithMaybeBlob(decision.pushPayload, payload, ctx, sessionId);
+    // 'finish' or 'tool-request' — deliver pushPayloads sequentially.
+    // The lib does no splitting; the hook returned the exact N pushes.
+    // Reasoning pushes coming from the hook flow through the same
+    // delivery path. `autoEmitReasoning` (default on) handles the
+    // framework-emitted ReasoningPush that comes from the LLM's
+    // `reasoning_content` field BEFORE the hook fires. Oversized
+    // payloads, reasoning included, are transport-wrapped by generic
+    // `_multipart` only after normal BlobStore priority is checked.
+    const messagesSent = await sendPushesSequentially(
+      decision.pushPayloads,
+      payload,
+      ctx,
+      sessionId,
+      sleep,
+    );
     onEvent({
       type: decision.decision === 'finish' ? 'final_pushed' : 'tool_request_pushed',
       sessionId,
       iteration,
+      messagesSent,
     });
     return { status: decision.decision === 'finish' ? 'finished' : 'tool_requested', sessionId, iteration };
   }
 
   // Loop budget exhausted: emit, attempt diagnostic push, return 200.
   onEvent({ type: 'loop_exceeded', sessionId, iteration });
-  const diagnostic = {
-    type: 'error',
-    code: 'LOOP_EXCEEDED',
+  const diagnostic = buildErrorPush({
+    messageType: 'instant',
+    source: 'instant',
+    messageId: `msg_${randomUUID()}_loop_exceeded`,
     sessionId,
-    iteration,
+    code: 'LOOP_EXCEEDED',
     message: `Agentic loop exceeded ${maxLoopIterations} iterations`,
-  };
+    iteration,
+    timestamp: new Date().toISOString(),
+  });
   try {
+    // The diagnostic is a single push by construction (one
+    // `buildErrorPush(...)` call above); no looping needed.
     await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
   } catch (err) {
     onEvent({ type: 'diagnostic_push_failed', code: 'LOOP_EXCEEDED', sessionId, cause: err });
@@ -543,12 +670,51 @@ function assertValidDecision(decision) {
   if (typeof tag !== 'string' || !VALID_DECISIONS.has(tag)) {
     throw new TypeError(`onLLMOutput returned invalid decision tag: ${stringifyForError(tag)}`);
   }
-  if (tag === 'continue' && !Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
-    throw new TypeError('decision:"continue" requires a nextHistory array');
+
+  const hasSingular = Object.prototype.hasOwnProperty.call(decision, 'pushPayload');
+  const hasPlural = Object.prototype.hasOwnProperty.call(decision, 'pushPayloads');
+
+  if (hasSingular) {
+    throw new TypeError(
+      hasPlural
+        ? 'pushPayload (singular) is removed in 0.8.0, use pushPayloads'
+        : 'pushPayload (singular) is removed in 0.8.0, use pushPayloads: [yourPayload]'
+    );
   }
-  if ((tag === 'finish' || tag === 'tool-request')
-      && /** @type {{ pushPayload?: unknown }} */ (decision).pushPayload === undefined) {
-    throw new TypeError(`decision:"${tag}" requires a pushPayload`);
+
+  if (tag === 'continue') {
+    if (!Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
+      throw new TypeError('decision:"continue" requires a nextHistory array');
+    }
+    return;
+  }
+
+  if (tag === 'skip-push') {
+    return;
+  }
+
+  // 'finish' / 'tool-request' — both need pushPayloads array
+  if (!hasPlural || !Array.isArray(/** @type {{ pushPayloads?: unknown }} */ (decision).pushPayloads)) {
+    throw new TypeError(`decision:"${tag}" requires a pushPayloads array`);
+  }
+  const pushes = /** @type {Array<unknown>} */ (decision.pushPayloads);
+  if (pushes.length === 0) {
+    throw new TypeError('pushPayloads: [] — use decision: skip-push to skip notification entirely');
+  }
+  for (let i = 0; i < pushes.length; i++) {
+    const p = pushes[i];
+    if (!p || typeof p !== 'object' || Array.isArray(p)) {
+      throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyForError(p)}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
+      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in 0.8.0; caller is responsible for splitting`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'messageId')) {
+      const id = p.messageId;
+      if (typeof id !== 'string' || id === '') {
+        throw new TypeError(`pushPayloads[${i}].messageId must be a non-empty string when set, got ${stringifyForError(id)}`);
+      }
+    }
   }
 }
 
@@ -561,12 +727,17 @@ function stringifyForError(value) {
 }
 
 /**
- * Push the hook-provided `pushPayload`. If its UTF-8 byte length
- * exceeds `maxInlineBytes`:
+ * Push a payload (any of the four `messageKind` types or a free-form
+ * hook payload). If its UTF-8 byte length exceeds `maxInlineBytes`:
  *   - With a `blobStore` configured → write body to the store, push
- *     a small envelope `{ _blob:true, key, url, type? }` instead.
- *   - Without → emit `payload_too_large` and throw
- *     `PayloadTooLargeError`.
+ *     a small envelope `{ _blob:true, key, url, messageKind?, type? }`
+ *     instead.
+ *   - Without a `blobStore` → use generic `_multipart` when enabled;
+ *     otherwise emit `payload_too_large` and throw `PayloadTooLargeError`.
+ *
+ * The envelope's `messageKind` (and legacy `type`) field is lifted
+ * from the original payload when present, so the SW can dispatch on
+ * the discriminator without having to fetch the blob first.
  *
  * The byte check uses **UTF-8 bytes**, not JS string `.length`.
  * String `.length` counts UTF-16 code units; a Chinese character is
@@ -614,8 +785,23 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
   }
 
   if (!ctx.blobStore || !ctx.blobStore.adapter) {
-    onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
-    throw new PayloadTooLargeError(byteLen, maxInline);
+    const multipart = resolveRuntimeMultipartOptions(ctx);
+    if (!multipart.enabled) {
+      onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
+      throw new PayloadTooLargeError(byteLen, maxInline);
+    }
+    await sendMultipartPushes(pushPayload, {
+      byteLen,
+      fetchImpl,
+      maxInline,
+      multipart,
+      onEvent,
+      payload,
+      serialized,
+      sessionId,
+      vapid: ctx.vapid,
+    });
+    return;
   }
 
   const adapter = ctx.blobStore.adapter;
@@ -632,19 +818,17 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
   }
   onEvent({ type: 'blob_written', key, size: byteLen, sessionId });
 
-  // Build absolute envelope URL from the inbound request — SW fetches
-  // back to the same origin without needing a separate endpoint
-  // config. Hard-coded `/blob/...` path: deployers wanting a sub-
-  // prefix must strip it in their outer router (see README §Subpath
-  // mount).
   const blobUrl = buildBlobUrl(ctx.requestUrl, key);
+  // Lift `messageKind` (and legacy `type`) into the envelope so the
+  // SW can dispatch on the discriminator without having to fetch the
+  // blob body first.
+  const payloadObj = pushPayload && typeof pushPayload === 'object' ? pushPayload : {};
   const envelope = {
     _blob: true,
     key,
     url: blobUrl,
-    type: pushPayload && typeof pushPayload === 'object'
-      ? /** @type {{ type?: unknown }} */ (pushPayload).type
-      : undefined,
+    messageKind: /** @type {{ messageKind?: unknown }} */ (payloadObj).messageKind,
+    type: /** @type {{ type?: unknown }} */ (payloadObj).type,
   };
 
   try {
@@ -660,12 +844,111 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
   }
 }
 
+function resolveRuntimeMultipartOptions(ctx) {
+  const hasMultipart = ctx && ctx.multipart !== undefined;
+  const raw = hasMultipart ? ctx.multipart : {};
+  const config = raw && typeof raw === 'object' ? raw : {};
+  let enabled = config.enabled !== false;
+  let maxChunkBytes = config.maxChunkBytes;
+
+  if (ctx && ctx.reasoningChunkBytes !== undefined && maxChunkBytes === undefined) {
+    if (ctx.reasoningChunkBytes === null) {
+      if (!hasMultipart) enabled = false;
+    } else {
+      maxChunkBytes = ctx.reasoningChunkBytes;
+    }
+  }
+
+  return {
+    enabled,
+    maxChunkBytes: positiveIntegerOrDefault(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES),
+    ttlMs: positiveIntegerOrDefault(config.ttlMs, DEFAULT_MULTIPART_TTL_MS),
+    maxChunks: positiveIntegerOrDefault(config.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS),
+    maxTotalBytes: positiveIntegerOrDefault(config.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES),
+  };
+}
+
+async function sendMultipartPushes(pushPayload, args) {
+  const {
+    byteLen,
+    fetchImpl,
+    maxInline,
+    multipart,
+    onEvent,
+    payload,
+    serialized,
+    sessionId,
+    vapid,
+  } = args;
+  const originalMessageKind = getOriginalMessageKind(pushPayload);
+
+  if (originalMessageKind === MULTIPART_MESSAGE_KIND) {
+    onEvent({ type: 'payload_too_large', byteLen, maxInline, sessionId });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  if (byteLen > multipart.maxTotalBytes) {
+    onEvent({
+      type: 'multipart_too_large',
+      byteLen,
+      maxTotalBytes: multipart.maxTotalBytes,
+      originalMessageKind,
+      sessionId,
+    });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  const parts = buildMultipartPushPayloads(pushPayload, {
+    maxChunkBytes: multipart.maxChunkBytes,
+    serializedPayload: serialized,
+    ttlMs: multipart.ttlMs,
+  });
+  if (parts.length > multipart.maxChunks) {
+    onEvent({
+      type: 'multipart_too_many_chunks',
+      byteLen,
+      maxChunks: multipart.maxChunks,
+      totalChunks: parts.length,
+      originalMessageKind,
+      sessionId,
+    });
+    throw new PayloadTooLargeError(byteLen, maxInline);
+  }
+
+  const firstPart = /** @type {{ multipart?: { id?: unknown } }} */ (parts[0] || {});
+  const id = firstPart.multipart?.id;
+  onEvent({
+    type: 'multipart_built',
+    id,
+    byteLen,
+    totalChunks: parts.length,
+    originalMessageKind,
+    sessionId,
+  });
+
+  for (const part of parts) {
+    await sendWebPush({
+      subscription: payload.pushSubscription,
+      payload: JSON.stringify(part),
+      vapid,
+      fetch: fetchImpl,
+    });
+  }
+  onEvent({ type: 'multipart_sent', id, totalChunks: parts.length, originalMessageKind, sessionId });
+}
+
+function getOriginalMessageKind(pushPayload) {
+  return pushPayload && typeof pushPayload === 'object'
+    ? /** @type {{ messageKind?: unknown }} */ (pushPayload).messageKind
+    : undefined;
+}
+
+function positiveIntegerOrDefault(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 /**
- * Derive the absolute `/blob/:key` URL the SW should fetch. Uses the
- * inbound `request.url` so the package never has to know the public
- * hostname. Falls back to a root-anchored path when `requestUrl` is
- * absent (rare — only when the handler is invoked outside the HTTP
- * adapter, e.g. via unit-test harness).
+ * Derive the absolute `/blob/:key` URL the SW should fetch.
  *
  * @param {string | undefined} requestUrl
  * @param {string} key
@@ -682,4 +965,4 @@ function buildBlobUrl(requestUrl, key) {
   return `/blob/${key}`;
 }
 
-export { sendPushWithMaybeBlob };
+export { sendPushWithMaybeBlob, readReasoningContent };

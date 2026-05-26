@@ -1,12 +1,16 @@
 /**
- * E2E test for amsg-instant 0.3.0.
+ * E2E test for amsg-instant 0.8.0.
  *
- * Verifies the push payload field shape produced by amsg-instant remains
- * byte-identical to amsg-server's scheduled path, so the shared SW
- * (`@rei-standard/amsg-sw`) keeps working unchanged. We intercept the
- * outgoing Web Push HTTP request via `options.fetch`, then decrypt the
- * RFC 8291 ciphertext using the test subscription's private key to read
- * the JSON the SW would actually receive.
+ * Verifies the push payload field shape produced by amsg-instant
+ * matches the three-axis schema from @rei-standard/amsg-shared:
+ *   - messageKind: 'content'  (with messageIndex / totalMessages set)
+ *   - all 13 legacy 0.7.x fields still present (back-compat for the
+ *     downstream SullyOS SW, which already grew handlers for them)
+ *   - plus new fields: messageKind, sessionId
+ *
+ * We intercept the outgoing Web Push HTTP request via `options.fetch`,
+ * then decrypt the RFC 8291 ciphertext using the test subscription's
+ * private key to read the JSON the SW would actually receive.
  */
 
 import { describe, it, before } from 'node:test';
@@ -32,7 +36,7 @@ before(async () => {
 });
 
 describe('e2e: push payload contract parity with amsg-server', () => {
-  it('produces a payload with every field defined in message-processor.js:78-93', async () => {
+  it('produces a ContentPush carrying all 13 legacy fields + messageKind + sessionId', async () => {
     const payload = {
       contactName: '小手机',
       avatarUrl: 'https://example.com/avatar.png',
@@ -68,6 +72,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     }
 
     const required = [
+      // legacy 0.7.x fields (still present in 0.8.0 ContentPush)
       'title',
       'message',
       'contactName',
@@ -81,11 +86,15 @@ describe('e2e: push payload contract parity with amsg-server', () => {
       'source',
       'avatarUrl',
       'metadata',
+      // 0.8.0 additions
+      'messageKind',
+      'sessionId',
     ];
     for (const field of required) {
       assert.ok(field in captured[0], `payload missing field: ${field}`);
     }
 
+    assert.equal(captured[0].messageKind, 'content');
     assert.equal(captured[0].title, '来自 小手机');
     assert.equal(captured[0].message, '第一句。');
     assert.equal(captured[0].messageType, 'instant');
@@ -97,9 +106,15 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     assert.match(captured[0].messageId, /^msg_[0-9a-f-]+_instant_0$/);
     assert.equal(captured[0].totalMessages, 2);
     assert.equal(captured[0].messageIndex, 1);
+    assert.match(captured[0].sessionId, /^sess_/);
 
+    assert.equal(captured[1].messageKind, 'content');
     assert.equal(captured[1].message, '第二句！');
     assert.equal(captured[1].messageIndex, 2);
     assert.match(captured[1].messageId, /^msg_[0-9a-f-]+_instant_1$/);
+
+    // Both pushes share the SAME sessionId — that's the new
+    // "one LLM round → one sessionId" invariant from the shared schema.
+    assert.equal(captured[0].sessionId, captured[1].sessionId);
   });
 });

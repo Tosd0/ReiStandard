@@ -3,7 +3,7 @@
  *
  * Stateless one-shot instant push handler. The entire lifecycle of an
  * instant request lives inside a single function invocation:
- *   parse → call LLM → split sentences → deliver Web Push → 200 OK.
+ *   parse → call LLM → build push payloads → deliver Web Push → 200 OK.
  * No DB, no cron, no tenant init. Zero runtime dependencies. Pure Web
  * Crypto under the hood, so the same handler runs unchanged on Cloudflare
  * Workers (no `nodejs_compat` flag), Vercel Edge, Netlify Edge, Deno,
@@ -30,6 +30,12 @@ import {
   hmacSha256,
   timingSafeEqualBytes,
 } from './utils.js';
+import {
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  DEFAULT_MULTIPART_TTL_MS,
+} from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -48,29 +54,75 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 /**
  * @typedef {Object} InstantHandlerOptions
  * @property {VapidConfig} vapid              - VAPID keys for Web Push.
+ *
+ * Note on splitting:
+ *
+ *   0.8.0 removes the public `splitPattern` / `reasoningSplitPattern`
+ *   / `errorSplitPattern` request fields. Hook callers own semantic
+ *   splitting now: implement any custom split function inside
+ *   `onLLMOutput`, then return the exact `pushPayloads` array to send.
+ *
+ *   The legacy non-hook path still keeps its v0.6-compatible internal
+ *   sentence splitter (`/([。！？!?]+)/`) so old completePrompt-style
+ *   callers retain the same burst behaviour. There is no handler-level
+ *   `splitFn` option.
  * @property {string} [clientToken]           - Optional shared secret. When set, requests must send a matching `X-Client-Token` header. Weak by design: the token is visible in any frontend bundle that uses it. Use `tokenSigningKey` for real auth.
  * @property {string} [tokenSigningKey]       - Optional HMAC key. When set, `Authorization: Bearer <token>` is verified.
  * @property {CorsConfig} [cors]              - CORS configuration. Defaults to `{ allowOrigin: '*' }`. Every response (including the 204 preflight short-circuit) carries the matching `Access-Control-Allow-*` headers.
  * @property {Object} [webpush]               - **Deprecated since 0.3.0.** Ignored. amsg-instant now implements RFC 8291 + RFC 8292 natively on Web Crypto. Tests should intercept the push HTTP request via `options.fetch` instead.
  * @property {typeof fetch} [fetch]           - Optional fetch override (testing / custom proxy). Used for BOTH the LLM call and the outgoing Web Push POST.
+ * @property {(work: Promise<unknown>) => void} [waitUntil]
+ *           - Optional lifecycle extender for runtimes with a background
+ *             completion hook. Prefer passing it per request when the
+ *             platform provides a request-scoped context (for example
+ *             Cloudflare Workers' `ctx.waitUntil`).
  * @property {(e: { type: string }) => void} [onEvent]
  * @property {(ctx: import('./session-context.js').SessionContext) => Promise<object> | object} [onLLMOutput]
  *           - **v0.7 hook.** When provided, the handler switches from
  *             the legacy one-shot path to a per-turn agentic loop.
  *             The hook returns one of:
- *               `{ decision: 'finish',       pushPayload }`
- *               `{ decision: 'tool-request', pushPayload }`
+ *               `{ decision: 'finish',       pushPayloads }`
+ *               `{ decision: 'tool-request', pushPayloads }`
  *               `{ decision: 'continue',     nextHistory }`
  *               `{ decision: 'skip-push' }`
  *             See README §Agentic Loop.
  * @property {import('./blob-store/interface.js').BlobStoreConfig} [blobStore]
- *           - Optional. When the hook returns a pushPayload whose
+ *           - Optional. When a push payload's
  *             UTF-8 byte length exceeds `maxInlineBytes` (default
  *             2600), the body is written to the adapter and the SW
- *             receives a small `{ _blob, key, url, type? }` envelope
- *             instead. Without `blobStore` the over-sized payload
- *             throws `PayloadTooLargeError`.
+ *             receives a small `{ _blob, key, url, messageKind?, type? }`
+ *             envelope instead. Without `blobStore`, the default
+ *             generic multipart transport handles JSON-safe oversized
+ *             payloads unless disabled or over its limits.
  * @property {number} [maxLoopIterations=10]  - Hard ceiling on in-loop `decision:'continue'` rounds within a single worker invocation. Cross-invocation `/continue` floods are the deployer's auth/rate-limit concern.
+ * @property {boolean} [autoEmitReasoning=true]
+ *           - **v0.8 hook-path config.** When `true` (default), the
+ *             framework auto-emits a `ReasoningPush` before invoking
+ *             `onLLMOutput` whenever the LLM response carries a
+ *             non-empty `choices[0].message.reasoning_content`. The
+ *             hook can still `skip-push` its own content/tool push —
+ *             the reasoning push has already shipped. Set to `false`
+ *             when the hook author wants total control over every
+ *             push that leaves the worker; in that mode the hook can
+ *             read `ctx.llmResponse.choices[0].message.reasoning_content`
+ *             and produce its own `buildReasoningPush(...)` envelope.
+ *             Legacy (non-hook) path always auto-emits regardless.
+ * @property {Object} [multipart]
+ *           - **0.8.0 transport knob.** Generic multipart fallback for
+ *             oversized JSON-safe push payloads when no BlobStore is
+ *             configured. Applies to every `messageKind` (including
+ *             reasoning, tool_request, content, error, and custom
+ *             kinds). Defaults to enabled.
+ * @property {boolean} [multipart.enabled=true]
+ * @property {number} [multipart.maxChunkBytes=1800]
+ * @property {number} [multipart.ttlMs=60000]
+ * @property {number} [multipart.maxChunks=128]
+ * @property {number} [multipart.maxTotalBytes=256000]
+ * @property {number | null} [reasoningChunkBytes]
+ *           - Deprecated alias for `multipart.maxChunkBytes`.
+ *             `null` disables generic multipart only when `multipart`
+ *             is not explicitly configured. It no longer produces
+ *             reasoning-only `chunkIndex` / `totalChunks` wire fields.
  */
 
 /**
@@ -79,9 +131,12 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  * The handler is the same shape used by Cloudflare Workers, Deno Deploy,
  * Vercel Edge, and Bun. Wrap it with one of the platform adapters if you
  * are on Node/Express, Netlify Functions, or Vercel Serverless Functions.
+ * When used directly as a Cloudflare Workers module `fetch`, the extra
+ * `(env, ctx)` arguments are accepted so the main LLM → split → push
+ * pipeline can be protected by `ctx.waitUntil`.
  *
  * @param {InstantHandlerOptions} options
- * @returns {(request: Request) => Promise<Response>}
+ * @returns {(request: Request, envOrRuntime?: unknown, runtime?: unknown) => Promise<Response>}
  */
 export function createInstantHandler(options) {
   if (!options) throw new Error('[amsg-instant] options is required');
@@ -106,18 +161,13 @@ export function createInstantHandler(options) {
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
     : 10;
-
-  // One-shot startup warning: a caller who sets both `onLLMOutput`
-  // and `splitPattern` almost certainly hasn't realised the hook
-  // path doesn't run the sentence splitter. We don't fail (the combo
-  // is benign), just nudge them in the console so the dead config
-  // doesn't go unnoticed in production logs.
-  if (onLLMOutput && options.splitPattern !== undefined) {
-    const warn = globalThis.console && globalThis.console.warn;
-    if (typeof warn === 'function') {
-      warn('[amsg-instant] splitPattern is ignored when onLLMOutput is provided. Move splitting logic into your hook if needed.');
-    }
-  }
+  // Default true: reasoning emission "just works" out of the box for
+  // most hook callers. The legacy path ignores this setting and
+  // always auto-emits.
+  const autoEmitReasoning = options.autoEmitReasoning !== false;
+  // Eager validation keeps transport misconfiguration in startup logs /
+  // unit tests instead of surprising the first oversized push.
+  const multipart = resolveMultipartOptions(options);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -125,7 +175,7 @@ export function createInstantHandler(options) {
 
   const respond = (status, body) => jsonResponse(status, body, corsHeaders);
 
-  return async function handler(request) {
+  return async function handler(request, envOrRuntime, runtime) {
     onEvent({ type: 'request' });
 
     // CORS preflight short-circuit. Browsers fire OPTIONS before any
@@ -245,34 +295,99 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const result = await processInstantMessage(payload, {
+      const work = processInstantMessage(payload, {
         vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
         onEvent,
         onLLMOutput,
         blobStore,
         maxLoopIterations,
+        autoEmitReasoning,
+        multipart,
         requestUrl: request.url,
         isResume: isContinue,
       });
+      registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+      const result = await work;
       return respond(200, { success: true, data: result });
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
       const status = mapErrorStatus(err, code);
-      // Unified envelope: every error goes through `error: { code, message }`
-      // so SDK consumers can always read `body.error.code`. The plan's
-      // earlier draft had HOOK_THREW emit a flat `error: 'hook_threw'`
-      // string — that diverged from every other v0.6/v0.7 error and made
-      // `body.error.code` undefined for hook failures. The push-payload
-      // wire format (what the SW receives) stays as `{type:'error',
-      // code:'HOOK_THREW',...}` — that's a separate layer.
+      // Unified HTTP envelope: every error goes through
+      // `error: { code, message }` so SDK consumers can always read
+      // `body.error.code`. The push-payload wire format (what the SW
+      // receives) is a separate layer — since 0.8.0 it's an ErrorPush
+      // (`messageKind: 'error'`, `code`, `message`, `iteration?`) built
+      // via `buildErrorPush(...)`. The pre-0.8.0 `{type:'error', code,
+      // ...}` envelope is gone — do not look for the `type` field.
       return respond(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' },
       });
     }
   };
+}
+
+function resolveWaitUntil(envOrRuntime, runtime, options) {
+  if (runtime && typeof runtime.waitUntil === 'function') {
+    return { waitUntil: runtime.waitUntil, target: runtime };
+  }
+  if (envOrRuntime && typeof envOrRuntime.waitUntil === 'function') {
+    return { waitUntil: envOrRuntime.waitUntil, target: envOrRuntime };
+  }
+  if (options && typeof options.waitUntil === 'function') {
+    return { waitUntil: options.waitUntil, target: undefined };
+  }
+  return null;
+}
+
+function registerWaitUntil(work, lifecycle, onEvent) {
+  if (!lifecycle) return;
+  const backgroundWork = work.catch((err) => {
+    onEvent({ type: 'wait_until_rejected', code: err?.code, message: err?.message });
+  });
+  try {
+    lifecycle.waitUntil.call(lifecycle.target, backgroundWork);
+  } catch (err) {
+    onEvent({ type: 'wait_until_failed', cause: err });
+  }
+}
+
+function resolveMultipartOptions(options) {
+  const hasMultipart = options.multipart !== undefined;
+  const raw = hasMultipart ? options.multipart : {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('[amsg-instant] multipart must be a plain object when set');
+  }
+
+  const multipart = /** @type {Record<string, unknown>} */ (raw);
+  let enabled = multipart.enabled !== false;
+  let maxChunkBytes = multipart.maxChunkBytes;
+
+  if (options.reasoningChunkBytes !== undefined && maxChunkBytes === undefined) {
+    if (options.reasoningChunkBytes === null) {
+      if (!hasMultipart) enabled = false;
+    } else {
+      maxChunkBytes = options.reasoningChunkBytes;
+    }
+  }
+
+  return {
+    enabled,
+    maxChunkBytes: resolvePositiveInt(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES, 'multipart.maxChunkBytes'),
+    ttlMs: resolvePositiveInt(multipart.ttlMs, DEFAULT_MULTIPART_TTL_MS, 'multipart.ttlMs'),
+    maxChunks: resolvePositiveInt(multipart.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS, 'multipart.maxChunks'),
+    maxTotalBytes: resolvePositiveInt(multipart.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES, 'multipart.maxTotalBytes'),
+  };
+}
+
+function resolvePositiveInt(value, fallback, fieldName) {
+  if (value === undefined || value === null) return fallback;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError(`[amsg-instant] ${fieldName} must be a positive integer. Got: ${value}`);
+  }
+  return value;
 }
 
 /**
@@ -505,12 +620,32 @@ async function verifyBearerToken(request, signingKey, respond) {
 
 export { validateInstantPayload, validateAvatarUrl, validateContinuePayload } from './validation.js';
 export {
-  splitMessageIntoSentences,
   processInstantMessage,
   normalizeAiApiUrl,
-  buildInstantPushPayload,
   sendPushWithMaybeBlob,
+  readReasoningContent,
 } from './message-processor.js';
+export { buildMultipartPushPayloads } from './multipart.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
 export { HookError, PayloadTooLargeError, LlmCallError, MemoryStoreFullError } from './errors.js';
 export { buildSessionContext, extractAssistantMessage } from './session-context.js';
+
+// Re-export the shared push schema so hook authors can import builders
+// and types from a single place (instant) rather than having to add a
+// second dependency on @rei-standard/amsg-shared.
+export {
+  MESSAGE_KIND,
+  MESSAGE_TYPE,
+  PUSH_SOURCE,
+  buildContentPush,
+  buildReasoningPush,
+  buildToolRequestPush,
+  buildErrorPush,
+  isContentPush,
+  isReasoningPush,
+  isToolRequestPush,
+  isErrorPush,
+  chunkReasoningByUtf8Bytes,
+} from '@rei-standard/amsg-shared';
+
+export { segmentTextWithProtectedBlocks } from './segmentation.js';

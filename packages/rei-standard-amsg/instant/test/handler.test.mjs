@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 
 import {
   createInstantHandler,
-  splitMessageIntoSentences,
   validateInstantPayload,
 } from '../src/index.js';
 import {
@@ -160,6 +159,106 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(p).valid, false);
   });
 
+  // ── assistant tool_call carrier (OpenAI 协议: 带 tool_calls 时 content 可空) ──
+  it('accepts assistant + tool_calls + empty content string', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: '搜小红书' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'xhs_browse', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: '{"notes":[]}' },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('accepts assistant + tool_calls + null content', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } },
+        ],
+      },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('accepts assistant + tool_calls + missing content key', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        tool_calls: [
+          { id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } },
+        ],
+      },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('rejects assistant with empty content AND empty tool_calls', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: '', tool_calls: [] },
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /不能是空字符串/);
+  });
+
+  it('rejects assistant with malformed tool_calls entry', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c' }] }, // 缺 function
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /tool_calls\[0\] 形状非法/);
+  });
+
+  it('accepts tool message with empty-string content (空结果合法)', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: '' },
+    ];
+    assert.equal(validateInstantPayload(p).valid, true);
+  });
+
+  it('requires tool_call_id on tool messages', () => {
+    const p = makeValidPayload();
+    delete p.completePrompt;
+    p.messages = [
+      { role: 'user', content: 'x' },
+      { role: 'tool', content: 'result' }, // 缺 tool_call_id
+    ];
+    const r = validateInstantPayload(p);
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /tool_call_id 必填/);
+  });
+
   it('accepts optional temperature', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: 0.3 })).valid, true);
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: null })).valid, true);
@@ -169,63 +268,12 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ temperature: 'hot' })).valid, false);
   });
 
-  // ── splitPattern (0.6.0) ───────────────────────────────────────────
-  it('accepts splitPattern as a single string', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: '([\\n]+)' })).valid, true);
-  });
-
-  it('accepts splitPattern as an array of strings (cascade)', () => {
-    assert.equal(
-      validateInstantPayload(makeValidPayload({ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'] })).valid,
-      true
-    );
-  });
-
-  it('treats empty splitPattern array as absent (uses default)', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: [] })).valid, true);
-  });
-
-  it('treats splitPattern=null as absent', () => {
-    assert.equal(validateInstantPayload(makeValidPayload({ splitPattern: null })).valid, true);
-  });
-
-  it('rejects splitPattern array element that is not a string', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: ['ok', 123] }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /splitPattern\[1\]/);
-  });
-
-  it('rejects splitPattern item longer than 200 chars', () => {
-    const long = 'a'.repeat(201);
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: long }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /200/);
-  });
-
-  it('rejects splitPattern array with more than 10 items', () => {
-    const r = validateInstantPayload(makeValidPayload({
-      splitPattern: Array.from({ length: 11 }, () => '.'),
-    }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /10/);
-  });
-
-  it('rejects splitPattern that is not a valid RegExp source', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: '[' }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /正则|RegExp|regex/i);
-  });
-
-  it('rejects splitPattern array element that is not a valid RegExp', () => {
-    const r = validateInstantPayload(makeValidPayload({ splitPattern: ['(\\n+)', '['] }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /splitPattern\[1\]/);
-  });
-
-  // ── avatarUrl (0.6.1) ──────────────────────────────────────────────
+  // ── avatarUrl (0.6.1 → soft-strip in 0.7.1) ──────────────────────────
   it('accepts a normal https avatarUrl', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 'https://example.com/a.png' }));
+    const payload = makeValidPayload({ avatarUrl: 'https://example.com/a.png' });
+    const r = validateInstantPayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, 'https://example.com/a.png');
   });
 
   it('treats avatarUrl=null / undefined as absent', () => {
@@ -233,113 +281,70 @@ describe('validateInstantPayload', () => {
     assert.equal(validateInstantPayload(makeValidPayload({ avatarUrl: undefined })).valid, true);
   });
 
-  it('rejects avatarUrl that is a data: URI', () => {
-    const r = validateInstantPayload(makeValidPayload({
+  it('soft-strips data: avatarUrl and continues', () => {
+    const payload = makeValidPayload({
       avatarUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQ',
-    }));
-    assert.equal(r.valid, false);
-    assert.equal(r.errorCode, 'INVALID_PAYLOAD_FORMAT');
-    assert.match(r.errorMessage, /data:/);
-    assert.deepEqual(r.details.invalidFields, ['avatarUrl']);
+    });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl with uppercase DATA: prefix (case-insensitive)', () => {
-    const r = validateInstantPayload(makeValidPayload({
-      avatarUrl: 'DATA:image/png;base64,xxx',
-    }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /data:/i);
+  it('soft-strips uppercase DATA: avatarUrl (case-insensitive)', () => {
+    const payload = makeValidPayload({ avatarUrl: 'DATA:image/png;base64,xxx' });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl longer than 2048 chars', () => {
+  it('soft-strips avatarUrl longer than 2048 chars', () => {
     const longUrl = 'https://example.com/' + 'a'.repeat(2048);
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: longUrl }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /2048/);
+    const payload = makeValidPayload({ avatarUrl: longUrl });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
   it('accepts avatarUrl exactly at the 2048 char limit', () => {
     const url = 'https://x/' + 'a'.repeat(2048 - 'https://x/'.length);
     assert.equal(url.length, 2048);
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: url }));
+    const payload = makeValidPayload({ avatarUrl: url });
+    const r = validateInstantPayload(payload);
     assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, url);
   });
 
-  it('rejects avatarUrl that is not a string', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 123 }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /字符串/);
+  it('soft-strips avatarUrl that is not a string', () => {
+    const payload = makeValidPayload({ avatarUrl: 123 });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 
-  it('rejects avatarUrl that is not a valid URL', () => {
-    const r = validateInstantPayload(makeValidPayload({ avatarUrl: 'not a url' }));
-    assert.equal(r.valid, false);
-    assert.match(r.errorMessage, /URL/);
+  it('soft-strips avatarUrl that is not a valid URL', () => {
+    const payload = makeValidPayload({ avatarUrl: 'not a url' });
+    const r = validateInstantPayload(payload);
+    assert.equal(r.valid, true);
+    assert.equal(payload.avatarUrl, null);
   });
 });
 
-// ─── Unit: sentence splitting ─────────────────────────────────────────
-
-describe('splitMessageIntoSentences', () => {
-  it('splits on Chinese punctuation', () => {
-    const result = splitMessageIntoSentences('你好。今天天气真好！要带伞吗？');
-    assert.deepEqual(result, ['你好。', '今天天气真好！', '要带伞吗？']);
+describe('0.8.0 — split-pattern fields removed', () => {
+  it('rejects request body splitPattern with INVALID_PAYLOAD_FORMAT', () => {
+    const r = validateInstantPayload(makeValidPayload({ splitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.equal(r.errorCode, 'INVALID_PAYLOAD_FORMAT');
+    assert.match(r.errorMessage, /splitPattern is removed in 0\.8\.0/);
   });
-
-  it('splits on English ! and ? but NOT . (mirrors amsg-server regex)', () => {
-    const result = splitMessageIntoSentences('Hello. World! Done?');
-    assert.deepEqual(result, ['Hello. World!', 'Done?']);
+  it('rejects request body reasoningSplitPattern', () => {
+    const r = validateInstantPayload(makeValidPayload({ reasoningSplitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /reasoningSplitPattern is removed in 0\.8\.0/);
   });
-
-  it('returns single-element array when no terminal punctuation', () => {
-    const result = splitMessageIntoSentences('no terminal punctuation here');
-    assert.deepEqual(result, ['no terminal punctuation here']);
-  });
-
-  // ── splitPattern override (0.6.0) ──────────────────────────────────
-  it('accepts a single splitPattern string and uses it instead of default', () => {
-    const result = splitMessageIntoSentences('行一\n行二\n行三', '([\\n]+)');
-    assert.deepEqual(result, ['行一\n', '行二\n', '行三']);
-  });
-
-  it('accepts splitPattern as a string[] cascade (paragraph → sentence)', () => {
-    const result = splitMessageIntoSentences(
-      '段一句一。段一句二。\n\n段二句一。',
-      ['(\\n\\n+)', '([。！？!?]+)']
-    );
-    // Cascade:
-    //   1. split by (\n\n+) → ['段一句一。段一句二。\n\n', '段二句一。']
-    //   2. split each by ([。！？!?]+); the trailing \n\n in chunk 1 becomes an
-    //      empty trimmed part and is dropped by the existing filter.
-    assert.deepEqual(result, ['段一句一。', '段一句二。', '段二句一。']);
-  });
-
-  it('uses default when splitPattern is null / undefined / []', () => {
-    const expected = ['你好。', '世界！'];
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', null), expected);
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', undefined), expected);
-    assert.deepEqual(splitMessageIntoSentences('你好。世界！', []), expected);
-  });
-
-  it('falls back to [original] when splitPattern matches everything', () => {
-    const result = splitMessageIntoSentences('abc', '.*');
-    assert.deepEqual(result, ['abc']);
-  });
-
-  it('passes chunk through unchanged when cascade regex does not match', () => {
-    // First regex matches nothing → chunk passed as-is to second regex which splits.
-    const result = splitMessageIntoSentences('a.b.c', ['(z+)', '(\\.)']);
-    assert.deepEqual(result, ['a.', 'b.', 'c']);
-  });
-
-  it('without a capture group, splitter does NOT re-attach delimiter (documented behavior)', () => {
-    // No capture group → split() returns only text parts; reduce keeps even
-    // indices and `arr[i+1]` is the next text chunk, not a delimiter — so we
-    // see the documented quirk where every other chunk is concatenated.
-    const result = splitMessageIntoSentences('a.b.c', '\\.');
-    // 'a.b.c'.split(/\./) === ['a','b','c']; reduce picks i=0 and i=2.
-    // i=0 → 'a' + arr[1] ('b') = 'ab'; i=2 → 'c' + undefined → 'c'.
-    assert.deepEqual(result, ['ab', 'c']);
+  it('rejects request body errorSplitPattern', () => {
+    const r = validateInstantPayload(makeValidPayload({ errorSplitPattern: '([。！？!?]+)' }));
+    assert.equal(r.valid, false);
+    assert.match(r.errorMessage, /errorSplitPattern is removed in 0\.8\.0/);
   });
 });
 

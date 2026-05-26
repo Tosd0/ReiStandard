@@ -47,40 +47,6 @@ export function validateAvatarUrl(value) {
   return null;
 }
 
-const SPLIT_PATTERN_MAX_LENGTH = 200;
-const SPLIT_PATTERN_MAX_ITEMS = 10;
-
-/**
- * Validate the optional `splitPattern` field. Mirrors amsg-server's
- * `validateSplitPattern` (kept in lockstep). Accepts string, string[], or
- * absent/null. Returns an error message string, or null when valid.
- *
- * The size caps are an input-size guard, NOT a ReDoS defense — a 6-char
- * pattern like `(a+)+$` is enough to trigger catastrophic backtracking.
- * Worker / runtime CPU limits are the real backstop; the blast radius is
- * self-inflicted only (caller's regex on caller's own LLM output).
- */
-function validateSplitPattern(value) {
-  if (value === undefined || value === null) return null;
-  const isArray = Array.isArray(value);
-  const items = isArray ? value : [value];
-  if (isArray && items.length === 0) return null;          // empty array = use default
-  if (items.length > SPLIT_PATTERN_MAX_ITEMS) {
-    return `splitPattern 数组最多 ${SPLIT_PATTERN_MAX_ITEMS} 项`;
-  }
-  for (let i = 0; i < items.length; i++) {
-    const s = items[i];
-    const label = isArray ? `splitPattern[${i}]` : 'splitPattern';
-    if (typeof s !== 'string') return `${label} 必须是字符串`;
-    if (s.length > SPLIT_PATTERN_MAX_LENGTH) {
-      return `${label} 不能超过 ${SPLIT_PATTERN_MAX_LENGTH} 字符`;
-    }
-    try { new RegExp(s); }
-    catch (_) { return `${label} 不是有效正则表达式`; }
-  }
-  return null;
-}
-
 function validateMessagesArray(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return 'messages 必须是长度 ≥ 1 的数组';
@@ -93,6 +59,37 @@ function validateMessagesArray(messages) {
     if (!VALID_MESSAGE_ROLES.has(m.role)) {
       return `messages[${i}].role 必须是 system / user / assistant / tool 之一`;
     }
+
+    // OpenAI 协议:assistant 消息在带 tool_calls 时, content 可为 null / 空串 / 缺省.
+    // 跳过 content 校验, 但仍要求 tool_calls 是非空数组 (否则就是无意义的纯空 assistant).
+    const isAssistantToolCallCarrier =
+      m.role === 'assistant'
+      && Array.isArray(m.tool_calls)
+      && m.tool_calls.length > 0;
+    if (isAssistantToolCallCarrier) {
+      // tool_calls 形状轻量校验 — 不严, 上游 LLM API 会再校一遍.
+      for (let j = 0; j < m.tool_calls.length; j++) {
+        const tc = m.tool_calls[j];
+        if (!tc || typeof tc !== 'object' || typeof tc.id !== 'string' || !tc.function) {
+          return `messages[${i}].tool_calls[${j}] 形状非法 (需要 { id, type:'function', function:{ name, arguments } })`;
+        }
+      }
+      continue;
+    }
+
+    // tool 消息: content 允许空串 (工具返回空结果是合法的, 例如 search 无命中);
+    // tool_call_id 必填 — 这是 OpenAI 协议的硬约束 (用于关联到此前的 tool_call).
+    if (m.role === 'tool') {
+      if (typeof m.content !== 'string' && !Array.isArray(m.content)) {
+        return `messages[${i}].content (tool) 必须是字符串或数组`;
+      }
+      if (typeof m.tool_call_id !== 'string' || !m.tool_call_id) {
+        return `messages[${i}].tool_call_id 必填 (tool 消息必须关联到一次 tool_call)`;
+      }
+      continue;
+    }
+
+    // system / user / 不带 tool_calls 的 assistant: 老校验.
     if (typeof m.content === 'string') {
       if (!m.content) {
         return `messages[${i}].content 不能是空字符串`;
@@ -283,12 +280,11 @@ export function validateInstantPayload(payload, opts) {
 
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
-    return {
-      valid: false,
-      errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: avatarErr,
-      details: { invalidFields: ['avatarUrl'] }
-    };
+    // Soft-strip: a bad avatarUrl (data: URI / oversized / malformed) used to
+    // 400 the whole /instant call. Avatar is cosmetic — drop the field, log,
+    // and let the push go through without an icon. See standards §6.2.
+    console.warn('[amsg-instant] avatarUrl 不合法，已置空：', avatarErr);
+    payload.avatarUrl = null;
   }
 
   // messageSubtype is a free-form string tag for SW-side classification.
@@ -309,13 +305,14 @@ export function validateInstantPayload(payload, opts) {
     };
   }
 
-  const splitErr = validateSplitPattern(payload.splitPattern);
-  if (splitErr) {
+  const removedField = ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']
+    .find((field) => payload[field] !== undefined);
+  if (removedField) {
     return {
       valid: false,
       errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: splitErr,
-      details: { invalidFields: ['splitPattern'] }
+      errorMessage: `${removedField} is removed in 0.8.0; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] },
     };
   }
 
@@ -448,9 +445,20 @@ export function validateContinuePayload(payload, opts) {
   }
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
+    // Soft-strip: same policy as /instant — drop the field, log, continue.
+    // See standards §6.2.
+    console.warn('[amsg-instant] /continue avatarUrl 不合法，已置空：', avatarErr);
+    payload.avatarUrl = null;
+  }
+
+  const removedField = ['splitPattern', 'reasoningSplitPattern', 'errorSplitPattern']
+    .find((field) => payload[field] !== undefined);
+  if (removedField) {
     return {
-      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: avatarErr, details: { invalidFields: ['avatarUrl'] }
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: `${removedField} is removed in 0.8.0; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] },
     };
   }
 
