@@ -350,6 +350,53 @@ return {
 
 请求 body 上的 `splitPattern` / `reasoningSplitPattern` / `errorSplitPattern` 在 0.8.0 里直接 400；push 上带 `splitPattern` 抛 `HookError`。迁移时把旧正则逻辑搬进 hook 内的自定义 split 函数，再返回一组 `pushPayloads`。
 
+#### 通用保护切分工具 `segmentTextWithProtectedBlocks`
+
+对于含有不可切碎内容（例如 markdown 代码块、自定义标记）的场景，你可以使用包提供的 `segmentTextWithProtectedBlocks` 帮助构造。它**不是业务解析器**，也不预设任何业务标签，而是纯粹基于正则帮你保护不想被普通 `splitText` 切断的文本片段。
+
+```js
+import { segmentTextWithProtectedBlocks } from '@rei-standard/amsg-instant';
+
+const segments = segmentTextWithProtectedBlocks(ctx.llmOutputText, {
+  // 基础文本怎么切
+  splitText: (text) => text.split('\n'),
+  // 对截取后的基础文本进行预处理（可选）
+  sanitizeText: (text) => text.trim(),
+  
+  // 遇到这些 pattern 匹配到的片段不切碎，原样作为一个独立块保留
+  protectedPatterns: [
+    { 
+      pattern: /```[\s\S]*?```/, 
+      preview: '[Code Block]', // OS 通知栏看到的替代文字
+    },
+    {
+      pattern: /<think>[\s\S]*?<\/think>/,
+      preview: (raw) => '[Thought Process]', // 支持固定字符串或函数
+      meta: { type: 'think-block' } // 可选元数据，输出时会附加到 segment 上
+    }
+  ]
+});
+
+// 输出的片段数组形如：
+// [
+//   { raw: '文本第一段', sanitized: '文本第一段', protect: false },
+//   { raw: '```js\nconst a = 1;\n```', sanitized: '[Code Block]', protect: true },
+//   { raw: '后续文本', sanitized: '后续文本', protect: false }
+// ]
+
+return {
+  decision: 'finish',
+  pushPayloads: segments.map((seg) => ({
+    messageKind: 'content',
+    sessionId: ctx.sessionId,
+    message: seg.raw,
+    // 保护段可以在通知栏显示短 preview，但 payload 原样发给客户端渲染
+    notification: { title: `来自 ${ctx.contactName}`, body: seg.sanitized },
+    metadata: seg.meta
+  })),
+};
+```
+
 #### 例 1：单 push
 
 ```js

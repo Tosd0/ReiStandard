@@ -647,3 +647,5 @@ export {
   isErrorPush,
   chunkReasoningByUtf8Bytes,
 } from '@rei-standard/amsg-shared';
+
+export { segmentTextWithProtectedBlocks } from './segmentation.js';

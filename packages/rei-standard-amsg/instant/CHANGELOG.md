@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.1 — segmentTextWithProtectedBlocks utility
+
+- **New**: 增加包级独立 utility `segmentTextWithProtectedBlocks`。该工具用于帮助 caller 将带有“不可拆片段”（如 Markdown 代码块、特定标记）的文本切分为 `PushTextSegment` 数组。纯正则匹配保护机制，不引入业务耦合，并支持自定义 preview 与 metadata，帮助更安全、方便地构建 hook 的 `pushPayloads` 返回值。
+
 ## 0.8.0 — waitUntil lifecycle support
 
 - 稳定版发布：`0.8.0-next.*` 能力毕业到 latest，依赖收敛到 `@rei-standard/amsg-shared@0.1.0`。

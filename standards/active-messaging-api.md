@@ -228,6 +228,8 @@ createInstantHandler({
 });
 ```
 
+对于需要保护特定片段（如 Markdown 代码块）不被切碎的复杂场景，包提供了一个纯工具函数 `segmentTextWithProtectedBlocks` 协助处理分段，但其调用仍位于 hook 内部，不改变 payload 契约。
+
 `amsg-instant` 的非 hook legacy 路径仍保留内部默认句切 `/([。！？!?]+)/`，用于保持 0.6/0.7 时代的 completePrompt 行为；只是这个内部切分不再暴露请求级配置。
 
 ### 6.2 `avatarUrl` 软清空策略
