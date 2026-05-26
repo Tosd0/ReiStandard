@@ -373,7 +373,7 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       });
       const blobAdapter = createMemoryBlobStore();
       // Build a JSON string of *exactly* `len` UTF-8 bytes after the
-      // sendPushesSequentially auto-fill mutates the push object.
+      // sendPushesSequentially auto-fill enriches the transport copy.
       // Final shape: {"type":"x","p":"...","messageId":"msg_<uuid>_chunk_0","messageIndex":1,"totalMessages":1}
       // messageId is the only variable-width field; its UUID is 36 chars,
       // so messageId value length is `msg_`.length + 36 + `_chunk_0`.length = 48.

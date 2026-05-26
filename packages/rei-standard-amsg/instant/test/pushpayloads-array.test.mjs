@@ -105,6 +105,24 @@ describe('1) pushPayloads.length === 1', () => {
     assert.deepEqual(pushes[0].notification, { title: 'Rei', body: 'hi' });
     assert.deepEqual(sleeps, []);
   });
+
+  it('accepts frozen push payload objects by enriching a shallow copy', async () => {
+    const frozenPush = Object.freeze({
+      messageKind: 'content',
+      message: 'frozen but valid',
+    });
+    const { result, pushes } = await runDirect({
+      decision: 'finish',
+      pushPayloads: [frozenPush],
+    }, { autoEmitReasoning: false });
+
+    assert.equal(result.status, 'finished');
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].message, 'frozen but valid');
+    assert.equal(pushes[0].messageIndex, 1);
+    assert.equal(pushes[0].totalMessages, 1);
+    assert.equal(Object.prototype.hasOwnProperty.call(frozenPush, 'messageIndex'), false);
+  });
 });
 
 // 2) Three-push multi-burst with 1500ms spacing

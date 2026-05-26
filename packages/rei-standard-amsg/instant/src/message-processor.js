@@ -47,8 +47,8 @@ const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
  * pushes. Each push goes through `sendPushWithMaybeBlob` so the blob
  * detour still applies per-push.
  *
- * Per-push auto-fill (mutates the push object in place — the hook
- * returned a plain literal, we own it from this point):
+ * Per-push auto-fill (copies each hook-returned object before enriching
+ * the transport payload):
  *   - `messageId`     — only when the hook didn't set one (auto-fill
  *                       with `msg_<uuid>_chunk_<i>` so deduplication
  *                       on the SW side works across retries).
@@ -69,7 +69,7 @@ const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sleep) {
   const total = pushPayloads.length;
   for (let i = 0; i < total; i++) {
-    const push = pushPayloads[i];
+    const push = { ...pushPayloads[i] };
     if (push.messageId === undefined) {
       push.messageId = `msg_${randomUUID()}_chunk_${i}`;
     }

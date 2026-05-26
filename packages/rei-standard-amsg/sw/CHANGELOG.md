@@ -1,5 +1,10 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.1.1 — multipart 并发与 hook thenable 修复
+
+- **Fix**: `_multipart` reassembly 现在按 multipart id 串行处理分片，避免并发 push delivery 下 IndexedDB read-modify-write 交错导致 `receivedCount` / `receivedBytes` 丢写，最终卡住重组。
+- **Fix**: `onBusinessPayload` 现在识别通用 thenable，并通过 `Promise.resolve(...)` 纳入 `event.waitUntil` 生命周期，不再只接受同 realm 的 `Promise` 实例。
+
 ## 2.1.0 — notification.show 及 Multipart chunk store
 
 ### New
@@ -9,7 +14,7 @@
 - **性能优化**：`dispatchBusinessPayload` 现在只会调用一次 `sw.clients.matchAll` 从而避免多余的 IPC 开销。
 - **IndexedDB 性能优化**：通过 `cachedDB` 保持 DB 连接，防止碎片化的 `openQueueDatabase` 导致的延迟。`REI_SW_DB_VERSION` 升级至 `3`。
 - **Multipart Chunk Store**：新增 `multipart-chunk` object store 用于独立存储分片的 payload，提升了超大 payload 还原的内存稳定性和入库速度。添加了 `expiresAt` 索引大幅加速清理超时数据的过程。
-- **去处硬编码**：移除了 `createNotificationFromPayload` 中硬编码的 “来自 {contactName}” 兜底，现在只会优雅地 fallback 到 `payload.contactName`。使用 `amsg-shared` 导出的 `MESSAGE_KIND` 枚举替代了魔法字符串。
+- **通知标题兜底**：恢复 `createNotificationFromPayload` 中 `来自 {contactName}` 的标题 fallback，避免 custom hook 只传 `contactName` 时显示裸名字。使用 `amsg-shared` 导出的 `MESSAGE_KIND` 枚举替代了魔法字符串。
 
 ## 2.1.0-next.3 — 新增 `onBusinessPayload` 离线钩子 (pre-release)
 

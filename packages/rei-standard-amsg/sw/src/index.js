@@ -73,6 +73,7 @@ const DEFAULT_MULTIPART_OPTIONS = Object.freeze({
 const memoryMultipartPending = new Map();
 const memoryMultipartDone = new Map();
 const memoryMultipartChunks = new Map();
+const multipartLocks = new Map();
 
 /**
  * Wire-level message type for SW → client postMessage envelopes.
@@ -227,8 +228,8 @@ async function dispatchBusinessPayload(sw, payload, defaults) {
   if (typeof defaults.onBusinessPayload === 'function') {
     try {
       const result = defaults.onBusinessPayload(payload);
-      if (result instanceof Promise) {
-        work.push(result.catch(error => {
+      if (result && typeof result.then === 'function') {
+        work.push(Promise.resolve(result).catch(error => {
           console.error('[rei-standard-amsg-sw] onBusinessPayload promise rejected:', error);
         }));
       }
@@ -352,7 +353,7 @@ function createNotificationFromPayload(payload, defaults) {
   const title =
     pushNotification.title ||
     payload.title ||
-    payload.contactName ||
+    (payload.contactName && `来自 ${payload.contactName}`) ||
     'New notification';
   const body = pushNotification.body || payload.body || payload.message || '';
   const data = pushNotification.data && typeof pushNotification.data === 'object'
@@ -411,14 +412,31 @@ function isMultipartPush(payload) {
 }
 
 async function acceptMultipartChunk(sw, payload, options) {
+  const normalized = normalizeMultipartChunk(payload, options);
+  if (!normalized) return null;
+
+  const previous = multipartLocks.get(normalized.id) || Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(() => acceptMultipartChunkInternal(sw, normalized, options));
+
+  multipartLocks.set(normalized.id, current);
+  try {
+    return await current;
+  } finally {
+    if (multipartLocks.get(normalized.id) === current) {
+      multipartLocks.delete(normalized.id);
+    }
+  }
+}
+
+async function acceptMultipartChunkInternal(sw, normalized, options) {
   // State machine:
   // 1. Validate the transport envelope and reject expired chunks before storage.
   // 2. Drop already-completed multipart ids using the short-lived done marker.
   // 3. Expire any stale pending record for this id before accepting a new one.
   // 4. Store only new chunk indexes, track total received bytes, and wait.
   // 5. Once all indexes are present, restore original JSON and mark done.
-  const normalized = normalizeMultipartChunk(payload, options);
-  if (!normalized) return null;
   if (normalized.expiresAt <= Date.now()) {
     await dispatchMultipartExpired(sw, {
       id: normalized.id,

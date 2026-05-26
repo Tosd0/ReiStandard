@@ -3,6 +3,7 @@
 ## 0.8.1 — segmentTextWithProtectedBlocks utility
 
 - **New**: 增加包级独立 utility `segmentTextWithProtectedBlocks`。该工具用于帮助 caller 将带有“不可拆片段”（如 Markdown 代码块、特定标记）的文本切分为 `PushTextSegment` 数组。纯正则匹配保护机制，不引入业务耦合，并支持自定义 preview 与 metadata，帮助更安全、方便地构建 hook 的 `pushPayloads` 返回值。
+- **Fix**: hook 返回的 `pushPayloads` 现在会在发送前浅拷贝再自动补齐 `messageId` / `messageIndex` / `totalMessages`，避免原地修改 caller 对象，并支持 `Object.freeze(...)` 这类不可变 payload。
 
 ## 0.8.0 — waitUntil lifecycle support
 

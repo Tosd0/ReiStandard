@@ -143,6 +143,43 @@ test('content push triggers showNotification AND postMessage with CONTENT_RECEIV
   });
 });
 
+test('onBusinessPayload waits for thenables returned by another promise implementation', async () => {
+  const { sw, triggerPush } = createSwMock();
+  let hookSettled = false;
+  const thenable = {
+    then(resolve) {
+      Promise.resolve().then(() => {
+        hookSettled = true;
+        resolve();
+      });
+    }
+  };
+  installReiSW(sw, {
+    onBusinessPayload() {
+      return thenable;
+    }
+  });
+
+  await triggerPush({ ...COMMON, messageKind: 'content', message: 'thenable hook' });
+
+  assert.equal(hookSettled, true);
+});
+
+test('content push without title falls back to "来自 {contactName}"', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'No explicit title',
+    contactName: 'Rei'
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, '来自 Rei');
+});
+
 test('content push broadcasts to every controlled client', async () => {
   const { sw, postedMessages, triggerPush } = createSwMock({ clientCount: 3 });
   installReiSW(sw);
@@ -286,6 +323,27 @@ test('generic multipart content restores payload before dispatch and notificatio
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].title, 'Multipart Rei');
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.CONTENT_RECEIVED);
+  assert.deepEqual(postedMessages[0].message.payload, payload);
+});
+
+test('generic multipart serializes concurrent chunks for the same id', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'content',
+    message: 'parallel multipart content '.repeat(30),
+    title: 'Concurrent Multipart Rei'
+  };
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_concurrent', maxChunkBytes: 80 });
+
+  await Promise.all(parts.map(part => triggerPush(part)));
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, 'Concurrent Multipart Rei');
   assert.equal(postedMessages.length, 1);
   assert.equal(postedMessages[0].message.event, REI_SW_EVENT.CONTENT_RECEIVED);
   assert.deepEqual(postedMessages[0].message.payload, payload);
@@ -570,4 +628,3 @@ test('multipart fully received payload with notification.show: "when-hidden" che
     assert.equal(notifications[0].title, 'Multipart Hidden');
   }
 });
-
