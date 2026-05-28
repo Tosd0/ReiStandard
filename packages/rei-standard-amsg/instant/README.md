@@ -40,7 +40,7 @@ npm install @rei-standard/amsg-instant
 | `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
 | `multipart`         | object    | ❌   | **0.8.0+**：通用 multipart transport。超出 inline、且没配 BlobStore 时，任意 JSON-safe payload 都可拆成 `_multipart` 分片。默认 `enabled:true`、`maxChunkBytes:1800`、`ttlMs:60000`、`maxChunks:128`、`maxTotalBytes:256000`。见 [Generic multipart transport](#generic-multipart-transport080)。 |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
-| `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
+| `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`，或 `content` 内含 `<thinking>` 等标签）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
 | `reasoningChunkBytes` | number \| null | ❌ | **Deprecated in 0.8.0**：旧 reasoning 专用字节切配置。保留为 `multipart.maxChunkBytes` 的兼容别名；`null` 仅在未显式配置 `multipart` 时禁用 generic multipart。不会再产生 `chunkIndex` / `totalChunks` reasoning wire fields。 |
 
 ### 鉴权策略

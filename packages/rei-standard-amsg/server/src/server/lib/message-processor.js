@@ -88,11 +88,24 @@ function readReasoningContent(llmResponse) {
   if (!llmResponse || typeof llmResponse !== 'object') return null;
   const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
   if (!Array.isArray(choices) || choices.length === 0) return null;
-  const message = /** @type {{ message?: { reasoning_content?: unknown } }} */ (choices[0])?.message;
+  const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
+  
   const raw = message?.reasoning_content;
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+
+  const content = message?.content;
+  if (typeof content === 'string') {
+    const match = content.match(/<(think|thinking|thought)>([\s\S]*?)<\/\1>/i);
+    if (match) {
+      const trimmed = match[2].trim();
+      if (trimmed.length > 0) return trimmed;
+    }
+  }
+
+  return null;
 }
 
 /**
