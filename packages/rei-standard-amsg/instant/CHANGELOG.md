@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.8.2 — readReasoningContent fallback
+
+- **Enhancement**: `readReasoningContent` 添加 fallback 支持。当原生 `reasoning_content` 字段缺失时，会 fallback 检查 `message.content` 是否包含 `<think>...</think>`、`<thinking>...</thinking>` 或 `<thought>...</thought>` 并提取，提供对更多模型（例如 DeepSeek-R1-Distill）的原生兼容。
+
 ## 0.8.1 — segmentTextWithProtectedBlocks utility
 
 - **New**: 增加包级独立 utility `segmentTextWithProtectedBlocks`。该工具用于帮助 caller 将带有“不可拆片段”（如 Markdown 代码块、特定标记）的文本切分为 `PushTextSegment` 数组。纯正则匹配保护机制，不引入业务耦合，并支持自定义 preview 与 metadata，帮助更安全、方便地构建 hook 的 `pushPayloads` 返回值。
