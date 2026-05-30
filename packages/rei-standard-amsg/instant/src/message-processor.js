@@ -16,6 +16,8 @@
  */
 
 import {
+  MESSAGE_TYPE,
+  PUSH_SOURCE,
   buildContentPush,
   buildReasoningPush,
   buildErrorPush,
@@ -42,6 +44,41 @@ const VALID_DECISIONS = new Set(['finish', 'tool-request', 'continue', 'skip-pus
 const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 
 /**
+ * Stamp a stable `messageId` on the payload if missing. All payloads
+ * flowing through `deliverPush()` get normalized here so the same id is
+ * reused for SSE writes and any subsequent Web Push fallback — clients
+ * dedupe on this id when both transports race.
+ *
+ * Idempotent: a payload that already has a non-empty string `messageId`
+ * is returned unchanged.
+ *
+ * @template T
+ * @param {T} push
+ * @returns {T}
+ */
+function ensureStableMessageId(push) {
+  if (!push || typeof push !== 'object') return push;
+  const obj = /** @type {{ messageId?: unknown }} */ (push);
+  if (typeof obj.messageId === 'string' && obj.messageId) return push;
+  return /** @type {T} */ ({ ...obj, messageId: `msg_${randomUUID()}` });
+}
+
+async function deliverPush(push, payload, ctx, sessionId) {
+  if (ctx.deliver) {
+    // ctx.deliver is the single normalization boundary — both the SSE
+    // and pure-push handler variants stamp `messageId` at entry, and
+    // hook authors calling `deliver` directly from onAfterLoop go
+    // through the same path. Don't double-normalize here.
+    await ctx.deliver(push);
+  } else {
+    // Fallback: external callers using `processInstantMessage` directly
+    // without wiring up a `ctx.deliver` still need a stable id before
+    // the payload reaches the transport.
+    await sendPushWithMaybeBlob(ensureStableMessageId(push), payload, ctx, sessionId);
+  }
+}
+
+/**
  * Deliver `pushPayloads` sequentially via `sendPushWithMaybeBlob`,
  * spacing `SLEEP_BETWEEN_MESSAGES_MS` (1500 ms) between consecutive
  * pushes. Each push goes through `sendPushWithMaybeBlob` so the blob
@@ -49,11 +86,13 @@ const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
  *
  * Per-push auto-fill (copies each hook-returned object before enriching
  * the transport payload):
- *   - `messageId`     — only when the hook didn't set one (auto-fill
- *                       with `msg_<uuid>_chunk_<i>` so deduplication
- *                       on the SW side works across retries).
  *   - `messageIndex`  — always overwritten (1-based) with the array index.
  *   - `totalMessages` — always overwritten with `pushPayloads.length`.
+ *
+ * `messageId` is NOT stamped here — `deliverPush()` runs
+ * `ensureStableMessageId()` on every payload that crosses transport,
+ * so a missing id is filled in once (and the same id is reused if the
+ * SSE write fails and falls back to Web Push).
  *
  * Throws on the first failed push; subsequent pushes are not attempted.
  * Callers decide whether to surface the throw or treat the partial
@@ -68,15 +107,18 @@ const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
  */
 async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sleep) {
   const total = pushPayloads.length;
+  // Spacing is a Web Push concern (gateway rate-limit smoothing + chat
+  // UX pacing). SSE responses pipe straight to the consumer, so the
+  // SSE handler sets `ctx.spacingMs = 0` to ship the burst immediately.
+  const spacingMs = Number.isFinite(ctx.spacingMs) && ctx.spacingMs >= 0
+    ? ctx.spacingMs
+    : SLEEP_BETWEEN_MESSAGES_MS;
   for (let i = 0; i < total; i++) {
     const push = { ...pushPayloads[i] };
-    if (push.messageId === undefined) {
-      push.messageId = `msg_${randomUUID()}_chunk_${i}`;
-    }
     push.messageIndex = i + 1;
     push.totalMessages = total;
     try {
-      await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+      await deliverPush(push, payload, ctx, sessionId);
     } catch (err) {
       // HookError / PayloadTooLargeError already carry their own .code and
       // should propagate unwrapped — those are caller-shape contract
@@ -91,8 +133,8 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
       wrapped.cause = err;
       throw wrapped;
     }
-    if (i < total - 1) {
-      await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    if (spacingMs > 0 && i < total - 1) {
+      await sleep(spacingMs);
     }
   }
   return total;
@@ -113,7 +155,7 @@ async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sle
  * @returns {Promise<number>}  Total leaves shipped.
  */
 async function emitReasoning(reasoningPush, payload, ctx, sessionId) {
-  await sendPushWithMaybeBlob(reasoningPush, payload, ctx, sessionId);
+  await deliverPush(reasoningPush, payload, ctx, sessionId);
   return 1;
 }
 
@@ -356,6 +398,10 @@ async function runLegacyInstant(payload, ctx) {
   const fetchImpl = ctx.fetch || globalThis.fetch;
   const sleep = ctx.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const onEvent = typeof ctx.onEvent === 'function' ? ctx.onEvent : () => {};
+  // SSE mode passes `spacingMs: 0` — pacing is a Web Push concern.
+  const spacingMs = Number.isFinite(ctx.spacingMs) && ctx.spacingMs >= 0
+    ? ctx.spacingMs
+    : SLEEP_BETWEEN_MESSAGES_MS;
 
   // sessionId is shared across all pushes from this legacy invocation:
   // an optional ReasoningPush + N ContentPush sentences. Callers can
@@ -388,8 +434,8 @@ async function runLegacyInstant(payload, ctx) {
   const reasoning = readReasoningContent(llmResponse);
   if (reasoning) {
     const reasoningPush = buildReasoningPush({
-      messageType: 'instant',
-      source: 'instant',
+      messageType: MESSAGE_TYPE.INSTANT,
+      source: PUSH_SOURCE.INSTANT,
       messageId: `msg_${randomUUID()}_instant_reasoning`,
       sessionId,
       reasoningContent: reasoning,
@@ -418,10 +464,11 @@ async function runLegacyInstant(payload, ctx) {
     }
 
     // Only space the burst when the reasoning push actually shipped —
-    // skipping the sleep when it failed shaves 1.5s off the perceived
-    // latency for that case.
-    if (reasoningShipped) {
-      await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    // skipping the sleep when it failed shaves the gap off perceived
+    // latency for that case. SSE callers set spacingMs=0 to skip
+    // entirely (no gateway to smooth for).
+    if (reasoningShipped && spacingMs > 0) {
+      await sleep(spacingMs);
     }
   }
 
@@ -444,8 +491,8 @@ async function runLegacyInstant(payload, ctx) {
 
   for (let i = 0; i < messages.length; i++) {
     const contentPush = buildContentPush({
-      messageType: 'instant',
-      source: 'instant',
+      messageType: MESSAGE_TYPE.INSTANT,
+      source: PUSH_SOURCE.INSTANT,
       messageId: `msg_${randomUUID()}_instant_${i}`,
       sessionId,
       message: messages[i],
@@ -461,7 +508,7 @@ async function runLegacyInstant(payload, ctx) {
     });
 
     try {
-      await sendPushWithMaybeBlob(contentPush, payload, ctx, sessionId);
+      await deliverPush(contentPush, payload, ctx, sessionId);
       onEvent({ type: 'push_sent', messageIndex: i + 1, totalMessages: messages.length, sessionId });
     } catch (err) {
       if (err && err.code === 'PAYLOAD_TOO_LARGE') throw err;
@@ -472,8 +519,8 @@ async function runLegacyInstant(payload, ctx) {
       throw error;
     }
 
-    if (i < messages.length - 1) {
-      await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    if (spacingMs > 0 && i < messages.length - 1) {
+      await sleep(spacingMs);
     }
   }
 
@@ -547,8 +594,8 @@ async function runAgenticLoop(payload, ctx) {
       const reasoning = readReasoningContent(llmResponse);
       if (reasoning) {
         const reasoningPush = buildReasoningPush({
-          messageType: 'instant',
-          source: 'instant',
+          messageType: MESSAGE_TYPE.INSTANT,
+          source: PUSH_SOURCE.INSTANT,
           messageId: `msg_${randomUUID()}_iter_${iteration}_reasoning`,
           sessionId,
           reasoningContent: reasoning,
@@ -589,8 +636,8 @@ async function runAgenticLoop(payload, ctx) {
     } catch (err) {
       onEvent({ type: 'hook_threw', sessionId, iteration, cause: err });
       const diagnostic = buildErrorPush({
-        messageType: 'instant',
-        source: 'instant',
+        messageType: MESSAGE_TYPE.INSTANT,
+        source: PUSH_SOURCE.INSTANT,
         messageId: `msg_${randomUUID()}_iter_${iteration}_error`,
         sessionId,
         code: 'HOOK_THREW',
@@ -599,7 +646,7 @@ async function runAgenticLoop(payload, ctx) {
         timestamp: new Date().toISOString(),
       });
       try {
-        await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
+        await deliverPush(diagnostic, payload, ctx, sessionId);
       } catch (pushErr) {
         onEvent({ type: 'diagnostic_push_failed', code: 'HOOK_THREW', sessionId, cause: pushErr });
       }
@@ -659,7 +706,7 @@ async function runAgenticLoop(payload, ctx) {
   try {
     // The diagnostic is a single push by construction (one
     // `buildErrorPush(...)` call above); no looping needed.
-    await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
+    await deliverPush(diagnostic, payload, ctx, sessionId);
   } catch (err) {
     onEvent({ type: 'diagnostic_push_failed', code: 'LOOP_EXCEEDED', sessionId, cause: err });
   }
@@ -978,4 +1025,4 @@ function buildBlobUrl(requestUrl, key) {
   return `/blob/${key}`;
 }
 
-export { sendPushWithMaybeBlob, readReasoningContent };
+export { sendPushWithMaybeBlob, readReasoningContent, ensureStableMessageId };

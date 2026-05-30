@@ -274,6 +274,155 @@ export class ReiClient {
   }
 
   /**
+   * Consume an instant SSE stream.
+   *
+   * Error semantics: any failure (network, protocol, abort, `onPayload`
+   * callback throwing) rejects the returned Promise. `options.onError`,
+   * when provided, is a side-channel notification (e.g. for logging or
+   * UI flashes) and fires before the rejection — it does not suppress
+   * it. Always wrap calls in `try / await` and treat the rejection as
+   * the canonical error path.
+   *
+   * @param {Object} payload - Instant message payload.
+   * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
+   * @param {Object} options
+   * @param {Record<string, string>} [options.headers]
+   * @param {(payload: unknown) => Promise<void> | void} options.onPayload
+   * @param {(error: unknown) => void} [options.onError]
+   * @param {() => void} [options.onDone]
+   * @param {AbortSignal} [options.signal]
+   * @returns {Promise<void>}
+   */
+  async consumeInstantStream(payload, endpointPath = '/instant', options = {}) {
+    this._sanitizeAvatarUrl(payload);
+    const json = JSON.stringify(payload);
+    this._assertPayloadSize(json, 'consumeInstantStream');
+
+    const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+    let body;
+
+    if (this._instantEncryption === false) {
+      body = json;
+      if (this._instantClientToken) {
+        headers['X-Client-Token'] = this._instantClientToken;
+      }
+    } else {
+      const encrypted = await this._encrypt(json);
+      headers['X-User-Id'] = this._userId;
+      headers['X-Payload-Encrypted'] = 'true';
+      headers['X-Encryption-Version'] = '1';
+      body = JSON.stringify(encrypted);
+    }
+
+    const path = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+    const res = await fetch(`${this._resolveBaseUrl('instant')}${path}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal: options.signal
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Instant request failed: ${res.status} ${text}`);
+    }
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('text/event-stream')) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Expected text/event-stream, got ${contentType}: ${text}`);
+    }
+
+    if (!res.body) {
+      throw new Error('Response body is null');
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let thrown;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || ''; // last part may be incomplete
+
+        for (const part of parts) {
+          if (!part.trim()) continue;
+
+          let eventName = 'message';
+          // Per SSE spec multiple `data:` lines in one event concatenate
+          // with `\n`. Our own server always emits a single data line,
+          // but `consumeInstantStream` is a general-purpose consumer.
+          let data = '';
+
+          const lines = part.split('\n');
+          for (const line of lines) {
+            if (line.startsWith(':')) continue; // keepalive comment
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              const piece = line.slice(5).trim();
+              data = data ? `${data}\n${piece}` : piece;
+            }
+          }
+
+          if (eventName === 'done') {
+            if (options.onDone) options.onDone();
+            return;
+          }
+
+          if (eventName === 'error') {
+            let parsedErr;
+            try {
+              parsedErr = JSON.parse(data);
+            } catch {
+              parsedErr = { code: 'PARSE_ERROR', message: data };
+            }
+            const err = new Error(parsedErr.message || 'Stream error');
+            err.code = parsedErr.code;
+            thrown = err;
+            return; // exit loop, finally re-throws
+          }
+
+          if (eventName === 'payload') {
+            let parsedPayload;
+            try {
+              parsedPayload = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            if (options.onPayload) {
+              await options.onPayload(parsedPayload);
+            }
+          }
+        }
+      }
+
+      // Stream ended without `event: done` — treat EOF as done.
+      if (options.onDone) options.onDone();
+    } catch (err) {
+      thrown = err;
+    } finally {
+      // Always notify onError (side-channel) and always throw — callers
+      // rely on Promise rejection as the canonical failure signal.
+      if (thrown) {
+        try { await reader.cancel(thrown); } catch { /* already cancelled */ }
+        if (options.onError) {
+          try { options.onError(thrown); } catch { /* observer can't break the throw */ }
+        }
+        try { reader.releaseLock(); } catch { /* already released */ }
+        throw thrown;
+      }
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+  }
+
+  /**
    * Update an existing scheduled message.
    *
    * If `updates.avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string),

@@ -9,8 +9,12 @@ import {
   generateTestVapid,
   generateTestSubscription,
   createFetchRouter,
+  decryptCapturedPushBody,
   makeLlmResponse,
+  consumeSse,
 } from './helpers.mjs';
+
+const ACCEPT_JSON = { accept: 'application/json' };
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
 
@@ -381,12 +385,25 @@ describe('createInstantHandler — request validation', () => {
 // ─── Handler: clientToken weak auth ────────────────────────────────────
 
 describe('createInstantHandler — clientToken', () => {
-  it('passes through when clientToken is not configured (open mode)', async () => {
+  it('opt-out (Accept: application/json): passes through when clientToken is not configured (open mode)', async () => {
+    const router = llmRouter('hi.');
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+    const res = await handler(makeRequest({ body: makeValidPayload(), headers: ACCEPT_JSON }));
+    assert.equal(res.status, 200);
+    assert.equal(router.pushCalls.length, 1);
+  });
+
+  it('SSE (default): passes through when clientToken is not configured (open mode)', async () => {
     const router = llmRouter('hi.');
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
     assert.equal(res.status, 200);
-    assert.equal(router.pushCalls.length, 1);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(payloads.length, 1);
+    assert.equal(doneReceived, true);
+    // SSE happy path must not fall back to Web Push.
+    assert.equal(router.pushCalls.length, 0);
   });
 
   it('returns 401 INVALID_CLIENT_TOKEN when header missing', async () => {
@@ -408,7 +425,22 @@ describe('createInstantHandler — clientToken', () => {
     assert.equal(body.error.code, 'INVALID_CLIENT_TOKEN');
   });
 
-  it('returns 200 when header matches clientToken', async () => {
+  it('opt-out (Accept: application/json): returns 200 when header matches clientToken', async () => {
+    const router = llmRouter('matched.');
+    const handler = createInstantHandler({
+      vapid,
+      clientToken: 'shared-secret-xyz',
+      fetch: router.fetch,
+    });
+    const res = await handler(makeRequest({
+      body: makeValidPayload(),
+      headers: { 'x-client-token': 'shared-secret-xyz', ...ACCEPT_JSON },
+    }));
+    assert.equal(res.status, 200);
+    assert.equal(router.pushCalls.length, 1);
+  });
+
+  it('SSE (default): returns 200 stream when header matches clientToken', async () => {
     const router = llmRouter('matched.');
     const handler = createInstantHandler({
       vapid,
@@ -420,18 +452,22 @@ describe('createInstantHandler — clientToken', () => {
       headers: { 'x-client-token': 'shared-secret-xyz' },
     }));
     assert.equal(res.status, 200);
-    assert.equal(router.pushCalls.length, 1);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(payloads.length, 1);
+    assert.equal(doneReceived, true);
+    assert.equal(router.pushCalls.length, 0);
   });
 });
 
 // ─── Handler: happy path & push delivery ──────────────────────────────
 
 describe('createInstantHandler — happy path', () => {
-  it('parses plaintext, calls LLM, splits, pushes each sentence, returns 200', async () => {
+  it('opt-out (Accept: application/json): parses plaintext, calls LLM, splits, pushes each sentence, returns 200', async () => {
     const router = llmRouter('你好。今天好天气！');
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
 
-    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const res = await handler(makeRequest({ body: makeValidPayload(), headers: ACCEPT_JSON }));
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.success, true);
@@ -447,20 +483,75 @@ describe('createInstantHandler — happy path', () => {
     }
   });
 
-  it('returns LLM_CALL_FAILED on upstream error', async () => {
+  it('SSE (default): parses plaintext, calls LLM, splits, streams each sentence as event: payload, no Web Push', async () => {
+    const router = llmRouter('你好。今天好天气！');
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[0].messageKind, 'content');
+    assert.equal(payloads[0].message, '你好。');
+    assert.equal(payloads[0].messageIndex, 1);
+    assert.equal(payloads[1].message, '今天好天气！');
+    assert.equal(payloads[1].messageIndex, 2);
+    // Same sessionId across the stream.
+    assert.equal(payloads[0].sessionId, payloads[1].sessionId);
+    // SSE direct delivery — no Web Push fallback hit.
+    assert.equal(router.pushCalls.length, 0);
+  });
+
+  it('opt-out (Accept: application/json): returns LLM_CALL_FAILED on upstream error', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
       llm: async () => ({ ok: false, status: 500, statusText: 'oops' }),
     });
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
-    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const res = await handler(makeRequest({ body: makeValidPayload(), headers: ACCEPT_JSON }));
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.equal(body.error.code, 'LLM_CALL_FAILED');
     assert.equal(router.pushCalls.length, 0);
   });
 
-  it('returns PUSH_SEND_FAILED when push gateway returns non-2xx', async () => {
+  it('SSE (default): emits event: error with LLM_CALL_FAILED on upstream error', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => ({ ok: false, status: 500, statusText: 'oops' }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    // SSE responses always 200 even on business errors — the error rides as event: error.
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    const { payloads, errors } = await consumeSse(res);
+    assert.equal(payloads.length, 0);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].code, 'LLM_CALL_FAILED');
+    assert.equal(errors[0].messageKind, 'error');
+    assert.equal(router.pushCalls.length, 0);
+  });
+
+  it('opt-out (Accept: application/json): returns PUSH_SEND_FAILED when push gateway returns non-2xx', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => makeLlmResponse('one sentence'),
+      onPush: () => new Response('gone', { status: 410, statusText: 'Gone' }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+    const res = await handler(makeRequest({ body: makeValidPayload(), headers: ACCEPT_JSON }));
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.error.code, 'PUSH_SEND_FAILED');
+  });
+
+  it('SSE (default): push gateway failure is irrelevant — SSE writes succeed without fallback', async () => {
+    // In SSE happy path, the push gateway is never touched. We still wire
+    // it up as an always-failing endpoint to prove the handler does not
+    // silently fall back; the test asserts zero push calls AND a clean stream.
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
       llm: async () => makeLlmResponse('one sentence'),
@@ -468,9 +559,12 @@ describe('createInstantHandler — happy path', () => {
     });
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const res = await handler(makeRequest({ body: makeValidPayload() }));
-    assert.equal(res.status, 502);
-    const body = await res.json();
-    assert.equal(body.error.code, 'PUSH_SEND_FAILED');
+    assert.equal(res.status, 200);
+    const { payloads, errors, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 1);
+    assert.equal(errors.length, 0);
+    assert.equal(router.pushCalls.length, 0);
   });
 
   it('rejects request when tokenSigningKey is set but Authorization missing', async () => {

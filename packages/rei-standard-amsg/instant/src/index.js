@@ -21,7 +21,8 @@
  */
 
 import { validateInstantPayload, validateContinuePayload } from './validation.js';
-import { processInstantMessage } from './message-processor.js';
+import { processInstantMessage, sendPushWithMaybeBlob, ensureStableMessageId } from './message-processor.js';
+import { MESSAGE_TYPE, PUSH_SOURCE, buildErrorPush } from '@rei-standard/amsg-shared';
 import { HookError, PayloadTooLargeError, LlmCallError } from './errors.js';
 import {
   utf8,
@@ -29,6 +30,7 @@ import {
   base64UrlToBytes,
   hmacSha256,
   timingSafeEqualBytes,
+  randomUUID,
 } from './utils.js';
 import {
   DEFAULT_MULTIPART_CHUNK_BYTES,
@@ -38,6 +40,14 @@ import {
 } from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Hot-path SSE encoding helpers. `TextEncoder` is stateless under the
+// hood, and the keepalive comment is fixed bytes — encoding either on
+// every request / every 15s is pure overhead. Hoist once at module
+// load.
+const SSE_ENCODER = new TextEncoder();
+const SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(': keepalive\n\n');
+const SSE_DONE_BYTES = SSE_ENCODER.encode('event: done\ndata: {}\n\n');
 
 /**
  * @typedef {Object} VapidConfig
@@ -86,6 +96,10 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *               `{ decision: 'continue',     nextHistory }`
  *               `{ decision: 'skip-push' }`
  *             See README §Agentic Loop.
+ * @property {(ctx: { requestBody: unknown, sessionId: string, metadata: Record<string, unknown> }) => unknown | Promise<unknown>} [onBeforeLoop]
+ *           - **v0.9 hook.** Run before the LLM loop starts. Use to launch parallel tasks.
+ * @property {(ctx: { deliver: (payload: unknown) => Promise<void>, sessionId: string, metadata: Record<string, unknown>, requestBody: unknown, pending: unknown }) => Promise<void>} [onAfterLoop]
+ *           - **v0.9 hook.** Run after the LLM loop ends. Use to await parallel tasks and append payloads.
  * @property {import('./blob-store/interface.js').BlobStoreConfig} [blobStore]
  *           - Optional. When a push payload's
  *             UTF-8 byte length exceeds `maxInlineBytes` (default
@@ -157,6 +171,8 @@ export function createInstantHandler(options) {
   const expectedClientTokenBytes = clientToken ? utf8(clientToken) : null;
   const corsHeaders = buildCorsHeaders(options.cors);
   const onLLMOutput = typeof options.onLLMOutput === 'function' ? options.onLLMOutput : null;
+  const onBeforeLoop = typeof options.onBeforeLoop === 'function' ? options.onBeforeLoop : null;
+  const onAfterLoop = typeof options.onAfterLoop === 'function' ? options.onAfterLoop : null;
   const blobStore = options.blobStore || null;
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
@@ -295,7 +311,10 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const work = processInstantMessage(payload, {
+      const isPurePush = request.headers.get('accept') === 'application/json';
+      const sessionId = typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : `sess_${randomUUID()}`;
+
+      const processorCtx = {
         vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
         onEvent,
@@ -306,21 +325,165 @@ export function createInstantHandler(options) {
         multipart,
         requestUrl: request.url,
         isResume: isContinue,
-      });
-      registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
-      const result = await work;
-      return respond(200, { success: true, data: result });
+      };
+
+      // Resolve metadata once. `|| {}` would mint two distinct empty
+      // objects for the two hook calls, so any reference-based
+      // book-keeping done by onBeforeLoop wouldn't survive into
+      // onAfterLoop. Sharing one ref also matches caller intuition.
+      const hookMetadata = payload.metadata || {};
+
+      // Single lifecycle helper used by both transport modes — keeps
+      // hook ordering identical regardless of how `deliver` is wired.
+      const runWithLifecycleHooks = async () => {
+        let pending;
+        if (onBeforeLoop) {
+          pending = await onBeforeLoop({ requestBody: payload, sessionId, metadata: hookMetadata });
+        }
+        const result = await processInstantMessage({ ...payload, sessionId }, processorCtx);
+        if (onAfterLoop) {
+          await onAfterLoop({
+            deliver: processorCtx.deliver,
+            sessionId,
+            metadata: hookMetadata,
+            requestBody: payload,
+            pending,
+          });
+        }
+        return result;
+      };
+
+      if (isPurePush) {
+        processorCtx.deliver = async (pushPayload) => {
+          await sendPushWithMaybeBlob(ensureStableMessageId(pushPayload), payload, processorCtx, sessionId);
+        };
+        const work = runWithLifecycleHooks();
+        registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+        const result = await work;
+        return respond(200, { success: true, data: result });
+      }
+
+      // SSE Mode — pacing is irrelevant since chunks pipe straight to
+      // the consumer (no push-gateway rate limit to smooth over).
+      processorCtx.spacingMs = 0;
+
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            let streamUsable = true;
+            let keepaliveTimer;
+
+            const onAbort = () => {
+              streamUsable = false;
+              if (keepaliveTimer) clearInterval(keepaliveTimer);
+            };
+            request.signal.addEventListener('abort', onAbort);
+
+            const stopKeepalive = () => {
+              if (keepaliveTimer) {
+                clearInterval(keepaliveTimer);
+                keepaliveTimer = null;
+              }
+            };
+            const startKeepalive = () => {
+              keepaliveTimer = setInterval(() => {
+                try {
+                  controller.enqueue(SSE_KEEPALIVE_BYTES);
+                } catch {
+                  stopKeepalive();
+                }
+              }, 15000);
+            };
+            const safeClose = () => {
+              // `controller.close()` throws TypeError if the stream is
+              // already errored (e.g. previous enqueue failed). We're
+              // exiting anyway — swallow.
+              try { controller.close(); } catch { /* already closed/errored */ }
+            };
+            const cleanup = () => {
+              stopKeepalive();
+              request.signal.removeEventListener('abort', onAbort);
+            };
+
+            // Single transport boundary: try SSE first, fall back to
+            // Web Push on stream-gone OR enqueue failure. Used for
+            // both normal `event: payload` and `event: error`.
+            const safeEnqueue = async (eventName, body, onFallbackFail) => {
+              const fallback = async () => {
+                try {
+                  await sendPushWithMaybeBlob(body, payload, processorCtx, sessionId);
+                } catch (pushErr) {
+                  if (onFallbackFail) onFallbackFail(pushErr);
+                }
+              };
+              if (!streamUsable) {
+                await fallback();
+                return;
+              }
+              try {
+                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${JSON.stringify(body)}\n\n`));
+              } catch {
+                streamUsable = false;
+                stopKeepalive();
+                await fallback();
+              }
+            };
+
+            processorCtx.deliver = async (pushPayload) => {
+              await safeEnqueue('payload', ensureStableMessageId(pushPayload));
+            };
+            startKeepalive();
+
+            try {
+              await runWithLifecycleHooks();
+
+              if (streamUsable) {
+                try { controller.enqueue(SSE_DONE_BYTES); } catch { /* race with abort */ }
+                safeClose();
+              }
+            } catch (err) {
+              // HookError carries an in-loop ErrorPush that already
+              // shipped via `deliver` (as event: payload) before the
+              // throw — don't echo a second `event: error` for the
+              // same logical failure. Other errors (LlmCallError,
+              // unexpected) had no in-loop diagnostic and DO need one.
+              if (err instanceof HookError) {
+                safeClose();
+              } else {
+                const diag = buildErrorPush({
+                  messageType: MESSAGE_TYPE.INSTANT,
+                  source: PUSH_SOURCE.INSTANT,
+                  messageId: `msg_${randomUUID()}_error`,
+                  sessionId,
+                  code: err?.code || 'INTERNAL_ERROR',
+                  message: err?.message || '内部错误',
+                  timestamp: new Date().toISOString(),
+                });
+                await safeEnqueue('error', diag, (pushErr) => {
+                  onEvent({ type: 'sse_error_fallback_failed', sessionId, cause: pushErr });
+                });
+                safeClose();
+              }
+            } finally {
+              cleanup();
+            }
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          }
+        }
+      );
+
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
       const status = mapErrorStatus(err, code);
-      // Unified HTTP envelope: every error goes through
-      // `error: { code, message }` so SDK consumers can always read
-      // `body.error.code`. The push-payload wire format (what the SW
-      // receives) is a separate layer — since 0.8.0 it's an ErrorPush
-      // (`messageKind: 'error'`, `code`, `message`, `iteration?`) built
-      // via `buildErrorPush(...)`. The pre-0.8.0 `{type:'error', code,
-      // ...}` envelope is gone — do not look for the `type` field.
       return respond(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' },

@@ -23,6 +23,7 @@ import {
   createFetchRouter,
   decryptCapturedPushBody,
   makeLlmResponse,
+  consumeSse,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -36,8 +37,8 @@ before(async () => {
 });
 
 describe('e2e: push payload contract parity with amsg-server', () => {
-  it('produces a ContentPush carrying all 13 legacy fields + messageKind + sessionId', async () => {
-    const payload = {
+  function buildPayload() {
+    return {
       contactName: '小手机',
       avatarUrl: 'https://example.com/avatar.png',
       completePrompt: 'reply with two sentences in Chinese',
@@ -48,6 +49,10 @@ describe('e2e: push payload contract parity with amsg-server', () => {
       pushSubscription: subKit.subscription,
       metadata: { foo: 'bar', n: 42 },
     };
+  }
+
+  it('opt-out (Accept: application/json): produces a ContentPush carrying all 13 legacy fields + messageKind + sessionId', async () => {
+    const payload = buildPayload();
 
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,
@@ -57,7 +62,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
     const req = new Request('http://localhost/instant', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(payload),
     });
     const res = await handler(req);
@@ -116,5 +121,43 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     // Both pushes share the SAME sessionId — that's the new
     // "one LLM round → one sessionId" invariant from the shared schema.
     assert.equal(captured[0].sessionId, captured[1].sessionId);
+  });
+
+  it('SSE (default): streams the same ContentPush field shape over event: payload, no Web Push', async () => {
+    const payload = buildPayload();
+
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => makeLlmResponse('第一句。第二句！'),
+    });
+
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const res = await handler(req);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 2);
+    assert.equal(router.pushCalls.length, 0, 'SSE happy path must not fall back to Web Push');
+
+    const required = [
+      'title', 'message', 'contactName', 'messageId', 'messageIndex',
+      'totalMessages', 'messageType', 'messageSubtype', 'taskId',
+      'timestamp', 'source', 'avatarUrl', 'metadata',
+      'messageKind', 'sessionId',
+    ];
+    for (const field of required) {
+      assert.ok(field in payloads[0], `payload missing field: ${field}`);
+    }
+    assert.equal(payloads[0].messageKind, 'content');
+    assert.equal(payloads[0].message, '第一句。');
+    assert.equal(payloads[1].message, '第二句！');
+    assert.equal(payloads[0].sessionId, payloads[1].sessionId);
   });
 });

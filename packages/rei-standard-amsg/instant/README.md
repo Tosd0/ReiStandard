@@ -37,6 +37,8 @@ npm install @rei-standard/amsg-instant
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
 | `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
 | `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
+| `onBeforeLoop`      | function  | ❌   | **0.9.0+**：主 LLM loop 启动前调用，约定同步启动副任务并返回 handle 对象。返回值透传给 `onAfterLoop` 的 `pending`。SSE / 纯 Push 两种传输模式都生效。见 [生命周期 hooks](#生命周期-hooks-onbeforeloop--onafterloop090) |
+| `onAfterLoop`       | function  | ❌   | **0.9.0+**：主 loop 结束后、流关闭前调用，从 `pending` 拿到 `onBeforeLoop` 返回的副任务 handle，await 完用 `deliver(payload)` 追加 push |
 | `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
 | `multipart`         | object    | ❌   | **0.8.0+**：通用 multipart transport。超出 inline、且没配 BlobStore 时，任意 JSON-safe payload 都可拆成 `_multipart` 分片。默认 `enabled:true`、`maxChunkBytes:1800`、`ttlMs:60000`、`maxChunks:128`、`maxTotalBytes:256000`。见 [Generic multipart transport](#generic-multipart-transport080)。 |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
@@ -98,12 +100,44 @@ const handler = createInstantHandler({
 
 ### HTTP 协议
 
-**请求**：
+#### 传输模式协商（0.9.0+）
+
+| 请求头                          | 响应                              | 适用场景                                            |
+|---------------------------------|-----------------------------------|-----------------------------------------------------|
+| 缺省 / 任意其他 Accept           | `Content-Type: text/event-stream` | **默认**。每条 push 走 SSE 流式直推，前台主线程直接消化，iOS 不爆通知，断流时自动 fallback Web Push |
+| `Accept: application/json`      | `Content-Type: application/json`  | 显式 opt-out 回到 0.8.x 纯 Web Push 行为；HTTP 状态码 + JSON body 错误语义都保留 |
+
+`pushSubscription` 在两种模式下都**必填**——SSE 模式下用作断流 / 写入失败时的 fallback 通道。
+
+SSE wire format：
+
+```
+: keepalive            ← 每 15s 一行，防 CDN/proxy 超时
+
+event: payload         ← 每条 push，data 是与 Web Push 通道一字节相同的 JSON
+data: {"messageKind":"reasoning","sessionId":"sess_...",...}
+
+event: payload
+data: {"messageKind":"content","messageId":"msg_...","message":"hello","messageIndex":1,"totalMessages":2,...}
+
+event: payload
+data: {"messageKind":"content","messageId":"msg_...","message":"second","messageIndex":2,"totalMessages":2,...}
+
+event: done            ← 流正常结束的最终信号；客户端可用 stream EOF 兜底
+data: {}
+```
+
+业务错误（LLM 调用失败、未知异常等）在流已开后通过 `event: error\ndata: <完整 ErrorPush>` 投递，HTTP 状态始终是 200——SSE 模式下不能再靠 HTTP 状态码表达错误。`HookError` 例外：诊断 ErrorPush 已经作为 `event: payload` 送出，不重复发 `event: error`。
+
+> 客户端实现见 [`@rei-standard/amsg-client`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) 的 `consumeInstantStream()`。验证非 SSE 响应（含错误页 / 非 2xx）必须先看 `Content-Type` + status，再进 stream parser。
+
+#### 请求
 
 ```http
 POST /instant
 Authorization: Bearer <jwt>     ← 仅当 tokenSigningKey 配置时检查
 X-Client-Token: <token>         ← 仅当 clientToken 配置时检查
+Accept: application/json        ← 可选；显式走纯 Web Push 路径（0.9.0+）
 Content-Type: application/json
 
 {
@@ -198,7 +232,9 @@ curl -X POST https://instant.example.com/instant \
 
 如果想绕开这个规则（比如代理路径很奇怪），传完整 `…/chat/completions` 即可。
 
-**响应**（成功）：
+**响应**（SSE 默认模式，0.9.0+）：见上面 [传输模式协商](#传输模式协商090) 的 wire format。
+
+**响应**（`Accept: application/json` opt-out 模式 / 0.8.x 行为）：
 
 ```json
 {
@@ -209,8 +245,6 @@ curl -X POST https://instant.example.com/instant \
   }
 }
 ```
-
-**响应**（失败）：
 
 ```json
 { "success": false, "error": { "code": "LLM_CALL_FAILED", "message": "..." } }
@@ -305,11 +339,11 @@ type LLMOutputDecision =
 
 lib 给每个 push 自动补这 3 个机械字段（hook 自己设 `messageId` 会被尊重，其余 2 个无论 hook 写什么都被覆盖）：
 
-| 字段            | 自动补充行为                                                       |
-|-----------------|-------------------------------------------------------------------|
-| `messageId`     | hook 未设 → lib 用 `msg_<uuid>_chunk_<i>` 填上；hook 已设 → 保留   |
-| `messageIndex`  | 永远覆盖：1-based 数组下标（i + 1）                                |
-| `totalMessages` | 永远覆盖：`pushPayloads.length`                                    |
+| 字段            | 自动补充行为                                                                 |
+|-----------------|-----------------------------------------------------------------------------|
+| `messageId`     | hook 未设 → lib 用 `msg_<uuid>` 填上（0.9.0 起；之前是 `msg_<uuid>_chunk_<i>`，chunk 位置已在下两个字段，重复编码到 ID 反而误导）；hook 已设 → 保留 |
+| `messageIndex`  | 永远覆盖：1-based 数组下标（i + 1）                                          |
+| `totalMessages` | 永远覆盖：`pushPayloads.length`                                              |
 
 剩下所有字段（`messageKind` / `notification` / `metadata` / kind 特定字段（e.g. tool_request 的 toolCalls / reasoning 的 reasoningContent / error 的 code） / 等）都是 per-push，caller 完全控制。每个 push 必须 **JSON-safe**（无循环引用 / BigInt / function 字段），否则被当作 hook 契约违反走 `HookError` / `HOOK_THREW` 路径。
 
@@ -557,6 +591,60 @@ POST body（结构与 `/instant` 入口相同 + `sessionId` + `iteration`）：
 - 鉴权链：**完整复用** `/instant` 的 Bearer（配了 `tokenSigningKey` 时）+ clientToken（配了 `clientToken` 时），顺序一致。否则在鉴权模式下 `/continue` 留后门。
 - `completePrompt` 永远不接受（`/continue` 是 v0.7 新端点，跟 v0.6 没关系）。
 - 越界 `iteration`（< 0 / 非整数 / ≥ `maxLoopIterations`）**直接 400 fail-fast**：设计前提是客户端是正常实现，传 999 说明 client 状态坏了，少跑一次多余 LLM 比让 in-loop counter 跑满再吐 LOOP_EXCEEDED 友好。不假设防恶意 client（那是 auth / rate-limit 的事）。
+
+### 生命周期 hooks `onBeforeLoop` / `onAfterLoop`（0.9.0+）
+
+在 `onLLMOutput` 这个"per-turn 决策 hook"之外，0.9.0 加了一对**链路级** hook，给"主 LLM loop 跑的同时并行一些副任务（情绪评估、外部 webhook、统计上报…），结束后把结果作为额外 push 追加"这类需求一个干净的口子，不用把副任务塞进 `onLLMOutput` 里跟决策逻辑挤在一起。
+
+```ts
+createInstantHandler({
+  vapid,
+  onLLMOutput,                         // 0.7.0+ 老 hook，不变
+  onBeforeLoop?: (ctx: {
+    requestBody: unknown;              // 原始请求 body，框架不解析自定义字段
+    sessionId: string;
+    metadata: Record<string, unknown>;
+  }) => unknown | Promise<unknown>,    // 返回值会被 opaque 透传给 onAfterLoop
+  onAfterLoop?: (ctx: {
+    deliver: (payload: unknown) => Promise<void>;
+    sessionId: string;
+    metadata: Record<string, unknown>;
+    requestBody: unknown;
+    pending: unknown;                  // = onBeforeLoop 的返回值
+  }) => Promise<void>,
+});
+```
+
+约定：`onBeforeLoop` 在主 loop 启动前调用，**同步启动副任务、立刻返回 handle 对象**。框架只 `await` 函数返回——不会替你 await 副任务本身。返回值原样进 `onAfterLoop` 的 `pending`。
+
+典型用法：
+
+```js
+onBeforeLoop: ({ requestBody }) => ({
+  // 这些 promise 立刻就在跑了，跟主 LLM loop 并行
+  emotion: runEmotionEval(requestBody),
+  metrics: pushToAnalytics(requestBody),
+}),
+
+onAfterLoop: async ({ pending, deliver, sessionId }) => {
+  const { emotion } = pending;
+  const result = await emotion;                  // 主 loop 这时已经结束了
+  if (result) {
+    await deliver({
+      messageKind: 'emotion_update',
+      sessionId,
+      data: result,
+    });                                          // 作为额外一条 push 追加到本次链路
+  }
+},
+```
+
+两个 hook 在 SSE 与纯 Push 两种传输模式下**都生效**，`deliver` 抹平差异：
+
+- SSE 模式：走当前 SSE controller `enqueue` `event: payload`，失败时 fallback Web Push
+- 纯 Push 模式：直接 `sendPushWithMaybeBlob`
+
+所以 hook 作者不用关心调用方走了哪条传输路径。
 
 ### 事件分类（0.7.0+）
 

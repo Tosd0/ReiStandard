@@ -24,10 +24,13 @@ before(async () => {
   subKit = await generateTestSubscription();
 });
 
+// waitUntil lifecycle wiring is exercised on the pure-push opt-out path —
+// the SSE branch keeps the response stream open by design and does not
+// register a separate background work item.
 function makeRequest(body) {
   return new Request('https://worker.example.com/instant', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(body),
   });
 }
@@ -211,6 +214,7 @@ function makeNodeRequestResponse(body) {
   req.headers = {
     host: 'localhost',
     'content-type': 'application/json',
+    accept: 'application/json',
     'content-length': String(Buffer.byteLength(rawBody)),
   };
   req.socket = {};

@@ -2,6 +2,10 @@
 
 `@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应和 Push 订阅。
 
+## v2.4.0-next.0 — SSE consumer
+
+新增 `consumeInstantStream(payload, endpointPath?, options)`：消费 amsg-instant 0.9.0+ 的 SSE 默认响应，按 frame 解析 `event: payload` / `event: done` / `event: error` 分发到 `options.onPayload`。前台场景下 push 不再绕 push service → SW → IDB → main thread 整条链路，延迟少一个数量级。详见下方 [SSE 流消费](#sse-流消费-consumeinstantstream240配合-amsg-instant-090)。`sendInstant()` 字节级不变；老调用方升级零成本。
+
 ## v2.3.0 — Shared push types
 
 The client now re-exports `@rei-standard/amsg-shared` 的类型、运行时常量（`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`）、推送 builder（`buildContentPush` 等）和类型守卫（`isContentPush` 等）。调用方可以直接 `import { MessageKind, buildContentPush, isContentPush } from '@rei-standard/amsg-client'`，无需单独再装一个 `@rei-standard/amsg-shared` 依赖。client 本身在运行时不消费这些导出 —— 它们是给同时调 `ReiClient` 又在 Service Worker / 客户端处理推送的 app 用的便利出口。
@@ -179,6 +183,40 @@ await client.sendInstant({
 
 - 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
 - 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
+
+### SSE 流消费 `consumeInstantStream`（2.4.0+，配合 amsg-instant 0.9.0+）
+
+`sendInstant()` 只在显式 `Accept: application/json` opt-out 模式下使用。amsg-instant 0.9.0 起默认走 SSE 流式传输——每条 push 通过 `event: payload` 直接打到主线程，省掉 push service → SW → IDB → window 的绕路，前台延迟从约 1–3s 降到次百毫秒。前台场景应该改用 `consumeInstantStream()`。
+
+```js
+const abort = new AbortController();
+
+try {
+  await client.consumeInstantStream(payload, '/instant', {
+    onPayload: async (push) => {
+      // 跟 SW 收到的 wire format 字节级一致：含 messageKind / sessionId / messageId
+      // 等。按 messageKind 分轨写 IDB / 渲染 / 更新 UI 状态机即可。
+      await routePushToIDB(push);
+    },
+    onError: (err) => log.warn('stream error', err),  // 通知性，不抑制 throw
+    onDone:  () => stopSpinner(),
+    signal:  abort.signal,
+  });
+} catch (err) {
+  // 网络 / 协议 / abort / onPayload 抛错都会到这里
+  showError(err);
+}
+```
+
+请求体跟 `sendInstant()` 完全一样——包括必须的 `pushSubscription`：SSE 写失败或客户端断开时 amsg-instant 用它做 best-effort fallback push（同一 `messageId`，客户端按 ID 幂等去重即可）。
+
+#### 错误语义
+
+任何失败——`fetch` 网络异常、非 2xx 响应、非 `text/event-stream` `Content-Type`、SSE `event: error` 帧、`onPayload` 回调抛错、`signal` abort——都会让返回的 Promise reject。`onError` 是**通知性 side-channel**（fire 后照常 throw），不要把它当 try/catch 替代。
+
+#### 端点 / transport 配置
+
+`endpointPath` 默认 `'/instant'`，按需传 `'/continue'` 续跑 tool result。加密 / 明文两种 transport 与 `sendInstant()` 共享构造器配置（`instantEncryption` / `instantClientToken`），调用方无感。
 
 ### 本地软清空：`avatarUrl` 与 payload 体积（2.2.4+ / 2.3.0+）
 

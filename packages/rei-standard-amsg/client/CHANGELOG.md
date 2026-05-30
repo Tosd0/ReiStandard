@@ -1,5 +1,33 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.4.0-next.0 — `consumeInstantStream()` SSE consumer (pre-release)
+
+发布在 `next` dist-tag。配套 `@rei-standard/amsg-instant@0.9.0-next.0+` 的 SSE 默认模式；老的 `sendInstant()` 字节级不变。
+
+### 新增 `consumeInstantStream(payload, endpointPath?, options)`
+
+POST 到 amsg-instant 的 `/instant` 或 `/continue` 端点，按 SSE frame 解析 `event: payload` / `event: error` / `event: done`，分发到 `options.onPayload` 回调；可被 `options.signal` 中止。
+
+```js
+await client.consumeInstantStream(payload, '/instant', {
+  onPayload: async (p) => routeToIDB(p),     // 必填
+  onError:   (err) => log(err),              // 可选；通知用，不抑制 throw
+  onDone:    () => stopSpinner(),            // 可选
+  signal:    abortController.signal,         // 可选
+});
+```
+
+错误语义：网络 / 协议 / abort / `onPayload` 抛错都会让返回的 Promise reject。`onError` 是**通知性 side-channel**（fire 后照常 throw），不是 try/catch 替代——总是 `await` + 外层 `try/catch` 处理。
+
+加密 / 明文两种 transport 共享构造器配置（`instantEncryption` / `instantClientToken`），用法和 `sendInstant` 一致。请求体跟 `sendInstant` 完全一样——包括必须的 `pushSubscription`（SSE 写失败时框架会用它做 fallback push）。
+
+### Spec 细节
+
+- 多行 `data:` 按 SSE 规范用 `\n` 拼接（不是后写覆盖）
+- 非 2xx / 非 `text/event-stream` 响应立即 throw，不进 parser
+- 出错时 `reader.cancel(err)` 关闭底层连接，避免 fetch stream 残留至 GC
+- AbortError 与其他错误一视同仁走 reject——caller 用 `signal` 主动取消时也能拿到 rejection
+
 ## 2.3.0 — Dependency bump
 
 - 依赖更新：同步升级 `@rei-standard/amsg-shared` 至稳定版 `0.1.0`。

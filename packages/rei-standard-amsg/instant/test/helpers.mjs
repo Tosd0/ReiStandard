@@ -201,4 +201,102 @@ export function makeLlmResponse(content, extra = {}) {
   };
 }
 
+/**
+ * Build a Fetch `Request` for handler tests. `mode` controls the
+ * `Accept` header: `'pure-push'` (default) stamps `application/json`
+ * so the handler takes the opt-out path; `'sse'` leaves Accept absent
+ * so the handler takes the default SSE path. Centralised here so test
+ * files don't each re-implement the same builder.
+ *
+ * @param {{
+ *   url?: string,
+ *   method?: string,
+ *   body?: unknown,
+ *   headers?: Record<string, string>,
+ *   mode?: 'pure-push' | 'sse',
+ * }} [opts]
+ * @returns {Request}
+ */
+export function buildHandlerRequest({
+  url = 'http://localhost/instant',
+  method = 'POST',
+  body,
+  headers = {},
+  mode = 'pure-push',
+} = {}) {
+  const merged = { 'content-type': 'application/json', ...headers };
+  if (mode === 'pure-push' && merged.accept === undefined) {
+    merged.accept = 'application/json';
+  }
+  return new Request(url, {
+    method,
+    headers: merged,
+    body: body === undefined
+      ? undefined
+      : (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+}
+
+/**
+ * Drain an SSE response and return the parsed events. Used by handler
+ * tests that exercise the default (SSE) transport path.
+ *
+ * Returns `{ payloads, errors, doneReceived }`:
+ *   - `payloads`: every `event: payload` (JSON-parsed) in arrival order
+ *   - `errors`: every `event: error` (JSON-parsed) in arrival order
+ *   - `doneReceived`: whether `event: done` arrived before stream EOF
+ *
+ * Keepalive comment lines (`:`-prefixed) are skipped silently.
+ *
+ * @param {Response} res
+ * @returns {Promise<{ payloads: Array<any>, errors: Array<any>, doneReceived: boolean }>}
+ */
+export async function consumeSse(res) {
+  const payloads = [];
+  const errors = [];
+  let doneReceived = false;
+  if (!res.body) return { payloads, errors, doneReceived };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() || '';
+      for (const frame of frames) {
+        if (!frame.trim()) continue;
+        let event = 'message';
+        let data = '';
+        for (const line of frame.split('\n')) {
+          if (line.startsWith(':')) continue;
+          if (line.startsWith('event:')) {
+            event = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            // SSE spec: multi-line `data:` concatenates with `\n`.
+            const piece = line.slice(5).trim();
+            data = data ? `${data}\n${piece}` : piece;
+          }
+        }
+        if (event === 'done') {
+          doneReceived = true;
+          return { payloads, errors, doneReceived };
+        }
+        if (event === 'error' && data) {
+          try { errors.push(JSON.parse(data)); } catch { /* ignore */ }
+          continue;
+        }
+        if (event === 'payload' && data) {
+          try { payloads.push(JSON.parse(data)); } catch { /* ignore */ }
+        }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  return { payloads, errors, doneReceived };
+}
+
 export { bytesToBase64Url, base64UrlToBytes };
