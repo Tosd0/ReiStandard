@@ -1,5 +1,25 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.9.0-next.1 — SSE 分支接入 waitUntil (pre-release)
+
+修补 `0.9.0-next.0` SSE 分支没接生命周期保护的遗漏。
+
+**问题**：SSE 模式下 handler 同步 `return Response`，`ReadableStream.start()` 在后台跑。客户端断开后流不再写字节，fallback 路径里 `await sendPushWithMaybeBlob(...)`（发 HTTP 给 push gateway）失去 runtime 的"还在干活"信号，部分 runtime（典型如 Cloudflare Workers）可能在这一步中途回收 isolate，导致 fallback push **服务端代码没机会跑完**。这是 plan §"环境约束"已经预警过的脆弱点，但 `0.9.0-next.0` 的实现没盖到。
+
+**修复**：SSE 分支也走 `registerWaitUntil`——`start()` 返回前注册一个 deferred，`start()` 的 `finally` 里 resolve。runtime 看到 unresolved promise 就不会先掐 isolate，fallback HTTP 调用得以完整发出。
+
+**保证范围**（去掉网络 / push 服务 / 设备 / SW 这些不可控因素后）：
+
+- 客户端断在 LLM 调用期间 → LLM 跑完 + 所有 push 全走 fallback 发完
+- 客户端断在第 N 条 SSE push 之后 → 第 N+1 条起的 fallback push 完整发出
+
+**不保证**：
+
+- 实际可跑时长**受所在 runtime / 计划档位的 `waitUntil` 与 CPU/wall 上限约束**——不同平台、不同付费层级窗口不一样，本包不承诺具体数字
+- `controller.enqueue()` 返回成功但客户端还没读完那部分字节、随后断开 → 服务端以为送达了不会触发 fallback。修复严格 at-least-once 需要 ACK + replay buffer，本版仍不引入
+
+非 SSE 分支与 `0.9.0-next.0` 一致。
+
 ## 0.9.0-next.0 — SSE 流式传输 + 生命周期 hooks (pre-release)
 
 发布在 `next` dist-tag。**不要在下游 SSE consumer（`@rei-standard/amsg-client@2.4.0-next.0+` 的 `consumeInstantStream`）接入完成前升级到 latest。**

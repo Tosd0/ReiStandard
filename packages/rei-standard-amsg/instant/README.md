@@ -993,6 +993,11 @@ export default createCloudflareWorker((env) => ({
 `createInstantHandler(...)` 挂成 Worker module `fetch` 也支持同样的 `(request, env, ctx)`
 形态。
 
+> **0.9.0+ 默认 SSE 模式同样接入 `waitUntil`**：客户端中途断开后，剩余 payload 的
+> Web Push fallback HTTP 调用也由 `ctx.waitUntil` 保护，runtime 不会在 `fetch(pushService)`
+> 还在 await 的时候回收 isolate。实际可跑窗口受所在 runtime 与计划档位的
+> `waitUntil` / CPU / wall 上限约束。
+
 ```toml
 # wrangler.toml
 name = "amsg-instant"

@@ -367,6 +367,19 @@ export function createInstantHandler(options) {
       // the consumer (no push-gateway rate limit to smooth over).
       processorCtx.spacingMs = 0;
 
+      // Lifecycle protection for the async tail of `start()`. After
+      // client disconnect the SSE controller stops emitting bytes, so
+      // runtimes like Cloudflare Workers lose their "request is alive"
+      // signal and may reclaim the isolate mid-fallback (the `await
+      // fetch(pushService)` inside `sendPushWithMaybeBlob`). Register
+      // a deferred that resolves only after `start()`'s `finally` runs
+      // — the runtime then keeps the isolate alive for the fallback
+      // push HTTP call to actually complete. Subject to the runtime /
+      // plan's own `waitUntil` and CPU/wall budget.
+      let resolveStartDone;
+      const startDone = new Promise((resolve) => { resolveStartDone = resolve; });
+      registerWaitUntil(startDone, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+
       return new Response(
         new ReadableStream({
           async start(controller) {
@@ -466,6 +479,7 @@ export function createInstantHandler(options) {
               }
             } finally {
               cleanup();
+              resolveStartDone();
             }
           }
         }),
