@@ -1,5 +1,23 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.4.0 — `consumeInstantStream()` SSE consumer
+
+配套 `@rei-standard/amsg-instant@0.9.0` 的 SSE 默认模式；同时移除 client 默认请求体大小上限，避免本地误拦长上下文请求。
+
+### New
+
+- 新增 `consumeInstantStream(payload, endpointPath?, options)`，按 SSE frame 解析 `event: payload` / `event: error` / `event: done`，并分发到 `options.onPayload`。
+- 新增构造器选项 `maxPayloadBytes?: number | null`。默认 `null`，不再由 client 对请求体大小做本地限制；显式配置后，超限请求仍抛 `PAYLOAD_TOO_LARGE_LOCAL`。
+- `@rei-standard/amsg-shared` 精确依赖升级到 `0.2.0`，同步 `notification.silent` 类型/校验能力。
+
+### Changed
+
+- 移除默认请求体大小上限。Web Push 单条回复超限仍由 `amsg-instant` 的 BlobStore / multipart 输出链路处理；client 只保留 `avatarUrl` 软清空，避免 data URI 头像把最终 push 撑爆。
+
+### Docs
+
+- `consumeInstantStream` 章节校正：原文写 "SSE 写失败 / 断开才 fallback push"，但 `amsg-instant 0.9.0` 起 Web Push backup 是 **always-on**——SSE 成功 enqueue 也照样发一份同 `messageId` 的 backup，由 SW / client dedupe 收敛。README 改成 "SSE 直送 + Web Push always-on backup + dedupe" 的双路语义；"fallback" 在文档里收窄回它本来该指代的含义（stream 不可用 / enqueue 抛错时的兜底）。仅文档，行为不变。
+
 ## 2.4.0-next.0 — `consumeInstantStream()` SSE consumer (pre-release)
 
 发布在 `next` dist-tag。配套 `@rei-standard/amsg-instant@0.9.0-next.0+` 的 SSE 默认模式；老的 `sendInstant()` 字节级不变。
@@ -34,7 +52,7 @@ await client.consumeInstantStream(payload, '/instant', {
 
 ## 2.3.0-next.1 — avatarUrl 本地软清空 (pre-release)
 
-Cherry-pick stable `2.2.4` 的本地 `avatarUrl` 软清空到 next 预发布线。`scheduleMessage` / `sendInstant` / `updateMessage` 不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串）改为 `console.warn` + 在 payload 上置 `null`（`updateMessage` 路径走 `delete` 以保留服务端原头像），请求继续发送。`Error.code === 'INVALID_AVATAR_URL_LOCAL'` 已移除；`PAYLOAD_TOO_LARGE_LOCAL`（3KB 体积上限）保留不变。详见 `2.2.4` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。
+Cherry-pick stable `2.2.4` 的本地 `avatarUrl` 软清空到 next 预发布线。`scheduleMessage` / `sendInstant` / `updateMessage` 不合法的 `avatarUrl`（`data:` URI / 长度 > 2048 / 非字符串）改为 `console.warn` + 在 payload 上置 `null`（`updateMessage` 路径走 `delete` 以保留服务端原头像），请求继续发送。`Error.code === 'INVALID_AVATAR_URL_LOCAL'` 已移除；当时版本的本地请求体体积预检保留不变，稳定版 2.4.0 已改为可选 `maxPayloadBytes` 且默认不限制。详见 `2.2.4` stable 条目；与 `@rei-standard/amsg-server` 2.4.0-next.1 / `@rei-standard/amsg-instant` 0.8.0-next.1 / `@rei-standard/amsg-sw` 2.1.0-next.1（SW 标题 fallback 至 `来自 {contactName}`）同步。
 
 `next.0` → `next.1` 行为变化只此一项；shared push types re-exports 部分**完全不动**。
 
@@ -74,15 +92,15 @@ One import surface — caller apps that consume `ReiClient` and also handle push
 
 ### Fix
 
-- **本地预校验 `avatarUrl` + payload 体积**（配合 [`@rei-standard/amsg-instant` 0.6.1](../instant/CHANGELOG.md#061--2026-05-18) / [`@rei-standard/amsg-server` 2.3.1](../server/CHANGELOG.md#231--2026-05-18)）：之前 `scheduleMessage` / `sendInstant` / `updateMessage` 是纯 payload-agnostic 透传，业务把 `data:image/...;base64,xxx` 当 `avatarUrl` 传进来，client 会先 AES-GCM 加密、再 POST 出去，绕一圈才在远端拿到 `413` 或 Web Push 4KB 上限报错。现在三个方法在发请求之前做两项本地预检：
+- **本地预校验 `avatarUrl` + payload 体积**（配合 [`@rei-standard/amsg-instant` 0.6.1](../instant/CHANGELOG.md#061--2026-05-18) / [`@rei-standard/amsg-server` 2.3.1](../server/CHANGELOG.md#231--2026-05-18)）：之前 `scheduleMessage` / `sendInstant` / `updateMessage` 是纯 payload-agnostic 透传，业务把 `data:image/...;base64,xxx` 当 `avatarUrl` 传进来，client 会先 AES-GCM 加密、再 POST 出去，绕一圈才在远端拿到 `413` 或 Web Push 4KB 上限报错。当时三个方法在发请求之前做两项本地预检；稳定版 2.4.0 已把请求体体积预检改为可选 `maxPayloadBytes`，默认不限制：
   - **avatarUrl**：拒 `data:` URI、拒长度 > 2048 字符、必须是字符串。违规 → 抛 `Error` with `.code === 'INVALID_AVATAR_URL_LOCAL'`。
-  - **payload 体积**：`JSON.stringify(payload)` 的 UTF-8 字节数 > 3072 → 抛 `Error` with `.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，附 `.details = { actualBytes, limitBytes, method }`。3KB 阈值是 Web Push 4KB 硬上限和典型网关 413 阈值往下留的余量；正常 payload（含多轮 messages、apiKey、push subscription）通常 1–2KB。
+  - **payload 体积**：超过当时内置本地阈值会抛 `Error` with `.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，附 `.details = { actualBytes, limitBytes, method }`。此固定阈值在 2.4.0 起不再默认启用。
 - 两个 code 都带 `LOCAL` 后缀，方便业务和远端返回的 `INVALID_PARAMETERS` / `INVALID_PAYLOAD_FORMAT` 区分（一个不耗远端配额，一个耗）。
 - 错误 message 只写「是什么 + 怎么改」（如「头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL」），不写「为什么」—— 触发原因写在本 CHANGELOG / README，避免错误对话框塞一整段背景说明。
 
 ### Compatibility
 
-- 业务**几乎零修改**：除非之前真的在传 `data:` URI 当 avatarUrl 或传 > 3KB 的 payload（那本来就跑不通），否则升级无感。
+- 业务**几乎零修改**：除非之前真的在传 `data:` URI 当 avatarUrl，或命中了当时版本的固定本地体积预检，否则升级无感。
 - 加密格式、headers、endpoint、响应 schema 全部不动。
 - `scheduleMessage` / `sendInstant` / `updateMessage` 的返回类型不变；新增的两类错误**只在抛出时**才出现。
 

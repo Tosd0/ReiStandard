@@ -59,6 +59,9 @@
  *                                                         a *weak* shared secret — it ships inside any
  *                                                         frontend bundle that uses it, so devtools can
  *                                                         read it. Use for casual URL-direct abuse only.
+ * @property {number|null} [maxPayloadBytes=null]        - Optional local UTF-8 byte cap for outgoing request
+ *                                                         payloads before encryption. `null` / omitted means
+ *                                                         no SDK-level request-size limit.
  */
 
 /**
@@ -68,15 +71,6 @@
  * the server would reject.
  */
 const AVATAR_URL_MAX_LENGTH = 2048;
-
-/**
- * Max byte length of a single outgoing payload (3 KB, measured pre-encryption
- * on the plaintext JSON body). Anything over this is almost certainly a base64
- * avatar smuggled into `avatarUrl` and will trigger downstream `413 Payload
- * Too Large` or hit the Web Push 4 KB hard limit at delivery. We bail locally
- * to save a remote round-trip and give a precise error.
- */
-const PAYLOAD_LOCAL_MAX_BYTES = 3072;
 
 function makeLocalError(code, message, details) {
   const err = new Error(`[rei-standard-amsg-client] ${message}`);
@@ -120,6 +114,8 @@ export class ReiClient {
     this._instantClientToken = typeof config.instantClientToken === 'string' && config.instantClientToken
       ? config.instantClientToken
       : '';
+    /** @private */
+    this._maxPayloadBytes = normalizeMaxPayloadBytes(config.maxPayloadBytes);
   }
 
   /**
@@ -181,8 +177,8 @@ export class ReiClient {
    *
    * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
    * client soft-strips it on the payload and emits a `console.warn` — the
-   * schedule still ships, just without an avatar. The only throw left is
-   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * schedule still ships, just without an avatar. If `maxPayloadBytes` is
+   * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
@@ -230,8 +226,8 @@ export class ReiClient {
    *
    * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
    * client soft-strips it on the payload and emits a `console.warn` — the
-   * push still ships, just without an icon. The only throw left is
-   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * push still ships, just without an icon. If `maxPayloadBytes` is
+   * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {Object} payload - Instant message payload.
    * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
@@ -428,8 +424,8 @@ export class ReiClient {
    * If `updates.avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string),
    * the client soft-strips it from the patch and emits a `console.warn` —
    * the rest of the update still applies, and the stored avatar is left
-   * untouched. The only throw left is `PAYLOAD_TOO_LARGE_LOCAL` —
-   * JSON-serialized updates exceed 3 KB.
+   * untouched. If `maxPayloadBytes` is configured, oversized JSON patches
+   * throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {string} uuid    - Task UUID.
    * @param {Object} updates - Fields to update.
@@ -567,21 +563,22 @@ export class ReiClient {
   }
 
   /**
-   * Reject outgoing payloads larger than 3 KB pre-encryption. Spares the
-   * remote a guaranteed 413 / Web Push 4 KB-limit failure and gives the
-   * caller a precise local error pointing at the size cap.
+   * Enforce the optional local request payload cap before encryption.
+   * By default there is no SDK-level request-size limit; runtime, proxy,
+   * database, and LLM-provider limits remain the deployer's boundary.
    *
    * @private
    * @param {string} bodyJson  - `JSON.stringify(payload)`.
    * @param {string} methodName
    */
   _assertPayloadSize(bodyJson, methodName) {
+    if (this._maxPayloadBytes == null) return;
     const bytes = new TextEncoder().encode(bodyJson).length;
-    if (bytes > PAYLOAD_LOCAL_MAX_BYTES) {
+    if (bytes > this._maxPayloadBytes) {
       throw makeLocalError(
         'PAYLOAD_TOO_LARGE_LOCAL',
-        `${methodName} payload 体积 ${bytes} 字节超过本地上限 ${PAYLOAD_LOCAL_MAX_BYTES} 字节`,
-        { method: methodName, actualBytes: bytes, limitBytes: PAYLOAD_LOCAL_MAX_BYTES }
+        `${methodName} payload 体积 ${bytes} 字节超过本地上限 ${this._maxPayloadBytes} 字节`,
+        { method: methodName, actualBytes: bytes, limitBytes: this._maxPayloadBytes }
       );
     }
   }
@@ -672,6 +669,14 @@ export class ReiClient {
     for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
     return arr;
   }
+}
+
+function normalizeMaxPayloadBytes(value) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError('[rei-standard-amsg-client] maxPayloadBytes must be a positive integer when set');
+  }
+  return value;
 }
 
 export {

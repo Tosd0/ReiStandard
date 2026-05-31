@@ -2,9 +2,9 @@
 
 `@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应和 Push 订阅。
 
-## v2.4.0-next.0 — SSE consumer
+## v2.4.0 — SSE consumer
 
-新增 `consumeInstantStream(payload, endpointPath?, options)`：消费 amsg-instant 0.9.0+ 的 SSE 默认响应，按 frame 解析 `event: payload` / `event: done` / `event: error` 分发到 `options.onPayload`。前台场景下 push 不再绕 push service → SW → IDB → main thread 整条链路，延迟少一个数量级。详见下方 [SSE 流消费](#sse-流消费-consumeinstantstream240配合-amsg-instant-090)。`sendInstant()` 字节级不变；老调用方升级零成本。
+新增 `consumeInstantStream(payload, endpointPath?, options)`：消费 amsg-instant 0.9.0+ 的 SSE 默认响应，按 frame 解析 `event: payload` / `event: done` / `event: error` 分发到 `options.onPayload`。前台场景下 push 不再绕 push service → SW → IDB → main thread 整条链路，延迟少一个数量级。详见下方 [SSE 流消费](#sse-流消费-consumeinstantstream240配合-amsg-instant-090)。请求体默认不再由 client 做本地体积限制；需要本地护栏时可在构造器传 `maxPayloadBytes`。
 
 ## v2.3.0 — Shared push types
 
@@ -179,14 +179,14 @@ await client.sendInstant({
 
 `splitPattern` 类型是 `string | string[]`。`scheduleMessage` 也支持，`updateMessage` 可显式传 `splitPattern: null` 重置回默认。client SDK 完全透传不校验，所有错误在 Worker / Server 端返回（每项 ≤ 200 字符、数组 ≤ 10 项、必须能 `new RegExp()` 通过）。
 
-**两个常见 footgun**：
+**两个常见坑**：
 
 - 传**正则 source**，不要带 `/.../` 也不要尾 flag。`'/foo/i'` 会被当字面量斜杠 + 字面量 `i`，不是大小写不敏感的 `foo`。大小写不敏感请用 `[Aa]` 字符类替代。
 - 想让分隔符回贴到前一段（默认行为），把分隔符包进 `(...)` 捕获组。库**不会自动包**——传 `'\\n+'` 而不是 `'(\\n+)'` 会得到首尾相连、分隔符丢失的奇怪结果。
 
 ### SSE 流消费 `consumeInstantStream`（2.4.0+，配合 amsg-instant 0.9.0+）
 
-`sendInstant()` 只在显式 `Accept: application/json` opt-out 模式下使用。amsg-instant 0.9.0 起默认走 SSE 流式传输——每条 push 通过 `event: payload` 直接打到主线程，省掉 push service → SW → IDB → window 的绕路，前台延迟从约 1–3s 降到次百毫秒。前台场景应该改用 `consumeInstantStream()`。
+`sendInstant()` 只在显式 `Accept: application/json` opt-out 模式下使用。amsg-instant 0.9.0 起默认走 SSE 流式传输——每条 push 通过 `event: payload` 直接打到主线程，前台延迟从约 1–3s（push service → SW → IDB → window）降到次百毫秒。Web Push backup 同时**常开 always-on**（即使 SSE enqueue 成功也照样发一份），用 SW / client 端按 `messageId` 做 dedupe 把两路收敛回一次。前台场景应该改用 `consumeInstantStream()`。
 
 ```js
 const abort = new AbortController();
@@ -208,7 +208,12 @@ try {
 }
 ```
 
-请求体跟 `sendInstant()` 完全一样——包括必须的 `pushSubscription`：SSE 写失败或客户端断开时 amsg-instant 用它做 best-effort fallback push（同一 `messageId`，客户端按 ID 幂等去重即可）。
+请求体跟 `sendInstant()` 完全一样——包括必须的 `pushSubscription`。两条投递路径同时跑：
+
+1. **SSE 直送**（首选）——payload 走 `event: payload` 直接到 `onPayload`。
+2. **Web Push always-on backup**——成功 enqueue 的 payload 也会通过 `pushSubscription` 发一份；SSE 写失败 / 客户端断开 / enqueue throw 时也走这条路兜底。
+
+同一 `messageId` 两路都到，由 SW 的 dedupe gate 或客户端按 ID 幂等去重收敛成一次业务投递与一次（必要时的）通知。
 
 #### 错误语义
 
@@ -218,25 +223,33 @@ try {
 
 `endpointPath` 默认 `'/instant'`，按需传 `'/continue'` 续跑 tool result。加密 / 明文两种 transport 与 `sendInstant()` 共享构造器配置（`instantEncryption` / `instantClientToken`），调用方无感。
 
-### 本地软清空：`avatarUrl` 与 payload 体积（2.2.4+ / 2.3.0+）
+### 本地软清空：`avatarUrl` 与可选 payload 体积上限（2.2.4+ / 2.4.0+）
 
-`scheduleMessage` / `sendInstant` / `updateMessage` 在发请求**之前**会在本地做两项保护：
+`scheduleMessage` / `sendInstant` / `consumeInstantStream` / `updateMessage` 在发请求**之前**会保留 `avatarUrl` 软清空保护。请求体大小默认不限制；如果你希望在 SDK 本地先挡住过大的请求，可以在构造器显式传 `maxPayloadBytes`：
+
+```js
+const client = new ReiClient({
+  baseUrl: '/api/v1',
+  userId,
+  maxPayloadBytes: 256_000, // 可选；默认 null / 不限制
+});
+```
 
 | 触发条件 | 处理方式 | 触发原因（背景说明，不在 message 里） |
 | --- | --- | --- |
 | `payload.avatarUrl` 以 `data:` 开头（含 `data:image/...;base64,...`） | `console.warn` + 在 payload 上把 `avatarUrl` 置为 `null`，请求照发（`updateMessage` 从 patch 里删除该字段，保留服务端原头像） | base64 内嵌头像把单个 push payload 撑到几十 KB，远端 Web Push 服务直接返回 4KB 超限 / 网关 `413`。 |
 | `payload.avatarUrl` 长度 > 2048 字符 | 同上 | 同上。建议用 CDN 缩略图 URL。 |
 | `payload.avatarUrl` 不是字符串 | 同上 | 类型错误。 |
-| `JSON.stringify(payload)` UTF-8 字节数 > 3072 | 抛出 `Error.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，错误对象带 `.details = { method, actualBytes, limitBytes }` | 远端网关 / Web Push 4KB 硬上限的本地兜底。 |
+| 已配置 `maxPayloadBytes`，且 `JSON.stringify(payload)` UTF-8 字节数超过该值 | 抛出 `Error.code === 'PAYLOAD_TOO_LARGE_LOCAL'`，错误对象带 `.details = { method, actualBytes, limitBytes }` | 只在调用方主动需要本地请求体护栏时启用。Web Push 单条回复超限由 `amsg-instant` 的 BlobStore / multipart 输出链路处理，不靠 client 限制请求体。 |
 
-头像是装饰字段，单个不合规 URL 不再让整次调度 / 推送挂掉；想拦到错误请监听 `console.warn`，或在调用前自己用 `validateAvatarUrl` 预检（server / instant 包都有导出）。`PAYLOAD_TOO_LARGE_LOCAL` 仍然是真正的"整包过大"信号，照常用 try/catch 捕获：
+头像是装饰字段，单个不合规 URL 不再让整次调度 / 推送挂掉；想拦到错误请监听 `console.warn`，或在调用前自己用 `validateAvatarUrl` 预检（server / instant 包都有导出）。未配置 `maxPayloadBytes` 时不会产生 `PAYLOAD_TOO_LARGE_LOCAL`；配置后照常用 try/catch 捕获：
 
 ```js
 try {
   await client.sendInstant(payload);
 } catch (err) {
   if (err.code === 'PAYLOAD_TOO_LARGE_LOCAL') {
-    // err.details = { method: 'sendInstant', actualBytes: 8732, limitBytes: 3072 }
+    // err.details = { method: 'sendInstant', actualBytes: 87320, limitBytes: 256000 }
   } else {
     throw err;
   }
