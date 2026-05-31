@@ -60,6 +60,10 @@ const REI_SW_MULTIPART_DONE_STORE = 'multipart-done';
 const REI_SW_MULTIPART_CHUNK_STORE = 'multipart-chunk';
 const REI_SW_DB_VERSION = 3;
 let cachedDB = null;
+const REI_AMSG_DEDUPE_DB_NAME = 'rei_amsg_sw_dedupe_v1';
+const REI_AMSG_DEDUPE_STORE = 'delivery-dedupe';
+const DEFAULT_DEDUPE_TTL_MS = 10 * 60_000;
+const DEFAULT_DEDUPE_CLEANUP_INTERVAL_MS = 60_000;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
 const MULTIPART_MESSAGE_KIND = '_multipart';
 const MULTIPART_ENCODING = 'json-utf8-base64url';
@@ -74,6 +78,7 @@ const memoryMultipartPending = new Map();
 const memoryMultipartDone = new Map();
 const memoryMultipartChunks = new Map();
 const multipartLocks = new Map();
+const dedupeDbCache = new Map();
 
 /**
  * Wire-level message type for SW → client postMessage envelopes.
@@ -103,9 +108,12 @@ export const REI_SW_EVENT = Object.freeze({
 
 export const REI_SW_MESSAGE_TYPE = Object.freeze({
   ENQUEUE_REQUEST: 'REI_ENQUEUE_REQUEST',
+  DELIVER: 'REI_AMSG_DELIVER',
   FLUSH_QUEUE: 'REI_FLUSH_QUEUE',
   QUEUE_RESULT: 'REI_QUEUE_RESULT'
 });
+
+export const REI_AMSG_DELIVER_MESSAGE_TYPE = REI_SW_MESSAGE_TYPE.DELIVER;
 
 /**
  * @typedef {Object} ReiSWOptions
@@ -117,7 +125,14 @@ export const REI_SW_MESSAGE_TYPE = Object.freeze({
  * @property {number} [multipart.maxTotalBytes=256000]
  * @property {number} [multipart.maxChunks=128]
  * @property {number} [multipart.cleanupIntervalMs=900000]
+ * @property {Object} [dedupe]
+ * @property {boolean} [dedupe.enabled=true]
+ * @property {number} [dedupe.ttlMs=600000]
+ * @property {number} [dedupe.cleanupIntervalMs=60000]
+ * @property {(payload: any) => string | undefined} [dedupe.key]
+ * @property {string} [dedupe.dbName='rei_amsg_sw_dedupe_v1'] - 隔离去重数据用。每个 dbName 对应一个独立的 IndexedDB instance，互不影响。`dedupe.storeName` 不再可配（传了会抛错）；本包不维护跨 storeName 的迁移逻辑。
  * @property {(payload: any) => void | Promise<void>} [onBusinessPayload]
+ * @property {(info: { key: string, source: string, messageKind?: string, firstSeenAt?: number, existingSource?: string, existingMessageKind?: string, existingNotificationShown?: boolean, duplicateNotificationShown?: boolean }) => void | Promise<void>} [onDuplicate]
  */
 
 /**
@@ -130,20 +145,28 @@ export function installReiSW(sw, opts = {}) {
   const defaultIcon = opts.defaultIcon || '/icon-192x192.png';
   const defaultBadge = opts.defaultBadge || '/badge-72x72.png';
   const multipart = normalizeMultipartOptions(opts.multipart);
+  const dedupe = normalizeDedupeOptions(opts.dedupe);
   let lastMultipartCleanupAt = 0;
+  let lastDedupeCleanupAt = 0;
+  const makeDeliveryContext = (source) => ({
+    defaultBadge,
+    defaultIcon,
+    dedupe,
+    multipart,
+    onDuplicate: opts.onDuplicate,
+    onBusinessPayload: opts.onBusinessPayload,
+    source,
+    getLastDedupeCleanupAt: () => lastDedupeCleanupAt,
+    setLastDedupeCleanupAt: (value) => { lastDedupeCleanupAt = value; },
+    getLastMultipartCleanupAt: () => lastMultipartCleanupAt,
+    setLastMultipartCleanupAt: (value) => { lastMultipartCleanupAt = value; },
+  });
 
   sw.addEventListener('push', (event) => {
     const payload = readPushPayload(event);
     if (!payload) return;
 
-    event.waitUntil(handlePushPayload(sw, payload, {
-      defaultBadge,
-      defaultIcon,
-      multipart,
-      onBusinessPayload: opts.onBusinessPayload,
-      getLastMultipartCleanupAt: () => lastMultipartCleanupAt,
-      setLastMultipartCleanupAt: (value) => { lastMultipartCleanupAt = value; },
-    }));
+    event.waitUntil(handlePushPayload(sw, payload, makeDeliveryContext('webpush')));
   });
 
   sw.addEventListener('message', (event) => {
@@ -154,6 +177,11 @@ export function installReiSW(sw, opts = {}) {
       event.waitUntil(
         enqueueAndFlush(sw, event, message.request)
       );
+      return;
+    }
+
+    if (message.type === REI_SW_MESSAGE_TYPE.DELIVER) {
+      event.waitUntil(handleDeliverMessage(sw, event, message, makeDeliveryContext()));
       return;
     }
 
@@ -175,18 +203,58 @@ async function handlePushPayload(sw, payload, ctx) {
     if (!ctx.multipart.enabled) return;
     const restoredPayload = await acceptMultipartChunk(sw, payload, ctx.multipart);
     if (!restoredPayload) return;
-    await handlePushPayload(sw, restoredPayload, ctx);
-    return;
+    return handlePushPayload(sw, restoredPayload, ctx);
+  }
+
+  const claim = await claimDedupe(payload, ctx);
+  if (claim.duplicate) {
+    const duplicateNotification = await maybeShowDuplicateNotification(sw, payload, claim, ctx);
+    claim.duplicateNotification = duplicateNotification;
+    await notifyDuplicate(payload, claim, ctx);
+    return { ...claim, duplicateNotification };
   }
 
   await dispatchBusinessPayload(sw, payload, {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
     onBusinessPayload: ctx.onBusinessPayload,
+  }, async (intermediateResult) => {
+    // Settle the dedupe pending flag as soon as the notification policy
+    // is decided (dispatch + showNotification done) — do NOT wait for
+    // onBusinessPayload. A backup arriving mid-business would otherwise
+    // hit `notificationStatePending` and skip the repair path.
+    await updateDedupeNotificationState(claim, ctx, intermediateResult);
   });
+  return claim;
 }
 
-async function dispatchBusinessPayload(sw, payload, defaults) {
+async function handleDeliverMessage(sw, event, message, ctx) {
+  let result = {};
+  try {
+    if (!Object.prototype.hasOwnProperty.call(message, 'payload')) {
+      throw new Error('[rei-standard-amsg-sw] REI_AMSG_DELIVER requires payload');
+    }
+    const source = typeof message.source === 'string' && message.source
+      ? message.source
+      : 'message';
+    result = await handlePushPayload(sw, message.payload, { ...ctx, source }) || {};
+    respondToSender(event, {
+      ok: true,
+      duplicate: Boolean(result.duplicate),
+      key: result.key,
+      requestId: message.requestId,
+    });
+  } catch (error) {
+    respondToSender(event, {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Failed to deliver payload',
+      key: result && result.key,
+      requestId: message.requestId,
+    });
+  }
+}
+
+async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSettled) {
   const eventName = resolveEventName(payload);
 
   let clientList = [];
@@ -198,47 +266,56 @@ async function dispatchBusinessPayload(sw, payload, defaults) {
   } catch (_matchError) {
     // Ignored
   }
-  
-  let shouldRenderNotification = false;
-  const showOpt = payload && payload.notification ? payload.notification.show : undefined;
 
-  if (showOpt === 'always') {
-    shouldRenderNotification = true;
-  } else if (showOpt === 'when-hidden') {
-    const hasVisibleClient = clientList.some(client => client.visibilityState === 'visible');
-    shouldRenderNotification = !hasVisibleClient;
-  } else if (showOpt === false) {
-    shouldRenderNotification = false;
-  } else {
-    shouldRenderNotification = isNotificationKind(payload);
-  }
+  const notificationState = {
+    shouldRender: shouldRenderNotification(payload, clientList),
+    shown: false,
+  };
 
   /** @type {Array<Promise<unknown>>} */
-  const work = [dispatchPushToClients(sw, eventName, payload, clientList)];
+  const notificationWork = [dispatchPushToClients(sw, eventName, payload, clientList)];
 
-  if (shouldRenderNotification) {
+  if (notificationState.shouldRender) {
     const notification = createNotificationFromPayload(payload, defaults);
     if (notification) {
-      work.push(
+      notificationWork.push(
         sw.registration.showNotification(notification.title, notification.options)
+          .then(() => {
+            notificationState.shown = true;
+          })
       );
     }
   }
 
+  // Kick the user's business callback off in parallel with notification
+  // work, but do NOT block notification-state settlement on it. A slow
+  // onBusinessPayload would otherwise keep `notificationStatePending`
+  // set, and a Web Push backup arriving in that window would be swallowed
+  // as 'first-delivery-pending' with no chance to repair a missed
+  // notification. The overall waitUntil chain still awaits the business
+  // callback below so the SW does not get killed mid-flight.
+  let businessWork = null;
   if (typeof defaults.onBusinessPayload === 'function') {
     try {
       const result = defaults.onBusinessPayload(payload);
       if (result && typeof result.then === 'function') {
-        work.push(Promise.resolve(result).catch(error => {
+        businessWork = Promise.resolve(result).catch(error => {
           console.error('[rei-standard-amsg-sw] onBusinessPayload promise rejected:', error);
-        }));
+        });
       }
     } catch (error) {
       console.error('[rei-standard-amsg-sw] onBusinessPayload error:', error);
     }
   }
 
-  await Promise.all(work);
+  await Promise.all(notificationWork);
+  const settledResult = { eventName, notification: notificationState };
+  if (typeof onNotificationSettled === 'function') {
+    await onNotificationSettled(settledResult);
+  }
+  if (businessWork) await businessWork;
+
+  return settledResult;
 }
 
 /**
@@ -270,7 +347,6 @@ function resolveEventName(payload) {
  * `messageKind: 'content'` renders a notification; everything else
  * (`reasoning`, `tool_request`, `error`) is dispatched silently so
  * apps can render them in-app.
- *
  * Legacy payloads with no `messageKind` field still render a
  * notification — that's the 2.0.x back-compat path.
  *
@@ -282,6 +358,21 @@ function isNotificationKind(payload) {
   const kind = payload.messageKind;
   if (kind === undefined || kind === null) return true;
   return kind === MESSAGE_KIND.CONTENT;
+}
+
+function shouldRenderNotification(payload, clientList) {
+  const showOpt = payload && payload.notification ? payload.notification.show : undefined;
+
+  if (showOpt === 'always') {
+    return true;
+  }
+  if (showOpt === 'when-hidden') {
+    return !clientList.some(client => client.visibilityState === 'visible');
+  }
+  if (showOpt === false) {
+    return false;
+  }
+  return isNotificationKind(payload);
 }
 
 /**
@@ -374,7 +465,8 @@ function createNotificationFromPayload(payload, defaults) {
       renotify: Boolean(pushNotification.renotify ?? payload.renotify ?? false),
       requireInteraction: Boolean(
         pushNotification.requireInteraction ?? payload.requireInteraction ?? false
-      )
+      ),
+      silent: Boolean(pushNotification.silent ?? payload.silent ?? false)
     }
   };
 }
@@ -398,8 +490,238 @@ function normalizeMultipartOptions(input) {
   };
 }
 
+function normalizeDedupeOptions(input) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+
+  // storeName 不再可配。同 dbName 下 storeName 一变就要做 IDB 版本升级，
+  // 暴露这个配置点的收益（一个内部 store 名字）远小于让用户踩 IDB upgrade
+  // 坑的代价。隔离用 dbName —— 每个 dbName 是独立 IndexedDB instance。
+  if (Object.prototype.hasOwnProperty.call(source, 'storeName')) {
+    throw new Error(
+      '[rei-standard-amsg-sw] dedupe.storeName 不再可配置。改 storeName 会触发 IndexedDB 版本升级，'
+        + '本包不维护 migration 逻辑。需要隔离去重数据请改用 dedupe.dbName（每个 dbName 是独立 IDB 实例）。'
+    );
+  }
+
+  return {
+    enabled: source.enabled !== false,
+    ttlMs: positiveIntegerOrDefault(source.ttlMs, DEFAULT_DEDUPE_TTL_MS),
+    cleanupIntervalMs: source.cleanupIntervalMs === 0
+      ? 0
+      : positiveIntegerOrDefault(
+          source.cleanupIntervalMs,
+          DEFAULT_DEDUPE_CLEANUP_INTERVAL_MS
+        ),
+    key: typeof source.key === 'function' ? source.key : null,
+    dbName: typeof source.dbName === 'string' && source.dbName.trim()
+      ? source.dbName.trim()
+      : REI_AMSG_DEDUPE_DB_NAME,
+    storeName: REI_AMSG_DEDUPE_STORE,
+    _memoryStore: new Map(),
+  };
+}
+
 function positiveIntegerOrDefault(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+async function claimDedupe(payload, ctx) {
+  if (!ctx.dedupe || ctx.dedupe.enabled === false) {
+    return { duplicate: false, key: undefined };
+  }
+
+  const key = resolveDedupeKey(payload, ctx.dedupe);
+  if (!key) return { duplicate: false, key: undefined };
+
+  await maybeCleanupDedupe(ctx);
+
+  const now = Date.now();
+  const record = {
+    key,
+    firstSeenAt: now,
+    expiresAt: now + ctx.dedupe.ttlMs,
+    source: ctx.source || 'unknown',
+    messageKind: getPayloadMessageKind(payload),
+    notificationShown: false,
+    notificationStatePending: true,
+  };
+
+  if (await addDedupeRecord(ctx.dedupe, record)) {
+    return { duplicate: false, key, record };
+  }
+
+  const existing = await readDedupeRecord(ctx.dedupe, key);
+  if (existing && existing.expiresAt <= now) {
+    await deleteDedupeRecord(ctx.dedupe, key);
+    if (await addDedupeRecord(ctx.dedupe, record)) {
+      return { duplicate: false, key, record };
+    }
+  }
+
+  return {
+    duplicate: true,
+    key,
+    record,
+    existing: existing || null,
+  };
+}
+
+async function updateDedupeNotificationState(claim, ctx, dispatchResult) {
+  if (!claim || claim.duplicate || !claim.key || !ctx.dedupe || ctx.dedupe.enabled === false) return;
+  if (!dispatchResult || !dispatchResult.notification) return;
+
+  const notification = dispatchResult.notification;
+  const next = {
+    ...claim.record,
+    notificationShown: notification.shown === true,
+    notificationStatePending: false,
+  };
+
+  try {
+    await putDedupeRecord(ctx.dedupe, next);
+    claim.record = next;
+  } catch (error) {
+    console.error('[rei-standard-amsg-sw] dedupe notification state update failed:', error);
+  }
+}
+
+async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
+  const existing = claim && claim.existing ? claim.existing : null;
+  if (!existing || existing.notificationShown === true) {
+    return { shown: false, reason: existing ? 'already-shown' : 'no-existing-record' };
+  }
+  if (existing.notificationStatePending === true) {
+    return { shown: false, reason: 'first-delivery-pending' };
+  }
+
+  let clientList = [];
+  try {
+    clientList = await sw.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    });
+  } catch (_matchError) {
+    // Ignored
+  }
+
+  if (!shouldRenderNotification(payload, clientList)) {
+    return { shown: false, reason: 'policy-suppressed' };
+  }
+
+  const notification = createNotificationFromPayload(payload, {
+    defaultIcon: ctx.defaultIcon,
+    defaultBadge: ctx.defaultBadge,
+  });
+  if (!notification) {
+    return { shown: false, reason: 'no-notification' };
+  }
+
+  await sw.registration.showNotification(notification.title, notification.options);
+
+  const next = {
+    ...existing,
+    notificationShown: true,
+    notificationStatePending: false,
+  };
+  await putDedupeRecord(ctx.dedupe, next);
+
+  return { shown: true, reason: 'shown-from-duplicate' };
+}
+
+function resolveDedupeKey(payload, dedupe) {
+  if (typeof dedupe.key === 'function') {
+    try {
+      const custom = dedupe.key(payload);
+      return typeof custom === 'string' && custom.trim() ? custom.trim() : undefined;
+    } catch (error) {
+      console.error('[rei-standard-amsg-sw] dedupe.key error:', error);
+      return undefined;
+    }
+  }
+
+  if (!payload || typeof payload !== 'object') return undefined;
+  for (const field of ['messageId', 'id', 'dedupeKey']) {
+    const value = payload[field];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function getPayloadMessageKind(payload) {
+  return payload && typeof payload === 'object' && typeof payload.messageKind === 'string'
+    ? payload.messageKind
+    : undefined;
+}
+
+async function notifyDuplicate(payload, claim, ctx) {
+  if (typeof ctx.onDuplicate !== 'function') return;
+  const existing = claim.existing || {};
+  const info = {
+    key: claim.key,
+    source: ctx.source || 'unknown',
+    messageKind: getPayloadMessageKind(payload),
+    firstSeenAt: existing.firstSeenAt,
+    existingSource: existing.source,
+    existingMessageKind: existing.messageKind,
+    existingNotificationShown: existing.notificationShown === true,
+    duplicateNotificationShown: claim.duplicateNotification && claim.duplicateNotification.shown === true,
+  };
+  try {
+    await ctx.onDuplicate(info);
+  } catch (error) {
+    console.error('[rei-standard-amsg-sw] onDuplicate error:', error);
+  }
+}
+
+async function maybeCleanupDedupe(ctx) {
+  if (!ctx.dedupe || ctx.dedupe.enabled === false || ctx.dedupe.cleanupIntervalMs === 0) return;
+  const now = Date.now();
+  const last = ctx.getLastDedupeCleanupAt ? ctx.getLastDedupeCleanupAt() : 0;
+  if (last && now - last < ctx.dedupe.cleanupIntervalMs) return;
+  if (ctx.setLastDedupeCleanupAt) ctx.setLastDedupeCleanupAt(now);
+  try {
+    await cleanupDedupeStore(ctx.dedupe, now);
+  } catch (error) {
+    console.error('[rei-standard-amsg-sw] dedupe cleanup failed:', error);
+  }
+}
+
+async function cleanupDedupeStore(dedupe, now) {
+  if (!hasIndexedDB()) {
+    const store = memoryDedupeStoreFor(dedupe);
+    for (const [key, record] of store.entries()) {
+      if (record.expiresAt <= now) store.delete(key);
+    }
+    return;
+  }
+
+  await withDedupeStore(dedupe, 'readwrite', (store, resolve, reject) => {
+    const index = store.index('expiresAt');
+    const range = IDBKeyRange.upperBound(now);
+    let failed = false;
+    const request = index.openCursor(range);
+    request.onsuccess = () => {
+      if (failed) return;
+      const cursor = request.result;
+      if (!cursor) {
+        resolve(undefined);
+        return;
+      }
+
+      const deleteRequest = cursor.delete();
+      deleteRequest.onsuccess = () => {
+        if (failed) return;
+        cursor.continue();
+      };
+      deleteRequest.onerror = () => {
+        if (!failed) {
+          failed = true;
+          reject(deleteRequest.error || new Error('Failed to delete expired dedupe record'));
+        }
+      };
+    };
+    request.onerror = () => reject(request.error || new Error('Failed to scan expired dedupe records'));
+  });
 }
 
 function isMultipartPush(payload) {
@@ -801,6 +1123,78 @@ function respondToSender(event, message) {
   }
 }
 
+async function addDedupeRecord(dedupe, record) {
+  if (!hasIndexedDB()) {
+    const store = memoryDedupeStoreFor(dedupe);
+    if (store.has(record.key)) return false;
+    store.set(record.key, cloneRecord(record));
+    return true;
+  }
+
+  return withDedupeStore(dedupe, 'readwrite', (store, resolve, reject) => {
+    let settled = false;
+    const request = store.add(record);
+    request.onsuccess = () => {
+      settled = true;
+      resolve(true);
+    };
+    request.onerror = (event) => {
+      settled = true;
+      if (request.error && request.error.name === 'ConstraintError') {
+        if (event && typeof event.preventDefault === 'function') event.preventDefault();
+        resolve(false);
+        return;
+      }
+      reject(request.error || new Error('Failed to add dedupe record'));
+    };
+    store.transaction.onerror = () => {
+      if (!settled) reject(store.transaction.error || new Error('Dedupe transaction failed'));
+    };
+  });
+}
+
+function readDedupeRecord(dedupe, key) {
+  if (!hasIndexedDB()) {
+    return Promise.resolve(cloneRecord(memoryDedupeStoreFor(dedupe).get(key) || null));
+  }
+
+  return withDedupeStore(dedupe, 'readonly', (store, resolve, reject) => {
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error('Failed to read dedupe record'));
+  });
+}
+
+function putDedupeRecord(dedupe, record) {
+  if (!record || typeof record.key !== 'string' || !record.key) {
+    return Promise.resolve();
+  }
+
+  if (!hasIndexedDB()) {
+    memoryDedupeStoreFor(dedupe).set(record.key, cloneRecord(record));
+    return Promise.resolve();
+  }
+
+  return withDedupeStore(dedupe, 'readwrite', (store, resolve, reject) => {
+    const request = store.put(record);
+    request.onsuccess = () => resolve(undefined);
+    request.onerror = () => reject(request.error || new Error('Failed to put dedupe record'));
+  });
+}
+
+function deleteDedupeRecord(dedupe, key) {
+  if (!hasIndexedDB()) {
+    memoryDedupeStoreFor(dedupe).delete(key);
+    return Promise.resolve();
+  }
+
+  return withDedupeStore(dedupe, 'readwrite', (store, resolve, reject) => {
+    const request = store.delete(key);
+    request.onsuccess = () => resolve(undefined);
+    request.onerror = () => reject(request.error || new Error('Failed to delete dedupe record'));
+  });
+}
+
 function readMultipartPending(id) {
   return readStoreRecord(REI_SW_MULTIPART_STORE, id);
 }
@@ -946,10 +1340,25 @@ async function withDatabaseStore(storeName, mode, handler) {
   });
 }
 
+async function withDedupeStore(dedupe, mode, handler) {
+  const db = await openDedupeDatabase(dedupe);
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(dedupe.storeName, mode);
+    const store = transaction.objectStore(dedupe.storeName);
+    transaction.onerror = () => reject(transaction.error || new Error('Dedupe transaction failed'));
+    Promise.resolve(handler(store, resolve, reject)).catch(reject);
+  });
+}
+
 function hasIndexedDB() {
   return typeof indexedDB !== 'undefined' &&
     indexedDB &&
     typeof indexedDB.open === 'function';
+}
+
+function memoryDedupeStoreFor(dedupe) {
+  if (!dedupe._memoryStore) dedupe._memoryStore = new Map();
+  return dedupe._memoryStore;
 }
 
 function memoryStoreFor(storeName) {
@@ -962,6 +1371,37 @@ function memoryStoreFor(storeName) {
 function cloneRecord(record) {
   if (record == null) return null;
   return JSON.parse(JSON.stringify(record));
+}
+
+function openDedupeDatabase(dedupe) {
+  const cacheKey = `${dedupe.dbName}:${dedupe.storeName}`;
+  const cached = dedupeDbCache.get(cacheKey);
+  if (cached) return Promise.resolve(cached);
+
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(dedupe.dbName, 1);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const store = db.objectStoreNames.contains(dedupe.storeName)
+        ? request.transaction.objectStore(dedupe.storeName)
+        : db.createObjectStore(dedupe.storeName, { keyPath: 'key' });
+      if (store && !store.indexNames.contains('expiresAt')) {
+        store.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
+    };
+
+    request.onsuccess = () => {
+      const db = request.result;
+      dedupeDbCache.set(cacheKey, db);
+      db.onversionchange = () => {
+        db.close();
+        dedupeDbCache.delete(cacheKey);
+      };
+      resolve(db);
+    };
+    request.onerror = () => reject(request.error || new Error('Failed to open dedupe database'));
+  });
 }
 
 function openQueueDatabase() {

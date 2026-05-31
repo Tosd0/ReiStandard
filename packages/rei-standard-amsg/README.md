@@ -1,13 +1,14 @@
 # ReiStandard AMSG SDK Workspace
 
-主动消息能力的 SDK 工作区，4 个可发布的 npm 包。
+主动消息能力的 SDK 工作区，5 个可发布的 npm 包。
 
 | Package | 版本 | 用途 |
 |---------|------|------|
-| [`@rei-standard/amsg-instant`](./instant/README.md) | `0.6.1` | 一次性即时推送 handler（无 DB / 无 cron / 无租户） |
-| [`@rei-standard/amsg-server`](./server/README.md) | `2.3.2` | 定时 + 周期消息：Blob 租户配置、token 鉴权、标准 handlers |
-| [`@rei-standard/amsg-client`](./client/README.md) | `2.2.3` | 浏览器 SDK：加密、请求封装、Push 订阅 |
-| [`@rei-standard/amsg-sw`](./sw/README.md) | `2.0.1` | Service Worker：推送展示、离线队列、后台重试 |
+| [`@rei-standard/amsg-shared`](./shared/README.md) | `0.2.0` | 三轴推送契约、builders、类型守卫 |
+| [`@rei-standard/amsg-instant`](./instant/README.md) | `0.9.0` | 一次性即时推送 handler（SSE 默认传输 / always-on Web Push backup） |
+| [`@rei-standard/amsg-server`](./server/README.md) | `2.5.0` | 定时 + 周期消息：Blob 租户配置、token 鉴权、标准 handlers |
+| [`@rei-standard/amsg-client`](./client/README.md) | `2.4.0` | 浏览器 SDK：加密、请求封装、Push 订阅、SSE consumer |
+| [`@rei-standard/amsg-sw`](./sw/README.md) | `2.2.0` | Service Worker：推送展示、离线队列、delivery dedupe |
 
 **服务端选哪个**：只发"按钮触发 → 立刻推" 用 `amsg-instant`；要定时 / 周期任务 用 `amsg-server`；两种都要就都装，共用同一套 VAPID + masterKey。
 

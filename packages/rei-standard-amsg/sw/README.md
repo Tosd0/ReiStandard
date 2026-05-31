@@ -52,7 +52,10 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 - `"when-hidden"`：仅当没有 `visibilityState === "visible"` 的客户端时才弹系统通知。如果应用在前台，则静默。
 - `false`：强制不弹通知，即使是 `content`。适合完全交给应用自行接管或自绘弹窗的场景。
 
-当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
+当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `renotify`, `requireInteraction`, `silent`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
+
+> **APNs / iOS Web Push 提醒**
+> 如果业务大量发送后台 push 却长期不展示可见通知，iOS Web Push 的送达可能被系统策略影响。生产环境建议对后台消息使用 `notification.show = "always"` 或 `"when-hidden"`，再配合 `tag` 折叠与 `silent: true` 降低打扰。
 
 #### 场景示例
 
@@ -88,9 +91,92 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 > **注意：对于 multipart 传输**
 > 当 payload 通过 `_multipart` 分片时，未收齐前不仅不派发业务事件，也**绝不**弹系统通知。收齐并还原为原始 payload 后，再按原始 payload 的 `notification.show` 策略执行判定。
 
+### Delivery dedupe（通知前去重）
+
+`installReiSW()` 默认启用包级 dedupe。所有业务 payload 不管来自 Web Push、multipart 还原、blob envelope，还是页面通过 `postMessage` 桥接进 SW，都会先经过同一个 gate：
+
+```
+dedupe -> notification.show 策略 -> showNotification / postMessage / onBusinessPayload
+```
+
+第一次到达的 payload 会正常走 `notification.show` 策略、窗口广播和 `onBusinessPayload`。重复 payload **不会**再次广播，也**不会**再次调用 `onBusinessPayload`；如果第一次到达时因为前台可见等原因没有展示系统通知，而后到的 Web Push backup 已经满足 `notification.show` 条件，SW 会只补一次系统通知，然后把结果放进 `onDuplicate(info)`。这层去重发生在业务落地前面，不依赖业务层 inbox 自己兜底。
+
+默认 key 按顺序读取：
+
+1. `payload.messageId`
+2. `payload.id`
+3. `payload.dedupeKey`
+
+没有 key 时不去重，保持旧 payload 兼容。multipart 会先还原成原始 payload 再取 key；blob envelope 如果携带 `messageId` / `id` / `dedupeKey`，也会被同一套 gate 覆盖。
+
+```js
+installReiSW(self, {
+  dedupe: {
+    enabled: true,              // 默认 true
+    ttlMs: 10 * 60_000,         // 默认 10 分钟
+    dbName: 'rei_amsg_sw_dedupe_v1', // 想隔离另一套去重数据就改这个；每个 dbName 是独立 IDB instance
+    key: (payload) => payload.messageId,
+  },
+  onDuplicate: async (info) => {
+    // { key, source, messageKind, firstSeenAt, existingSource,
+    //   existingMessageKind, existingNotificationShown, duplicateNotificationShown }
+  },
+});
+```
+
+实现使用 IndexedDB 的 `add()` + keyPath 做原子 claim：第一次 add 成功才放行；几乎同时到达的同 key payload，后到者会命中 `ConstraintError` 并作为 duplicate 返回。TTL 清理是懒清理，不需要 KV / D1 / Durable Object。
+
+### 页面 -> SW 业务投递
+
+SSE 默认先进页面主线程。若要让 SSE payload 和 Web Push backup 共用 SW 的 dedupe / notification / `onBusinessPayload` 管线，页面可以把 payload 转交给 SW：
+
+```js
+const registration = await navigator.serviceWorker.ready;
+const channel = new MessageChannel();
+
+channel.port1.onmessage = (event) => {
+  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string }
+  // 失败：{ ok: false, error: string, key?: string, requestId?: string }
+};
+
+registration.active?.postMessage({
+  type: 'REI_AMSG_DELIVER',
+  source: 'sse',
+  requestId: crypto.randomUUID(),
+  payload,
+}, [channel.port2]);
+```
+
+Web Push `push` event 和 `REI_AMSG_DELIVER` 最终都会进入同一个内部 pipeline。SSE 先到时，后来的 Web Push backup 会被 dedupe；Web Push 先到时，后来的 SSE bridge 也会被 dedupe。若首包已经落过业务但没弹通知，重复包只负责按当前 `notification.show` 策略补通知，不会重复触发业务回调。
+
+### 生产推荐链路：SSE + Web Push backup + SW dedupe
+
+0.9.0 / 2.2.0 起，正式环境推荐把“双路投递、包层去重”当作默认责任边界。`amsg-instant` 固定 `backupPush:'on'`，所以 Worker 不需要等断线才发 backup；client 收到 SSE 后应立刻桥接给 SW；SW 负责统一去重、补通知和业务落地。
+
+| 环节 | 包配置 / 调用 | 推荐值 | 责任 |
+|------|---------------|--------|------|
+| Worker 侧 SSE | `createInstantHandler({ sse })` | 可省略；等价于 `backupPush:'on'`, `keepaliveMs:1_000`, `immediateKeepalive:true` | SSE 正常流式返回，同时每条 payload 都发 Web Push backup |
+| Client 侧 SSE → SW | `consumeInstantStream(..., { onPayload })` 内立刻 `postMessage({ type:'REI_AMSG_DELIVER', payload, source:'sse', requestId })` | 强烈推荐 | 让 SSE 与 Web Push 进入同一条 SW delivery / dedupe 管线 |
+| SW 侧 dedupe | `installReiSW(self, { dedupe })` | 可省略；默认启用，key 为 `messageId` → `id` → `dedupeKey`，TTL 10 分钟 | 先到者触发业务，后到者不重复入库；必要时只补系统通知 |
+| 通知策略 | `payload.notification.show` | 普通内容推荐 `'when-hidden'`；低打扰更新可加 `silent:true` + `tag` | 前台交给 UI，隐藏/关闭后由 Web Push backup 补通知 |
+
+一个最小形态：
+
+```js
+installReiSW(self, {
+  defaultIcon: './icons/icon-192.png',
+  defaultBadge: './icons/icon-192.png',
+  multipart: { enabled: true },
+  onBusinessPayload: async (payload) => persistIncomingPayload(payload),
+  onDuplicate: async (info) => traceDuplicate(info),
+});
+```
+
+这样当前台页面还活着时，SSE bridge 先进入 SW，`notification.show:'when-hidden'` 不弹系统通知但会触发业务落地；如果页面随后隐藏或已关闭，Web Push backup 到达 SW 后会命中同一个 key，只补通知，不重复调用 `onBusinessPayload`。
+
 ### Blob envelope
 
-当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
+当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type?, messageId?, id?, dedupeKey? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
 
 ### Generic multipart transport（2.1.0+）
 

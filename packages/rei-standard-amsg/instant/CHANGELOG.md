@@ -1,5 +1,93 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.9.0 — always-on SSE backup push + keepalive controls
+
+- **New**: SSE backup push 固定开启。SSE payload enqueue 成功后立即发送同 `messageId` 的 Web Push backup，配合 `@rei-standard/amsg-sw` 默认 dedupe 作为正式环境推荐链路。
+- **Changed**: `sse.backupPush:'off' | 'delayed'` 与 `sse.backupDelayMs` 在稳定版中移除并拒绝配置，避免正式部署误入已知可能丢 payload 的模式。
+- **New**: SSE keepalive 可配置，默认 `immediateKeepalive:true` + `keepaliveMs:1000`，并把 `keepaliveMs` clamp 到最小 250ms。
+- **New**: SSE transport 事件补齐：`sse_payload_enqueued`、`sse_payload_enqueue_failed`、`sse_stream_aborted`、`sse_stream_canceled`、`backup_push_scheduled`、`backup_push_sent`、`backup_push_failed`、`fallback_push_sent`、`fallback_push_failed`。`backup_push_*` 事件 payload 不再带 `delayMs` 字段（always-on backup 后永远是 0，留着只是噪声）。
+- **Fix**: SSE `ReadableStream.cancel(reason)` 现在会标记 stream 不可用，后续 payload 走 Web Push fallback。
+- **Fix**: Blob envelope 现在携带原始 payload 的 `messageId` / `id` / `dedupeKey`，让 SSE payload 与 blob backup 能在 `@rei-standard/amsg-sw` 层共用 dedupe。
+- **Docs**: `safeEnqueue` 内联注释跟 always-on backup 行为对齐——之前注释只描述了 fallback 路径，没提成功 enqueue 也会照样发同 `messageId` 的 backup push。注释修正，行为不变。
+
+## 0.9.0-next.1 — SSE 分支接入 waitUntil (pre-release)
+
+修补 `0.9.0-next.0` SSE 分支没接生命周期保护的遗漏。
+
+**问题**：SSE 模式下 handler 同步 `return Response`，`ReadableStream.start()` 在后台跑。客户端断开后流不再写字节，fallback 路径里 `await sendPushWithMaybeBlob(...)`（发 HTTP 给 push gateway）失去 runtime 的"还在干活"信号，部分 runtime（典型如 Cloudflare Workers）可能在这一步中途回收 isolate，导致 fallback push **服务端代码没机会跑完**。这是 plan §"环境约束"已经预警过的脆弱点，但 `0.9.0-next.0` 的实现没盖到。
+
+**修复**：SSE 分支也走 `registerWaitUntil`——`start()` 返回前注册一个 deferred，`start()` 的 `finally` 里 resolve。runtime 看到 unresolved promise 就不会先掐 isolate，fallback HTTP 调用得以完整发出。
+
+**保证范围**（去掉网络 / push 服务 / 设备 / SW 这些不可控因素后）：
+
+- 客户端断在 LLM 调用期间 → LLM 跑完 + 所有 push 全走 fallback 发完
+- 客户端断在第 N 条 SSE push 之后 → 第 N+1 条起的 fallback push 完整发出
+
+**不保证**：
+
+- 实际可跑时长**受所在 runtime / 计划档位的 `waitUntil` 与 CPU/wall 上限约束**——不同平台、不同付费层级窗口不一样，本包不承诺具体数字
+- `controller.enqueue()` 返回成功但客户端还没读完那部分字节、随后断开 → 服务端以为送达了不会触发 fallback。修复严格 at-least-once 需要 ACK + replay buffer，本版仍不引入
+
+非 SSE 分支与 `0.9.0-next.0` 一致。
+
+## 0.9.0-next.0 — SSE 流式传输 + 生命周期 hooks (pre-release)
+
+发布在 `next` dist-tag。**不要在下游 SSE consumer（`@rei-standard/amsg-client@2.4.0-next.0+` 的 `consumeInstantStream`）接入完成前升级到 latest。**
+
+### 默认传输模式切换为 SSE
+
+不带 `Accept: application/json` 的请求现在返回 `text/event-stream`：每条 push 通过 `event: payload\ndata: <json>\n\n` 流式投递，流末尾发 `event: done\ndata: {}\n\n`。结果直达主线程（不绕 push service → SW → IDB → window 这条链路），延迟从约 1–3s 降到次百毫秒；iOS WebKit 也不再为每条 payload 触发系统通知。
+
+显式带 `Accept: application/json` 走 0.8.x 既有的纯 Web Push 路径，行为字节级不变——`{"success": true, "data": {...}}` JSON 响应、错误码与状态码映射、1500ms 间隔节奏都保留。
+
+> 请求 body 仍**必须**带 `pushSubscription`：SSE 写失败或客户端断开时框架用它做 best-effort fallback push。
+
+### Best-effort SSE → Web Push fallback
+
+SSE 写入抛错或 `request.signal.aborted` 触发 → 当前及后续 payload 自动走 `sendPushWithMaybeBlob` 转发到 Web Push 通道。同一 payload 在 SSE 和 fallback Push 上共用同一 `messageId`，客户端按 ID 幂等去重即可。
+
+第一版**不做**严格 at-least-once / exactly-once：
+
+- SSE `controller.enqueue()` 只意味着字节进了 Worker 出口队列，不代表客户端已读完并入库
+- 可能重复（SSE 发了但客户端没处理完就断了，Push 又补发同一条）
+- 也可能少量丢失 in-flight payload
+- 严格交付保证需要 ACK + replay buffer，这版不引入
+
+### 新增 `onBeforeLoop` / `onAfterLoop` 生命周期 hook
+
+```ts
+onBeforeLoop?: (ctx: { requestBody, sessionId, metadata }) => unknown | Promise<unknown>;
+onAfterLoop?:  (ctx: { deliver, sessionId, metadata, requestBody, pending }) => Promise<void>;
+```
+
+`onBeforeLoop` 在主 LLM loop 启动**前**调用，约定 hook 同步启动副任务并返回 handle 对象（例如 `{ lookup: runBackgroundLookup(...) }`，里面的 promise 已经在跑）。框架只 await 函数返回——**不**会替你 await 副任务本身。返回值作为 `pending` 透传给 `onAfterLoop`，由后者按自己的结构 `await` 并通过 `deliver(payload)` 追加 push。
+
+两个 hook 在 SSE 与纯 Push 两种传输模式下都生效，`deliver` 抹平差异——hook 作者不用关心当前哪种传输。`requestBody` 透传给 hook（框架不解析调用方的自定义字段）。
+
+### 流内业务错误
+
+SSE 流已开后，业务错误（`LlmCallError`、未知异常）通过 `event: error\ndata: <完整 ErrorPush>\n\n` 投递，HTTP 状态始终是 200——SSE 模式不能再靠 HTTP 状态码表达错误。客户端按 `messageKind === 'error'` 分轨即可，与 push 通道的 ErrorPush 是同一形状。
+
+**`HookError` 例外**：hook throw 时框架已经在 loop 内通过 `deliver` 把诊断 ErrorPush 作为 `event: payload` 送出，外层 catch 不再重复发 `event: error`——同一个逻辑错误送两次会让下游错误处理器双触发。这是这版有意的取舍；未来加新的"开 loop 后才抛"的错误类型时，按"诊断是否已通过 deliver 出去"判断是否要 emit 外层 `event: error`。
+
+### Keepalive
+
+SSE 空闲时每 15 秒发一行 `: keepalive\n\n` 注释，防 CDN / 反向代理的空连接超时断连。
+
+### 内部 transport abstraction
+
+所有 push 透传统一走 `deliverPush()` 入口，`ensureStableMessageId()` 在边界一次性兜底 `messageId`——之前散落在 `sendPushesSequentially` 的 fallback id 生成逻辑收敛到这里。`createInstantHandler` 把 `ctx.deliver` 设成 SSE enqueue 或 `sendPushWithMaybeBlob`，下游 push builder（reasoning / content / tool_request / error）对传输无感。
+
+副作用：caller 没显式 set `messageId` 时，框架自动生成的 ID 格式从 `msg_<uuid>_chunk_<i>` 改为 `msg_<uuid>`——chunk 位置信息一直在 `messageIndex` / `totalMessages` 字段里，重复编码到 ID 反而误导客户端 dedup 实现。hook 自己 set 的 `messageId` 不受影响。
+
+### 其他
+
+- SSE 模式下 `sendPushesSequentially` 跳过 1500ms 间隔（push gateway 节流不适用于流式直发），纯 Push 模式保留原节奏。多 push 的 SSE 响应感知延迟少 N × 1.5s
+- 内部全面切到 `MESSAGE_TYPE.INSTANT` / `PUSH_SOURCE.INSTANT` 常量
+- SSE 热路径：`TextEncoder` 与 keepalive / done 字节预编码到 module 顶层（不再每请求 `new TextEncoder()` / 每 15s 重新 encode）
+- `controller.close()` / `controller.enqueue()` 全部包在 try/swallow，避免 errored stream 上再次操作炸出 `TypeError`
+- abort listener 命名 + finally 清理，不留 dangling 引用
+
 ## 0.8.2 — readReasoningContent fallback
 
 - **Enhancement**: `readReasoningContent` 添加 fallback 支持。当原生 `reasoning_content` 字段缺失时，会 fallback 检查 `message.content` 是否包含 `<think>...</think>`、`<thinking>...</thinking>` 或 `<thought>...</thought>` 并提取，提供对更多模型（例如 DeepSeek-R1-Distill）的原生兼容。
@@ -22,7 +110,7 @@
 
 ## 0.8.0-next.6 — BREAKING: generic multipart transport (pre-release)
 
-next 阶段把 oversized push 的 transport 收敛成一套通用 multipart 协议。旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除；`reasoning`、`tool_request`、`content`、`error`、`emotion_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，都可以被 `_multipart` 包装。
+next 阶段把 oversized push 的 transport 收敛成一套通用 multipart 协议。旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除；`reasoning`、`tool_request`、`content`、`error`、`status_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，都可以被 `_multipart` 包装。
 
 ### New
 

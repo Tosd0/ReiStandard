@@ -21,7 +21,8 @@
  */
 
 import { validateInstantPayload, validateContinuePayload } from './validation.js';
-import { processInstantMessage } from './message-processor.js';
+import { processInstantMessage, sendPushWithMaybeBlob, ensureStableMessageId } from './message-processor.js';
+import { MESSAGE_TYPE, PUSH_SOURCE, buildErrorPush } from '@rei-standard/amsg-shared';
 import { HookError, PayloadTooLargeError, LlmCallError } from './errors.js';
 import {
   utf8,
@@ -29,6 +30,7 @@ import {
   base64UrlToBytes,
   hmacSha256,
   timingSafeEqualBytes,
+  randomUUID,
 } from './utils.js';
 import {
   DEFAULT_MULTIPART_CHUNK_BYTES,
@@ -38,6 +40,16 @@ import {
 } from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Hot-path SSE encoding helpers. `TextEncoder` is stateless under the
+// hood, and the keepalive comment is fixed bytes — encoding either on
+// every request / every 15s is pure overhead. Hoist once at module
+// load.
+const SSE_ENCODER = new TextEncoder();
+const SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(': keepalive\n\n');
+const SSE_DONE_BYTES = SSE_ENCODER.encode('event: done\ndata: {}\n\n');
+const DEFAULT_SSE_KEEPALIVE_MS = 1000;
+const MIN_SSE_KEEPALIVE_MS = 250;
 
 /**
  * @typedef {Object} VapidConfig
@@ -86,6 +98,10 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *               `{ decision: 'continue',     nextHistory }`
  *               `{ decision: 'skip-push' }`
  *             See README §Agentic Loop.
+ * @property {(ctx: { requestBody: unknown, sessionId: string, metadata: Record<string, unknown> }) => unknown | Promise<unknown>} [onBeforeLoop]
+ *           - **v0.9 hook.** Run before the LLM loop starts. Use to launch parallel tasks.
+ * @property {(ctx: { deliver: (payload: unknown) => Promise<void>, sessionId: string, metadata: Record<string, unknown>, requestBody: unknown, pending: unknown }) => Promise<void>} [onAfterLoop]
+ *           - **v0.9 hook.** Run after the LLM loop ends. Use to await parallel tasks and append payloads.
  * @property {import('./blob-store/interface.js').BlobStoreConfig} [blobStore]
  *           - Optional. When a push payload's
  *             UTF-8 byte length exceeds `maxInlineBytes` (default
@@ -123,6 +139,13 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
  *             `null` disables generic multipart only when `multipart`
  *             is not explicitly configured. It no longer produces
  *             reasoning-only `chunkIndex` / `totalChunks` wire fields.
+ * @property {Object} [sse]
+ * @property {'on'} [sse.backupPush='on']
+ *           - SSE always sends a Web Push backup after every successful
+ *             enqueue. `off` / `delayed` are intentionally rejected so
+ *             production cannot opt into known-lossy delivery modes.
+ * @property {number} [sse.keepaliveMs=1000]
+ * @property {boolean} [sse.immediateKeepalive=true]
  */
 
 /**
@@ -157,6 +180,8 @@ export function createInstantHandler(options) {
   const expectedClientTokenBytes = clientToken ? utf8(clientToken) : null;
   const corsHeaders = buildCorsHeaders(options.cors);
   const onLLMOutput = typeof options.onLLMOutput === 'function' ? options.onLLMOutput : null;
+  const onBeforeLoop = typeof options.onBeforeLoop === 'function' ? options.onBeforeLoop : null;
+  const onAfterLoop = typeof options.onAfterLoop === 'function' ? options.onAfterLoop : null;
   const blobStore = options.blobStore || null;
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
@@ -168,6 +193,7 @@ export function createInstantHandler(options) {
   // Eager validation keeps transport misconfiguration in startup logs /
   // unit tests instead of surprising the first oversized push.
   const multipart = resolveMultipartOptions(options);
+  const sse = resolveSseOptions(options.sse);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -295,7 +321,10 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const work = processInstantMessage(payload, {
+      const isPurePush = request.headers.get('accept') === 'application/json';
+      const sessionId = typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : `sess_${randomUUID()}`;
+
+      const processorCtx = {
         vapid: options.vapid,
         fetch: options.fetch || globalThis.fetch,
         onEvent,
@@ -306,21 +335,238 @@ export function createInstantHandler(options) {
         multipart,
         requestUrl: request.url,
         isResume: isContinue,
-      });
-      registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
-      const result = await work;
-      return respond(200, { success: true, data: result });
+      };
+
+      // Resolve metadata once. `|| {}` would mint two distinct empty
+      // objects for the two hook calls, so any reference-based
+      // book-keeping done by onBeforeLoop wouldn't survive into
+      // onAfterLoop. Sharing one ref also matches caller intuition.
+      const hookMetadata = payload.metadata || {};
+
+      // Single lifecycle helper used by both transport modes — keeps
+      // hook ordering identical regardless of how `deliver` is wired.
+      const runWithLifecycleHooks = async () => {
+        let pending;
+        if (onBeforeLoop) {
+          pending = await onBeforeLoop({ requestBody: payload, sessionId, metadata: hookMetadata });
+        }
+        const result = await processInstantMessage({ ...payload, sessionId }, processorCtx);
+        if (onAfterLoop) {
+          await onAfterLoop({
+            deliver: processorCtx.deliver,
+            sessionId,
+            metadata: hookMetadata,
+            requestBody: payload,
+            pending,
+          });
+        }
+        return result;
+      };
+
+      if (isPurePush) {
+        processorCtx.deliver = async (pushPayload) => {
+          await sendPushWithMaybeBlob(ensureStableMessageId(pushPayload), payload, processorCtx, sessionId);
+        };
+        const work = runWithLifecycleHooks();
+        registerWaitUntil(work, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+        const result = await work;
+        return respond(200, { success: true, data: result });
+      }
+
+      // SSE Mode — pacing is irrelevant since chunks pipe straight to
+      // the consumer (no push-gateway rate limit to smooth over).
+      processorCtx.spacingMs = 0;
+
+      // Lifecycle protection for the async tail of `start()`. After
+      // client disconnect the SSE controller stops emitting bytes, so
+      // runtimes like Cloudflare Workers lose their "request is alive"
+      // signal and may reclaim the isolate mid-fallback (the `await
+      // fetch(pushService)` inside `sendPushWithMaybeBlob`). Register
+      // a deferred that resolves only after `start()`'s `finally` runs
+      // — the runtime then keeps the isolate alive for the fallback
+      // push HTTP call to actually complete. Subject to the runtime /
+      // plan's own `waitUntil` and CPU/wall budget.
+      let resolveStartDone;
+      const startDone = new Promise((resolve) => { resolveStartDone = resolve; });
+      registerWaitUntil(startDone, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
+
+      const backupWork = new Set();
+      let streamUsable = true;
+      let keepaliveTimer = null;
+      let activeController = null;
+
+      const stopKeepalive = () => {
+        if (keepaliveTimer) {
+          clearInterval(keepaliveTimer);
+          keepaliveTimer = null;
+        }
+      };
+      const trackBackupWork = (work) => {
+        backupWork.add(work);
+        work.finally(() => {
+          backupWork.delete(work);
+        });
+      };
+      const messageIdOf = (body) => (
+        body && typeof body === 'object' && typeof body.messageId === 'string'
+          ? body.messageId
+          : undefined
+      );
+      const scheduleBackupPush = (body) => {
+        const messageId = messageIdOf(body);
+        onEvent({ type: 'backup_push_scheduled', sessionId, messageId });
+        const work = (async () => {
+          try {
+            await sendPushWithMaybeBlob(body, payload, processorCtx, sessionId);
+            onEvent({ type: 'backup_push_sent', sessionId, messageId });
+          } catch (pushErr) {
+            onEvent({ type: 'backup_push_failed', sessionId, messageId, cause: pushErr });
+          }
+        })();
+        trackBackupWork(work);
+      };
+      const enqueueKeepalive = () => {
+        if (!streamUsable || request.signal.aborted || !activeController) return;
+        try {
+          activeController.enqueue(SSE_KEEPALIVE_BYTES);
+        } catch {
+          streamUsable = false;
+          stopKeepalive();
+        }
+      };
+      const startKeepalive = () => {
+        if (!streamUsable || request.signal.aborted) return;
+        if (sse.immediateKeepalive) enqueueKeepalive();
+        if (!streamUsable || request.signal.aborted) return;
+        keepaliveTimer = setInterval(enqueueKeepalive, sse.keepaliveMs);
+      };
+      const safeClose = () => {
+        // `controller.close()` throws TypeError if the stream is
+        // already errored (e.g. previous enqueue failed). We're
+        // exiting anyway — swallow.
+        try { activeController && activeController.close(); } catch { /* already closed/errored */ }
+      };
+
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            activeController = controller;
+            const onAbort = () => {
+              if (!streamUsable) return;
+              streamUsable = false;
+              stopKeepalive();
+              onEvent({ type: 'sse_stream_aborted', sessionId });
+            };
+            request.signal.addEventListener('abort', onAbort);
+            if (request.signal.aborted) onAbort();
+
+            const cleanup = () => {
+              stopKeepalive();
+              request.signal.removeEventListener('abort', onAbort);
+            };
+
+            // Dual transport boundary. Two cases, NOT one:
+            //   (1) Always-on backup: when SSE enqueue succeeds we ALSO
+            //       call `scheduleBackupPush(stableBody)` so the same
+            //       `messageId` ships on both SSE and Web Push. The SW
+            //       / client dedupe gate collapses them back to a single
+            //       business delivery (and at most one notification).
+            //   (2) True fallback: when the stream is unusable (gone /
+            //       aborted) or `controller.enqueue` throws, we skip SSE
+            //       entirely and ship the payload via Web Push only.
+            // Used for both normal `event: payload` and `event: error`.
+            const safeEnqueue = async (eventName, body, onFallbackFail) => {
+              const stableBody = ensureStableMessageId(body);
+              const messageId = messageIdOf(stableBody);
+              const fallback = async () => {
+                try {
+                  await sendPushWithMaybeBlob(stableBody, payload, processorCtx, sessionId);
+                  onEvent({ type: 'fallback_push_sent', sessionId, messageId, eventName });
+                } catch (pushErr) {
+                  onEvent({ type: 'fallback_push_failed', sessionId, messageId, eventName, cause: pushErr });
+                  if (onFallbackFail) onFallbackFail(pushErr);
+                }
+              };
+              if (!streamUsable || request.signal.aborted) {
+                streamUsable = false;
+                stopKeepalive();
+                await fallback();
+                return;
+              }
+              try {
+                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${JSON.stringify(stableBody)}\n\n`));
+                onEvent({ type: 'sse_payload_enqueued', sessionId, messageId, eventName });
+                scheduleBackupPush(stableBody);
+              } catch (err) {
+                streamUsable = false;
+                stopKeepalive();
+                onEvent({ type: 'sse_payload_enqueue_failed', sessionId, messageId, eventName, cause: err });
+                await fallback();
+              }
+            };
+
+            processorCtx.deliver = async (pushPayload) => {
+              await safeEnqueue('payload', pushPayload);
+            };
+            startKeepalive();
+
+            try {
+              await runWithLifecycleHooks();
+
+              if (streamUsable) {
+                try { controller.enqueue(SSE_DONE_BYTES); } catch { /* race with abort */ }
+                safeClose();
+              }
+            } catch (err) {
+              // HookError carries an in-loop ErrorPush that already
+              // shipped via `deliver` (as event: payload) before the
+              // throw — don't echo a second `event: error` for the
+              // same logical failure. Other errors (LlmCallError,
+              // unexpected) had no in-loop diagnostic and DO need one.
+              if (err instanceof HookError) {
+                safeClose();
+              } else {
+                const diag = buildErrorPush({
+                  messageType: MESSAGE_TYPE.INSTANT,
+                  source: PUSH_SOURCE.INSTANT,
+                  messageId: `msg_${randomUUID()}_error`,
+                  sessionId,
+                  code: err?.code || 'INTERNAL_ERROR',
+                  message: err?.message || '内部错误',
+                  timestamp: new Date().toISOString(),
+                });
+                await safeEnqueue('error', diag, (pushErr) => {
+                  onEvent({ type: 'sse_error_fallback_failed', sessionId, cause: pushErr });
+                });
+                safeClose();
+              }
+            } finally {
+              cleanup();
+              await Promise.allSettled(Array.from(backupWork));
+              resolveStartDone();
+            }
+          },
+          cancel(reason) {
+            streamUsable = false;
+            stopKeepalive();
+            onEvent({ type: 'sse_stream_canceled', sessionId, reason });
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          }
+        }
+      );
+
     } catch (err) {
       onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
       const status = mapErrorStatus(err, code);
-      // Unified HTTP envelope: every error goes through
-      // `error: { code, message }` so SDK consumers can always read
-      // `body.error.code`. The push-payload wire format (what the SW
-      // receives) is a separate layer — since 0.8.0 it's an ErrorPush
-      // (`messageKind: 'error'`, `code`, `message`, `iteration?`) built
-      // via `buildErrorPush(...)`. The pre-0.8.0 `{type:'error', code,
-      // ...}` envelope is gone — do not look for the `type` field.
       return respond(status, {
         success: false,
         error: { code, message: err?.message || '内部错误' },
@@ -379,6 +625,32 @@ function resolveMultipartOptions(options) {
     ttlMs: resolvePositiveInt(multipart.ttlMs, DEFAULT_MULTIPART_TTL_MS, 'multipart.ttlMs'),
     maxChunks: resolvePositiveInt(multipart.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS, 'multipart.maxChunks'),
     maxTotalBytes: resolvePositiveInt(multipart.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES, 'multipart.maxTotalBytes'),
+  };
+}
+
+function resolveSseOptions(input) {
+  const raw = input === undefined ? {} : input;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('[amsg-instant] sse must be a plain object when set');
+  }
+
+  const backupPush = raw.backupPush === undefined ? 'on' : String(raw.backupPush);
+  if (backupPush !== 'on') {
+    throw new TypeError('[amsg-instant] sse.backupPush is always "on" in 0.9.0 stable');
+  }
+  if (raw.backupDelayMs !== undefined) {
+    throw new TypeError('[amsg-instant] sse.backupDelayMs was removed; backup push is immediate');
+  }
+
+  const keepaliveMs = Math.max(
+    MIN_SSE_KEEPALIVE_MS,
+    resolvePositiveInt(raw.keepaliveMs, DEFAULT_SSE_KEEPALIVE_MS, 'sse.keepaliveMs')
+  );
+
+  return {
+    backupPush,
+    keepaliveMs,
+    immediateKeepalive: raw.immediateKeepalive !== false,
   };
 }
 

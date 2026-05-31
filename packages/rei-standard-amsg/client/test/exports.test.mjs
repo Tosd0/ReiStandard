@@ -91,3 +91,46 @@ test('ReiClient constructs without throwing', () => {
     });
   });
 });
+
+test('ReiClient has no request payload size cap by default', () => {
+  const client = new ReiClient({
+    baseUrl: 'https://example.com',
+    instantEncryption: false,
+  });
+
+  assert.doesNotThrow(() => {
+    client._assertPayloadSize('x'.repeat(70_000), 'sendInstant');
+  });
+});
+
+test('ReiClient maxPayloadBytes opt-in cap throws PAYLOAD_TOO_LARGE_LOCAL', () => {
+  const client = new ReiClient({
+    baseUrl: 'https://example.com',
+    instantEncryption: false,
+    maxPayloadBytes: 10,
+  });
+
+  assert.throws(
+    () => client._assertPayloadSize('x'.repeat(11), 'sendInstant'),
+    (err) => {
+      assert.equal(err.code, 'PAYLOAD_TOO_LARGE_LOCAL');
+      assert.deepEqual(err.details, {
+        method: 'sendInstant',
+        actualBytes: 11,
+        limitBytes: 10,
+      });
+      return true;
+    }
+  );
+});
+
+test('ReiClient rejects invalid maxPayloadBytes config', () => {
+  assert.throws(
+    () => new ReiClient({
+      baseUrl: 'https://example.com',
+      instantEncryption: false,
+      maxPayloadBytes: 0,
+    }),
+    /maxPayloadBytes must be a positive integer/
+  );
+});

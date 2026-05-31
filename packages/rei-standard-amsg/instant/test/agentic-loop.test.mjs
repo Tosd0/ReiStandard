@@ -37,6 +37,8 @@ import {
   createFetchRouter,
   decryptCapturedPushBody,
   base64UrlToBytes,
+  consumeSse,
+  waitForPushCalls,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -74,7 +76,20 @@ function basePayload(overrides = {}) {
   };
 }
 
+// All existing tests in this file pre-date the SSE-default transport
+// and assert on the JSON response body (`res.json()` / `res.status`).
+// To keep that coverage intact, this helper opts the request out into
+// pure-push mode (`Accept: application/json`) by default. New SSE-mode
+// tests build their request via `makeSseRequest()` instead.
 function makeRequest(url, body, headers = {}) {
+  return new Request(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+function makeSseRequest(url, body, headers = {}) {
   return new Request(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...headers },
@@ -131,7 +146,8 @@ describe('agentic loop — decision: finish', () => {
     // sendPushesSequentially auto-fills these on every push.
     assert.equal(decoded.messageIndex, 1);
     assert.equal(decoded.totalMessages, 1);
-    assert.match(decoded.messageId, /^msg_[0-9a-f-]+_chunk_0$/);
+    // ensureStableMessageId stamps `msg_<uuid>` when the hook didn't set one.
+    assert.match(decoded.messageId, /^msg_[0-9a-f-]+$/);
   });
 });
 
@@ -373,14 +389,14 @@ describe('sendPushWithMaybeBlob — byte boundary', () => {
       });
       const blobAdapter = createMemoryBlobStore();
       // Build a JSON string of *exactly* `len` UTF-8 bytes after the
-      // sendPushesSequentially auto-fill enriches the transport copy.
-      // Final shape: {"type":"x","p":"...","messageId":"msg_<uuid>_chunk_0","messageIndex":1,"totalMessages":1}
-      // messageId is the only variable-width field; its UUID is 36 chars,
-      // so messageId value length is `msg_`.length + 36 + `_chunk_0`.length = 48.
+      // transport auto-fill enriches the payload.
+      // Final shape: {"type":"x","p":"...","messageId":"msg_<uuid>","messageIndex":1,"totalMessages":1}
+      // messageId is the only variable-width field; ensureStableMessageId
+      // stamps `msg_<uuid>` so the value length is `msg_`.length + 36 = 40.
       const overhead = JSON.stringify({
         type: 'x',
         p: '',
-        messageId: 'm'.repeat(48),
+        messageId: 'm'.repeat(40),
         messageIndex: 1,
         totalMessages: 1,
       }).length;
@@ -960,5 +976,211 @@ describe('0.8.0 — pushPayloads happy paths', () => {
     assert.equal(caught.messageIndex, 2);
     assert.equal(pushIdx, 2, 'second push attempted, third skipped');
     assert.equal(events.some(e => e.type === 'final_pushed'), false, 'no final_pushed on partial delivery');
+  });
+});
+
+// ─── SSE transport (default mode) ───────────────────────────────────────
+//
+// Mirror tests that exercise each agentic-loop decision branch through
+// the default SSE transport. The pure-push opt-out coverage for the same
+// scenarios lives in the describe blocks above (their local `makeRequest`
+// stamps `Accept: application/json`).
+
+describe('agentic loop — SSE: decision: finish', () => {
+  it('streams the hook-returned payload as event: payload and ends with event: done', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('hi there'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: (ctx) => ({
+        decision: 'finish',
+        pushPayloads: [{ type: 'custom', text: ctx.llmOutputText }],
+      }),
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    const { payloads, errors, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(errors.length, 0);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].type, 'custom');
+    assert.equal(payloads[0].text, 'hi there');
+    assert.equal(payloads[0].messageIndex, 1);
+    assert.equal(payloads[0].totalMessages, 1);
+    assert.match(payloads[0].messageId, /^msg_[0-9a-f-]+$/);
+    await waitForPushCalls(router, 1);
+  });
+});
+
+describe('agentic loop — SSE: decision: tool-request', () => {
+  it('streams the tool-request payload', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('NEED_TOOL get_weather'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => ({
+        decision: 'tool-request',
+        pushPayloads: [{ type: 'tool-request', tool: 'get_weather' }],
+      }),
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].type, 'tool-request');
+    assert.equal(payloads[0].tool, 'get_weather');
+    await waitForPushCalls(router, 1);
+  });
+});
+
+describe('agentic loop — SSE: decision: continue → finish', () => {
+  it('loops once then streams finish payload via SSE', async () => {
+    let llmCalls = 0;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse(`round-${++llmCalls}`),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: (ctx) => {
+        if (ctx.iteration === 0) {
+          return {
+            decision: 'continue',
+            nextHistory: [
+              ...ctx.messages,
+              { role: 'user', content: 'reflect again' },
+            ],
+          };
+        }
+        return { decision: 'finish', pushPayloads: [{ type: 'done' }] };
+      },
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(llmCalls, 2);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].type, 'done');
+    await waitForPushCalls(router, 1);
+  });
+});
+
+describe('agentic loop — SSE: decision: skip-push', () => {
+  it('emits no payload, closes with event: done', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('nothing to push'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => ({ decision: 'skip-push' }),
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    const { payloads, errors, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 0);
+    assert.equal(errors.length, 0);
+    assert.equal(router.pushCalls.length, 0);
+  });
+});
+
+describe('agentic loop — SSE: loop-exceeded', () => {
+  it('streams a LOOP_EXCEEDED ErrorPush as event: payload', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('again'),
+    });
+    const events = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onEvent: (e) => events.push(e),
+      maxLoopIterations: 3,
+      onLLMOutput: (ctx) => ({ decision: 'continue', nextHistory: ctx.messages }),
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+    const { payloads, doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].messageKind, 'error');
+    assert.equal(payloads[0].code, 'LOOP_EXCEEDED');
+    assert.ok(events.find((e) => e.type === 'loop_exceeded'));
+    await waitForPushCalls(router, 1);
+  });
+});
+
+describe('agentic loop — SSE: hook contract violations', () => {
+  it('hook throw → in-loop diagnostic as event: payload, no duplicate event: error', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('boom'),
+    });
+    const events = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onEvent: (e) => events.push(e),
+      onLLMOutput: () => { throw new Error('hook intentional fail'); },
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    // SSE always responds 200 — the error rides on the stream.
+    assert.equal(res.status, 200);
+    const { payloads, errors } = await consumeSse(res);
+    // The in-loop diagnostic flows through deliver as event: payload …
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].messageKind, 'error');
+    assert.equal(payloads[0].code, 'HOOK_THREW');
+    // … and the outer HookError re-throw is intentionally NOT echoed
+    // as event: error — the diagnostic already shipped, second copy
+    // would just double-trigger error handlers downstream.
+    assert.equal(errors.length, 0);
+    assert.ok(events.find((e) => e.type === 'hook_threw'));
+    await waitForPushCalls(router, 1);
+  });
+
+  it('hook returns null → in-loop diagnostic only, no event: error', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => null,
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+    const { payloads, errors } = await consumeSse(res);
+    assert.equal(errors.length, 0);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].code, 'HOOK_THREW');
+  });
+
+  it('hook returns unknown decision tag → in-loop diagnostic only, no event: error', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => makeLlmResponse('whatever'),
+    });
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      onLLMOutput: () => ({ decision: 'bogus' }),
+    });
+    const res = await handler(makeSseRequest('http://h/instant', basePayload()));
+    assert.equal(res.status, 200);
+    const { payloads, errors } = await consumeSse(res);
+    assert.equal(errors.length, 0);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].code, 'HOOK_THREW');
   });
 });

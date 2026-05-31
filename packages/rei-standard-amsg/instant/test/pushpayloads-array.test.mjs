@@ -36,10 +36,13 @@ function basePayload(overrides = {}) {
   };
 }
 
+// Existing tests in this file assert on the Web Push wire shape — keep
+// them on the pure-push opt-out path. SSE-mode coverage lives in
+// agentic-loop.test.mjs and handler.test.mjs.
 function makeRequest(url, body, headers = {}) {
   return new Request(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...headers },
     body: JSON.stringify(body),
   });
 }

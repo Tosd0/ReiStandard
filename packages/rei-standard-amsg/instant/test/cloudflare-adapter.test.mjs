@@ -24,7 +24,18 @@ before(async () => {
   subKit = await generateTestSubscription();
 });
 
+// Default `makeRequest` opts into pure-push so the existing assertions
+// continue to read `messagesSent` from the JSON response body. SSE-mode
+// waitUntil coverage uses `makeSseRequest` below.
 function makeRequest(body) {
+  return new Request('https://worker.example.com/instant', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+function makeSseRequest(body) {
   return new Request('https://worker.example.com/instant', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -128,6 +139,31 @@ describe('Cloudflare waitUntil lifecycle', () => {
     assert.equal(waitUntilPromises.length, 1);
     assert.equal((await waitUntilPromises[0]).messagesSent, 1);
   });
+
+  it('SSE mode also registers a waitUntil deferred so post-disconnect fallback can finish', async () => {
+    // After a client disconnect the SSE stream stops emitting bytes, so
+    // CF runtime needs an explicit waitUntil to keep the isolate alive
+    // for the fallback Web Push HTTP call. This test just verifies the
+    // wiring — actual disconnect behaviour needs Miniflare to exercise.
+    const router = makeRouter();
+    const waitUntilPromises = [];
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(makeSseRequest(makePayload()), {}, {
+      waitUntil(work) {
+        waitUntilPromises.push(work);
+      },
+    });
+
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+    assert.equal(waitUntilPromises.length, 1, 'SSE branch must register a waitUntil');
+
+    // Drain the SSE response so start()'s finally runs and the deferred resolves.
+    const reader = res.body.getReader();
+    while (!(await reader.read()).done) { /* drain */ }
+    await assert.doesNotReject(waitUntilPromises[0]);
+  });
 });
 
 describe('adapter waitUntil lifecycle', () => {
@@ -211,6 +247,7 @@ function makeNodeRequestResponse(body) {
   req.headers = {
     host: 'localhost',
     'content-type': 'application/json',
+    accept: 'application/json',
     'content-length': String(Buffer.byteLength(rawBody)),
   };
   req.socket = {};

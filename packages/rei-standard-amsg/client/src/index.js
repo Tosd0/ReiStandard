@@ -59,6 +59,9 @@
  *                                                         a *weak* shared secret — it ships inside any
  *                                                         frontend bundle that uses it, so devtools can
  *                                                         read it. Use for casual URL-direct abuse only.
+ * @property {number|null} [maxPayloadBytes=null]        - Optional local UTF-8 byte cap for outgoing request
+ *                                                         payloads before encryption. `null` / omitted means
+ *                                                         no SDK-level request-size limit.
  */
 
 /**
@@ -68,15 +71,6 @@
  * the server would reject.
  */
 const AVATAR_URL_MAX_LENGTH = 2048;
-
-/**
- * Max byte length of a single outgoing payload (3 KB, measured pre-encryption
- * on the plaintext JSON body). Anything over this is almost certainly a base64
- * avatar smuggled into `avatarUrl` and will trigger downstream `413 Payload
- * Too Large` or hit the Web Push 4 KB hard limit at delivery. We bail locally
- * to save a remote round-trip and give a precise error.
- */
-const PAYLOAD_LOCAL_MAX_BYTES = 3072;
 
 function makeLocalError(code, message, details) {
   const err = new Error(`[rei-standard-amsg-client] ${message}`);
@@ -120,6 +114,8 @@ export class ReiClient {
     this._instantClientToken = typeof config.instantClientToken === 'string' && config.instantClientToken
       ? config.instantClientToken
       : '';
+    /** @private */
+    this._maxPayloadBytes = normalizeMaxPayloadBytes(config.maxPayloadBytes);
   }
 
   /**
@@ -181,8 +177,8 @@ export class ReiClient {
    *
    * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
    * client soft-strips it on the payload and emits a `console.warn` — the
-   * schedule still ships, just without an avatar. The only throw left is
-   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * schedule still ships, just without an avatar. If `maxPayloadBytes` is
+   * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
@@ -230,8 +226,8 @@ export class ReiClient {
    *
    * If `avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string), the
    * client soft-strips it on the payload and emits a `console.warn` — the
-   * push still ships, just without an icon. The only throw left is
-   * `PAYLOAD_TOO_LARGE_LOCAL` — JSON-serialized payload exceeds 3 KB.
+   * push still ships, just without an icon. If `maxPayloadBytes` is
+   * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {Object} payload - Instant message payload.
    * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
@@ -274,13 +270,161 @@ export class ReiClient {
   }
 
   /**
+   * Consume an instant SSE stream.
+   *
+   * Error semantics: any failure (network, protocol, abort, `onPayload`
+   * callback throwing) rejects the returned Promise. `options.onError`,
+   * when provided, is a side-channel notification (e.g. for logging or
+   * UI flashes) and fires before the rejection — it does not suppress
+   * it. Always wrap calls in `try / await` and treat the rejection as
+   * the canonical error path.
+   *
+   * @param {Object} payload - Instant message payload.
+   * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
+   * @param {Object} options
+   * @param {Record<string, string>} [options.headers]
+   * @param {(payload: unknown) => Promise<void> | void} options.onPayload
+   * @param {(error: unknown) => void} [options.onError]
+   * @param {() => void} [options.onDone]
+   * @param {AbortSignal} [options.signal]
+   * @returns {Promise<void>}
+   */
+  async consumeInstantStream(payload, endpointPath = '/instant', options = {}) {
+    this._sanitizeAvatarUrl(payload);
+    const json = JSON.stringify(payload);
+    this._assertPayloadSize(json, 'consumeInstantStream');
+
+    const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+    let body;
+
+    if (this._instantEncryption === false) {
+      body = json;
+      if (this._instantClientToken) {
+        headers['X-Client-Token'] = this._instantClientToken;
+      }
+    } else {
+      const encrypted = await this._encrypt(json);
+      headers['X-User-Id'] = this._userId;
+      headers['X-Payload-Encrypted'] = 'true';
+      headers['X-Encryption-Version'] = '1';
+      body = JSON.stringify(encrypted);
+    }
+
+    const path = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+    const res = await fetch(`${this._resolveBaseUrl('instant')}${path}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal: options.signal
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Instant request failed: ${res.status} ${text}`);
+    }
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('text/event-stream')) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Expected text/event-stream, got ${contentType}: ${text}`);
+    }
+
+    if (!res.body) {
+      throw new Error('Response body is null');
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let thrown;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || ''; // last part may be incomplete
+
+        for (const part of parts) {
+          if (!part.trim()) continue;
+
+          let eventName = 'message';
+          // Per SSE spec multiple `data:` lines in one event concatenate
+          // with `\n`. Our own server always emits a single data line,
+          // but `consumeInstantStream` is a general-purpose consumer.
+          let data = '';
+
+          const lines = part.split('\n');
+          for (const line of lines) {
+            if (line.startsWith(':')) continue; // keepalive comment
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              const piece = line.slice(5).trim();
+              data = data ? `${data}\n${piece}` : piece;
+            }
+          }
+
+          if (eventName === 'done') {
+            if (options.onDone) options.onDone();
+            return;
+          }
+
+          if (eventName === 'error') {
+            let parsedErr;
+            try {
+              parsedErr = JSON.parse(data);
+            } catch {
+              parsedErr = { code: 'PARSE_ERROR', message: data };
+            }
+            const err = new Error(parsedErr.message || 'Stream error');
+            err.code = parsedErr.code;
+            throw err;
+          }
+
+          if (eventName === 'payload') {
+            let parsedPayload;
+            try {
+              parsedPayload = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            if (options.onPayload) {
+              await options.onPayload(parsedPayload);
+            }
+          }
+        }
+      }
+
+      // Stream ended without `event: done` — treat EOF as done.
+      if (options.onDone) options.onDone();
+    } catch (err) {
+      thrown = err;
+    } finally {
+      // Always notify onError (side-channel) and always throw — callers
+      // rely on Promise rejection as the canonical failure signal.
+      if (thrown) {
+        try { await reader.cancel(thrown); } catch { /* already cancelled */ }
+        if (options.onError) {
+          try { options.onError(thrown); } catch { /* observer can't break the throw */ }
+        }
+        try { reader.releaseLock(); } catch { /* already released */ }
+        throw thrown;
+      }
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+  }
+
+  /**
    * Update an existing scheduled message.
    *
    * If `updates.avatarUrl` is unusable (`data:` URI, > 2 KB, or non-string),
    * the client soft-strips it from the patch and emits a `console.warn` —
    * the rest of the update still applies, and the stored avatar is left
-   * untouched. The only throw left is `PAYLOAD_TOO_LARGE_LOCAL` —
-   * JSON-serialized updates exceed 3 KB.
+   * untouched. If `maxPayloadBytes` is configured, oversized JSON patches
+   * throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
    * @param {string} uuid    - Task UUID.
    * @param {Object} updates - Fields to update.
@@ -418,21 +562,22 @@ export class ReiClient {
   }
 
   /**
-   * Reject outgoing payloads larger than 3 KB pre-encryption. Spares the
-   * remote a guaranteed 413 / Web Push 4 KB-limit failure and gives the
-   * caller a precise local error pointing at the size cap.
+   * Enforce the optional local request payload cap before encryption.
+   * By default there is no SDK-level request-size limit; runtime, proxy,
+   * database, and LLM-provider limits remain the deployer's boundary.
    *
    * @private
    * @param {string} bodyJson  - `JSON.stringify(payload)`.
    * @param {string} methodName
    */
   _assertPayloadSize(bodyJson, methodName) {
+    if (this._maxPayloadBytes == null) return;
     const bytes = new TextEncoder().encode(bodyJson).length;
-    if (bytes > PAYLOAD_LOCAL_MAX_BYTES) {
+    if (bytes > this._maxPayloadBytes) {
       throw makeLocalError(
         'PAYLOAD_TOO_LARGE_LOCAL',
-        `${methodName} payload 体积 ${bytes} 字节超过本地上限 ${PAYLOAD_LOCAL_MAX_BYTES} 字节`,
-        { method: methodName, actualBytes: bytes, limitBytes: PAYLOAD_LOCAL_MAX_BYTES }
+        `${methodName} payload 体积 ${bytes} 字节超过本地上限 ${this._maxPayloadBytes} 字节`,
+        { method: methodName, actualBytes: bytes, limitBytes: this._maxPayloadBytes }
       );
     }
   }
@@ -523,6 +668,14 @@ export class ReiClient {
     for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
     return arr;
   }
+}
+
+function normalizeMaxPayloadBytes(value) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError('[rei-standard-amsg-client] maxPayloadBytes must be a positive integer when set');
+  }
+  return value;
 }
 
 export {

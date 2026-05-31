@@ -1,5 +1,10 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.5.0 — Dependency bump
+
+- 依赖更新：同步升级 `@rei-standard/amsg-shared` 至稳定版 `0.2.0`，让正式发版环境不解析出混版本 shared graph。
+- 运行时行为不变；本包只是随 shared 的 `notification.silent` 类型/校验补齐做协调发版。
+
 ## 2.4.1 — readReasoningContent fallback
 
 - **Enhancement**: `readReasoningContent` 添加 fallback 支持。当原生 `reasoning_content` 字段缺失时，会 fallback 检查 `message.content` 是否包含 `<think>...</think>`、`<thinking>...</thinking>` 或 `<thought>...</thought>` 并提取，提供对更多模型（例如 DeepSeek-R1-Distill）的原生兼容。

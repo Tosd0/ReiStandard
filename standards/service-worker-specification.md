@@ -1375,9 +1375,26 @@ self.addEventListener('notificationclick', (event) => {
 
 ## 15. 变更日志
 
+### v2.2.0 (2026-05-31)
+
+#### 改进优化
+
+**1. Delivery dedupe**
+- `@rei-standard/amsg-sw` 在通知展示和 `onBusinessPayload` 前加入 delivery dedupe gate。
+- 默认 key 顺序为 `payload.messageId` → `payload.id` → `payload.dedupeKey`；没有 key 的 payload 不参与 dedupe。
+- 重复 payload 不重复调用业务回调；如果首包未展示系统通知、重复包到达时 `notification.show` 条件满足，会只补一次通知，并通过 `onDuplicate(info)` 暴露观测信息。
+
+**2. 页面到 SW 的统一投递协议**
+- 新增 `{ type: 'REI_AMSG_DELIVER', payload, source?, requestId? }`，让 SSE page bridge 和 Web Push 进入同一条 SW pipeline。
+- SSE 与 Web Push backup 共用同一个业务 key 时，先到者放行业务回调，后到者被 dedupe 收敛；若需要补系统通知，只补通知不重复业务。
+- 正式环境推荐搭配 `@rei-standard/amsg-instant` 固定 `sse.backupPush = "on"`：SSE 正常流式返回，同时每条 payload 也走 Web Push backup，最终由 SW dedupe 统一收敛。
+
+**3. 无声通知**
+- `notification.silent` 进入 shared 类型与 SW 渲染链路，可配合 `tag` 做折叠、低打扰通知。
+
 ### v2.1.0 (2026-05-25)
 
-#### 🔧 改进优化
+#### 改进优化
 
 **1. 三轴 Push Schema 与 `messageKind`**
 - 引入了 `messageKind` 属性，区分 `content`、`reasoning`、`tool_request`、`error` 类型的推送。
@@ -1386,6 +1403,9 @@ self.addEventListener('notificationclick', (event) => {
 **2. 通知显示策略 (`notification.show`)**
 - 支持通过 `notification.show` 显式控制系统通知行为（`auto`, `always`, `when-hidden`, `false`）。
 - 进一步提升前台应用接管消息的自由度，免除不必要的通知打扰。
+
+> **APNs / iOS Web Push 提醒**
+> 如果业务大量发送后台 push 却长期不展示可见通知，iOS Web Push 的送达可能被系统策略影响。生产环境建议对后台消息使用 `notification.show = "always"` 或 `"when-hidden"`，再配合 `tag` 折叠与 `silent: true` 降低打扰。
 
 **3. `onBusinessPayload` 与 Generic Multipart（SDK 功能）**
 - 统一了分片数据还原逻辑，移除了老的 `chunkIndex` 专属逻辑，改为基于 `_multipart` 进行可靠重组。

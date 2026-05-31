@@ -29,10 +29,14 @@ before(async () => {
   subKit = await generateTestSubscription();
 });
 
+// Existing tests in this file assert on the Web Push wire shape — keep
+// them on the pure-push opt-out path by stamping `Accept: application/json`
+// here. SSE-mode reasoning behavior is covered separately in
+// agentic-loop.test.mjs and handler.test.mjs.
 function makeRequest(body, headers = {}) {
   return new Request('http://localhost/instant', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...headers },
     body: JSON.stringify(body),
   });
 }

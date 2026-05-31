@@ -1,10 +1,10 @@
 {
   "name": "@rei-standard/amsg-client",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "ReiStandard Active Messaging browser client SDK — also re-exports shared push types, builders, and guards from @rei-standard/amsg-shared",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Tosd0/ReiStandard",
+    "url": "git+https://github.com/Tosd0/ReiStandard.git",
     "directory": "packages/rei-standard-amsg/client"
   },
   "license": "MIT",
@@ -33,7 +33,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@rei-standard/amsg-shared": "0.1.0"
+    "@rei-standard/amsg-shared": "0.2.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
