@@ -1,12 +1,12 @@
 /**
  * BlobStore — pluggable transient store for "envelope-redirected" pushes.
  *
- * Web Push has a hard ~3 KB safe-line on plaintext payload (see README
- * §BlobStore for provenance). When the hook returns a large pushPayload
- * (e.g. tool-request envelopes carrying replay history + reasoning),
+ * Web Push has a small plaintext payload budget (see README §BlobStore
+ * for provenance). When the hook returns a large pushPayload (e.g.
+ * tool-request envelopes carrying replay history + reasoning),
  * amsg-instant writes the body to a BlobStoreAdapter and pushes a
- * ~200 B envelope `{ _blob:true, key, url, type? }` instead. The SW
- * fetches `${url}` to recover the original body.
+ * small envelope `{ _blob:true, key, url, type? }` instead. The SW /
+ * client recovers the original body through that envelope contract.
  *
  * Adapter contract:
  *   put(key, body, ttlSeconds)  - durable until ttlSeconds elapses (or

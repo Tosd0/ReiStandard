@@ -654,10 +654,8 @@ async function runAgenticLoop(payload, ctx) {
     }
 
     if (decision.decision === 'continue') {
-      // `nextHistory` REPLACES messages — that's the documented
-      // contract, even though most callers will want to do
-      // `[...ctx.messages, toolResult]`. README §"continue +
-      // nextHistory footgun" warns about this.
+      // `nextHistory` replaces the next-turn messages array. Callers
+      // that want append semantics must pass `[...ctx.messages, next]`.
       messages = Array.isArray(decision.nextHistory) ? decision.nextHistory.slice() : [];
       iteration++;
       continue;
@@ -890,6 +888,12 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
     messageKind: /** @type {{ messageKind?: unknown }} */ (payloadObj).messageKind,
     type: /** @type {{ type?: unknown }} */ (payloadObj).type,
   };
+  for (const field of ['messageId', 'id', 'dedupeKey']) {
+    const value = /** @type {Record<string, unknown>} */ (payloadObj)[field];
+    if (typeof value === 'string' && value) {
+      envelope[field] = value;
+    }
+  }
 
   try {
     await sendWebPush({

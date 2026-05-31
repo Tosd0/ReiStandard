@@ -41,6 +41,7 @@ npm install @rei-standard/amsg-instant
 | `onAfterLoop`       | function  | ❌   | **0.9.0+**：主 loop 结束后、流关闭前调用，从 `pending` 拿到 `onBeforeLoop` 返回的副任务 handle，await 完用 `deliver(payload)` 追加 push |
 | `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
 | `multipart`         | object    | ❌   | **0.8.0+**：通用 multipart transport。超出 inline、且没配 BlobStore 时，任意 JSON-safe payload 都可拆成 `_multipart` 分片。默认 `enabled:true`、`maxChunkBytes:1800`、`ttlMs:60000`、`maxChunks:128`、`maxTotalBytes:256000`。见 [Generic multipart transport](#generic-multipart-transport080)。 |
+| `sse`               | object    | ❌   | **0.9.0+**：SSE 传输配置。`backupPush` 固定为 `'on'`，每条 SSE payload enqueue 成功后也发送同 `messageId` 的 Web Push backup；`keepaliveMs` 默认 1000、最小 250；`immediateKeepalive` 默认 true。 |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
 | `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`，或 `content` 内含 `<thinking>` 等标签）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
 | `reasoningChunkBytes` | number \| null | ❌ | **Deprecated in 0.8.0**：旧 reasoning 专用字节切配置。保留为 `multipart.maxChunkBytes` 的兼容别名；`null` 仅在未显式配置 `multipart` 时禁用 generic multipart。不会再产生 `chunkIndex` / `totalChunks` reasoning wire fields。 |
@@ -104,7 +105,7 @@ const handler = createInstantHandler({
 
 | 请求头                          | 响应                              | 适用场景                                            |
 |---------------------------------|-----------------------------------|-----------------------------------------------------|
-| 缺省 / 任意其他 Accept           | `Content-Type: text/event-stream` | **默认**。每条 push 走 SSE 流式直推，前台主线程直接消化，iOS 不爆通知，断流时自动 fallback Web Push |
+| 缺省 / 任意其他 Accept           | `Content-Type: text/event-stream` | **默认**。每条 payload 走 SSE 流式直推，同时默认发送 Web Push backup；由 SW dedupe 防重复，断流/写入失败时也继续 fallback Web Push |
 | `Accept: application/json`      | `Content-Type: application/json`  | 显式 opt-out 回到 0.8.x 纯 Web Push 行为；HTTP 状态码 + JSON body 错误语义都保留 |
 
 `pushSubscription` 在两种模式下都**必填**——SSE 模式下用作断流 / 写入失败时的 fallback 通道。
@@ -112,7 +113,7 @@ const handler = createInstantHandler({
 SSE wire format：
 
 ```
-: keepalive            ← 每 15s 一行，防 CDN/proxy 超时
+: keepalive            ← 默认 start 后立即发一次，之后每 1000ms 一行（可配，最小 250ms）
 
 event: payload         ← 每条 push，data 是与 Web Push 通道一字节相同的 JSON
 data: {"messageKind":"reasoning","sessionId":"sess_...",...}
@@ -130,6 +131,43 @@ data: {}
 业务错误（LLM 调用失败、未知异常等）在流已开后通过 `event: error\ndata: <完整 ErrorPush>` 投递，HTTP 状态始终是 200——SSE 模式下不能再靠 HTTP 状态码表达错误。`HookError` 例外：诊断 ErrorPush 已经作为 `event: payload` 送出，不重复发 `event: error`。
 
 > 客户端实现见 [`@rei-standard/amsg-client`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) 的 `consumeInstantStream()`。验证非 SSE 响应（含错误页 / 非 2xx）必须先看 `Content-Type` + status，再进 stream parser。
+
+#### SSE backup push（0.9.0+）
+
+正式环境推荐保持默认链路：SSE 正常流式返回，每条 payload enqueue 成功后也发一份 Web Push backup。它不是“断了才发”，而是 backup 常开；重复处理交给 `@rei-standard/amsg-sw` 的 delivery dedupe 解决。
+
+| 配置 | 默认值 | 行为 | 生产建议 |
+|------|--------|------|----------|
+| `backupPush` | `'on'` | SSE payload enqueue 成功后，立即发送同 `messageId` 的 Web Push backup | 固定开启；`off` / `delayed` 会被拒绝，避免正式部署误入已知可能丢 payload 的模式 |
+| `keepaliveMs` | `1000` | SSE 空闲 keepalive 间隔，最小 250ms | 保持默认 |
+| `immediateKeepalive` | `true` | stream start 后立即发送第一条 keepalive | 保持默认 |
+
+显式写出来可以长这样；省略 `sse` 时也是这组默认值：
+
+```js
+createInstantHandler({
+  vapid: { ... },
+  sse: {
+    backupPush: 'on',
+    keepaliveMs: 1_000,
+    immediateKeepalive: true,
+  }
+});
+```
+
+同一业务 payload 在 SSE 与 Web Push backup 中共用完全相同的 `messageId`。直接 Web Push、Blob envelope（会携带原 payload 的 `messageId` / `id` / `dedupeKey`）和 generic multipart 还原后的 payload 都能被 `@rei-standard/amsg-sw` 的 dedupe gate 识别。
+
+新增 `onEvent` 事件：
+
+- `sse_payload_enqueued`
+- `sse_payload_enqueue_failed`
+- `sse_stream_aborted`
+- `sse_stream_canceled`
+- `backup_push_scheduled`
+- `backup_push_sent`
+- `backup_push_failed`
+- `fallback_push_sent`
+- `fallback_push_failed`
 
 #### 请求
 
@@ -594,7 +632,7 @@ POST body（结构与 `/instant` 入口相同 + `sessionId` + `iteration`）：
 
 ### 生命周期 hooks `onBeforeLoop` / `onAfterLoop`（0.9.0+）
 
-在 `onLLMOutput` 这个"per-turn 决策 hook"之外，0.9.0 加了一对**链路级** hook，给"主 LLM loop 跑的同时并行一些副任务（情绪评估、外部 webhook、统计上报…），结束后把结果作为额外 push 追加"这类需求一个干净的口子，不用把副任务塞进 `onLLMOutput` 里跟决策逻辑挤在一起。
+在 `onLLMOutput` 这个"per-turn 决策 hook"之外，0.9.0 加了一对**链路级** hook，给"主 LLM loop 跑的同时并行一些副任务（外部 webhook、统计上报、索引刷新…），结束后把结果作为额外 push 追加"这类需求一个干净的口子，不用把副任务塞进 `onLLMOutput` 里跟决策逻辑挤在一起。
 
 ```ts
 createInstantHandler({
@@ -622,16 +660,16 @@ createInstantHandler({
 ```js
 onBeforeLoop: ({ requestBody }) => ({
   // 这些 promise 立刻就在跑了，跟主 LLM loop 并行
-  emotion: runEmotionEval(requestBody),
+  lookup: runBackgroundLookup(requestBody),
   metrics: pushToAnalytics(requestBody),
 }),
 
 onAfterLoop: async ({ pending, deliver, sessionId }) => {
-  const { emotion } = pending;
-  const result = await emotion;                  // 主 loop 这时已经结束了
+  const { lookup } = pending;
+  const result = await lookup;                   // 主 loop 这时已经结束了
   if (result) {
     await deliver({
-      messageKind: 'emotion_update',
+      messageKind: 'status_update',
       sessionId,
       data: result,
     });                                          // 作为额外一条 push 追加到本次链路
@@ -660,7 +698,7 @@ onAfterLoop: async ({ pending, deliver, sessionId }) => {
 
 ## Generic multipart transport（0.8.0+）
 
-> **0.8.0 BREAKING**：旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除。`reasoning`、`tool_request`、`content`、`error`、`emotion_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，超限时都走同一套 generic `_multipart` transport。应用层不应该再监听或拼接 reasoning 半片。
+> **0.8.0 BREAKING**：旧 reasoning 专用 `chunkIndex` / `totalChunks` wire format 已移除。`reasoning`、`tool_request`、`content`、`error`、`status_update` 或任何自定义 `messageKind`，只要是 JSON-safe payload，超限时都走同一套 generic `_multipart` transport。应用层不应该再监听或拼接 reasoning 半片。
 
 发送优先级很简单：
 
@@ -763,10 +801,10 @@ agentic loop 模式下 payload 大小分布（经验值）：
 
 | 场景 | 常态 | p90 | p99 |
 |---|---|---|---|
-| 纯文本 / 副作用 push，无 reasoning | 0.5–1.5 KB | 2 KB | 3 KB |
-| 副作用 push + reasoning chain | 1–2.5 KB | 3 KB | 4–5 KB（撞线） |
+| 纯文本 / 副作用 push，无 reasoning | 0.5–1.5 KB | 2 KB | 约 3000 B |
+| 副作用 push + reasoning chain | 1–2.5 KB | 约 3000 B | 4–5 KB（撞线） |
 | tool-request push（带本轮 LLM 原文） | 0.8–1.8 KB | 2.5 KB | 3.5 KB |
-| tool-request + reasoning | 1.5–3 KB | 4 KB（临界） | 5–6 KB（超） |
+| tool-request + reasoning | 1.5 KB–约 3000 B | 4 KB（临界） | 5–6 KB（超） |
 
 → **90 % 场景直传安全**，但开 reasoning / 长输出的 p90-p99 会超。0.8.0 阶段引入 [generic multipart transport](#generic-multipart-transport080) 后，没有 BlobStore 时也能透明拆分任意 JSON-safe payload；`BlobStore` 仍是更可靠方案，且优先级高于 multipart：超限 payload 写到外部存储，push 只推 ~200 B envelope `{ _blob:true, key, url, messageKind?, type? }`，SW / client 再按 envelope 约定读取真 body。
 

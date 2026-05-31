@@ -48,6 +48,8 @@ const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const SSE_ENCODER = new TextEncoder();
 const SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(': keepalive\n\n');
 const SSE_DONE_BYTES = SSE_ENCODER.encode('event: done\ndata: {}\n\n');
+const DEFAULT_SSE_KEEPALIVE_MS = 1000;
+const MIN_SSE_KEEPALIVE_MS = 250;
 
 /**
  * @typedef {Object} VapidConfig
@@ -137,6 +139,13 @@ const SSE_DONE_BYTES = SSE_ENCODER.encode('event: done\ndata: {}\n\n');
  *             `null` disables generic multipart only when `multipart`
  *             is not explicitly configured. It no longer produces
  *             reasoning-only `chunkIndex` / `totalChunks` wire fields.
+ * @property {Object} [sse]
+ * @property {'on'} [sse.backupPush='on']
+ *           - SSE always sends a Web Push backup after every successful
+ *             enqueue. `off` / `delayed` are intentionally rejected so
+ *             production cannot opt into known-lossy delivery modes.
+ * @property {number} [sse.keepaliveMs=1000]
+ * @property {boolean} [sse.immediateKeepalive=true]
  */
 
 /**
@@ -184,6 +193,7 @@ export function createInstantHandler(options) {
   // Eager validation keeps transport misconfiguration in startup logs /
   // unit tests instead of surprising the first oversized push.
   const multipart = resolveMultipartOptions(options);
+  const sse = resolveSseOptions(options.sse);
 
   // Validate VAPID shape eagerly so misconfiguration surfaces on the very
   // first request rather than the first Web Push attempt.
@@ -380,70 +390,123 @@ export function createInstantHandler(options) {
       const startDone = new Promise((resolve) => { resolveStartDone = resolve; });
       registerWaitUntil(startDone, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
 
+      const backupWork = new Set();
+      let streamUsable = true;
+      let keepaliveTimer = null;
+      let activeController = null;
+
+      const stopKeepalive = () => {
+        if (keepaliveTimer) {
+          clearInterval(keepaliveTimer);
+          keepaliveTimer = null;
+        }
+      };
+      const trackBackupWork = (work) => {
+        backupWork.add(work);
+        work.finally(() => {
+          backupWork.delete(work);
+        });
+      };
+      const messageIdOf = (body) => (
+        body && typeof body === 'object' && typeof body.messageId === 'string'
+          ? body.messageId
+          : undefined
+      );
+      const scheduleBackupPush = (body) => {
+        const messageId = messageIdOf(body);
+        onEvent({ type: 'backup_push_scheduled', sessionId, messageId });
+        const work = (async () => {
+          try {
+            await sendPushWithMaybeBlob(body, payload, processorCtx, sessionId);
+            onEvent({ type: 'backup_push_sent', sessionId, messageId });
+          } catch (pushErr) {
+            onEvent({ type: 'backup_push_failed', sessionId, messageId, cause: pushErr });
+          }
+        })();
+        trackBackupWork(work);
+      };
+      const enqueueKeepalive = () => {
+        if (!streamUsable || request.signal.aborted || !activeController) return;
+        try {
+          activeController.enqueue(SSE_KEEPALIVE_BYTES);
+        } catch {
+          streamUsable = false;
+          stopKeepalive();
+        }
+      };
+      const startKeepalive = () => {
+        if (!streamUsable || request.signal.aborted) return;
+        if (sse.immediateKeepalive) enqueueKeepalive();
+        if (!streamUsable || request.signal.aborted) return;
+        keepaliveTimer = setInterval(enqueueKeepalive, sse.keepaliveMs);
+      };
+      const safeClose = () => {
+        // `controller.close()` throws TypeError if the stream is
+        // already errored (e.g. previous enqueue failed). We're
+        // exiting anyway — swallow.
+        try { activeController && activeController.close(); } catch { /* already closed/errored */ }
+      };
+
       return new Response(
         new ReadableStream({
           async start(controller) {
-            let streamUsable = true;
-            let keepaliveTimer;
-
+            activeController = controller;
             const onAbort = () => {
+              if (!streamUsable) return;
               streamUsable = false;
-              if (keepaliveTimer) clearInterval(keepaliveTimer);
+              stopKeepalive();
+              onEvent({ type: 'sse_stream_aborted', sessionId });
             };
             request.signal.addEventListener('abort', onAbort);
+            if (request.signal.aborted) onAbort();
 
-            const stopKeepalive = () => {
-              if (keepaliveTimer) {
-                clearInterval(keepaliveTimer);
-                keepaliveTimer = null;
-              }
-            };
-            const startKeepalive = () => {
-              keepaliveTimer = setInterval(() => {
-                try {
-                  controller.enqueue(SSE_KEEPALIVE_BYTES);
-                } catch {
-                  stopKeepalive();
-                }
-              }, 15000);
-            };
-            const safeClose = () => {
-              // `controller.close()` throws TypeError if the stream is
-              // already errored (e.g. previous enqueue failed). We're
-              // exiting anyway — swallow.
-              try { controller.close(); } catch { /* already closed/errored */ }
-            };
             const cleanup = () => {
               stopKeepalive();
               request.signal.removeEventListener('abort', onAbort);
             };
 
-            // Single transport boundary: try SSE first, fall back to
-            // Web Push on stream-gone OR enqueue failure. Used for
-            // both normal `event: payload` and `event: error`.
+            // Dual transport boundary. Two cases, NOT one:
+            //   (1) Always-on backup: when SSE enqueue succeeds we ALSO
+            //       call `scheduleBackupPush(stableBody)` so the same
+            //       `messageId` ships on both SSE and Web Push. The SW
+            //       / client dedupe gate collapses them back to a single
+            //       business delivery (and at most one notification).
+            //   (2) True fallback: when the stream is unusable (gone /
+            //       aborted) or `controller.enqueue` throws, we skip SSE
+            //       entirely and ship the payload via Web Push only.
+            // Used for both normal `event: payload` and `event: error`.
             const safeEnqueue = async (eventName, body, onFallbackFail) => {
+              const stableBody = ensureStableMessageId(body);
+              const messageId = messageIdOf(stableBody);
               const fallback = async () => {
                 try {
-                  await sendPushWithMaybeBlob(body, payload, processorCtx, sessionId);
+                  await sendPushWithMaybeBlob(stableBody, payload, processorCtx, sessionId);
+                  onEvent({ type: 'fallback_push_sent', sessionId, messageId, eventName });
                 } catch (pushErr) {
+                  onEvent({ type: 'fallback_push_failed', sessionId, messageId, eventName, cause: pushErr });
                   if (onFallbackFail) onFallbackFail(pushErr);
                 }
               };
-              if (!streamUsable) {
+              if (!streamUsable || request.signal.aborted) {
+                streamUsable = false;
+                stopKeepalive();
                 await fallback();
                 return;
               }
               try {
-                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${JSON.stringify(body)}\n\n`));
-              } catch {
+                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${JSON.stringify(stableBody)}\n\n`));
+                onEvent({ type: 'sse_payload_enqueued', sessionId, messageId, eventName });
+                scheduleBackupPush(stableBody);
+              } catch (err) {
                 streamUsable = false;
                 stopKeepalive();
+                onEvent({ type: 'sse_payload_enqueue_failed', sessionId, messageId, eventName, cause: err });
                 await fallback();
               }
             };
 
             processorCtx.deliver = async (pushPayload) => {
-              await safeEnqueue('payload', ensureStableMessageId(pushPayload));
+              await safeEnqueue('payload', pushPayload);
             };
             startKeepalive();
 
@@ -479,8 +542,14 @@ export function createInstantHandler(options) {
               }
             } finally {
               cleanup();
+              await Promise.allSettled(Array.from(backupWork));
               resolveStartDone();
             }
+          },
+          cancel(reason) {
+            streamUsable = false;
+            stopKeepalive();
+            onEvent({ type: 'sse_stream_canceled', sessionId, reason });
           }
         }),
         {
@@ -556,6 +625,32 @@ function resolveMultipartOptions(options) {
     ttlMs: resolvePositiveInt(multipart.ttlMs, DEFAULT_MULTIPART_TTL_MS, 'multipart.ttlMs'),
     maxChunks: resolvePositiveInt(multipart.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS, 'multipart.maxChunks'),
     maxTotalBytes: resolvePositiveInt(multipart.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES, 'multipart.maxTotalBytes'),
+  };
+}
+
+function resolveSseOptions(input) {
+  const raw = input === undefined ? {} : input;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('[amsg-instant] sse must be a plain object when set');
+  }
+
+  const backupPush = raw.backupPush === undefined ? 'on' : String(raw.backupPush);
+  if (backupPush !== 'on') {
+    throw new TypeError('[amsg-instant] sse.backupPush is always "on" in 0.9.0 stable');
+  }
+  if (raw.backupDelayMs !== undefined) {
+    throw new TypeError('[amsg-instant] sse.backupDelayMs was removed; backup push is immediate');
+  }
+
+  const keepaliveMs = Math.max(
+    MIN_SSE_KEEPALIVE_MS,
+    resolvePositiveInt(raw.keepaliveMs, DEFAULT_SSE_KEEPALIVE_MS, 'sse.keepaliveMs')
+  );
+
+  return {
+    backupPush,
+    keepaliveMs,
+    immediateKeepalive: raw.immediateKeepalive !== false,
   };
 }
 

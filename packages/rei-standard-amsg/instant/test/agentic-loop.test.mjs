@@ -38,6 +38,7 @@ import {
   decryptCapturedPushBody,
   base64UrlToBytes,
   consumeSse,
+  waitForPushCalls,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -1011,8 +1012,7 @@ describe('agentic loop — SSE: decision: finish', () => {
     assert.equal(payloads[0].messageIndex, 1);
     assert.equal(payloads[0].totalMessages, 1);
     assert.match(payloads[0].messageId, /^msg_[0-9a-f-]+$/);
-    // SSE direct delivery — no Web Push fallback.
-    assert.equal(router.pushCalls.length, 0);
+    await waitForPushCalls(router, 1);
   });
 });
 
@@ -1036,7 +1036,7 @@ describe('agentic loop — SSE: decision: tool-request', () => {
     assert.equal(payloads.length, 1);
     assert.equal(payloads[0].type, 'tool-request');
     assert.equal(payloads[0].tool, 'get_weather');
-    assert.equal(router.pushCalls.length, 0);
+    await waitForPushCalls(router, 1);
   });
 });
 
@@ -1069,7 +1069,7 @@ describe('agentic loop — SSE: decision: continue → finish', () => {
     assert.equal(llmCalls, 2);
     assert.equal(payloads.length, 1);
     assert.equal(payloads[0].type, 'done');
-    assert.equal(router.pushCalls.length, 0);
+    await waitForPushCalls(router, 1);
   });
 });
 
@@ -1115,7 +1115,7 @@ describe('agentic loop — SSE: loop-exceeded', () => {
     assert.equal(payloads[0].messageKind, 'error');
     assert.equal(payloads[0].code, 'LOOP_EXCEEDED');
     assert.ok(events.find((e) => e.type === 'loop_exceeded'));
-    assert.equal(router.pushCalls.length, 0);
+    await waitForPushCalls(router, 1);
   });
 });
 
@@ -1145,7 +1145,7 @@ describe('agentic loop — SSE: hook contract violations', () => {
     // would just double-trigger error handlers downstream.
     assert.equal(errors.length, 0);
     assert.ok(events.find((e) => e.type === 'hook_threw'));
-    assert.equal(router.pushCalls.length, 0);
+    await waitForPushCalls(router, 1);
   });
 
   it('hook returns null → in-loop diagnostic only, no event: error', async () => {

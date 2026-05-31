@@ -1,11 +1,11 @@
 /**
- * E2E test for amsg-instant 0.8.0.
+ * E2E test for amsg-instant push payload compatibility.
  *
  * Verifies the push payload field shape produced by amsg-instant
  * matches the three-axis schema from @rei-standard/amsg-shared:
  *   - messageKind: 'content'  (with messageIndex / totalMessages set)
- *   - all 13 legacy 0.7.x fields still present (back-compat for the
- *     downstream SullyOS SW, which already grew handlers for them)
+ *   - all 13 legacy 0.7.x fields still present for downstream SW
+ *     back-compat
  *   - plus new fields: messageKind, sessionId
  *
  * We intercept the outgoing Web Push HTTP request via `options.fetch`,
@@ -24,6 +24,7 @@ import {
   decryptCapturedPushBody,
   makeLlmResponse,
   consumeSse,
+  waitForPushCalls,
 } from './helpers.mjs';
 
 const LLM_URL = 'https://api.example.com/v1/chat/completions';
@@ -123,7 +124,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     assert.equal(captured[0].sessionId, captured[1].sessionId);
   });
 
-  it('SSE (default): streams the same ContentPush field shape over event: payload, no Web Push', async () => {
+  it('SSE (default): streams the same ContentPush shape and sends matching Web Push backups', async () => {
     const payload = buildPayload();
 
     const router = createFetchRouter({
@@ -144,7 +145,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     const { payloads, doneReceived } = await consumeSse(res);
     assert.equal(doneReceived, true);
     assert.equal(payloads.length, 2);
-    assert.equal(router.pushCalls.length, 0, 'SSE happy path must not fall back to Web Push');
+    await waitForPushCalls(router, 2);
 
     const required = [
       'title', 'message', 'contactName', 'messageId', 'messageIndex',
@@ -159,5 +160,12 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     assert.equal(payloads[0].message, '第一句。');
     assert.equal(payloads[1].message, '第二句！');
     assert.equal(payloads[0].sessionId, payloads[1].sessionId);
+
+    const backups = [];
+    for (const call of router.pushCalls) {
+      backups.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
+    }
+    assert.equal(backups[0].messageId, payloads[0].messageId);
+    assert.equal(backups[1].messageId, payloads[1].messageId);
   });
 });

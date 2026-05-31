@@ -184,6 +184,16 @@ export function createFetchRouter(routes) {
   return { fetch: fetchImpl, pushCalls };
 }
 
+export async function waitForPushCalls(router, count, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (router.pushCalls.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  if (router.pushCalls.length !== count) {
+    throw new Error(`expected ${count} push call(s), got ${router.pushCalls.length}`);
+  }
+}
+
 /**
  * Convenience: build a fake LLM response with the given content. Any
  * `extra` keys are merged onto `choices[0].message`, so callers can
