@@ -130,7 +130,7 @@ export const REI_AMSG_DELIVER_MESSAGE_TYPE = REI_SW_MESSAGE_TYPE.DELIVER;
  * @property {number} [dedupe.ttlMs=600000]
  * @property {number} [dedupe.cleanupIntervalMs=60000]
  * @property {(payload: any) => string | undefined} [dedupe.key]
- * @property {string} [dedupe.dbName='rei_amsg_sw_dedupe_v1'] - 隔离去重数据用。每个 dbName 对应一个独立的 IndexedDB instance，互不影响。`dedupe.storeName` 不再可配（传了会抛错）；本包不维护跨 dbName 的迁移逻辑。
+ * @property {string} [dedupe.dbName='rei_amsg_sw_dedupe_v1'] - 隔离去重数据用。每个 dbName 对应一个独立的 IndexedDB instance，互不影响。`dedupe.storeName` 不再可配（传了会抛错）；本包不维护跨 storeName 的迁移逻辑。
  * @property {(payload: any) => void | Promise<void>} [onBusinessPayload]
  * @property {(info: { key: string, source: string, messageKind?: string, firstSeenAt?: number, existingSource?: string, existingMessageKind?: string, existingNotificationShown?: boolean, duplicateNotificationShown?: boolean }) => void | Promise<void>} [onDuplicate]
  */
