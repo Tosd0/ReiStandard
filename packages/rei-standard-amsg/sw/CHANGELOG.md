@@ -1,5 +1,32 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.2.0 — delivery dedupe + SSE bridge
+
+- **New**: `installReiSW({ dedupe })` 新增通用 delivery dedupe，默认开启。默认 key 为 `payload.messageId` → `payload.id` → `payload.dedupeKey`，没有 key 时保持兼容不去重。
+- **New**: dedupe gate 发生在 `showNotification` 和 `onBusinessPayload` 之前；重复 payload 不重复调用业务回调。若首包未展示系统通知、重复包到达时 `notification.show` 条件满足，SW 会只补一次通知，并通过 `onDuplicate(info)` 通知应用。
+- **New**: 新增页面到 SW 的通用业务投递协议 `{ type:'REI_AMSG_DELIVER', payload, source?, requestId? }`，用于让 SSE page bridge 和 Web Push 进入同一条 pipeline。
+- **New**: 文档明确生产推荐链路：`amsg-instant` always-on Web Push backup + client `REI_AMSG_DELIVER` bridge + SW 默认 dedupe。
+- **New**: dedupe 使用 IndexedDB keyPath + `add()` 做原子 claim，默认 DB 为 `rei_amsg_sw_dedupe_v1`，TTL 懒清理，无需 KV / D1 / Durable Object。
+- **Fix**: multipart 还原后的最终 payload、携带 `messageId` 的 blob envelope、Web Push payload、SSE bridge payload 都走同一套 dedupe gate。
+- **Changed**: `dedupe.storeName` 不再可配置，传了会在 `installReiSW` 安装时抛 Error。需要隔离去重数据改用 `dedupe.dbName` —— 每个 dbName 是独立 IndexedDB instance，互不影响。
+
+  原因：同一 dbName 下换 storeName 需要做 IndexedDB 版本升级，本包不打算维护跨 storeName 的 migration 逻辑；继续暴露 storeName 配置只会让用户踩 IDB upgrade 坑（升级一次后 store 永远建不出来，所有 dedupe transaction 都抛 NotFoundError）。
+
+  | 之前配置 | 之前行为 | 现在 |
+  | --- | --- | --- |
+  | 不传 dbName / storeName | 用默认 | 不变 |
+  | 只传 `dbName` | 静默失效（store 建不出来） | 正常隔离 |
+  | 只传 `storeName` | 静默失效 | 装包时抛 Error |
+  | 同时传 `dbName` + `storeName`（首次部署） | OK | 装包时抛 Error |
+  | 同时传 `dbName` + 后续改 `storeName` | 老 client 上 store 建不出来，整条 dedupe 链路挂掉 | 装包时抛 Error |
+
+- **Fix**: 慢的 `onBusinessPayload` 回调不再阻塞 dedupe 的通知补救判定。
+
+  之前：业务回调长时间未 resolve + 前台从可见变隐藏 + 同 `messageId` 的 Web Push backup 在窗口内到达 → backup 被判为 "first-delivery-pending" 丢弃，用户看不到通知。
+
+  现在：通知决策一确定就解锁补救路径，backup 照常补出系统通知。业务回调依旧 await，`event.waitUntil` 生命周期不变。
+- **Changed**: `@rei-standard/amsg-shared` 精确依赖升级到 `0.2.0`，并支持 `notification.silent` 透传到 `showNotification()`。
+
 ## 2.1.1 — multipart 并发与 hook thenable 修复
 
 - **Fix**: `_multipart` reassembly 现在按 multipart id 串行处理分片，避免并发 push delivery 下 IndexedDB read-modify-write 交错导致 `receivedCount` / `receivedBytes` 丢写，最终卡住重组。

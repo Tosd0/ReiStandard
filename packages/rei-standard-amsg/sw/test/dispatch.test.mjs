@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import {
   installReiSW,
   REI_SW_EVENT,
-  REI_AMSG_POSTMESSAGE_TYPE
+  REI_AMSG_POSTMESSAGE_TYPE,
+  REI_AMSG_DELIVER_MESSAGE_TYPE
 } from '../src/index.js';
 
 /**
@@ -32,6 +33,12 @@ function createSwMock({ clientCount = 1, visibleCount = 0 } = {}) {
       postedMessages.push({ client: index, message });
     }
   }));
+
+  function setVisibleCount(nextVisibleCount) {
+    clients.forEach((client, index) => {
+      client.visibilityState = index < nextVisibleCount ? 'visible' : 'hidden';
+    });
+  }
 
   const sw = {
     addEventListener(name, handler) {
@@ -71,7 +78,31 @@ function createSwMock({ clientCount = 1, visibleCount = 0 } = {}) {
     await Promise.all(pending);
   }
 
-  return { sw, listeners, notifications, postedMessages, triggerPush };
+  async function triggerMessage(message) {
+    const messageHandler = listeners.get('message');
+    if (!messageHandler) throw new Error('message handler was never registered');
+
+    /** @type {Array<Promise<unknown>>} */
+    const pending = [];
+    /** @type {Array<unknown>} */
+    const replies = [];
+    const fakeEvent = {
+      data: message,
+      ports: [{
+        postMessage(reply) {
+          replies.push(reply);
+        }
+      }],
+      waitUntil(work) {
+        pending.push(Promise.resolve(work));
+      }
+    };
+    messageHandler(fakeEvent);
+    await Promise.all(pending);
+    return replies;
+  }
+
+  return { sw, listeners, notifications, postedMessages, triggerPush, triggerMessage, setVisibleCount };
 }
 
 const COMMON = Object.freeze({
@@ -109,6 +140,385 @@ function buildMultipartPayloads(payload, {
     };
   });
 }
+
+test('dedupe: WebPush duplicate messageId only dispatches once', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_webpush',
+    messageKind: 'content',
+    message: 'dedupe me',
+  };
+  await triggerPush(payload);
+  await triggerPush(payload);
+
+  assert.equal(notifications.length, 1);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].key, 'msg_dedupe_webpush');
+  assert.equal(duplicates[0].source, 'webpush');
+  assert.equal(duplicates[0].messageKind, 'content');
+});
+
+test('dedupe: SSE bridge first, WebPush backup second is swallowed before notification', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_sse_first',
+    messageKind: 'content',
+    message: 'sse first',
+  };
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-sse-first',
+    payload,
+  });
+  await triggerPush(payload);
+
+  assert.deepEqual(replies[0], {
+    ok: true,
+    duplicate: false,
+    key: 'msg_dedupe_sse_first',
+    requestId: 'req-sse-first',
+  });
+  assert.equal(notifications.length, 1);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].source, 'webpush');
+});
+
+test('dedupe: WebPush first, SSE bridge second is swallowed', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_webpush_first',
+    messageKind: 'content',
+    message: 'webpush first',
+  };
+  await triggerPush(payload);
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-webpush-first',
+    payload,
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].source, 'sse');
+  assert.deepEqual(replies[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_dedupe_webpush_first',
+    requestId: 'req-webpush-first',
+  });
+});
+
+test('dedupe: SSE visible first, WebPush backup hidden later only repairs notification', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush, triggerMessage, setVisibleCount } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_notification_repair',
+    messageKind: 'content',
+    message: 'repair notification',
+    notification: { show: 'when-hidden', title: 'Hidden repair' },
+  };
+
+  await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-repair',
+    payload,
+  });
+  assert.equal(notifications.length, 0, 'visible SSE delivery should not show a notification');
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+
+  setVisibleCount(0);
+  await triggerPush(payload);
+
+  assert.equal(notifications.length, 1, 'duplicate backup should repair notification when now hidden');
+  assert.equal(notifications[0].title, 'Hidden repair');
+  assert.equal(postedMessages.length, 1, 'duplicate backup must not re-post to clients');
+  assert.equal(businessPayloads.length, 1, 'duplicate backup must not rerun business payload handling');
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].existingNotificationShown, false);
+  assert.equal(duplicates[0].duplicateNotificationShown, true);
+});
+
+test('dedupe: backup push repairs notification while first delivery business callback is still pending', async () => {
+  // Regression: notificationStatePending must be cleared as soon as the
+  // notification policy is settled (dispatch + showNotification done),
+  // NOT when onBusinessPayload finally resolves. Otherwise a slow user
+  // callback keeps the pending flag set, and a Web Push backup arriving
+  // in that window gets swallowed by 'first-delivery-pending' with no
+  // second chance to repair the missing notification.
+  const businessStarted = [];
+  let releaseBusiness;
+  const businessGate = new Promise((resolve) => { releaseBusiness = resolve; });
+
+  const { sw, listeners, notifications, postedMessages, triggerPush, setVisibleCount } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => {
+      businessStarted.push(payload);
+      return businessGate;
+    },
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_pending_repair',
+    messageKind: 'content',
+    message: 'pending repair',
+    notification: { show: 'when-hidden', title: 'Repair while pending' },
+  };
+
+  // Kick SSE delivery without awaiting — business callback is gated, so
+  // the underlying handlePushPayload promise will not settle until we
+  // release it below.
+  const messageHandler = listeners.get('message');
+  const ssePending = [];
+  messageHandler({
+    data: {
+      type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+      source: 'sse',
+      requestId: 'req-pending-repair',
+      payload,
+    },
+    ports: [{ postMessage() {} }],
+    waitUntil(work) { ssePending.push(Promise.resolve(work)); },
+  });
+
+  // Let claim + notification work flush microtasks; business callback
+  // stays pending.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(businessStarted.length, 1, 'first delivery should have entered business callback');
+  assert.equal(notifications.length, 0, 'visible client suppresses first-delivery notification');
+  assert.equal(postedMessages.length, 1, 'first delivery still broadcasts to the client');
+
+  // Visibility flips to hidden; backup arrives while first delivery is
+  // still stuck inside its business callback.
+  setVisibleCount(0);
+  await triggerPush(payload);
+
+  assert.equal(
+    notifications.length,
+    1,
+    'backup push should repair the notification even though first-delivery business callback is still pending',
+  );
+  assert.equal(notifications[0].title, 'Repair while pending');
+
+  // Release the gate and let the original delivery wind down.
+  releaseBusiness();
+  await Promise.all(ssePending);
+  assert.equal(postedMessages.length, 1, 'duplicate backup must not re-post to clients');
+  assert.equal(businessStarted.length, 1, 'duplicate backup must not rerun business callback');
+});
+
+test('dedupe: SSE visible first, WebPush backup still visible stays notification-silent', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush, triggerMessage } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_notification_still_visible',
+    messageKind: 'content',
+    message: 'still visible',
+    notification: { show: 'when-hidden', title: 'Should stay hidden' },
+  };
+
+  await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-still-visible',
+    payload,
+  });
+  await triggerPush(payload);
+
+  assert.equal(notifications.length, 0);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+  assert.equal(duplicates.length, 1);
+  assert.equal(duplicates[0].existingNotificationShown, false);
+  assert.equal(duplicates[0].duplicateNotificationShown, false);
+});
+
+test('dedupe: payload without messageId/id/dedupeKey keeps legacy non-dedupe behavior', async () => {
+  const businessPayloads = [];
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+  });
+
+  const payload = {
+    messageKind: 'content',
+    message: 'legacy no id',
+    title: 'No Key',
+  };
+  await triggerPush(payload);
+  await triggerPush(payload);
+
+  assert.equal(notifications.length, 2);
+  assert.equal(postedMessages.length, 2);
+  assert.equal(businessPayloads.length, 2);
+});
+
+test('dedupe: concurrent duplicate payloads only allow one winner', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_concurrent',
+    messageKind: 'content',
+    message: 'race',
+  };
+  await Promise.all([triggerPush(payload), triggerPush(payload)]);
+
+  assert.equal(notifications.length, 1);
+  assert.equal(postedMessages.length, 1);
+  assert.equal(businessPayloads.length, 1);
+  assert.equal(duplicates.length, 1);
+});
+
+test('dedupe: TTL expiry allows the same key again', async () => {
+  const businessPayloads = [];
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw, {
+    dedupe: {
+      ttlMs: 5,
+      cleanupIntervalMs: 0,
+      dbName: 'rei_amsg_sw_dedupe_ttl_test',
+    },
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_ttl',
+    messageKind: 'content',
+    message: 'ttl',
+  };
+  await triggerPush(payload);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await triggerPush(payload);
+
+  assert.equal(notifications.length, 2);
+  assert.equal(businessPayloads.length, 2);
+});
+
+test('dedupe: multipart restore and blob envelopes use the same messageId gate', async () => {
+  const businessPayloads = [];
+  const duplicates = [];
+  const { sw, notifications, postedMessages, triggerPush, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    multipart: { cleanupIntervalMs: 0 },
+    onBusinessPayload: (payload) => businessPayloads.push(payload),
+    onDuplicate: (info) => duplicates.push(info),
+  });
+
+  const multipartPayload = {
+    ...COMMON,
+    messageId: 'msg_dedupe_multipart',
+    messageKind: 'content',
+    message: 'multipart body '.repeat(20),
+    title: 'Multipart Dedupe',
+  };
+  await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    payload: multipartPayload,
+  });
+  for (const part of buildMultipartPayloads(multipartPayload, { id: 'mp_dedupe_same_key', maxChunkBytes: 80 })) {
+    await triggerPush(part);
+  }
+
+  const blobEnvelope = {
+    _blob: true,
+    key: 'blob-key',
+    url: 'https://worker.example.com/blob/blob-key',
+    messageKind: 'content',
+    messageId: 'msg_dedupe_blob',
+  };
+  await triggerPush(blobEnvelope);
+  await triggerPush(blobEnvelope);
+
+  assert.equal(notifications.length, 2, 'one multipart original + one blob envelope');
+  assert.equal(postedMessages.length, 2);
+  assert.equal(businessPayloads.length, 2);
+  assert.equal(duplicates.length, 2);
+  assert.deepEqual(duplicates.map((info) => info.key).sort(), [
+    'msg_dedupe_blob',
+    'msg_dedupe_multipart',
+  ]);
+});
+
+test('dedupe: passing storeName throws — config no longer supported, must isolate via dbName', () => {
+  const { sw } = createSwMock();
+  assert.throws(
+    () => installReiSW(sw, { dedupe: { storeName: 'whatever' } }),
+    /dedupe\.storeName 不再可配置/,
+  );
+});
+
+test('dedupe: custom dbName alone installs without error', () => {
+  const { sw } = createSwMock();
+  assert.doesNotThrow(() => installReiSW(sw, {
+    dedupe: { dbName: 'isolated-db' },
+  }));
+});
 
 test('installReiSW registers the push listener', () => {
   const { sw, listeners } = createSwMock();
@@ -377,11 +787,11 @@ test('generic multipart custom messageKind restores and dispatches UNKNOWN_RECEI
 
   const payload = {
     ...COMMON,
-    messageKind: 'emotion_update',
-    mood: 'curious',
+    messageKind: 'status_update',
+    status: 'ready',
     detail: 'x'.repeat(400)
   };
-  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_emotion', maxChunkBytes: 90 });
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_status', maxChunkBytes: 90 });
 
   for (const part of parts) {
     await triggerPush(part);
@@ -428,12 +838,17 @@ test('generic multipart missing chunks do not dispatch and expire observably', a
     messageKind: 'reasoning',
     reasoningContent: 'partial '.repeat(50)
   };
-  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_expire', maxChunkBytes: 80, ttlMs: 1 });
+  const ttlMs = 50;
+  const parts = buildMultipartPayloads(payload, {
+    id: 'mp_sw_expire',
+    maxChunkBytes: 80,
+    ttlMs,
+  });
 
   await triggerPush(parts[0]);
   assert.equal(postedMessages.length, 0);
 
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, ttlMs + 10));
   await triggerPush({ ...COMMON, messageKind: 'error', code: 'NOOP', message: 'tick cleanup' });
 
   const expired = postedMessages.find((entry) =>
@@ -586,6 +1001,21 @@ test('notification.data is passed through to notification options', async () => 
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].options.data.customField, 'value');
+});
+
+test('notification.silent is passed through to notification options', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Quiet hello',
+    notification: { show: 'always', silent: true }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, true);
 });
 
 test('multipart fully received payload with notification.show: "when-hidden" checks visible client', async () => {
