@@ -125,13 +125,7 @@ test('buildReasoningPush rejects empty reasoningContent', () => {
   );
 });
 
-// ─── notification typed support (next.3+) ─────────────────────────────
-//
-// `notification` was previously an untyped spread footgun — hook
-// authors could write any of the seven fields amsg-sw reads
-// (`title` / `body` / `icon` / `badge` / `tag` / `renotify` /
-// `requireInteraction`), but the builder didn't accept it as a typed
-// arg so spread-based usage bypassed the IDE.
+// ─── notification directive validation ─────────────────────────────────
 
 test('buildContentPush threads notification through verbatim', () => {
   const notification = {
@@ -142,6 +136,7 @@ test('buildContentPush threads notification through verbatim', () => {
     tag: 'thread-42',
     renotify: true,
     requireInteraction: false,
+    silent: true,
   };
   const push = buildContentPush({ ...COMMON, message: 'hi', notification });
   assert.deepEqual(push.notification, notification);
@@ -174,8 +169,8 @@ test('buildContentPush rejects non-string notification.{title,body,icon,badge,ta
   }
 });
 
-test('buildContentPush rejects non-boolean notification.{renotify,requireInteraction}', () => {
-  for (const field of ['renotify', 'requireInteraction']) {
+test('buildContentPush rejects non-boolean notification.{renotify,requireInteraction,silent}', () => {
+  for (const field of ['renotify', 'requireInteraction', 'silent']) {
     assert.throws(
       () => buildContentPush({ ...COMMON, message: 'hi', notification: { [field]: 'yes' } }),
       new RegExp(`'notification\\.${field}' must be a boolean`),

@@ -1,5 +1,19 @@
 # @rei-standard/amsg-shared
 
+## 0.2.0 — Notification silent support
+
+### New
+
+- **NotificationDirective**：新增并校验 `notification.silent?: boolean`，与 `@rei-standard/amsg-sw@2.2.0` 的无声通知渲染能力对齐。
+
+### Fix
+
+- **NotificationDirective typedef 与 SW 实际行为对齐**：原 typedef 写 `tag` / `renotify` / `requireInteraction` / `silent` 没有 top-level fallback，实际上 `amsg-sw` 一直对这四个字段（以及 `data`）都按 `notification.X` → `payload.X` → 默认值的顺序回退。typedef 改成承认完整 fallback，避免 producer 误以为漏在 payload 顶级的字段不生效。仅 doc / type，wire format 不变。
+
+### Compatibility
+
+- 纯 additive。未传 `notification.silent` 时 wire format 不变。
+
 ## 0.1.0 — NotificationDirective 与 Shared utilities
 
 ### New
@@ -20,7 +34,7 @@ Coordinated with `@rei-standard/amsg-instant@0.8.0-next.3`. Install with `npm in
 
 ### 为什么 typed 全部 7 个字段（而不只是 `title` / `body`）
 
-最早的 follow-up 草稿写的是 `{ title?: string; body?: string }`。但 SW 实际读 7 个，只 typed 2 个会让另外 5 个仍然走 untyped spread——recreate next.3 amsg-instant 那个 footgun 的根本原因（typedef 不全 → spread bypass → 行为静默）。一次性 typed 完整集干净。SullyOS 这种 caller 后续 1 行 diff 就能从 untyped spread 迁到 typed arg。
+SW 实际读取 7 个 notification 字段；只 typed 其中一部分会让剩余字段继续绕过 builder 校验，表现成“代码能过、行为静默不生效”。这版一次性补齐完整字段集，caller 可以直接从手写 spread 迁到 typed arg。
 
 ### 行为兼容
 

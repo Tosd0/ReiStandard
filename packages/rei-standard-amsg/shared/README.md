@@ -48,6 +48,30 @@ origin** (`'instant'` for `amsg-instant`, `'scheduled'` for any
 
 ---
 
+## Notification directive
+
+`ContentPush` and `ToolRequestPush` can carry an optional
+`notification` object. It is a producer-side hint consumed by
+`@rei-standard/amsg-sw` before rendering a system notification.
+
+| Field                | Type                                      | Notes |
+|----------------------|-------------------------------------------|-------|
+| `show`               | `'auto' \| 'always' \| 'when-hidden' \| false` | Display policy. `auto` follows SW defaults. |
+| `title`              | `string?`                                | Notification title override. |
+| `body`               | `string?`                                | Notification body override. |
+| `icon`               | `string?`                                | Notification icon URL. |
+| `badge`              | `string?`                                | Notification badge URL. |
+| `tag`                | `string?`                                | Notification grouping tag. |
+| `renotify`           | `boolean?`                               | Re-alert when a matching `tag` replaces an existing notification. |
+| `requireInteraction` | `boolean?`                               | Keep the notification visible until the user dismisses it. |
+| `silent`             | `boolean?`                               | Suppress notification sound and vibration. |
+| `data`               | `Record<string, unknown>?`               | Custom data passed to the notification. |
+
+Unknown fields are preserved for forward compatibility, but the known
+fields above are validated by the builders when present.
+
+---
+
 ## Per-kind fields
 
 ### `ContentPush` — final user-facing content

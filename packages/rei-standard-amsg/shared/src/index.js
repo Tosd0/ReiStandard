@@ -102,29 +102,33 @@ export const PUSH_SOURCE = Object.freeze({
 
 /**
  * SW-rendering directive. Mirrors the fields that `amsg-sw`'s
- * `createNotificationFromPayload` consumes (`notification.{title,body,icon,badge,tag,renotify,requireInteraction,data}`)
- * — typing all fields so callers don't lose IDE checking and slip back into the untyped-spread footgun.
+ * `createNotificationFromPayload` consumes (`notification.{show,title,body,icon,badge,tag,renotify,requireInteraction,silent,data}`)
+ * so producers get builder validation for the fields the SW actually reads.
  *
- * Routing in SW (kept here so producers don't have to cross-check):
+ * Routing in SW:
  *   - By default (`show: "auto"` or omitted), `messageKind: 'content'` (and legacy un-kinded payloads)
  *     will display a system notification. `reasoning` / `tool_request` / `error` will dispatch silently.
  *   - `show: "always"`, `"when-hidden"`, or `false` overrides this default.
- *   - When rendering, `notification.*` is consulted, with per-field fallback to
- *     the top-level `title` / `avatarUrl` / `messageId` and finally
- *     to the SW's `defaultIcon` / `defaultBadge` options. Everything
- *     else (`tag`, `renotify`, `requireInteraction`) has no top-level
- *     fallback — set them under `notification` or accept the SW default.
+ *   - When rendering, `notification.*` is consulted first, with per-field
+ *     fallback to the matching top-level payload fields (`title`,
+ *     `body`/`message`, `icon`/`avatarUrl`, `badge`, `tag`/`messageId`,
+ *     `renotify`, `requireInteraction`, `silent`, `data`), and finally to
+ *     the SW's `defaultIcon` / `defaultBadge` options (boolean knobs
+ *     default to `false` at the SW). Prefer setting overrides under
+ *     `notification` for explicitness; top-level fallback exists so that
+ *     legacy un-namespaced payloads keep working byte-for-byte.
  *
  * @typedef {Object} NotificationDirective
  * @property {"auto" | "always" | "when-hidden" | false} [show] - Rendering strategy. Defaults to "auto" (render only if messageKind is content).
- * @property {string}  [title]              - Notification title override.
- * @property {string}  [body]               - Notification body override.
- * @property {string}  [icon]               - Icon URL override (falls back to top-level `avatarUrl` then SW `defaultIcon`).
- * @property {string}  [badge]              - Badge URL override (falls back to SW `defaultBadge`).
- * @property {string}  [tag]                - Notification grouping tag; matching tag replaces the prior notification.
- * @property {boolean} [renotify]           - When tag matches, still vibrate/sound. Default false at SW.
- * @property {boolean} [requireInteraction] - Notification stays until user dismisses. Default false at SW.
- * @property {Record<string, unknown>} [data] - Custom payload data to attach to the notification.
+ * @property {string}  [title]              - Notification title override (falls back to top-level `title`, then `来自 {contactName}`).
+ * @property {string}  [body]               - Notification body override (falls back to top-level `body`, then `message`).
+ * @property {string}  [icon]               - Icon URL override (falls back to top-level `icon`/`avatarUrl`, then SW `defaultIcon`).
+ * @property {string}  [badge]              - Badge URL override (falls back to top-level `badge`, then SW `defaultBadge`).
+ * @property {string}  [tag]                - Notification grouping tag; matching tag replaces the prior notification (falls back to top-level `tag`, then `messageId`, then a generated unique tag).
+ * @property {boolean} [renotify]           - When tag matches, still vibrate/sound (falls back to top-level `renotify`, default false at SW).
+ * @property {boolean} [requireInteraction] - Notification stays until user dismisses (falls back to top-level `requireInteraction`, default false at SW).
+ * @property {boolean} [silent]             - Suppress sound and vibration (falls back to top-level `silent`, default false at SW).
+ * @property {Record<string, unknown>} [data] - Custom payload data to attach to the notification (falls back to top-level `data`).
  */
 
 /**
@@ -434,7 +438,7 @@ export function buildToolRequestPush(args) {
  * Validate the optional `notification` argument.
  * Plain object required (`null` / arrays / primitives rejected); field-level shape is
  * checked best-effort — `title` / `body` / `icon` / `badge` / `tag`
- * must be strings when present, `renotify` / `requireInteraction`
+ * must be strings when present, `renotify` / `requireInteraction` / `silent`
  * must be booleans. Unknown keys are tolerated so the SW's
  * forward-compatibility (it just won't read them) is preserved.
  *
@@ -455,7 +459,7 @@ function validateNotificationArg(kind, value) {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a string when present`);
     }
   }
-  for (const f of ['renotify', 'requireInteraction']) {
+  for (const f of ['renotify', 'requireInteraction', 'silent']) {
     if (n[f] !== undefined && typeof n[f] !== 'boolean') {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a boolean when present`);
     }
@@ -568,10 +572,10 @@ const REASONING_CHUNK_DECODER = new TextDecoder('utf-8', { fatal: true });
 /**
  * Slice a string into UTF-8 byte chunks no larger than `maxBytes`,
  * always cutting at codepoint boundaries (never inside a multi-byte
- * char). Designed for the {@link ReasoningPush} byte-chunking path
- * in amsg-instant — producers facing the ~3 KB Web Push payload
- * limit slice oversized reasoning into N pushes with
- * `chunkIndex` / `totalChunks`, the SW reassembles by concat.
+ * char). This is a generic byte-safe string helper retained for
+ * callers that need deterministic UTF-8 chunking around small Web Push
+ * payload budgets; current amsg-instant oversized payload delivery uses
+ * BlobStore / generic multipart instead of reasoning-only wire fields.
  *
  * Algorithm: TextEncoder → Uint8Array → backward scan from each
  * candidate cut index until the byte is a UTF-8 lead byte (any byte
