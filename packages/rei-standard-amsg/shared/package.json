@@ -1,10 +1,10 @@
 {
   "name": "@rei-standard/amsg-shared",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ReiStandard Active Messaging shared types and push builders — the lowest layer (no deps on other amsg packages)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Tosd0/ReiStandard",
+    "url": "git+https://github.com/Tosd0/ReiStandard.git",
     "directory": "packages/rei-standard-amsg/shared"
   },
   "license": "MIT",
