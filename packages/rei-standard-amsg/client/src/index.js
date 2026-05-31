@@ -381,8 +381,7 @@ export class ReiClient {
             }
             const err = new Error(parsedErr.message || 'Stream error');
             err.code = parsedErr.code;
-            thrown = err;
-            return; // exit loop, finally re-throws
+            throw err;
           }
 
           if (eventName === 'payload') {
