@@ -135,7 +135,7 @@ const registration = await navigator.serviceWorker.ready;
 const channel = new MessageChannel();
 
 channel.port1.onmessage = (event) => {
-  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string }
+  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string, businessError?: string }
   // 失败：{ ok: false, error: string, key?: string, requestId?: string }
 };
 
@@ -148,6 +148,36 @@ registration.active?.postMessage({
 ```
 
 Web Push `push` event 和 `REI_AMSG_DELIVER` 最终都会进入同一个内部 pipeline。SSE 先到时，后来的 Web Push backup 会被 dedupe；Web Push 先到时，后来的 SSE bridge 也会被 dedupe。若首包已经落过业务但没弹通知，重复包只负责按当前 `notification.show` 策略补通知，不会重复触发业务回调。
+
+#### ack 的 `ok` 表示「已收下并分发」，不表示「业务已落库」
+
+DELIVER ack 的 `ok: true` 只代表 SW 收下了 payload 并完成了分发（窗口广播 + 通知策略），**不代表** `onBusinessPayload` 已经成功落库。如果业务回调 reject 或抛错，ack 仍然是 `ok: true`，但会带上一个可选的 `businessError` 字段（业务回调失败时填 `error.message`，成功时不出现这个字段）：
+
+```js
+channel.port1.onmessage = (event) => {
+  const { ok, duplicate, businessError } = event.data;
+  if (ok && businessError) {
+    // payload 已分发，但消费方落库失败 —— 由你决定是否重试 / 上报
+  }
+};
+```
+
+这样设计是为了向后兼容：`ok` 的含义保持不变，原本只看 `ok` 的调用方不受影响；需要严格区分「传输成功」和「业务落库成功」的调用方读 `businessError` 即可。webpush `push` 路径没有 ack，业务回调失败只会在 SW 内部 `console.error`，不会让投递 promise reject。
+
+`businessError` 会持久化到 dedupe 记录上：之后**同 key 的重复包**（发送方重试、或另一条 transport 的 backup）被去重后，ack 仍会带上首包的 `businessError`，不会回一个看着干净的 `{ ok:true, duplicate:true }` 把未解决的失败藏起来。但要注意——**去重不会让 `onBusinessPayload` 重跑**：这个字段只是把信号报准，不是补救机制。想让「失败的投递」能被重试真正修好，得消费方自己保证业务回调幂等（见下方「在 SW 内执行 tool_request 的安全边界」）。
+
+#### 在 SW 内执行 tool_request 的安全边界
+
+`onBusinessPayload` 里直接执行 `tool_request`（在 SW 里跑工具、回结果）是支持的常见用法。这里要理解清楚去重提供的保证和它的边界：
+
+- **正常情况下不会重复执行**：dedupe 是「先占坑、再跑业务」，所以同一个 `messageId` 在 TTL 窗口内（默认 10 分钟）`onBusinessPayload` **最多被调用一次**。SSE + Web Push backup 双路送达、push 服务重投递，重复的那些都会在跑业务之前被挡掉。换句话说，**dedupe 本身就是你的「执行一次」闸门**，普通场景你不需要再自己记账本。
+- **边界一：TTL**。这个「只执行一次」只保 TTL 那段时间。极少数超过 TTL 才发生的重投递会被当成新消息、重新执行。绝大多数重投递都在秒级~分钟级，10 分钟够用；要更死的保证就自己按 `id` 记一张永久「执行账本」。
+- **边界二：失败不回滚**。`onBusinessPayload` 失败时，dedupe 的坑**不会撤销**——同 key 重试会被去重、不会重跑业务（ack 会持续带上 `businessError` 提醒你「这条仍未解决」）。所以：
+
+  - 如果你的工具有**真实副作用**（发邮件、下单、转账、加未读数、播声音……），**不要**指望「重发同一条」来补救失败——那只会被去重吞掉。让 `onBusinessPayload` 失败时把 `businessError` 报上去，由应用层用**新的 id / 新的请求**去重试，或自备幂等「执行账本」（执行前查 `id` 是否已执行）后再考虑开启失败回滚。
+  - 如果你的业务回调是**纯幂等**（只按 `messageId` 覆盖写、工具可安全重跑），那重跑无害，怎么重试都行。
+
+> 一句话：**普通成功路径，在 SW 里执行 tool_request 是安全的，dedupe 已经保证不重复执行**；只有当你需要「失败的工具自动重试」时，幂等才成为你的责任。
 
 ### 生产推荐链路：SSE + Web Push backup + SW dedupe
 
@@ -234,6 +264,15 @@ TTL 到期仍未收齐时，SW 会清理 pending 并广播：
 
 业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知。
 
+### IndexedDB 连接韧性（2.3.0+）
+
+dedupe 库、queue / multipart 库都把 IndexedDB 连接缓存复用。浏览器底层可能在存储压力、backing store 出错、用户清数据等情况下**强制关闭**这些连接——这种强关只触发 `close` 事件，不触发 `versionchange`。2.3.0 之前缓存里的死连接会被无限复用，之后每次事务都抛 `InvalidStateError`，导致去重失灵、push 落库被阻断、`dedupe cleanup failed` 刷屏，且不重启 SW 不会自愈。
+
+2.3.0 起包内做了两层兜底，无需业务侧改动：
+
+- **`onclose` 清缓存**：连接被强关时把它从缓存里剔除，下次访问自动重开。
+- **事务级一次重开**：因为 `close` 事件可能晚于下一次事务调用、而 `db.transaction()` 是同步抛错，所以发事务时若命中「连接 closing/closed」，会清缓存、重开一次、重试一次；第二次仍失败才如实抛出（重试上限 1 次，不会无限循环）。
+
 ### 升级注意事项
 
 - 想给 `reasoning` / `tool_request` / `error` 弹通知的业务：SW 默认不再为它们弹通知，但可以通过设置 `payload.notification.show = "always"` 或 `"when-hidden"` 来让 SW 在包层直接弹通知。无需再强求在 app 内自绘。
@@ -248,6 +287,7 @@ TTL 到期仍未收齐时，SW 会清理 pending 并广播：
 - 处理 `message` 事件：支持离线请求入队与主动冲刷队列
 - 处理 `sync` 事件：在网络恢复后自动重试队列请求
 - 使用 IndexedDB 存储待发送请求，避免页面关闭后丢失
+- IndexedDB 连接被浏览器强制关闭后自愈（`onclose` 清缓存 + 事务级一次重开），无需重启 SW
 
 > 注意：插件默认**不内置** `notificationclick` 逻辑，点击跳转策略由业务自行实现。
 

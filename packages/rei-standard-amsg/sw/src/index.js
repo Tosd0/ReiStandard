@@ -211,10 +211,21 @@ async function handlePushPayload(sw, payload, ctx) {
     const duplicateNotification = await maybeShowDuplicateNotification(sw, payload, claim, ctx);
     claim.duplicateNotification = duplicateNotification;
     await notifyDuplicate(payload, claim, ctx);
-    return { ...claim, duplicateNotification };
+    const result = { ...claim, duplicateNotification };
+    // The first delivery claims this key and runs business at most once. If
+    // that business failed, the failure is persisted on the dedupe record —
+    // surface it so a retry/backup gets an honest ack, not a clean ok:true.
+    // Read the LATEST record, not the pre-await `claim.existing` snapshot:
+    // while we awaited the repair path above, an in-flight first delivery may
+    // have just persisted its businessError, which the stale snapshot misses.
+    const businessError = await readDuplicateBusinessError(claim, ctx);
+    if (businessError !== undefined) {
+      result.businessError = businessError;
+    }
+    return result;
   }
 
-  await dispatchBusinessPayload(sw, payload, {
+  const dispatchResult = await dispatchBusinessPayload(sw, payload, {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
     onBusinessPayload: ctx.onBusinessPayload,
@@ -225,6 +236,13 @@ async function handlePushPayload(sw, payload, ctx) {
     // hit `notificationStatePending` and skip the repair path.
     await updateDedupeNotificationState(claim, ctx, intermediateResult);
   });
+  const businessError = dispatchResult ? dispatchResult.businessError : undefined;
+  if (businessError !== undefined) {
+    claim.businessError = businessError;
+    // Persist the failure on the dedupe record so later duplicates of this
+    // same key (a retry, or the other transport's backup) can report it too.
+    await updateDedupeBusinessState(claim, ctx, businessError);
+  }
   return claim;
 }
 
@@ -238,12 +256,19 @@ async function handleDeliverMessage(sw, event, message, ctx) {
       ? message.source
       : 'message';
     result = await handlePushPayload(sw, message.payload, { ...ctx, source }) || {};
-    respondToSender(event, {
+    const ack = {
       ok: true,
       duplicate: Boolean(result.duplicate),
       key: result.key,
       requestId: message.requestId,
-    });
+    };
+    // `ok` means "received and dispatched", NOT "business persisted". When
+    // the consumer's onBusinessPayload failed, surface it without flipping
+    // `ok`, so existing callers keep working and stricter callers can react.
+    if (result.businessError !== undefined) {
+      ack.businessError = result.businessError;
+    }
+    respondToSender(event, ack);
   } catch (error) {
     respondToSender(event, {
       ok: false,
@@ -295,15 +320,23 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
   // notification. The overall waitUntil chain still awaits the business
   // callback below so the SW does not get killed mid-flight.
   let businessWork = null;
+  let businessError;
   if (typeof defaults.onBusinessPayload === 'function') {
     try {
       const result = defaults.onBusinessPayload(payload);
       if (result && typeof result.then === 'function') {
-        businessWork = Promise.resolve(result).catch(error => {
-          console.error('[rei-standard-amsg-sw] onBusinessPayload promise rejected:', error);
-        });
+        businessWork = Promise.resolve(result).then(
+          () => {},
+          (error) => {
+            // Capture (do not swallow) the rejection so the DELIVER ack can
+            // reflect that the payload was dispatched but not persisted.
+            businessError = errorToMessage(error);
+            console.error('[rei-standard-amsg-sw] onBusinessPayload promise rejected:', error);
+          }
+        );
       }
     } catch (error) {
+      businessError = errorToMessage(error);
       console.error('[rei-standard-amsg-sw] onBusinessPayload error:', error);
     }
   }
@@ -315,6 +348,8 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
   }
   if (businessWork) await businessWork;
 
+  // Resolved as `undefined` on success — callers only act when it is set.
+  settledResult.businessError = businessError;
   return settledResult;
 }
 
@@ -585,6 +620,64 @@ async function updateDedupeNotificationState(claim, ctx, dispatchResult) {
   }
 }
 
+/**
+ * Persist a business-callback failure onto the dedupe record so that later
+ * duplicates of the same key (a sender retry, or the other transport's
+ * backup) can report it on their ack. Business runs at most once per key,
+ * so this is the only place the failure can be remembered.
+ */
+async function updateDedupeBusinessState(claim, ctx, businessError) {
+  if (businessError === undefined) return;
+  if (!claim || claim.duplicate || !claim.key || !ctx.dedupe || ctx.dedupe.enabled === false) return;
+
+  try {
+    // Attach only to the very record we claimed. While our business callback
+    // ran, the stored record may have been:
+    //   (a) repaired by a duplicate/backup — keep that by merging onto the
+    //       LATEST record, not the first delivery's stale snapshot, so we
+    //       don't flip `notificationShown` back and re-show a notification; or
+    //   (b) replaced by a TTL-renewed claim (delete + re-add) — a fresh
+    //       `firstSeenAt` means a different delivery now owns this key, and
+    //       stamping our old failure onto it would mis-report that newer
+    //       delivery (which may have succeeded).
+    const latest = await readDedupeRecord(ctx.dedupe, claim.key);
+    if (!latest || !claim.record || latest.firstSeenAt !== claim.record.firstSeenAt) return;
+    const next = { ...latest, key: claim.key, businessError };
+    await putDedupeRecord(ctx.dedupe, next);
+    claim.record = next;
+  } catch (error) {
+    console.error('[rei-standard-amsg-sw] dedupe business state update failed:', error);
+  }
+}
+
+/**
+ * Resolve the businessError to report on a duplicate's ack. Reads the latest
+ * persisted record (the first delivery's business may have failed and
+ * persisted it after this duplicate snapshotted `claim.existing`), falling
+ * back to that snapshot if the live read yields nothing.
+ */
+async function readDuplicateBusinessError(claim, ctx) {
+  const snapshot = claim && claim.existing ? claim.existing.businessError : undefined;
+  if (!ctx.dedupe || ctx.dedupe.enabled === false || !claim || !claim.key || !claim.existing) {
+    return snapshot;
+  }
+  try {
+    const latest = await readDedupeRecord(ctx.dedupe, claim.key);
+    // Trust the live record only if it is still the same claim we duplicated.
+    // A TTL-renewed claim (fresh `firstSeenAt`) belongs to a different, newer
+    // delivery, so reporting its businessError on this stale duplicate's ack
+    // would misattribute an unrelated failure. Mirrors the write path.
+    if (latest
+        && latest.firstSeenAt === claim.existing.firstSeenAt
+        && latest.businessError !== undefined) {
+      return latest.businessError;
+    }
+  } catch (_readError) {
+    // Fall back to the snapshot below.
+  }
+  return snapshot;
+}
+
 async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
   const existing = claim && claim.existing ? claim.existing : null;
   if (!existing || existing.notificationShown === true) {
@@ -618,8 +711,14 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
 
   await sw.registration.showNotification(notification.title, notification.options);
 
+  // Merge onto the LATEST record, not the pre-await `existing` snapshot:
+  // while we awaited showNotification, the first delivery may have persisted
+  // a `businessError` (or other fields) onto this key. Overwriting from the
+  // stale snapshot would erase it and break the DELIVER ack contract.
+  const latest = await readDedupeRecord(ctx.dedupe, claim.key);
+  const base = latest || existing;
   const next = {
-    ...existing,
+    ...base,
     notificationShown: true,
     notificationStatePending: false,
   };
@@ -1110,6 +1209,10 @@ async function registerFlushSync(sw) {
   }
 }
 
+function errorToMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function respondToSender(event, message) {
   const messagePort = event.ports && event.ports[0];
   if (messagePort && typeof messagePort.postMessage === 'function') {
@@ -1330,24 +1433,107 @@ async function listStoreRecords(storeName) {
   });
 }
 
-async function withDatabaseStore(storeName, mode, handler) {
-  const db = await openQueueDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(storeName, mode);
+/**
+ * True when an error means the IndexedDB connection we just used is
+ * closing/closed — i.e. the browser force-closed it (backing-store error,
+ * storage pressure, user clearing data) and any `transaction()` on it
+ * throws synchronously. `versionchange` is NOT involved here, so the cached
+ * handle would otherwise stay dead forever.
+ */
+function isConnectionClosingError(error) {
+  if (!error) return false;
+  if (error.name === 'InvalidStateError') return true;
+  const message = String(error.message || error);
+  return /connection is closing|database connection is closing/i.test(message);
+}
+
+// Evict the dead connection `db` from the cache. Only touch it if it is
+// STILL the cached handle: under concurrent recovery, another attempt may
+// have already reopened and cached a fresh connection, and closing that
+// fresh one would defeat the self-heal. When `db` is undefined (the open()
+// itself failed, so nothing of ours is cached) this is a no-op.
+function invalidateDedupeCache(dedupe, db) {
+  const cacheKey = `${dedupe.dbName}:${dedupe.storeName}`;
+  const cached = dedupeDbCache.get(cacheKey);
+  if (cached && cached === db) {
+    try { cached.close(); } catch (_closeError) { /* already closing */ }
+    dedupeDbCache.delete(cacheKey);
+  }
+}
+
+function invalidateQueueCache(db) {
+  if (cachedDB && cachedDB === db) {
+    try { cachedDB.close(); } catch (_closeError) { /* already closing */ }
+    cachedDB = null;
+  }
+}
+
+/**
+ * Run `run(db)` against a cached IndexedDB connection, with a single
+ * transparent reopen if the connection turns out to be closing/closed.
+ *
+ * `db.transaction()` throws *synchronously* on a dead connection, and the
+ * `close` event (which would evict the cache) can land later than the next
+ * call — so we cannot rely on the `onclose` handler alone. On the first
+ * attempt we drop the cached handle and retry once; a second failure is
+ * surfaced as-is. The retry is capped at one to avoid spinning forever.
+ */
+async function withConnectionRetry(open, invalidate, run) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let db;
+    try {
+      db = await open();
+    } catch (error) {
+      // open() rejects only when nothing of ours is cached, so there is no
+      // specific handle to evict here.
+      if (attempt === 0) { invalidate(undefined); continue; }
+      throw error;
+    }
+    try {
+      return await run(db);
+    } catch (error) {
+      // Evict ONLY the handle that just failed — never whatever is cached
+      // now, which a concurrent attempt may have already reopened.
+      if (attempt === 0 && isConnectionClosingError(error)) { invalidate(db); continue; }
+      throw error;
+    }
+  }
+  // Unreachable: the loop returns or throws on attempt 1.
+  throw new Error('[rei-standard-amsg-sw] store connection retry exhausted');
+}
+
+function withDatabaseStore(storeName, mode, handler) {
+  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) => new Promise((resolve, reject) => {
+    let transaction;
+    try {
+      transaction = db.transaction(storeName, mode);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const store = transaction.objectStore(storeName);
     transaction.onerror = () => reject(transaction.error || new Error('Database transaction failed'));
     Promise.resolve(handler(store, resolve, reject)).catch(reject);
-  });
+  }));
 }
 
-async function withDedupeStore(dedupe, mode, handler) {
-  const db = await openDedupeDatabase(dedupe);
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(dedupe.storeName, mode);
-    const store = transaction.objectStore(dedupe.storeName);
-    transaction.onerror = () => reject(transaction.error || new Error('Dedupe transaction failed'));
-    Promise.resolve(handler(store, resolve, reject)).catch(reject);
-  });
+function withDedupeStore(dedupe, mode, handler) {
+  return withConnectionRetry(
+    () => openDedupeDatabase(dedupe),
+    (db) => invalidateDedupeCache(dedupe, db),
+    (db) => new Promise((resolve, reject) => {
+      let transaction;
+      try {
+        transaction = db.transaction(dedupe.storeName, mode);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const store = transaction.objectStore(dedupe.storeName);
+      transaction.onerror = () => reject(transaction.error || new Error('Dedupe transaction failed'));
+      Promise.resolve(handler(store, resolve, reject)).catch(reject);
+    }),
+  );
 }
 
 function hasIndexedDB() {
@@ -1394,10 +1580,19 @@ function openDedupeDatabase(dedupe) {
     request.onsuccess = () => {
       const db = request.result;
       dedupeDbCache.set(cacheKey, db);
+      // Only evict if WE are still the cached handle — a stale connection's
+      // late close event must not drop a freshly reopened one.
+      const drop = () => {
+        if (dedupeDbCache.get(cacheKey) === db) dedupeDbCache.delete(cacheKey);
+      };
       db.onversionchange = () => {
         db.close();
-        dedupeDbCache.delete(cacheKey);
+        drop();
       };
+      // Browser force-closed the connection (backing-store error / storage
+      // pressure / cleared data). This does NOT fire on versionchange, so
+      // without it the cache would keep handing out a dead connection.
+      db.onclose = () => { drop(); };
       resolve(db);
     };
     request.onerror = () => reject(request.error || new Error('Failed to open dedupe database'));
@@ -1427,12 +1622,18 @@ function openQueueDatabase() {
     };
 
     request.onsuccess = () => {
-      cachedDB = request.result;
-      cachedDB.onversionchange = () => {
-        cachedDB.close();
-        cachedDB = null;
+      const db = request.result;
+      cachedDB = db;
+      db.onversionchange = () => {
+        db.close();
+        if (cachedDB === db) cachedDB = null;
       };
-      resolve(cachedDB);
+      // Browser force-closed the connection — evict so the next access
+      // reopens instead of reusing a dead handle.
+      db.onclose = () => {
+        if (cachedDB === db) cachedDB = null;
+      };
+      resolve(db);
     };
     request.onerror = () => reject(request.error || new Error('Failed to open queue database'));
   });
@@ -1443,17 +1644,22 @@ function createObjectStoreIfMissing(db, tx, name, options) {
   return db.createObjectStore(name, options);
 }
 
-async function withQueueStore(mode, handler) {
-  const db = await openQueueDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(REI_SW_DB_STORE, mode);
+function withQueueStore(mode, handler) {
+  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) => new Promise((resolve, reject) => {
+    let transaction;
+    try {
+      transaction = db.transaction(REI_SW_DB_STORE, mode);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const store = transaction.objectStore(REI_SW_DB_STORE);
 
     transaction.oncomplete = () => resolve(undefined);
     transaction.onerror = () => reject(transaction.error || new Error('Queue transaction failed'));
 
     Promise.resolve(handler(store, resolve, reject)).catch(reject);
-  });
+  }));
 }
 
 async function addQueuedRequest(request) {

@@ -1,5 +1,13 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.3.0 — IndexedDB 连接韧性 + 业务感知的 DELIVER ack
+
+- **Fix**: IndexedDB 连接被浏览器**强制关闭**（backing store 出错 / 存储压力 / 清数据）后自愈。强关只触发 `close`、不触发 `versionchange`，此前缓存里的死连接会被无限复用，每次事务都抛 `InvalidStateError`，导致去重失灵、push 落库被阻断、`dedupe cleanup failed` 刷屏且不重启 SW 不恢复。dedupe 库与 queue / multipart 库（`cachedDB`）一并修复。
+  - 给缓存连接挂 `onclose`：被强关时剔除缓存，下次访问重开。
+  - 事务级一次重开兜底：`close` 事件可能晚于下一次事务、而 `db.transaction()` 同步抛错，故发事务命中「连接 closing/closed」时清缓存、重开一次、重试一次；重试上限 1 次，第二次仍失败如实抛出。
+- **New**: DELIVER ack 增加可选字段 `businessError`（非破坏）。`onBusinessPayload` reject 或抛错时，ack 仍是 `ok: true` 但带上 `businessError: <message>`；成功时不出现该字段。`ok` 的含义明确为「已收下并分发」而非「业务已落库」，需要严格区分「传输成功 / 业务落库成功」的消费方读 `businessError` 即可。webpush `push` 路径无 ack，业务失败仅内部 `console.error`，不会让投递 promise reject。
+  - 失败会持久化到 dedupe 记录上：之后**同 key 的重复包**（发送方重试 / 另一条 transport 的 backup）被去重后，ack 仍会带上首包的 `businessError`，而不是回一个看着干净的 `ok:true, duplicate:true`。注意：去重不会让 `onBusinessPayload` 重跑——这只是让信号诚实，不是补救机制；要「失败可重试」需消费方自己做幂等（见 README「在 SW 内执行 tool_request 的安全边界」）。
+
 ## 2.2.0 — delivery dedupe + SSE bridge
 
 - **New**: `installReiSW({ dedupe })` 新增通用 delivery dedupe，默认开启。默认 key 为 `payload.messageId` → `payload.id` → `payload.dedupeKey`，没有 key 时保持兼容不去重。
