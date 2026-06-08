@@ -1,5 +1,81 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.5.0-next.0 — `deliver()` 平台无关送达 primitive (pre-release)
+
+发布在 `next` dist-tag。供 SullyOS 等真实接入方端到端验证 deliver() 在 iOS PWA / SW 双通道实战下的行为；本地 55 条单测全过但 SSE 流式 / Web Push backup / iOS 后台杀 fetch 等场景没法在 Node 里仿真，所以先 next 再升 latest。验收 OK 后 graduate 到 `2.5.0`（`npm dist-tag add` 或重发正式版）。
+
+把"发出去"和"业务上是否真送达"在 API 层显式分开。新增 `client.deliver()` 作为新代码的首选入口；老的 `sendInstant()` / `consumeInstantStream()` 仍可用但降级为低级 transport，配 opt-in dev warning 引导迁移。SSE 与 JSON 两条 transport 一并升级到统一的送达协调层，调用方无需感知。
+
+### New
+
+- 新增 `client.deliver(payload, opts)`：单一入口，根据响应 `Content-Type` 自动选 SSE 或 JSON transport，与 caller 提供的「观察通道 `Promise<ObservedDeliveryReceipt>`」做 race + grace，返回 `DeliveryResult` 含五值 `outcome`（`delivered` / `cancelled` / `timeout` / `send-failed` / `completed-unconfirmed`）。
+- 观察通道是 **平台无关 Promise**：库不绑 Service Worker / IndexedDB / Web Push / 任何具体后端，调用方自己把 SW 广播、IPC、原生桥、轮询、自定义通道包成 Promise 即可。
+- `delivery` 用 discriminated union 显式声明 `mode: 'observed' | 'transport-only'`，不允许「传永不 resolve 的 Promise 假装在 observed 模式」的写法。
+- `outcome:'delivered'` 仅 observed 模式可达，且必须 receipt identity 校验通过（receipt 至少含 `messageId` 或 `sessionId` 之一的非空字符串）；invalid receipt 视为「观察从未触发」继续 race，杜绝并发串单。
+- `outcome:'cancelled'` 独立于 `timeout` / `send-failed`：caller `signal.abort()` 触发；但若 grace 内仍观察到 receipt，会改报 `delivered` + `detail.cancelledByCaller: true`（iOS 切回前台后 push 仍接力的实战场景）。
+- `outcome:'timeout'` 在 observed 模式 + transport 干净结束 + observation 未接力 时，额外带 `detail.observationChannelStalled: true`——观察通道挂了不等于发送失败。
+- `outcome:'send-failed'` 仅在 transport 有 captured error **且** 观察通道也没接力时触发。
+- `outcome:'completed-unconfirmed'` 仅 transport-only 模式专用，明确标注「best-effort 乐观，无真相信号」。
+- Pre-flight `signal.aborted` 检查：进入时若已 aborted，直接返回 `cancelled`，不下发 fetch。
+- `postTransportGraceMs` 默认 = `min(remainingBudget, max(5000, timeoutMs * 0.1))`：5s 下限 + 10% 比例，跨 30s / 300s / 多分钟 timeout 都有合理 grace。
+- `onChunk`（可选 SSE 每帧 UI 钩子）抛错被捕获进 `detail.chunkHandlerError`，**不**升级 outcome 到 `send-failed`——UI 钩子失败是 caller-bug-shaped。
+
+### Soft-deprecated（仍可用，文档与 warning 引导迁移）
+
+- `sendInstant()` JSDoc 改标 **Low-level JSON dispatcher**，提示 「HTTP 200 ≠ delivery confirmation」当 backup push 开启时。
+- `consumeInstantStream()` JSDoc 改标 **Low-level SSE consumer**，提示 「rejection ≠ delivery failure」当 backup push 开启时。
+- 两者新增可选 `opts.expectsBackupPush`：
+  - `true` → 实例 + 方法首次调用时 `console.warn` 一次（migration 审计用）
+  - `false` → 显式表示「我知道这点」永久静音
+  - 不传 → 不警告
+- 没有立刻 `@deprecated`，留两个 minor 缓冲到 3.0.0。
+
+### 内部重构（行为字节不变）
+
+- 抽取私有 `_buildInstantRequest` / `_runInstantTransport` / `_consumeSseStream`，`sendInstant` / `consumeInstantStream` / `deliver` 三条路径共用。
+- SSE 解析逻辑与 2.4.0 byte-identical（多行 `data:` 用 `\n` 拼接、`event: done` 优先、EOF 视为 done、`event: error` 解 JSON 抛带 `code` 的 Error）。
+
+### Migration
+
+| 旧写法 | 新写法 |
+| --- | --- |
+| `try { await consumeInstantStream(p, '/instant', { onPayload }) } catch { fail() }` | `const r = await deliver(p, { delivery: { mode: 'observed', observed }, timeoutMs, onChunk: onPayload }); if (r.outcome !== 'delivered') ...` |
+| `const r = await sendInstant(p); if (!r.success) fail()` | `const r = await deliver(p, { delivery: { mode: 'observed', observed }, timeoutMs }); if (r.outcome === 'send-failed') ...` |
+| `sendInstant(p, '/instant', { authorization: 'Bearer ...' })` | `deliver(p, { delivery, timeoutMs, authorization: 'Bearer ...' })` |
+
+详见 README 的 `deliver()` 标准用法与「为什么需要 `deliver()`」段。
+
+### 发布前 review 期修复（折叠进 2.5.0）
+
+Self-review 时（仿 ultrareview 多角度分派）抓到的 correctness 修复，均不破前面任何 API：
+
+- **SSE 帧分隔**：原 `buffer.split('\n\n')` 在 CRLF 服务端（.NET / IIS / 某些 CDN）下永远拼不到分隔符，全流静默丢。改成先 `\r\n?` → `\n` 整 buffer 归一化再 split，覆盖 `\r\n\r\n` / `\n\n` / `\r\r` 与跨 chunk seam 的混合行尾。
+- **SSE EOF flush**：流结束时漏 `decoder.decode()` 收尾 + 漏处理无尾随空行的最后一帧。两处都补上，避免跨 chunk 的 UTF-8 多字节字符丢字节、最后一帧静默丢。
+- **本地校验错误不再被埋**：`PAYLOAD_TOO_LARGE_LOCAL` / 加密未初始化等本地错误现在直接从 `deliver()` 抛出，不再被吞进 IIFE 变成 `outcome:'send-failed'` + `detail.transportError`。请求构造提前到 race 启动之前。
+- **post-return 写穿防护**：observed 模式赢 race 后，仍在跑的 transport IIFE 不再有机会改 caller 已持有的 `detail`（`finalized` 闸口同步关）。
+- **caller signal listener 卸载**：每个终态都会 removeEventListener，长生命周期 `AbortController` 跨 N 次调用不再累积 2N 个 stale 闭包。
+- **abort 微任务窗口竞态**：pre-flight 与 listener 注册之间窗口内 abort 触发时，新注册的 listener 不会 fire（DOM spec），现在 addEventListener 后会再查一次 `signal.aborted` 并补触发。
+- **transport-only + cancel 不再 linger**：`mode: 'transport-only'` 下 caller abort 之后直接返回，不再死等 grace/2 拿一个永远不会到的 observation。
+- **`deliver()` 接受 `opts.authorization`**：从 `sendInstant({authorization})` 迁过来时不会再静默丢 header。
+- **结构化 JSON Content-Type**：`application/problem+json` / `application/vnd.api+json` 这类 structured-suffix variant 现在被识别为 JSON。
+- **JSDoc 写明 cancel grace `/2`**：`postTransportGraceMs` 注释明确 cancel 路径生效的是 `grace/2`（一半留给清理）。
+
+依赖与外部接口零变更；以上全部在 `client` 包内部完成，并加了 9 条 regression 测试覆盖。
+
+### Codex review 后追加的修复（同样折叠进 2.5.0）
+
+走完一轮 9-angle self-review 之后，又请 Codex 独立读了一遍 working tree，抓到 7 个我漏的：
+
+- **transport-only 模式 transport 结束后仍然等 grace**：之前只 fix 了 cancel 路径，post-transport-ended 路径还在白等（`timeoutMs: 60_000` 默认会多卡 ~5s）。observed mode 才有观察通道值得等，transport-only 直接按 transport 结果出 outcome。
+- **abort 期间 `_buildInstantRequest` 仍可能发 fetch**：pre-flight 只查了一次，但 build 是 async（加密走 Web Crypto 会 await），signal 在 build 中途 abort 会被吞，仍走 fetch。现在 build 完成后再查一次 `signal.aborted`，aborted 就直接返回 cancelled 不下发请求。
+- **post-transport grace 期间 abort 被忽略**：transport 先结束后，late-receipt 等待只 race `validatedObserved` + 自己的 timer，没 race `cancelledP`。caller 在 grace 期间 abort 会被错报成 timeout / send-failed。现在 grace 等待跟 cancel signal 一起 race，abort 赢就报 cancelled。
+- **SSE CRLF 跨 chunk seam 仍然破**：第一轮修了 `\r\n\r\n` 的统一归一化，但当真实 CRLF 正好被分到两个 chunk（chunk1 末尾 `\r`、chunk2 开头 `\n`），原 normalize 会把 chunk1 的 trailing `\r` 提前变成 `\n`，再跟下一个 chunk 拼成 `\n\n` 误判帧边界。修：把 trailing `\r` 留到下一 chunk 再统一归一化。
+- **`onChunk` 抛错跨 deliver-return mutate detail**：上轮防了 transport IIFE 的 `detail.transportResponse` 写穿，但 `wrappedOnChunk` 的 catch 仍直接写 `detail.chunkHandlerError`，observed 赢 race 返回后 onChunk 延迟 throw 仍能改 caller 持有的 detail。现在 `chunkHandlerError` 写入也 gate 在 `finalized`。
+- **Content-Type 用 substring 不是 media-type 解析**：`application/json; note=text/event-stream` 这种参数里带其他媒体类型的会被错认。改成严格 media-type 解析：先用 `;` 切参数、trim、lowercase，再 exact match + structured-suffix 正则。`consumeInstantStream` 的 SSE 检查也一并改成走 `classifyContentType`。
+- **`NEVER_SETTLES` 共享 sentinel 累积 Promise reactions**：`Promise.race` 每次都给那个全局永不 settle 的 Promise 挂 reaction，长生命周期页面会持续累积。改成条件式构造 race 数组——transport-only 不参 observed/`validatedObserved`，无 signal 不参 cancelledP，整个 `NEVER_SETTLES` 常量直接删掉。
+
+测试集相应扩到 55 条，覆盖以上每个修复 + transport-only 短路 + 跨 chunk seam 的真 CRLF 场景；之前自己写的 5 条直接动 `globalThis.fetch` 的测试也改成走 `installFetch()` restore 模式，避免污染更大 suite。
+
 ## 2.4.0 — `consumeInstantStream()` SSE consumer
 
 配套 `@rei-standard/amsg-instant@0.9.0` 的 SSE 默认模式；同时移除 client 默认请求体大小上限，避免本地误拦长上下文请求。
