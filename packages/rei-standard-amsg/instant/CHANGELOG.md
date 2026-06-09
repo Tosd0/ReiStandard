@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.9.1-next.1 — SSE lifecycle regression tests (pre-release)
+
+- **Tests**: 增加三条针对"LLM 永远不被塞进 waitUntil 30s 桶"契约的回归测试——多 chunk + 中途 abort 全 fallback 投递、SSE 模式 waitUntil 注册数恒为 1（只剩 startDone）、慢 LLM 必须先于 `controller.close()` resolve。任何让 LLM 调用或 push HTTP 漂出 `start()` 的改动都会被这套断言拦下。
+
 ## 0.9.1-next.0 — SSE stream lifecycle owns LLM + push completion (pre-release)
 
 - **Fix**: SSE 模式下 LLM 调用与每条 payload 的 Web Push backup / fallback 完整运行在 `ReadableStream.start()` 内——`start()` 先 await 所有 backup 推送，再 `controller.close()`。响应仍在产出期间 runtime 不会施加 wall-clock 上限，慢 LLM + 客户端中途断开（iOS Safari 杀掉后台 SSE socket、页面切走等）的组合下也能把这一轮消息送达。
