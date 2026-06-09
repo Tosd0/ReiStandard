@@ -89,7 +89,7 @@ function readReasoningContent(llmResponse) {
   const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
   if (!Array.isArray(choices) || choices.length === 0) return null;
   const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
-  
+
   const raw = message?.reasoning_content;
   if (typeof raw === 'string') {
     const trimmed = raw.trim();
@@ -98,7 +98,7 @@ function readReasoningContent(llmResponse) {
 
   const content = message?.content;
   if (typeof content === 'string') {
-    const match = content.match(/<(think|thinking|thought)>([\s\S]*?)<\/\1>/i);
+    const match = content.match(REASONING_TAG_RE);
     if (match) {
       const trimmed = match[2].trim();
       if (trimmed.length > 0) return trimmed;
@@ -106,6 +106,22 @@ function readReasoningContent(llmResponse) {
   }
 
   return null;
+}
+
+const REASONING_TAG_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/i;
+const REASONING_TAG_RE_G = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
+
+/**
+ * Mirrors `amsg-instant/src/message-processor.js#stripReasoningTags`.
+ * Removes any private chain-of-thought markup leaking through
+ * `message.content` so it does not also ship inside ContentPush.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function stripReasoningTags(content) {
+  if (typeof content !== 'string' || !content.includes('<')) return content;
+  return content.replace(REASONING_TAG_RE_G, '').trim();
 }
 
 /**
@@ -161,6 +177,15 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       throw new Error('Invalid message configuration: no content source available');
     }
 
+    // Auto-extract reasoning BEFORE the sentence split: when reasoning
+    // came from the `<think>` fallback inside message.content, the same
+    // span is still embedded in messageContent and would otherwise leak
+    // as raw markup into ContentPush.
+    const reasoning = readReasoningContent(llmResponse);
+    if (reasoning) {
+      messageContent = stripReasoningTags(messageContent);
+    }
+
     // Sentence splitting (mirrors @rei-standard/amsg-instant
     // splitMessageIntoSentences — keep in lockstep; do not drift). Caller may
     // override the default regex via decryptedPayload.splitPattern (string
@@ -197,7 +222,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     // LLM response carried non-empty reasoning_content. `fixed` and
     // explicit-userMessage paths produce no LLM response, so this
     // block is naturally skipped for them (llmResponse stays null).
-    const reasoning = readReasoningContent(llmResponse);
     if (reasoning) {
       const reasoningPush = buildReasoningPush({
         messageType: decryptedPayload.messageType,

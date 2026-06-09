@@ -303,11 +303,19 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
   if (notificationState.shouldRender) {
     const notification = createNotificationFromPayload(payload, defaults);
     if (notification) {
+      // A rejected showNotification (permission revoked / quota / OS error)
+      // must NOT stop onNotificationSettled from running — that callback is
+      // the only thing that clears `notificationStatePending`, and leaving
+      // it stuck makes the backup transport's repair path swallow every
+      // duplicate as 'first-delivery-pending'.
       notificationWork.push(
         sw.registration.showNotification(notification.title, notification.options)
-          .then(() => {
-            notificationState.shown = true;
-          })
+          .then(
+            () => { notificationState.shown = true; },
+            (error) => {
+              console.error('[rei-standard-amsg-sw] showNotification rejected:', error);
+            }
+          )
       );
     }
   }

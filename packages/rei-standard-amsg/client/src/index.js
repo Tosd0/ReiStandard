@@ -28,6 +28,12 @@
  *   await client.scheduleMessage({ ... });
  */
 
+import { base64UrlToBytes } from '@rei-standard/amsg-shared';
+
+// `TextEncoder` is stateless — hoist once instead of allocating a fresh
+// instance for every encrypt + payload-size check.
+const TEXT_ENCODER = new TextEncoder();
+
 /** @typedef {import('@rei-standard/amsg-shared').MessageKind} MessageKind */
 /** @typedef {import('@rei-standard/amsg-shared').MessageType} MessageType */
 /** @typedef {import('@rei-standard/amsg-shared').PushSource} PushSource */
@@ -398,11 +404,11 @@ export class ReiClient {
    * @param {string} [endpointPath] - Path under the resolved base URL. Default '/instant'.
    * @param {{ authorization?: string, expectsBackupPush?: boolean }} [opts]
    *   - `authorization`: optional auth header to forward.
-   *   - `expectsBackupPush`: opt-in flag for the dev warning. Set to `true`
-   *     to log a one-shot console.warn confirming you understand the
-   *     "200 ≠ delivered" pitfall and have your own out-of-band check
-   *     (or migrated to `deliver()`). Set to `false` to explicitly silence
-   *     the warning (you have read this contract).
+   *   - `expectsBackupPush`: opt-in dev reminder. Set to `true` to log a
+   *     one-shot console.warn that this is a low-level transport and
+   *     "HTTP 200 ≠ delivery confirmation" once the worker has backup
+   *     push enabled (amsg-instant 0.9.0+ default). Default (omitted) is
+   *     silent.
    * @returns {Promise<Object>} `{ success, data?: { messagesSent, sentAt }, error? }`
    */
   async sendInstant(payload, endpointPath = '/instant', opts = {}) {
@@ -413,6 +419,10 @@ export class ReiClient {
       endpointPath,
       { authorization: opts.authorization, methodName: 'sendInstant' }
     );
+    // Pin the response shape: amsg-instant routes the JSON `{ success, data }`
+    // envelope only when the caller asked exclusively for it. Omitting Accept
+    // gets the SSE branch and `res.json()` then throws on the SSE bytes.
+    headers['Accept'] = 'application/json';
 
     const res = await fetch(url, { method: 'POST', headers, body });
     return res.json();
@@ -445,10 +455,10 @@ export class ReiClient {
    * @param {(error: unknown) => void} [options.onError]
    * @param {() => void} [options.onDone]
    * @param {AbortSignal} [options.signal]
-   * @param {boolean} [options.expectsBackupPush] - Opt-in flag for the dev warning.
-   *   Set to `true` to log a one-shot console.warn confirming you understand the
-   *   "rejection ≠ delivery failure" pitfall and have your own check (or migrated
-   *   to `deliver()`). Set to `false` to explicitly silence the warning.
+   * @param {boolean} [options.expectsBackupPush] - Opt-in dev reminder. Set
+   *   to `true` to log a one-shot console.warn that "rejection ≠ delivery
+   *   failure" once the worker has backup push enabled (amsg-instant 0.9.0+
+   *   default). Default (omitted) is silent.
    * @returns {Promise<void>}
    */
   async consumeInstantStream(payload, endpointPath = '/instant', options = {}) {
@@ -858,7 +868,7 @@ export class ReiClient {
   async subscribePush(vapidPublicKey, registration) {
     const subscription = await registration.pushManager.subscribe({
       userVisibleOnly: true,
-      applicationServerKey: this._urlBase64ToUint8Array(vapidPublicKey)
+      applicationServerKey: base64UrlToBytes(vapidPublicKey)
     });
     return subscription;
   }
@@ -909,7 +919,7 @@ export class ReiClient {
    */
   _assertPayloadSize(bodyJson, methodName) {
     if (this._maxPayloadBytes == null) return;
-    const bytes = new TextEncoder().encode(bodyJson).length;
+    const bytes = TEXT_ENCODER.encode(bodyJson).length;
     if (bytes > this._maxPayloadBytes) {
       throw makeLocalError(
         'PAYLOAD_TOO_LARGE_LOCAL',
@@ -1202,10 +1212,10 @@ export class ReiClient {
   }
 
   /**
-   * One-shot dev warning for low-level instant APIs. The warning is opt-in
-   * per call via `opts.expectsBackupPush === true`, and can be explicitly
-   * silenced via `opts.expectsBackupPush === false`. Fires at most once per
-   * ReiClient instance per method name.
+   * One-shot dev reminder for low-level instant APIs. The warning is opt-in
+   * per call via `opts.expectsBackupPush === true` and fires at most once
+   * per ReiClient instance per method name. Default (omitted or `false`)
+   * is silent.
    *
    * @private
    * @param {string} methodName
@@ -1219,7 +1229,7 @@ export class ReiClient {
       ? 'HTTP 200 ≠ delivery confirmation'
       : 'rejection ≠ delivery failure';
     console.warn(
-      `[rei-standard-amsg-client] ${methodName} is a low-level transport — ${verdict} when the worker is configured with always-on backup Web Push (amsg-instant 0.9.0+ default). Prefer client.deliver() for a correct delivered / cancelled / timeout / send-failed verdict. Pass expectsBackupPush: false to silence this warning.`
+      `[rei-standard-amsg-client] ${methodName} is a low-level transport — ${verdict} when the worker is configured with always-on backup Web Push (amsg-instant 0.9.0+ default). Prefer client.deliver() for a correct delivered / cancelled / timeout / send-failed verdict.`
     );
   }
 
@@ -1236,7 +1246,7 @@ export class ReiClient {
 
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const key = await crypto.subtle.importKey('raw', this._userKey, { name: 'AES-GCM' }, false, ['encrypt']);
-    const encoded = new TextEncoder().encode(plaintext);
+    const encoded = TEXT_ENCODER.encode(plaintext);
     const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
 
     // Web Crypto appends the 16-byte auth tag at the end of the ciphertext
@@ -1300,15 +1310,6 @@ export class ReiClient {
     return arr;
   }
 
-  /** @private */
-  _urlBase64ToUint8Array(base64String) {
-    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-    const raw = atob(base64);
-    const arr = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-    return arr;
-  }
 }
 
 function normalizeMaxPayloadBytes(value) {

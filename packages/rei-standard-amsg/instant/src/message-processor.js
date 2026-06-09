@@ -320,7 +320,7 @@ function readReasoningContent(llmResponse) {
   const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
   if (!Array.isArray(choices) || choices.length === 0) return null;
   const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
-  
+
   const raw = message?.reasoning_content;
   if (typeof raw === 'string') {
     const trimmed = raw.trim();
@@ -329,7 +329,7 @@ function readReasoningContent(llmResponse) {
 
   const content = message?.content;
   if (typeof content === 'string') {
-    const match = content.match(/<(think|thinking|thought)>([\s\S]*?)<\/\1>/i);
+    const match = content.match(REASONING_TAG_RE);
     if (match) {
       const trimmed = match[2].trim();
       if (trimmed.length > 0) return trimmed;
@@ -337,6 +337,28 @@ function readReasoningContent(llmResponse) {
   }
 
   return null;
+}
+
+/**
+ * Matches `<think>…</think>` / `<thinking>…</thinking>` / `<thought>…</thought>`
+ * spans (case-insensitive, lazy multi-line). Mirrored in
+ * `amsg-server/src/server/lib/message-processor.js` — keep in lockstep.
+ */
+const REASONING_TAG_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/i;
+const REASONING_TAG_RE_G = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
+
+/**
+ * Drop any `<think>` / `<thinking>` / `<thought>` spans from a user-facing
+ * content string. Used after `readReasoningContent` matched the regex
+ * fallback path so the same private chain-of-thought does not also ship
+ * inside the ContentPush burst.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function stripReasoningTags(content) {
+  if (typeof content !== 'string' || !content.includes('<')) return content;
+  return content.replace(REASONING_TAG_RE_G, '').trim();
 }
 
 /**
@@ -433,6 +455,10 @@ async function runLegacyInstant(payload, ctx) {
   // the actual reply.
   const reasoning = readReasoningContent(llmResponse);
   if (reasoning) {
+    // When reasoning came from the `<think>` fallback in message.content,
+    // the same span is still embedded in messageContent — strip it before
+    // the sentence-split below so raw markup never ships inside ContentPush.
+    messageContent = stripReasoningTags(messageContent);
     const reasoningPush = buildReasoningPush({
       messageType: MESSAGE_TYPE.INSTANT,
       source: PUSH_SOURCE.INSTANT,
@@ -1029,4 +1055,4 @@ function buildBlobUrl(requestUrl, key) {
   return `/blob/${key}`;
 }
 
-export { sendPushWithMaybeBlob, readReasoningContent, ensureStableMessageId };
+export { sendPushWithMaybeBlob, readReasoningContent, stripReasoningTags, ensureStableMessageId };

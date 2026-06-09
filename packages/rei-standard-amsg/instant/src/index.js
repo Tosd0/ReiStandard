@@ -52,6 +52,22 @@ const DEFAULT_SSE_KEEPALIVE_MS = 1000;
 const MIN_SSE_KEEPALIVE_MS = 250;
 
 /**
+ * True when the caller asked exclusively for JSON. Any Accept value
+ * that lists another media type (including `*\/*`) keeps the default
+ * SSE transport — that's the legacy `consumeInstantStream` path which
+ * does not set an Accept header at all.
+ *
+ * Strict `headers.get('accept') === 'application/json'` is too narrow:
+ * `application/json; charset=utf-8` or `application/json, *\/*` would
+ * silently fall through to SSE and break `await res.json()` callers.
+ */
+function acceptsJsonOnly(acceptHeader) {
+  if (typeof acceptHeader !== 'string' || acceptHeader.length === 0) return false;
+  const ranges = acceptHeader.split(',').map((r) => r.split(';')[0].trim().toLowerCase()).filter(Boolean);
+  return ranges.length > 0 && ranges.every((r) => r === 'application/json');
+}
+
+/**
  * @typedef {Object} VapidConfig
  * @property {string} email
  * @property {string} publicKey   - base64url, 65 B uncompressed P-256 point.
@@ -324,7 +340,7 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const isPurePush = request.headers.get('accept') === 'application/json';
+      const isPurePush = acceptsJsonOnly(request.headers.get('accept'));
       const sessionId = typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : `sess_${randomUUID()}`;
 
       const processorCtx = {
