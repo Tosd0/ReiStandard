@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-sw",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "ReiStandard Active Messaging service worker SDK — three-axis push schema (content / reasoning / tool_request / error) with per-kind client postMessage events",
   "repository": {
     "type": "git",

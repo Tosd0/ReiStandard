@@ -1,10 +1,10 @@
 # Changelog — @rei-standard/amsg-client
 
-## 2.5.0-next.0 — `deliver()` 平台无关送达 primitive (pre-release)
-
-发布在 `next` dist-tag。供 SullyOS 等真实接入方端到端验证 deliver() 在 iOS PWA / SW 双通道实战下的行为；本地 55 条单测全过但 SSE 流式 / Web Push backup / iOS 后台杀 fetch 等场景没法在 Node 里仿真，所以先 next 再升 latest。验收 OK 后 graduate 到 `2.5.0`（`npm dist-tag add` 或重发正式版）。
+## 2.5.0 — `deliver()` 平台无关送达 primitive
 
 把"发出去"和"业务上是否真送达"在 API 层显式分开。新增 `client.deliver()` 作为新代码的首选入口；老的 `sendInstant()` / `consumeInstantStream()` 仍可用但降级为低级 transport，配 opt-in dev warning 引导迁移。SSE 与 JSON 两条 transport 一并升级到统一的送达协调层，调用方无需感知。
+
+`2.5.0-next.0` 先发在 `next` dist-tag 跑了一轮 SullyOS 等接入方的端到端验证（iOS PWA / SW 双通道实战），无回归后 graduate 到 `latest`。
 
 ### New
 
@@ -75,6 +75,13 @@ Self-review 时（仿 ultrareview 多角度分派）抓到的 correctness 修复
 - **`NEVER_SETTLES` 共享 sentinel 累积 Promise reactions**：`Promise.race` 每次都给那个全局永不 settle 的 Promise 挂 reaction，长生命周期页面会持续累积。改成条件式构造 race 数组——transport-only 不参 observed/`validatedObserved`，无 signal 不参 cancelledP，整个 `NEVER_SETTLES` 常量直接删掉。
 
 测试集相应扩到 55 条，覆盖以上每个修复 + transport-only 短路 + 跨 chunk seam 的真 CRLF 场景；之前自己写的 5 条直接动 `globalThis.fetch` 的测试也改成走 `installFetch()` restore 模式，避免污染更大 suite。
+
+### 正式版补丁（折叠进 2.5.0）
+
+- **`sendInstant()` 显式带 `Accept: application/json`**：默认 `Accept: */*` 会落到 amsg-instant 的 SSE 分支，随后的 `res.json()` 在 SSE 字节流上抛 SyntaxError。`sendInstant()` 是声明回 JSON 的入口，header 一并钉死。
+- **`expectsBackupPush` 文档与代码对齐**：JSDoc 与 warn 文案此前宣称 "Pass `expectsBackupPush: false` to silence"，实际 `false`、不传都是静默，`true` 才会触发一次性 warn。文案改成 opt-in dev reminder，默认静默，不再误导调用方。
+- **去掉 `_urlBase64ToUint8Array`**：与 `@rei-standard/amsg-shared` 的 `base64UrlToBytes` 逐字节重复（已有 `atob` + Node `Buffer` 双兜底），改 import shared 版本。
+- **模块级 `TEXT_ENCODER`**：`_encrypt` 与 `_assertPayloadSize` 此前每次都 `new TextEncoder()`。`TextEncoder` 是无状态的，提到 module top 复用，跟 instant / sw 对齐。
 
 ## 2.4.0 — `consumeInstantStream()` SSE consumer
 

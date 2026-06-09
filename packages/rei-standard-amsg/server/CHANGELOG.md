@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.5.1 — `<think>` 不再泄进 ContentPush
+
+- **Fix**: `readReasoningContent` 走 `<think>` / `<thinking>` / `<thought>` fallback 抽出 reasoning 后，`splitMessageIntoSentences` 拿到的还是原始字符串，私有 chain-of-thought 被同步当成 ContentPush 推送给用户。新增 `stripReasoningTags()` 并把 reasoning 抽取重排到 sentence-split 之前——命中 fallback 时把同一段从 `messageContent` 里剥掉再切句，与 `@rei-standard/amsg-instant` 0.9.1 保持镜像同步。
+
 ## 2.5.0 — Dependency bump
 
 - 依赖更新：同步升级 `@rei-standard/amsg-shared` 至稳定版 `0.2.0`，让正式发版环境不解析出混版本 shared graph。

@@ -1,5 +1,9 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.3.1 — `showNotification` 拒绝不再卡死 dedupe 状态
+
+- **Fix**: `dispatchBusinessPayload` 给 `sw.registration.showNotification(...)` 加了 `.catch(...)` 兜底。原链路只挂了成功分支 `.then(() => notificationState.shown = true)`，当浏览器拒绝展示（权限被撤、quota / OS 限制等）时整个 `Promise.all(notificationWork)` 会 reject，`onNotificationSettled` 被跳过，dedupe 记录永远停在 `notificationStatePending: true`。后续同 key 的 backup transport 重复会被 `maybeShowDuplicateNotification` 当成 `first-delivery-pending` 吞掉，用户彻底看不到通知。现在拒绝只记录到 `console.error`，`notificationState.shown` 保持 false，但 `onNotificationSettled` 一定执行，dedupe 状态正常推进。
+
 ## 2.3.0 — IndexedDB 连接韧性 + 业务感知的 DELIVER ack
 
 - **Fix**: IndexedDB 连接被浏览器**强制关闭**（backing store 出错 / 存储压力 / 清数据）后自愈。强关只触发 `close`、不触发 `versionchange`，此前缓存里的死连接会被无限复用，每次事务都抛 `InvalidStateError`，导致去重失灵、push 落库被阻断、`dedupe cleanup failed` 刷屏且不重启 SW 不恢复。dedupe 库与 queue / multipart 库（`cachedDB`）一并修复。
