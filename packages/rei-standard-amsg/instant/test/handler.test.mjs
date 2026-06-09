@@ -531,7 +531,15 @@ describe('createInstantHandler — happy path', () => {
     assert.equal(errors.length, 1);
     assert.equal(errors[0].code, 'LLM_CALL_FAILED');
     assert.equal(errors[0].messageKind, 'error');
-    assert.equal(router.pushCalls.length, 0);
+    // The diagnostic `event: error` rides the same always-on backup
+    // push lane as every other SSE payload — same `messageId`, so the
+    // SW dedupes the SSE + push pair into a single notification. Wait
+    // for that backup push to land instead of relying on consumeSse
+    // returning before the fetch races in.
+    await waitForPushCalls(router, 1);
+    const backup = JSON.parse(await decryptCapturedPushBody(router.pushCalls[0].body, subKit));
+    assert.equal(backup.messageId, errors[0].messageId);
+    assert.equal(backup.code, 'LLM_CALL_FAILED');
   });
 
   it('opt-out (Accept: application/json): returns PUSH_SEND_FAILED when push gateway returns non-2xx', async () => {
@@ -705,6 +713,96 @@ describe('createInstantHandler — SSE backup push and stream lifecycle', () => 
     await waitForPushCalls(router, 1);
     assert.ok(events.some((event) => event.type === 'sse_stream_canceled' && event.reason === 'tab closed'));
     assert.ok(events.some((event) => event.type === 'fallback_push_sent'));
+  });
+
+  it('defers controller.close() until backup pushes settle (no waitUntil 30s starvation)', async () => {
+    // Regression for the iOS-PWA backgrounded SSE failure: when
+    // `controller.close()` fired before backupWork awaited, the
+    // remaining push fetches got budgeted against waitUntil's 30s
+    // ceiling and slow LLM responses lost messages on CF Workers.
+    // The contract: stream EOF must NOT be observable until every
+    // backup push HTTP call has actually resolved.
+    let pushResolvedAt = 0;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => makeLlmResponse('deferred close path.'),
+      pushHandler: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        pushResolvedAt = Date.now();
+        return new Response(null, { status: 201 });
+      },
+    });
+    const waitUntilPromises = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const reader = res.body.getReader();
+    // Drain past `event: done` to the real EOF — that's when
+    // `controller.close()` actually took effect.
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    const eofAt = Date.now();
+    await waitUntilPromises[0];
+
+    assert.ok(pushResolvedAt > 0, 'backup push must have been invoked');
+    assert.ok(
+      pushResolvedAt <= eofAt,
+      `expected backup push to resolve at-or-before stream EOF (push=${pushResolvedAt}, eof=${eofAt})`,
+    );
+  });
+
+  it('fallback push on stream abort also settles before the worker releases', async () => {
+    // Same contract on the SSE-failure side: an aborted stream
+    // routes through `await fallback()` inline, but we want to
+    // observe the fallback fetch completing before the deferred
+    // `startDone` (= waitUntilPromises[0]) resolves. That's what
+    // protects the iOS-backgrounded user from a CF wall-clock kill.
+    let fallbackResolvedAt = 0;
+    let resolveLlm;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => new Promise((resolve) => {
+        resolveLlm = () => resolve(makeLlmResponse('aborted slow-push path.'));
+      }),
+      pushHandler: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        fallbackResolvedAt = Date.now();
+        return new Response(null, { status: 201 });
+      },
+    });
+    const waitUntilPromises = [];
+    const controller = new AbortController();
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeValidPayload()),
+      signal: controller.signal,
+    });
+
+    const res = await handler(req);
+    assert.equal(res.status, 200);
+    controller.abort();
+    resolveLlm();
+
+    await waitUntilPromises[0];
+    const releasedAt = Date.now();
+
+    assert.ok(fallbackResolvedAt > 0, 'fallback push must have been invoked');
+    assert.ok(
+      fallbackResolvedAt <= releasedAt,
+      `expected fallback push to resolve before startDone (push=${fallbackResolvedAt}, released=${releasedAt})`,
+    );
   });
 
   it('immediateKeepalive enqueues a heartbeat as the first SSE chunk', async () => {

@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.9.1-next.0 — SSE stream lifecycle owns LLM + push completion (pre-release)
+
+- **Fix**: SSE 模式下 LLM 调用与每条 payload 的 Web Push backup / fallback 完整运行在 `ReadableStream.start()` 内——`start()` 先 await 所有 backup 推送，再 `controller.close()`。响应仍在产出期间 runtime 不会施加 wall-clock 上限，慢 LLM + 客户端中途断开（iOS Safari 杀掉后台 SSE socket、页面切走等）的组合下也能把这一轮消息送达。
+- **Fix**: `event: error`（流内业务错误诊断）的 always-on backup push 现在确定性到达 push gateway，与其它 SSE payload 共用同一 `messageId`，由 `@rei-standard/amsg-sw` 的 dedupe gate 合并为单次通知。
+- **Docs**: README / JSDoc 校准 SSE 生命周期描述。SSE 模式由 stream 生命周期托管；`ctx.waitUntil` 在该模式下只做收尾兜底。纯 Web Push 模式（`Accept: application/json`）继续把主回复链路注册到 `waitUntil`。
+
 ## 0.9.0 — always-on SSE backup push + keepalive controls
 
 - **New**: SSE backup push 固定开启。SSE payload enqueue 成功后立即发送同 `messageId` 的 Web Push backup，配合 `@rei-standard/amsg-sw` 默认 dedupe 作为正式环境推荐链路。

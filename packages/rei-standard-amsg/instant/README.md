@@ -83,8 +83,8 @@ createInstantHandler({
 ### `createInstantHandler(options) → (request: Request, env?, ctx?) => Promise<Response>`
 
 返回标准 Web Fetch API handler。直接挂到 Cloudflare Workers / Deno Deploy / Vercel Edge / Bun，或用下方四个 adapter 接到 Node / Netlify。
-如果运行时提供 `waitUntil`，可以通过请求 context 或 `options.waitUntil` 交给 handler，
-主回复链路（LLM 生成 → 构造/切段 push payloads → 逐条 Web Push）会被注册进去。
+SSE 模式下 LLM + push 全程由 stream 生命周期托管，runtime 不会在响应仍在产出时回收 isolate；
+纯 Web Push 模式下若运行时提供 `waitUntil`（请求 context 或 `options.waitUntil`），主回复链路会注册到它上面。
 
 ```js
 import { createInstantHandler } from '@rei-standard/amsg-instant';
@@ -1025,16 +1025,17 @@ export default createCloudflareWorker((env) => ({
 }));
 ```
 
-`createCloudflareWorker` 会接住 Workers 的第三个参数 `ctx`，并把主回复链路
-（LLM 生成 → 构造/切段 push payloads → 逐条 Web Push）注册到 `ctx.waitUntil`。这样浏览器关掉、
-页面切后台导致 HTTP 连接断开时，Worker 仍会尽力把这一轮推送跑完。直接把
+`createCloudflareWorker` 会接住 Workers 的第三个参数 `ctx`。直接把
 `createInstantHandler(...)` 挂成 Worker module `fetch` 也支持同样的 `(request, env, ctx)`
 形态。
 
-> **0.9.0+ 默认 SSE 模式同样接入 `waitUntil`**：客户端中途断开后，剩余 payload 的
-> Web Push fallback HTTP 调用也由 `ctx.waitUntil` 保护，runtime 不会在 `fetch(pushService)`
-> 还在 await 的时候回收 isolate。实际可跑窗口受所在 runtime 与计划档位的
-> `waitUntil` / CPU / wall 上限约束。
+SSE 默认模式下，handler 在 `ReadableStream.start()` 内部把 LLM 调用与每条
+payload 的 Web Push backup / fallback 全部驱动完，才关闭流——runtime 把这整段
+看作"响应仍在产出"，不会施加 wall-clock 上限。即便客户端中途断开（页面切后台、
+iOS Safari 杀掉 SSE socket），剩余 LLM 输出与 fallback HTTP push 仍会跑完。
+`ctx.waitUntil` 在这里只是收尾兜底，不承载主回复链路；纯 Web Push 模式（`Accept:
+application/json`）的主回复链路会注册到 `ctx.waitUntil`，仍受 runtime 的
+`waitUntil` / CPU / wall 上限约束。
 
 ```toml
 # wrangler.toml
