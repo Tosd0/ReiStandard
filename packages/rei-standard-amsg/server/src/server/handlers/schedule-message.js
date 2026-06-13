@@ -107,12 +107,20 @@ export function createScheduleMessageHandler(ctx) {
     const encryptedPayload = encryptForStorage(JSON.stringify(fullTaskData), userKey);
 
     /**
-     * @deprecated Soft-deprecated. For new code, use @rei-standard/amsg-instant.
-     *   This branch is kept for backward compatibility and the existing behavior
-     *   (create task → process → delete) is unchanged. The dedicated amsg-instant
-     *   package is stateless (no DB roundtrip), deployable to Cloudflare Workers,
-     *   and locks the encryption + push-payload contract behind a single version.
-     *   See packages/rei-standard-amsg/instant/README.md.
+     * In-server instant path. Delivers an instant message through this
+     * server's own task queue (create task → process by UUID → delete task).
+     * The task is written to the database before processing, so delivery is
+     * not tied to the request connection: even if the client disconnects, the
+     * row stays and the generation keeps running (and can be retried) for as
+     * long as it needs. Use this when you have a database and want long or
+     * guaranteed-complete generations with no dropped messages.
+     *
+     * The stateless alternative is `@rei-standard/amsg-instant`: it streams
+     * over SSE with a Web Push backup and needs no database, which makes it a
+     * good fit for edge runtimes (e.g. Cloudflare Workers). Its work rides the
+     * response connection, so after the client disconnects it only has the
+     * platform's brief grace window to finish (≈20-30s observed on Deno
+     * Deploy) — ideal for short instant messages that complete quickly.
      */
     // Instant type: check VAPID before creating the task to avoid orphaned rows
     if (payload.messageType === 'instant') {
@@ -168,11 +176,20 @@ export function createScheduleMessageHandler(ctx) {
     }
 
     /**
-     * @deprecated Soft-deprecated. For new code, use @rei-standard/amsg-instant.
-     *   The "create-task → process-by-uuid → delete-task" sequence below is
-     *   preserved verbatim so existing clients keep working. New integrations
-     *   should call the dedicated amsg-instant endpoint instead — it skips this
-     *   DB round-trip entirely. See packages/rei-standard-amsg/instant/README.md.
+     * In-server instant path. Delivers an instant message through this
+     * server's own task queue (create task → process by UUID → delete task).
+     * The task is written to the database before processing, so delivery is
+     * not tied to the request connection: even if the client disconnects, the
+     * row stays and the generation keeps running (and can be retried) for as
+     * long as it needs. Use this when you have a database and want long or
+     * guaranteed-complete generations with no dropped messages.
+     *
+     * The stateless alternative is `@rei-standard/amsg-instant`: it streams
+     * over SSE with a Web Push backup and needs no database, which makes it a
+     * good fit for edge runtimes (e.g. Cloudflare Workers). Its work rides the
+     * response connection, so after the client disconnects it only has the
+     * platform's brief grace window to finish (≈20-30s observed on Deno
+     * Deploy) — ideal for short instant messages that complete quickly.
      */
     // Instant type: send immediately
     if (payload.messageType === 'instant') {

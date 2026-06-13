@@ -54,7 +54,9 @@ const rei = await createReiServer({
 
 ## 关于 `messageType: 'instant'`
 
-> **Note**：新代码的 instant 消息请用 [@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)，跳过本端点的"建任务 → 处理 → 删任务" DB 来回。本端点的 `instant` 分支为兼容保留，行为不变、不会有运行时警告。
+> **两条 instant 路径，按各自特点选一条（都是正式支持路径）：**
+> - **本端点的 `messageType: 'instant'`**（create task → process by UUID → delete task）：任务先写进数据库再处理，投递不绑在请求连接上——客户端断开也没关系，任务行还在，能继续跑、能重试，想跑多久跑多久。适合**有数据库、需要长时间生成或保证消息零丢失**的场景。
+> - **[@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)**：纯 SSE 流 + Web Push backup，不需要数据库，适合无状态边缘运行时（如 Cloudflare Workers）。它的处理挂在响应连接上，客户端一断开就只剩平台给的那点宽限期把活干完（Deno Deploy 实测 ≈20-30s），所以适合**能快速跑完的短即时消息**。
 
 ## AI 接口 `apiUrl` 约束
 

@@ -3,13 +3,13 @@
  * ReiStandard amsg-server v2.4.0
  *
  * Handles single message content generation and Web Push delivery for
- * scheduled tasks (`fixed` / `prompted` / `auto`) and the legacy
- * via-server instant path (`messageType: 'instant'`).
+ * scheduled tasks (`fixed` / `prompted` / `auto`) and the
+ * in-server instant path (`messageType: 'instant'`).
  *
  * Push wire shape comes from `@rei-standard/amsg-shared`'s
  * discriminated union (`AmsgPush`). The SW (`@rei-standard/amsg-sw`)
  * routes on `messageKind`. Server-driven pushes always carry
- * `source: 'instant'` (for the legacy in-server instant) or
+ * `source: 'instant'` (for the in-server instant path) or
  * `source: 'scheduled'` (for everything else).
  *
  * v2.4.0: when the LLM response carries non-empty
@@ -213,7 +213,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     // `messageId` format — deterministic when we have a task.id so a
     // retry produces the same id for the same (task, sentence) pair
     // (downstream dedupers can key on it). Falls back to a UUID for
-    // the legacy in-server instant path that has no row id.
+    // the in-server instant path that has no row id.
     const messageIdBase = task.id != null
       ? `msg_task_${task.id}`
       : `msg_${randomUUID()}_instant`;
