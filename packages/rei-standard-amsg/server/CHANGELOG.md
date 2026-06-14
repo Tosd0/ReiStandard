@@ -1,5 +1,16 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.5.2 — in-server instant 路径恢复为一等公民
+
+- **文档**：移除 `schedule-message` 中 `messageType: 'instant'` 两处 JSDoc 的 `@deprecated Soft-deprecated` 标记；该路径（create task → process by UUID → delete task）现以正式支持路径身份记录，不再携带弃用暗示。
+- **注释**：`message-processor` 模块头及行内注释中的 "legacy in-server instant" 措辞统一改为 "in-server instant path"（中性术语）。
+- **选型说明**：JSDoc 与 README 补充两条 instant 路径各自的适用场景——本端点的 DB 路径任务落库后投递不绑连接生命周期，适合长时间生成 / 零丢失；`@rei-standard/amsg-instant` 无状态、纯 SSE + Web Push，适合能在断连宽限期内（Deno Deploy 实测 ≈20-30s）跑完的短任务。不再有"新代码请改用"的导流建议。
+- 运行时行为不变，无 breaking change。
+
+## 2.5.1 — `<think>` 不再泄进 ContentPush
+
+- **Fix**: `readReasoningContent` 走 `<think>` / `<thinking>` / `<thought>` fallback 抽出 reasoning 后，`splitMessageIntoSentences` 拿到的还是原始字符串，私有 chain-of-thought 被同步当成 ContentPush 推送给用户。新增 `stripReasoningTags()` 并把 reasoning 抽取重排到 sentence-split 之前——命中 fallback 时把同一段从 `messageContent` 里剥掉再切句，与 `@rei-standard/amsg-instant` 0.9.1 保持镜像同步。
+
 ## 2.5.0 — Dependency bump
 
 - 依赖更新：同步升级 `@rei-standard/amsg-shared` 至稳定版 `0.2.0`，让正式发版环境不解析出混版本 shared graph。

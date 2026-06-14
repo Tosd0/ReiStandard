@@ -1,5 +1,14 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.9.1 — SSE stream lifecycle owns LLM + push completion
+
+- **Fix**: SSE 模式下 LLM 调用与每条 payload 的 Web Push backup / fallback 完整运行在 `ReadableStream.start()` 内——`start()` 先 await 所有 backup 推送，再 `controller.close()`。响应仍在产出期间 runtime 不会施加 wall-clock 上限，慢 LLM + 客户端中途断开（iOS Safari 杀掉后台 SSE socket、页面切走等）的组合下也能把这一轮消息送达。
+- **Fix**: `event: error`（流内业务错误诊断）的 always-on backup push 现在确定性到达 push gateway，与其它 SSE payload 共用同一 `messageId`，由 `@rei-standard/amsg-sw` 的 dedupe gate 合并为单次通知。
+- **Fix**: `isPurePush` 不再用严格相等比对 Accept header。原 `headers.get('accept') === 'application/json'` 把 `application/json; charset=utf-8` / `application/json, */*` 这类合规变种全部错路由到 SSE 分支；改成 `acceptsJsonOnly()`——只在所有 media range 都是 `application/json` 时返回纯 push 分支，让声明要 JSON 的调用方真的拿到 JSON。
+- **Fix**: `readReasoningContent` 命中 `<think>` / `<thinking>` / `<thought>` fallback 时，原本同一段内容会被推两次——一次 ReasoningPush，一次仍带 raw 标签嵌在 ContentPush。新增 `stripReasoningTags()` 在 sentence-split 之前剥掉这些 span，私有 chain-of-thought 不再泄到正文。
+- **Tests**: 增加三条针对"LLM 永远不被塞进 waitUntil 30s 桶"契约的回归测试——多 chunk + 中途 abort 全 fallback 投递、SSE 模式 waitUntil 注册数恒为 1（只剩 startDone）、慢 LLM 必须先于 `controller.close()` resolve。任何让 LLM 调用或 push HTTP 漂出 `start()` 的改动都会被这套断言拦下。
+- **Docs**: README / JSDoc 校准 SSE 生命周期描述。SSE 模式由 stream 生命周期托管；`ctx.waitUntil` 在该模式下只做收尾兜底。纯 Web Push 模式（`Accept: application/json`）继续把主回复链路注册到 `waitUntil`。
+
 ## 0.9.0 — always-on SSE backup push + keepalive controls
 
 - **New**: SSE backup push 固定开启。SSE payload enqueue 成功后立即发送同 `messageId` 的 Web Push backup，配合 `@rei-standard/amsg-sw` 默认 dedupe 作为正式环境推荐链路。

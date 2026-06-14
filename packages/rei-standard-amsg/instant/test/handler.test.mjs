@@ -531,7 +531,15 @@ describe('createInstantHandler — happy path', () => {
     assert.equal(errors.length, 1);
     assert.equal(errors[0].code, 'LLM_CALL_FAILED');
     assert.equal(errors[0].messageKind, 'error');
-    assert.equal(router.pushCalls.length, 0);
+    // The diagnostic `event: error` rides the same always-on backup
+    // push lane as every other SSE payload — same `messageId`, so the
+    // SW dedupes the SSE + push pair into a single notification. Wait
+    // for that backup push to land instead of relying on consumeSse
+    // returning before the fetch races in.
+    await waitForPushCalls(router, 1);
+    const backup = JSON.parse(await decryptCapturedPushBody(router.pushCalls[0].body, subKit));
+    assert.equal(backup.messageId, errors[0].messageId);
+    assert.equal(backup.code, 'LLM_CALL_FAILED');
   });
 
   it('opt-out (Accept: application/json): returns PUSH_SEND_FAILED when push gateway returns non-2xx', async () => {
@@ -705,6 +713,210 @@ describe('createInstantHandler — SSE backup push and stream lifecycle', () => 
     await waitForPushCalls(router, 1);
     assert.ok(events.some((event) => event.type === 'sse_stream_canceled' && event.reason === 'tab closed'));
     assert.ok(events.some((event) => event.type === 'fallback_push_sent'));
+  });
+
+  it('defers controller.close() until backup pushes settle (no waitUntil 30s starvation)', async () => {
+    // Regression for the iOS-PWA backgrounded SSE failure: when
+    // `controller.close()` fired before backupWork awaited, the
+    // remaining push fetches got budgeted against waitUntil's 30s
+    // ceiling and slow LLM responses lost messages on CF Workers.
+    // The contract: stream EOF must NOT be observable until every
+    // backup push HTTP call has actually resolved.
+    let pushResolvedAt = 0;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => makeLlmResponse('deferred close path.'),
+      pushHandler: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        pushResolvedAt = Date.now();
+        return new Response(null, { status: 201 });
+      },
+    });
+    const waitUntilPromises = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const reader = res.body.getReader();
+    // Drain past `event: done` to the real EOF — that's when
+    // `controller.close()` actually took effect.
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    const eofAt = Date.now();
+    await waitUntilPromises[0];
+
+    assert.ok(pushResolvedAt > 0, 'backup push must have been invoked');
+    assert.ok(
+      pushResolvedAt <= eofAt,
+      `expected backup push to resolve at-or-before stream EOF (push=${pushResolvedAt}, eof=${eofAt})`,
+    );
+  });
+
+  it('fallback push on stream abort also settles before the worker releases', async () => {
+    // Same contract on the SSE-failure side: an aborted stream
+    // routes through `await fallback()` inline, but we want to
+    // observe the fallback fetch completing before the deferred
+    // `startDone` (= waitUntilPromises[0]) resolves. That's what
+    // protects the iOS-backgrounded user from a CF wall-clock kill.
+    let fallbackResolvedAt = 0;
+    let resolveLlm;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => new Promise((resolve) => {
+        resolveLlm = () => resolve(makeLlmResponse('aborted slow-push path.'));
+      }),
+      pushHandler: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        fallbackResolvedAt = Date.now();
+        return new Response(null, { status: 201 });
+      },
+    });
+    const waitUntilPromises = [];
+    const controller = new AbortController();
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeValidPayload()),
+      signal: controller.signal,
+    });
+
+    const res = await handler(req);
+    assert.equal(res.status, 200);
+    controller.abort();
+    resolveLlm();
+
+    await waitUntilPromises[0];
+    const releasedAt = Date.now();
+
+    assert.ok(fallbackResolvedAt > 0, 'fallback push must have been invoked');
+    assert.ok(
+      fallbackResolvedAt <= releasedAt,
+      `expected fallback push to resolve before startDone (push=${fallbackResolvedAt}, released=${releasedAt})`,
+    );
+  });
+
+  it('multi-chunk + mid-LLM abort: every chunk ships via fallback push before stream EOF', async () => {
+    // Regression guard for the worst-case iOS-PWA flow:
+    // - LLM produces N>1 sentences → N delivers
+    // - Client aborts the SSE socket while LLM is still running
+    // - Every chunk after the abort takes the inline `await fallback()`
+    //   path; none should be dropped, all must land before EOF
+    // This protects against a regression where fallback push gets made
+    // fire-and-forget OR where the LLM loop bails on abort.
+    let resolveLlm;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => new Promise((resolve) => {
+        resolveLlm = () => resolve(makeLlmResponse('第一句。第二句。第三句。第四句。'));
+      }),
+    });
+    const events = [];
+    const waitUntilPromises = [];
+    const abortCtl = new AbortController();
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+      onEvent: (event) => events.push(event),
+    });
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeValidPayload()),
+      signal: abortCtl.signal,
+    });
+
+    const res = await handler(req);
+    assert.equal(res.status, 200);
+    abortCtl.abort();
+    resolveLlm();
+    await waitUntilPromises[0];
+
+    // Legacy splitter cuts on `[。！？!?]+` → 4 sentences, 4 delivers.
+    // All 4 must show up as fallback pushes (since SSE was aborted
+    // before any payload landed).
+    await waitForPushCalls(router, 4);
+    const fallbackSent = events.filter((e) => e.type === 'fallback_push_sent');
+    assert.equal(fallbackSent.length, 4, `expected 4 fallback_push_sent events, got ${fallbackSent.length}`);
+    // No payload_enqueued events — stream was already aborted.
+    assert.equal(events.filter((e) => e.type === 'sse_payload_enqueued').length, 0);
+  });
+
+  it('SSE mode never registers the LLM/push pipeline with waitUntil (only the start() deferred)', async () => {
+    // Structural contract: waitUntil receives exactly ONE promise in
+    // SSE mode — the `startDone` deferred from registerWaitUntil at the
+    // top of the SSE branch. If a future change adds a second
+    // registerWaitUntil for the main reply chain (regressing toward the
+    // 30s-ceilinged failure mode), this test fails.
+    const router = llmRouter('contract check.');
+    const waitUntilPromises = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const { doneReceived } = await consumeSse(res);
+    assert.equal(doneReceived, true);
+    await waitUntilPromises[0];
+
+    assert.equal(
+      waitUntilPromises.length,
+      1,
+      `SSE mode must register exactly one waitUntil promise (startDone). Got ${waitUntilPromises.length} — has the LLM/push pipeline regressed onto waitUntil?`,
+    );
+  });
+
+  it('slow LLM resolves inside start() — controller.close() never fires before LLM completes', async () => {
+    // Regression guard for "LLM call moved out of start() and onto
+    // waitUntil". If that ever happens, a slow LLM would be killed at
+    // the runtime's waitUntil ceiling (~30s on Cloudflare Workers) and
+    // ship no messages on iOS-PWA backgrounded sessions.
+    //
+    // We assert the timing directly: LLM resolve timestamp must come
+    // strictly before stream EOF (i.e. `controller.close()`).
+    let llmResolvedAt = 0;
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: () => new Promise((resolve) => {
+        setTimeout(() => {
+          llmResolvedAt = Date.now();
+          resolve(makeLlmResponse('slow llm content.'));
+        }, 150);
+      }),
+    });
+    const waitUntilPromises = [];
+    const handler = createInstantHandler({
+      vapid,
+      fetch: router.fetch,
+      waitUntil: (work) => waitUntilPromises.push(work),
+    });
+
+    const res = await handler(makeRequest({ body: makeValidPayload() }));
+    const reader = res.body.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    const eofAt = Date.now();
+    await waitUntilPromises[0];
+
+    assert.ok(llmResolvedAt > 0, 'LLM must have resolved');
+    assert.ok(
+      llmResolvedAt < eofAt,
+      `LLM must resolve strictly before stream EOF (llm=${llmResolvedAt}, eof=${eofAt}). If they swapped, the LLM call has been moved out of start() onto waitUntil — DO NOT ship.`,
+    );
   });
 
   it('immediateKeepalive enqueues a heartbeat as the first SSE chunk', async () => {

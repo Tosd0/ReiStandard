@@ -12,7 +12,7 @@ function updatePkg(pkgPath, version, sharedDep) {
 }
 
 updatePkg('packages/rei-standard-amsg/shared/package.json', '0.2.0', null);
-updatePkg('packages/rei-standard-amsg/sw/package.json', '2.2.0', '0.2.0');
-updatePkg('packages/rei-standard-amsg/instant/package.json', '0.9.0', '0.2.0');
-updatePkg('packages/rei-standard-amsg/client/package.json', '2.4.0', '0.2.0');
-updatePkg('packages/rei-standard-amsg/server/package.json', '2.5.0', '0.2.0');
+updatePkg('packages/rei-standard-amsg/sw/package.json', '2.3.1', '0.2.0');
+updatePkg('packages/rei-standard-amsg/instant/package.json', '0.9.1', '0.2.0');
+updatePkg('packages/rei-standard-amsg/client/package.json', '2.5.0', '0.2.0');
+updatePkg('packages/rei-standard-amsg/server/package.json', '2.5.1', '0.2.0');

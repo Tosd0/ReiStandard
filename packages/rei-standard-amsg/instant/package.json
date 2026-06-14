@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-instant",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "ReiStandard Active Messaging — agentic-loop framework for instant push. Pluggable per-turn hook + optional blob envelope for oversize payloads. Three-axis push schema (messageKind / messageType / messageSubtype) from @rei-standard/amsg-shared. Auto-emits ReasoningPush when the LLM response carries reasoning_content. Pure Web Crypto. Deployable to Cloudflare Workers / Vercel Edge / Netlify / Node with no flags.",
   "repository": {
     "type": "git",

@@ -11,6 +11,9 @@ node_modules/
 # Editor / tooling
 .serena/
 
+# Claude Code local state (machine/session-specific)
+.claude/
+
 # Build output
 packages/*/dist/
 packages/*/*/dist/

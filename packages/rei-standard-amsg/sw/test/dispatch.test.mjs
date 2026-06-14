@@ -1058,3 +1058,490 @@ test('multipart fully received payload with notification.show: "when-hidden" che
     assert.equal(notifications[0].title, 'Multipart Hidden');
   }
 });
+
+// --- Gap 2 (method A): DELIVER ack reflects business landing failure ---
+
+// onBusinessPayload failures are logged by the SDK for observability. These
+// tests intentionally trigger that, so capture console.error to keep the
+// runner output clean while still asserting the log happened.
+async function captureConsoleError(run) {
+  const originalError = console.error;
+  const errors = [];
+  console.error = (...args) => { errors.push(args.map(String).join(' ')); };
+  try {
+    const value = await run();
+    return { value, errors };
+  } finally {
+    console.error = originalError;
+  }
+}
+
+test('DELIVER ack surfaces businessError when onBusinessPayload rejects', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: () => Promise.reject(new Error('inbox write failed')),
+  });
+
+  const { value: replies, errors } = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-biz-reject',
+    payload: { ...COMMON, messageId: 'msg_biz_reject', messageKind: 'content', message: 'x' },
+  }));
+
+  // ok stays true (the SW DID receive and dispatch the payload); the
+  // optional businessError field carries the consumer's failure so callers
+  // that trust the ack can tell "delivered" from "actually persisted".
+  assert.deepEqual(replies[0], {
+    ok: true,
+    duplicate: false,
+    key: 'msg_biz_reject',
+    requestId: 'req-biz-reject',
+    businessError: 'inbox write failed',
+  });
+  assert.ok(
+    errors.some((line) => line.includes('onBusinessPayload promise rejected')),
+    'the rejection is still logged for observability',
+  );
+});
+
+test('DELIVER ack surfaces businessError when onBusinessPayload throws synchronously', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: () => { throw new Error('sync boom'); },
+  });
+
+  const { value: replies } = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-biz-throw',
+    payload: { ...COMMON, messageId: 'msg_biz_throw', messageKind: 'content', message: 'x' },
+  }));
+
+  assert.equal(replies[0].businessError, 'sync boom');
+  assert.equal(replies[0].ok, true);
+});
+
+test('DELIVER ack omits businessError when onBusinessPayload resolves (back-compat shape)', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: () => Promise.resolve(),
+  });
+
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-biz-ok',
+    payload: { ...COMMON, messageId: 'msg_biz_ok', messageKind: 'content', message: 'x' },
+  });
+
+  assert.deepEqual(replies[0], {
+    ok: true,
+    duplicate: false,
+    key: 'msg_biz_ok',
+    requestId: 'req-biz-ok',
+  });
+  assert.ok(!('businessError' in replies[0]), 'success acks must not carry a businessError key');
+});
+
+test('push: a rejecting onBusinessPayload does not reject the push delivery', async () => {
+  const { sw, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: () => Promise.reject(new Error('boom')),
+  });
+
+  // The webpush path has no ack to carry the error — it must stay silent
+  // and never let the business rejection escape the waitUntil chain.
+  await captureConsoleError(() => triggerPush(
+    { ...COMMON, messageId: 'msg_push_reject', messageKind: 'content', message: 'x' },
+  ));
+
+  assert.equal(postedMessages.length, 1, 'dispatch to clients still happened');
+});
+
+test('DELIVER ack surfaces businessError on a later duplicate of a failed business delivery', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  let calls = 0;
+  installReiSW(sw, {
+    onBusinessPayload: () => {
+      calls += 1;
+      return Promise.reject(new Error('inbox write failed'));
+    },
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_dup_bizerr', messageKind: 'content', message: 'x' };
+
+  // First delivery: business fails, ack carries businessError (and the
+  // failure is persisted on the dedupe record).
+  const first = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-dup-1',
+    payload,
+  }));
+  assert.equal(first.value[0].businessError, 'inbox write failed');
+
+  // Retry the same key: deduped, business is NOT re-run, but the ack still
+  // honestly reports the unresolved business failure instead of a clean
+  // ok:true that would mislead a retry flow.
+  const second = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-dup-2',
+    payload,
+  });
+  assert.deepEqual(second[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_dup_bizerr',
+    requestId: 'req-dup-2',
+    businessError: 'inbox write failed',
+  });
+  assert.equal(calls, 1, 'business must not re-run on the duplicate');
+});
+
+test('DELIVER duplicate ack has no businessError when the first delivery succeeded', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    onBusinessPayload: () => Promise.resolve(),
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_dup_ok', messageKind: 'content', message: 'x' };
+  await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-dupok-1',
+    payload,
+  });
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-dupok-2',
+    payload,
+  });
+
+  assert.deepEqual(replies[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_dup_ok',
+    requestId: 'req-dupok-2',
+  });
+  assert.ok(!('businessError' in replies[0]), 'a clean success must not leave a sticky businessError');
+});
+
+test('a failed first-delivery business callback must not clobber a notification a backup already repaired', async () => {
+  // Race: first delivery is visible (no notification) with a slow business
+  // callback; a hidden backup repairs the notification (notificationShown ->
+  // true) while business is still pending; then business fails. Persisting
+  // the error must merge onto the LATEST record, not overwrite from the
+  // first delivery's stale snapshot — otherwise notificationShown flips back
+  // to false and the next duplicate shows a second notification.
+  let rejectBusiness;
+  const businessGate = new Promise((_resolve, reject) => { rejectBusiness = reject; });
+
+  const { sw, listeners, notifications, triggerPush, setVisibleCount } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    onBusinessPayload: () => businessGate,
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_clobber_repair',
+    messageKind: 'content',
+    message: 'x',
+    notification: { show: 'when-hidden', title: 'Repaired once' },
+  };
+
+  // First delivery (SSE): visible client suppresses the notification, business
+  // is gated and stays pending.
+  const messageHandler = listeners.get('message');
+  const ssePending = [];
+  messageHandler({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-clobber-1', payload },
+    ports: [{ postMessage() {} }],
+    waitUntil(work) { ssePending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notifications.length, 0, 'visible first delivery shows no notification');
+
+  // Backup arrives while business is pending; client now hidden -> repairs.
+  setVisibleCount(0);
+  await triggerPush(payload);
+  assert.equal(notifications.length, 1, 'backup repaired the notification once');
+
+  // First delivery's business now FAILS. Persisting the error must not undo
+  // the repair above.
+  rejectBusiness(new Error('inbox write failed'));
+  await captureConsoleError(() => Promise.all(ssePending));
+
+  // A third copy of the same key must NOT trigger another notification.
+  await triggerPush(payload);
+  assert.equal(notifications.length, 1, 'no second notification after the failed business write');
+});
+
+test('a failed first delivery must not stamp its error onto a TTL-renewed claim', async () => {
+  // Race: the first delivery's business callback outlives the dedupe TTL, so
+  // the same key is later accepted as a brand-new claim whose business
+  // SUCCEEDS. When the long-dead first delivery finally fails, its error must
+  // not be written onto the renewed (successful) record, or every later
+  // duplicate would falsely report the stale failure.
+  let rejectFirst;
+  const firstGate = new Promise((_resolve, reject) => { rejectFirst = reject; });
+  let calls = 0;
+  const { sw, listeners, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    dedupe: { ttlMs: 30, cleanupIntervalMs: 0, dbName: 'rei_amsg_sw_dedupe_ttl_renew' },
+    onBusinessPayload: () => {
+      calls += 1;
+      return calls === 1 ? firstGate : Promise.resolve();
+    },
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_ttl_renew', messageKind: 'content', message: 'x' };
+
+  // First delivery: business is gated and stays pending past the TTL.
+  const firstPending = [];
+  listeners.get('message')({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-r1', payload },
+    ports: [{ postMessage() {} }],
+    waitUntil(work) { firstPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1, 'first delivery entered the business callback');
+
+  // TTL elapses so the same key is accepted as a fresh claim.
+  await new Promise((resolve) => setTimeout(resolve, 45));
+
+  // Renewed delivery: re-claims the key and its business SUCCEEDS.
+  await triggerMessage({ type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-r2', payload });
+  assert.equal(calls, 2, 'renewed delivery ran a second business callback');
+
+  // The long-dead first delivery now fails — its error must not contaminate
+  // the renewed claim.
+  rejectFirst(new Error('stale failure'));
+  await captureConsoleError(() => Promise.all(firstPending));
+
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-r3',
+    payload,
+  });
+  assert.equal(replies[0].duplicate, true);
+  assert.ok(
+    !('businessError' in replies[0]),
+    'stale first-delivery error must not attach to the renewed claim',
+  );
+});
+
+test('a concurrent duplicate notification repair must not erase a persisted businessError', async () => {
+  // Race: a backup reads the dedupe record and parks inside showNotification.
+  // While it is parked, the first delivery's business fails and persists
+  // businessError. When the backup resumes it writes its repair record back —
+  // from a pre-await snapshot — which must NOT clobber the businessError.
+  let rejectBusiness;
+  const businessGate = new Promise((_resolve, reject) => { rejectBusiness = reject; });
+
+  const { sw, listeners, setVisibleCount, triggerMessage } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    onBusinessPayload: () => businessGate,
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_repair_erase',
+    messageKind: 'content',
+    message: 'x',
+    notification: { show: 'when-hidden', title: 'Repair' },
+  };
+
+  // First delivery (SSE), visible: no notification, but the notification
+  // state settles (notificationStatePending -> false) while business stays
+  // pending behind the gate.
+  const firstPending = [];
+  listeners.get('message')({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-e1', payload },
+    ports: [{ postMessage() {} }],
+    waitUntil(work) { firstPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Park the backup inside showNotification.
+  let releaseShow;
+  const showGate = new Promise((resolve) => { releaseShow = resolve; });
+  sw.registration.showNotification = () => showGate;
+
+  // Backup (WebPush), now hidden: duplicate that enters the repair path and
+  // parks awaiting showNotification.
+  setVisibleCount(0);
+  const backupPending = [];
+  listeners.get('push')({
+    data: { json: () => payload },
+    waitUntil(work) { backupPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // First delivery's business now fails -> businessError persisted onto the
+  // record while the backup is still parked in showNotification.
+  rejectBusiness(new Error('inbox write failed'));
+  await captureConsoleError(() => Promise.all(firstPending));
+
+  // Backup resumes and writes its repair record back.
+  releaseShow();
+  await Promise.all(backupPending);
+
+  // A later duplicate must still surface the businessError.
+  const replies = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-e2',
+    payload,
+  });
+  assert.equal(
+    replies[0].businessError,
+    'inbox write failed',
+    'the duplicate notification repair must not erase the persisted businessError',
+  );
+});
+
+test('an in-flight duplicate DELIVER ack must reflect a businessError persisted during its repair', async () => {
+  // Read-side race: a duplicate reads `claim.existing` at claim time (no
+  // businessError yet), then parks inside showNotification. While parked, the
+  // first delivery's business fails and persists businessError. When the
+  // duplicate resumes it must ack from the LATEST record, not its stale
+  // snapshot, or it falsely reports a clean ok:true.
+  let rejectBusiness;
+  const businessGate = new Promise((_resolve, reject) => { rejectBusiness = reject; });
+
+  const { sw, listeners, setVisibleCount } = createSwMock({ clientCount: 1, visibleCount: 1 });
+  installReiSW(sw, {
+    onBusinessPayload: () => businessGate,
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dup_ack_race',
+    messageKind: 'content',
+    message: 'x',
+    notification: { show: 'when-hidden', title: 'Repair' },
+  };
+
+  // First delivery (SSE), visible: no notification, business pending; the
+  // notification state settles so the duplicate can enter the repair path.
+  const firstPending = [];
+  listeners.get('message')({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-f1', payload },
+    ports: [{ postMessage() {} }],
+    waitUntil(work) { firstPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Park the duplicate inside showNotification.
+  let releaseShow;
+  const showGate = new Promise((resolve) => { releaseShow = resolve; });
+  sw.registration.showNotification = () => showGate;
+
+  // Backup DELIVER (hidden): duplicate that enters the repair path and parks
+  // awaiting showNotification. Capture its ack.
+  setVisibleCount(0);
+  const backupReplies = [];
+  const backupPending = [];
+  listeners.get('message')({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-dup', payload },
+    ports: [{ postMessage(reply) { backupReplies.push(reply); } }],
+    waitUntil(work) { backupPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // First delivery's business now fails -> businessError persisted while the
+  // duplicate is still parked.
+  rejectBusiness(new Error('inbox write failed'));
+  await captureConsoleError(() => Promise.all(firstPending));
+
+  // Duplicate resumes and acks.
+  releaseShow();
+  await Promise.all(backupPending);
+
+  assert.equal(backupReplies[0].duplicate, true);
+  assert.equal(
+    backupReplies[0].businessError,
+    'inbox write failed',
+    'in-flight duplicate ack must reflect the businessError persisted during its repair',
+  );
+});
+
+test('an in-flight duplicate must not inherit a businessError from a TTL-renewed claim', async () => {
+  // Read-side symmetric to the write-side TTL guard: a duplicate is delayed
+  // past the dedupe TTL inside showNotification; meanwhile the same key is
+  // reclaimed as a fresh delivery whose business FAILS. The stale duplicate
+  // must not report that newer (unrelated) claim's failure on its ack.
+  let calls = 0;
+  const { sw, listeners, setVisibleCount, triggerMessage } = createSwMock({
+    clientCount: 1,
+    visibleCount: 1,
+  });
+  installReiSW(sw, {
+    dedupe: { ttlMs: 30, cleanupIntervalMs: 0, dbName: 'rei_amsg_sw_dedupe_dup_renew' },
+    onBusinessPayload: () => {
+      calls += 1;
+      return calls === 1 ? Promise.resolve() : Promise.reject(new Error('renewed failure'));
+    },
+  });
+
+  const payload = {
+    ...COMMON,
+    messageId: 'msg_dup_renew_ack',
+    messageKind: 'content',
+    message: 'x',
+    notification: { show: 'when-hidden', title: 'Repair' },
+  };
+
+  // A: first delivery, visible -> no notification, business succeeds. Record T0.
+  await triggerMessage({ type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-a', payload });
+  assert.equal(calls, 1);
+
+  // Park the duplicate (B) inside showNotification.
+  let releaseShow;
+  const showGate = new Promise((resolve) => { releaseShow = resolve; });
+  sw.registration.showNotification = () => showGate;
+
+  // B: duplicate, hidden -> enters repair path, parks awaiting showNotification.
+  setVisibleCount(0);
+  const bReplies = [];
+  const bPending = [];
+  listeners.get('message')({
+    data: { type: REI_AMSG_DELIVER_MESSAGE_TYPE, source: 'sse', requestId: 'req-b', payload },
+    ports: [{ postMessage(reply) { bReplies.push(reply); } }],
+    waitUntil(work) { bPending.push(Promise.resolve(work)); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // TTL elapses so the key can be reclaimed by a new delivery.
+  await new Promise((resolve) => setTimeout(resolve, 45));
+
+  // C: renewed delivery (show:false so it never parks), business FAILS and
+  // persists businessError onto the NEW record.
+  await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-c',
+    payload: { ...payload, notification: { show: false } },
+  }));
+  assert.equal(calls, 2);
+
+  // Release B; its ack must NOT inherit C's (the renewed claim's) failure.
+  releaseShow();
+  await Promise.all(bPending);
+
+  assert.equal(bReplies[0].duplicate, true);
+  assert.ok(
+    !('businessError' in bReplies[0]),
+    'duplicate ack must not inherit a businessError from a TTL-renewed claim',
+  );
+});

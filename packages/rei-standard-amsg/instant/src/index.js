@@ -52,6 +52,22 @@ const DEFAULT_SSE_KEEPALIVE_MS = 1000;
 const MIN_SSE_KEEPALIVE_MS = 250;
 
 /**
+ * True when the caller asked exclusively for JSON. Any Accept value
+ * that lists another media type (including `*\/*`) keeps the default
+ * SSE transport — that's the legacy `consumeInstantStream` path which
+ * does not set an Accept header at all.
+ *
+ * Strict `headers.get('accept') === 'application/json'` is too narrow:
+ * `application/json; charset=utf-8` or `application/json, *\/*` would
+ * silently fall through to SSE and break `await res.json()` callers.
+ */
+function acceptsJsonOnly(acceptHeader) {
+  if (typeof acceptHeader !== 'string' || acceptHeader.length === 0) return false;
+  const ranges = acceptHeader.split(',').map((r) => r.split(';')[0].trim().toLowerCase()).filter(Boolean);
+  return ranges.length > 0 && ranges.every((r) => r === 'application/json');
+}
+
+/**
  * @typedef {Object} VapidConfig
  * @property {string} email
  * @property {string} publicKey   - base64url, 65 B uncompressed P-256 point.
@@ -155,8 +171,11 @@ const MIN_SSE_KEEPALIVE_MS = 250;
  * Vercel Edge, and Bun. Wrap it with one of the platform adapters if you
  * are on Node/Express, Netlify Functions, or Vercel Serverless Functions.
  * When used directly as a Cloudflare Workers module `fetch`, the extra
- * `(env, ctx)` arguments are accepted so the main LLM → split → push
- * pipeline can be protected by `ctx.waitUntil`.
+ * `(env, ctx)` arguments are accepted: SSE mode drives LLM and every
+ * push to completion inside the stream's `start()`, so the runtime
+ * never reclaims the isolate while work is in flight; pure-push mode
+ * (`Accept: application/json`) registers the LLM → split → push chain
+ * with `ctx.waitUntil`.
  *
  * @param {InstantHandlerOptions} options
  * @returns {(request: Request, envOrRuntime?: unknown, runtime?: unknown) => Promise<Response>}
@@ -321,7 +340,7 @@ export function createInstantHandler(options) {
     }
 
     try {
-      const isPurePush = request.headers.get('accept') === 'application/json';
+      const isPurePush = acceptsJsonOnly(request.headers.get('accept'));
       const sessionId = typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : `sess_${randomUUID()}`;
 
       const processorCtx = {
@@ -377,15 +396,21 @@ export function createInstantHandler(options) {
       // the consumer (no push-gateway rate limit to smooth over).
       processorCtx.spacingMs = 0;
 
-      // Lifecycle protection for the async tail of `start()`. After
-      // client disconnect the SSE controller stops emitting bytes, so
-      // runtimes like Cloudflare Workers lose their "request is alive"
-      // signal and may reclaim the isolate mid-fallback (the `await
-      // fetch(pushService)` inside `sendPushWithMaybeBlob`). Register
-      // a deferred that resolves only after `start()`'s `finally` runs
-      // — the runtime then keeps the isolate alive for the fallback
-      // push HTTP call to actually complete. Subject to the runtime /
-      // plan's own `waitUntil` and CPU/wall budget.
+      // Stream lifecycle. The runtime treats the Response body as
+      // "still in production" while `start()` is awaiting — no
+      // wall-clock limit applies. We use that window to drive LLM +
+      // every push to completion, then close last:
+      //   - `streamUsable=false` on enqueue failure / abort makes
+      //     subsequent payloads ship via Web Push fallback without
+      //     returning early from `start()`.
+      //   - `controller.close()` is called in `finally`, after
+      //     `Promise.allSettled(backupWork)`, so push HTTP calls
+      //     never race the runtime tearing down the isolate.
+      // `registerWaitUntil(startDone)` is a thin insurance for the
+      // window between `start()` finishing and the runtime releasing
+      // the isolate; it's resolved at the tail of `finally`, so under
+      // normal conditions there's nothing left for waitUntil to wait
+      // on. The LLM body never rides on it.
       let resolveStartDone;
       const startDone = new Promise((resolve) => { resolveStartDone = resolve; });
       registerWaitUntil(startDone, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
@@ -515,7 +540,6 @@ export function createInstantHandler(options) {
 
               if (streamUsable) {
                 try { controller.enqueue(SSE_DONE_BYTES); } catch { /* race with abort */ }
-                safeClose();
               }
             } catch (err) {
               // HookError carries an in-loop ErrorPush that already
@@ -523,9 +547,7 @@ export function createInstantHandler(options) {
               // throw — don't echo a second `event: error` for the
               // same logical failure. Other errors (LlmCallError,
               // unexpected) had no in-loop diagnostic and DO need one.
-              if (err instanceof HookError) {
-                safeClose();
-              } else {
+              if (!(err instanceof HookError)) {
                 const diag = buildErrorPush({
                   messageType: MESSAGE_TYPE.INSTANT,
                   source: PUSH_SOURCE.INSTANT,
@@ -538,11 +560,16 @@ export function createInstantHandler(options) {
                 await safeEnqueue('error', diag, (pushErr) => {
                   onEvent({ type: 'sse_error_fallback_failed', sessionId, cause: pushErr });
                 });
-                safeClose();
               }
             } finally {
               cleanup();
+              // Close last: while `start()` is awaiting backupWork the
+              // runtime keeps the isolate alive without wall-clock
+              // pressure. Closing earlier would flip the request into
+              // invocation-end state and budget the remaining push
+              // HTTP fetches against the runtime's waitUntil ceiling.
               await Promise.allSettled(Array.from(backupWork));
+              safeClose();
               resolveStartDone();
             }
           },
