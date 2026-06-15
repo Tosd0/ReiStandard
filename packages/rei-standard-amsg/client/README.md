@@ -165,6 +165,8 @@ interface DeliverOptions {
 
   timeoutMs: number;                                       // 总预算（含 transport + grace）
   onChunk?: (payload: unknown) => Promise<void> | void;    // 可选 SSE 每帧钩子，抛错被吞
+  onRawRead?: (meta: RawReadMeta) => void;                 // 可选 SSE 原始读遥测，排查链路用；抛错被吞
+                                                            // 每次 reader.read() 后触发，保留 ':' 注释行
   postTransportGraceMs?: number;                           // transport 结束后等观察的 grace
                                                             // 默认 = min(remaining, max(5000, timeoutMs * 0.1))
                                                             // cancel 路径下生效的是 grace / 2
@@ -183,7 +185,19 @@ interface ObservedDeliveryReceipt {
   sessionId?: string;        // ↑
   channel?: string;          // 'sw' / 'ipc' / 'native' / 'poll' / 任意诊断 label
 }
+
+interface RawReadMeta {
+  ts: number;                // Date.now()
+  byteLength: number;        // 本次 reader.read() 拿到的字节数
+  done: boolean;             // 流是否结束
+  textPreview: string;       // 本次数据解码后的前 120 字符，保留 ':' keepalive 注释行
+  status?: number;           // 仅首帧带：响应状态码
+  contentEncoding?: string | null;  // 仅首帧带：响应 Content-Encoding（查是否被边缘压缩）
+  contentType?: string | null;      // 仅首帧带
+}
 ```
+
+> `onRawRead` 是诊断钩子：SSE 解析层默认丢弃 `:` 注释行（含每秒一发的 keepalive），出问题时无从判断「静默期里到底有没有字节到达」。挂上它就能在 raw `reader.read()` 这一层看到每次读到的原始字节与 keepalive 帧。不传则零开销、行为不变。
 
 ### `delivery.mode` 必须显式选
 

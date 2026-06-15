@@ -193,6 +193,29 @@ const TEXT_ENCODER = new TextEncoder();
  *   `deliver()` don't silently drop the header.
  * @property {string}   [endpointPath='/instant']  - Path under the resolved instant base URL. Pass
  *   `'/continue'` for tool-result resume on amsg-instant 0.9.0+.
+ * @property {(meta: RawReadMeta) => void} [onRawRead] - Optional raw-read telemetry hook for the
+ *   foreground SSE transport. Fires once per `reader.read()` BEFORE any SSE parsing/filtering, so it
+ *   sees every byte that reached the client — including `: keepalive` comment frames that the parser
+ *   silently drops. Use it to tell "connection alive but no business data" apart from "no bytes flowing
+ *   at all" when diagnosing stalled streams. Purely observational: throws are swallowed and never affect
+ *   transport. Not invoked for the JSON transport.
+ */
+
+/**
+ * Metadata for a single raw `reader.read()` on the SSE body, passed to
+ * `DeliverOptions.onRawRead`. The response-meta fields
+ * (`status` / `contentEncoding` / `contentType`) are only populated on the
+ * first invocation; later calls omit them.
+ *
+ * @typedef {Object} RawReadMeta
+ * @property {number}  ts                       - `Date.now()` at the moment the read resolved.
+ * @property {number}  byteLength               - Bytes in this chunk (`value?.byteLength ?? 0`).
+ * @property {boolean} done                     - The `done` flag from `reader.read()`.
+ * @property {string}  textPreview              - First ~120 chars of this chunk decoded as UTF-8,
+ *   WITHOUT any keepalive/comment filtering (so `:`-prefixed lines stay visible).
+ * @property {string|null} [contentEncoding]    - `res.headers.get('content-encoding')`. First call only.
+ * @property {string|null} [contentType]        - `res.headers.get('content-type')`. First call only.
+ * @property {number}  [status]                 - `res.status`. First call only.
  */
 
 /**
@@ -534,7 +557,7 @@ export class ReiClient {
     }
     const {
       delivery, timeoutMs, onChunk, postTransportGraceMs,
-      signal, headers, authorization, endpointPath,
+      signal, headers, authorization, endpointPath, onRawRead,
     } = opts;
 
     if (!delivery || typeof delivery !== 'object') {
@@ -627,6 +650,7 @@ export class ReiClient {
         const result = await this._runInstantTransport(built, {
           signal: internalAbort.signal,
           onChunk: wrappedOnChunk,
+          onRawRead,
         });
         if (finalized) return;
         transportEnded = true;
@@ -979,11 +1003,12 @@ export class ReiClient {
    *
    * @private
    * @param {{ url: string, headers: Record<string, string>, body: string }} built
-   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void }} opts
+   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void, onRawRead?: (meta: RawReadMeta) => void }} opts
+   *   `onRawRead` is forwarded to the SSE consumer for raw read-loop telemetry (see `DeliverOptions.onRawRead`).
    * @returns {Promise<{ kind: 'sse' } | { kind: 'json', body: unknown }>}
    */
   async _runInstantTransport(built, opts) {
-    const { signal, onChunk } = opts;
+    const { signal, onChunk, onRawRead } = opts;
     const { url, headers, body } = built;
 
     const res = await fetch(url, { method: 'POST', headers, body, signal });
@@ -999,7 +1024,15 @@ export class ReiClient {
     const kind = classifyContentType(contentType);
     if (kind === 'sse') {
       if (!res.body) throw new Error('Response body is null');
-      await this._consumeSseStream(res, { onPayload: onChunk });
+      await this._consumeSseStream(res, {
+        onPayload: onChunk,
+        onRawRead,
+        responseMeta: {
+          status: res.status,
+          contentEncoding: res.headers.get('content-encoding'),
+          contentType: res.headers.get('content-type'),
+        },
+      });
       return { kind: 'sse' };
     }
     if (kind === 'json') {
@@ -1017,15 +1050,53 @@ export class ReiClient {
    *
    * @private
    * @param {Response} res
-   * @param {{ onPayload?: (p: unknown) => Promise<void> | void }} opts
+   * @param {{
+   *   onPayload?: (p: unknown) => Promise<void> | void,
+   *   onRawRead?: (meta: RawReadMeta) => void,
+   *   responseMeta?: { status?: number, contentEncoding?: string | null, contentType?: string | null }
+   * }} opts
+   *   `onRawRead` (if supplied) fires once per `reader.read()` before any SSE parsing/filtering — it sees
+   *   raw bytes including `: keepalive` comment frames. Throws from it are swallowed. `responseMeta` is
+   *   attached to the FIRST `onRawRead` call only. See `DeliverOptions.onRawRead`.
    * @returns {Promise<void>}
    */
   async _consumeSseStream(res, opts) {
-    const { onPayload } = opts;
+    const { onPayload, onRawRead, responseMeta } = opts;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let thrown;
+
+    // Raw read-loop telemetry (opt-in via onRawRead). Kept completely
+    // separate from the parsing path: a one-shot decoder for the preview so
+    // it never perturbs the streaming `decoder` above, and the first call
+    // carries response meta (status / encoding / content-type).
+    const previewDecoder = onRawRead ? new TextDecoder() : null;
+    let rawReadFired = false;
+    const emitRawRead = (done, value) => {
+      if (!onRawRead) return;
+      try {
+        let textPreview = '';
+        if (value && value.byteLength) {
+          // One-shot decode (no { stream: true }) so we don't carry state
+          // between calls and disturb the main buffer's decoder.
+          textPreview = previewDecoder.decode(value).slice(0, 120);
+        }
+        const meta = {
+          ts: Date.now(),
+          byteLength: value && value.byteLength ? value.byteLength : 0,
+          done: !!done,
+          textPreview,
+        };
+        if (!rawReadFired) {
+          meta.status = responseMeta ? responseMeta.status : undefined;
+          meta.contentEncoding = responseMeta ? responseMeta.contentEncoding : undefined;
+          meta.contentType = responseMeta ? responseMeta.contentType : undefined;
+        }
+        rawReadFired = true;
+        onRawRead(meta);
+      } catch { /* telemetry must never break the transport */ }
+    };
 
     // Parse one SSE frame body (lines between two terminators). Returns
     // `'done'` if the frame signals end-of-stream so the caller can
@@ -1069,6 +1140,7 @@ export class ReiClient {
     try {
       while (true) {
         const { done, value } = await reader.read();
+        emitRawRead(done, value);
         if (done) {
           // Flush any tail bytes the decoder held back (partial UTF-8
           // sequences split across the final chunk boundary).

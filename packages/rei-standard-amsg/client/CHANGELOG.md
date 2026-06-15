@@ -1,5 +1,16 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.6.0 — `deliver()` 新增 `onRawRead` 原始读遥测钩子
+
+给 `deliver()` 加一个**可选**的 `onRawRead` 钩子，专供排查 SSE 链路用。SSE transport 每次 `reader.read()` 后回调，把原始字节信息交给调用方，便于回答「连接静默期里到底有没有字节真的到达客户端」这类问题。
+
+不传 = 行为完全不变；SSE 解析逻辑（含 `:` 注释行的处理）一字未动。
+
+### New
+
+- 新增 `deliver()` 选项 `onRawRead(meta)`：SSE transport 每次 `reader.read()` 之后触发，`meta` 含 `ts` / `byteLength` / `done` / `textPreview`（本次数据解码后的前 120 字符，**保留 `:` 注释行**，能看到平时被解析层跳过的 keepalive 帧）；首帧额外带 `status` / `contentEncoding` / `contentType` 三个响应元信息。
+- 钩子抛错被吞，不影响送达主流程；`textPreview` 用独立 decoder 取样，不干扰流式解析。
+
 ## 2.5.0 — `deliver()` 平台无关送达 primitive
 
 把"发出去"和"业务上是否真送达"在 API 层显式分开。新增 `client.deliver()` 作为新代码的首选入口；老的 `sendInstant()` / `consumeInstantStream()` 仍可用但降级为低级 transport，配 opt-in dev warning 引导迁移。SSE 与 JSON 两条 transport 一并升级到统一的送达协调层，调用方无需感知。
