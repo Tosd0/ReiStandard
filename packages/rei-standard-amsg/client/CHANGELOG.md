@@ -1,5 +1,20 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.7.0 — `deliver()` 新增 `compressRequest` 请求体 gzip 压缩
+
+给 `deliver()` 加一个**可选**的 `compressRequest`，把要发出去的请求体在上网线之前 gzip 压一下。中文 + 重复结构的 JSON 压缩比很高（实测 ~322KB 能压到 ~50KB），网线上字节小了，大 body 在慢/不稳的上行链路上就能在「发了没回应就杀」的超时之前传完。压的是**请求**，不是响应；上下文内容一字不动，只是传输层省字节。
+
+不传 = 关闭 = 行为完全不变（向后兼容）。SSE 与 JSON 两条 transport 共用同一请求体，压缩对两者一致生效。解压由接收端（worker）负责，客户端只压不解。
+
+### New
+
+- 新增 `deliver()` 选项 `compressRequest`：
+  - 不传 / falsy ⇒ 关闭，照常发明文 JSON。
+  - `true` 或 `{}` ⇒ 启用，阈值取默认 **16384 字节（16 KB）**。
+  - `{ thresholdBytes: N }` ⇒ 启用并自定义阈值。
+- 启用后**仅当**请求体 UTF-8 字节数超过阈值、**且**运行时有 `CompressionStream` 时才压缩；否则原样发明文（优雅降级，压缩过程任何异常都兜回明文，绝不让它把发送搞挂）。
+- 压缩时请求体发**原始 gzip 字节**，并加自定义头 `X-Amsg-Request-Encoding: gzip`（特意不用标准 `Content-Encoding`——那个会被 CDN / 代理自动解压导致双重解压）。接收端据此头自行 gunzip。
+
 ## 2.6.0 — `deliver()` 新增 `onRawRead` 原始读遥测钩子
 
 给 `deliver()` 加一个**可选**的 `onRawRead` 钩子，专供排查 SSE 链路用。SSE transport 每次 `reader.read()` 后回调，把原始字节信息交给调用方，便于回答「连接静默期里到底有没有字节真的到达客户端」这类问题。

@@ -1068,3 +1068,152 @@ test('Content-Type: parameter value containing media-type string is not mis-clas
     assert.deepEqual(result.detail.transportResponse, body);
   } finally { restore(); }
 });
+
+// ─── compressRequest (request-body gzip, opt-in) ─────────────────
+//
+// Contract under test (must stay lockstep with the receiving worker):
+//   - enabled + body over threshold ⇒ fetch carries header
+//     `X-Amsg-Request-Encoding: gzip` and body is raw gzip bytes that
+//     gunzip back to the original plaintext JSON.
+//   - small body, or compressRequest omitted ⇒ plaintext, NO such header.
+//   - CompressionStream unavailable ⇒ graceful fallback to plaintext.
+
+import { gunzipSync } from 'node:zlib';
+
+const COMPRESS_HEADER = 'X-Amsg-Request-Encoding';
+
+// Read a header value from a fetch `init.headers` plain object, case-insensitively.
+function headerOf(headers, name) {
+  if (!headers) return undefined;
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return undefined;
+}
+
+// Swap CompressionStream out for the duration of a test; restore after.
+function withoutCompressionStream(fn) {
+  const original = globalThis.CompressionStream;
+  // eslint-disable-next-line no-undef
+  delete globalThis.CompressionStream;
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => { globalThis.CompressionStream = original; });
+}
+
+test('compressRequest: enabled + large body → gzip header + body gunzips to original JSON', async () => {
+  const client = newClient();
+  // A payload that serializes well past the default 16 KB threshold.
+  const payload = { kind: 'big', notes: Array.from({ length: 4000 }, (_, i) => `中文重复内容-${i % 7}`) };
+  const expectedJson = JSON.stringify(payload);
+
+  let captured;
+  const restore = installFetch((_url, init) => {
+    captured = init;
+    return makeJsonResponse({ ack: true });
+  });
+
+  try {
+    await client.deliver(payload, {
+      delivery: { mode: 'transport-only' },
+      timeoutMs: 1000,
+      compressRequest: true,
+    });
+
+    assert.equal(headerOf(captured.headers, COMPRESS_HEADER), 'gzip', 'gzip marker header must be set');
+    assert.ok(
+      captured.body instanceof Uint8Array,
+      'compressed body should be raw bytes, not a string'
+    );
+    // Wire bytes should be much smaller than the plaintext for this payload.
+    assert.ok(
+      captured.body.byteLength < new TextEncoder().encode(expectedJson).length,
+      'gzip body should be smaller than plaintext'
+    );
+    const roundTrip = gunzipSync(Buffer.from(captured.body)).toString('utf8');
+    assert.equal(roundTrip, expectedJson, 'gunzip(body) must equal the original JSON');
+  } finally { restore(); }
+});
+
+test('compressRequest: custom thresholdBytes triggers compression on a smaller body', async () => {
+  const client = newClient();
+  const payload = { tag: 'smallish', blob: 'x'.repeat(200) };
+  const expectedJson = JSON.stringify(payload);
+
+  let captured;
+  const restore = installFetch((_url, init) => { captured = init; return makeJsonResponse({ ack: true }); });
+
+  try {
+    await client.deliver(payload, {
+      delivery: { mode: 'transport-only' },
+      timeoutMs: 1000,
+      compressRequest: { thresholdBytes: 16 },
+    });
+    assert.equal(headerOf(captured.headers, COMPRESS_HEADER), 'gzip');
+    assert.ok(captured.body instanceof Uint8Array);
+    assert.equal(gunzipSync(Buffer.from(captured.body)).toString('utf8'), expectedJson);
+  } finally { restore(); }
+});
+
+test('compressRequest: small body (below threshold) → plaintext, no gzip header', async () => {
+  const client = newClient();
+  const payload = { tag: 'tiny', n: 1 };
+  const expectedJson = JSON.stringify(payload);
+
+  let captured;
+  const restore = installFetch((_url, init) => { captured = init; return makeJsonResponse({ ack: true }); });
+
+  try {
+    await client.deliver(payload, {
+      delivery: { mode: 'transport-only' },
+      timeoutMs: 1000,
+      compressRequest: true, // enabled, but body is far below 16 KB
+    });
+    assert.equal(headerOf(captured.headers, COMPRESS_HEADER), undefined, 'no gzip header for small body');
+    assert.equal(typeof captured.body, 'string', 'small body stays plaintext string');
+    assert.equal(captured.body, expectedJson);
+  } finally { restore(); }
+});
+
+test('compressRequest: omitted → plaintext, no gzip header (backward compatible)', async () => {
+  const client = newClient();
+  const payload = { kind: 'big', notes: Array.from({ length: 4000 }, (_, i) => `中文重复内容-${i % 7}`) };
+  const expectedJson = JSON.stringify(payload);
+
+  let captured;
+  const restore = installFetch((_url, init) => { captured = init; return makeJsonResponse({ ack: true }); });
+
+  try {
+    await client.deliver(payload, {
+      delivery: { mode: 'transport-only' },
+      timeoutMs: 1000,
+      // compressRequest intentionally omitted
+    });
+    assert.equal(headerOf(captured.headers, COMPRESS_HEADER), undefined);
+    assert.equal(typeof captured.body, 'string');
+    assert.equal(captured.body, expectedJson);
+  } finally { restore(); }
+});
+
+test('compressRequest: CompressionStream unavailable → graceful fallback to plaintext', async () => {
+  const client = newClient();
+  const payload = { kind: 'big', notes: Array.from({ length: 4000 }, (_, i) => `中文重复内容-${i % 7}`) };
+  const expectedJson = JSON.stringify(payload);
+
+  let captured;
+  const restore = installFetch((_url, init) => { captured = init; return makeJsonResponse({ ack: true }); });
+
+  try {
+    await withoutCompressionStream(async () => {
+      await client.deliver(payload, {
+        delivery: { mode: 'transport-only' },
+        timeoutMs: 1000,
+        compressRequest: true,
+      });
+    });
+    assert.equal(headerOf(captured.headers, COMPRESS_HEADER), undefined, 'no header when CompressionStream missing');
+    assert.equal(typeof captured.body, 'string', 'falls back to plaintext string');
+    assert.equal(captured.body, expectedJson);
+  } finally { restore(); }
+});

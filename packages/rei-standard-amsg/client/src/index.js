@@ -199,6 +199,17 @@ const TEXT_ENCODER = new TextEncoder();
  *   silently drops. Use it to tell "connection alive but no business data" apart from "no bytes flowing
  *   at all" when diagnosing stalled streams. Purely observational: throws are swallowed and never affect
  *   transport. Not invoked for the JSON transport.
+ * @property {boolean | { thresholdBytes?: number }} [compressRequest] - Opt-in gzip of the request
+ *   BODY before it is sent (applies to both the SSE and JSON transports — it compresses the request,
+ *   not the response). Omit / falsy = OFF and behavior is fully unchanged (backward compatible).
+ *   `true` or `{}` enables it at the default 16384-byte (16 KB) threshold; `{ thresholdBytes: N }`
+ *   sets a custom threshold. When enabled, the body is gzip-compressed only if its UTF-8 byte length
+ *   exceeds the threshold AND the runtime provides `CompressionStream`; otherwise it is sent as
+ *   plaintext (graceful degradation, never throws). On compression the request gains the custom
+ *   header `X-Amsg-Request-Encoding: gzip` (NOT standard `Content-Encoding`, which CDNs / proxies
+ *   would auto-decompress and double-decode) and the body is the raw gzip bytes — the receiving
+ *   worker is responsible for gunzipping. Use it when delivering large bodies over slow / flaky
+ *   uplinks where a big upload can outrun the connection's send timeout.
  */
 
 /**
@@ -262,6 +273,68 @@ function classifyContentType(contentType) {
   if (main === 'application/json') return 'json';
   if (/^application\/[\w.+-]+\+json$/.test(main)) return 'json';
   return 'unknown';
+}
+
+/**
+ * Default size floor for request-body gzip: bodies at or below this are not
+ * worth compressing (the gzip header/overhead can outweigh the gain on tiny
+ * payloads). 16 KB matches the contract documented on `DeliverOptions.compressRequest`.
+ */
+const COMPRESS_REQUEST_DEFAULT_THRESHOLD = 16384;
+
+/**
+ * Custom request header used to mark a gzip-compressed body. Deliberately NOT
+ * the standard `Content-Encoding` — CDNs / reverse proxies (Cloudflare, etc.)
+ * auto-decompress `Content-Encoding: gzip` on the way in, which would double-
+ * decompress and corrupt the body. The receiving worker keys off this custom
+ * header to know it must gunzip the body itself.
+ */
+const COMPRESS_REQUEST_HEADER = 'X-Amsg-Request-Encoding';
+
+/**
+ * Optionally gzip a request body string before it hits `fetch`.
+ *
+ * Pure optimization with graceful degradation: returns the original plaintext
+ * body (and no extra header) whenever compression is disabled, the body is at
+ * or below the threshold, the runtime lacks `CompressionStream`, or anything
+ * throws. The wire bytes shrink (Chinese / repetitive JSON compresses ~5-8x)
+ * so large uploads finish before flaky links time out — without dropping any
+ * context. Decompression is the receiving worker's job (keyed off
+ * `X-Amsg-Request-Encoding: gzip`).
+ *
+ * @param {string} body - The already-serialized request body (plaintext JSON).
+ * @param {boolean | { thresholdBytes?: number } | undefined} compressRequest
+ *   `undefined`/falsy ⇒ disabled (no-op, backward compatible). `true` / `{}` ⇒
+ *   enabled at the 16 KB default. `{ thresholdBytes: N }` ⇒ enabled at N bytes.
+ * @returns {Promise<{ body: string | Uint8Array, header: string | null }>}
+ *   `header` is the gzip marker header name to set when compression happened,
+ *   or `null` to send plaintext with no extra header.
+ */
+async function maybeCompressRequestBody(body, compressRequest) {
+  // Disabled / no opt-in ⇒ behavior unchanged.
+  if (!compressRequest) return { body, header: null };
+
+  const threshold =
+    typeof compressRequest === 'object' && typeof compressRequest.thresholdBytes === 'number'
+      ? compressRequest.thresholdBytes
+      : COMPRESS_REQUEST_DEFAULT_THRESHOLD;
+
+  try {
+    if (typeof CompressionStream === 'undefined') return { body, header: null };
+
+    const bytes = new TextEncoder().encode(body);
+    if (bytes.length <= threshold) return { body, header: null };
+
+    const gz = new Uint8Array(
+      await new Response(
+        new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))
+      ).arrayBuffer()
+    );
+    return { body: gz, header: COMPRESS_REQUEST_HEADER };
+  } catch {
+    // Compression is an optimization, never a failure mode: fall back to plaintext.
+    return { body, header: null };
+  }
 }
 
 export class ReiClient {
@@ -558,6 +631,7 @@ export class ReiClient {
     const {
       delivery, timeoutMs, onChunk, postTransportGraceMs,
       signal, headers, authorization, endpointPath, onRawRead,
+      compressRequest,
     } = opts;
 
     if (!delivery || typeof delivery !== 'object') {
@@ -651,6 +725,7 @@ export class ReiClient {
           signal: internalAbort.signal,
           onChunk: wrappedOnChunk,
           onRawRead,
+          compressRequest,
         });
         if (finalized) return;
         transportEnded = true;
@@ -1003,15 +1078,23 @@ export class ReiClient {
    *
    * @private
    * @param {{ url: string, headers: Record<string, string>, body: string }} built
-   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void, onRawRead?: (meta: RawReadMeta) => void }} opts
+   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void, onRawRead?: (meta: RawReadMeta) => void, compressRequest?: boolean | { thresholdBytes?: number } }} opts
    *   `onRawRead` is forwarded to the SSE consumer for raw read-loop telemetry (see `DeliverOptions.onRawRead`).
+   *   `compressRequest` opts the request body into gzip before `fetch` (see `DeliverOptions.compressRequest`).
    * @returns {Promise<{ kind: 'sse' } | { kind: 'json', body: unknown }>}
    */
   async _runInstantTransport(built, opts) {
-    const { signal, onChunk, onRawRead } = opts;
+    const { signal, onChunk, onRawRead, compressRequest } = opts;
     const { url, headers, body } = built;
 
-    const res = await fetch(url, { method: 'POST', headers, body, signal });
+    // Optionally gzip the request body (opt-in, graceful fallback to plaintext).
+    const { body: wireBody, header: compressionHeader } =
+      await maybeCompressRequestBody(body, compressRequest);
+    const wireHeaders = compressionHeader
+      ? { ...headers, [compressionHeader]: 'gzip' }
+      : headers;
+
+    const res = await fetch(url, { method: 'POST', headers: wireHeaders, body: wireBody, signal });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
