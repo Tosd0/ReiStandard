@@ -2,41 +2,25 @@ name: Release
 
 on:
   push:
-    tags:
-      # Per-package release tags only. Historical `v*` tags (v2.1.0, etc.)
-      # were left over from when this repo was a single package — the root
-      # package.json is now `private: true` with no version field, so a
-      # `v*` tag has no semantic meaning here. Manual sweep-all is still
-      # available via `workflow_dispatch`.
-      - 'rei-standard-amsg-*@*'
+    branches:
+      - main
   workflow_dispatch:
 
-# Per-ref concurrency group: each tag (or workflow_dispatch ref) gets its
-# own queue, so coordinated multi-package releases (e.g. instant + server
-# + client tags pushed together) all run in parallel without cancelling
-# each other.
-#
-# Earlier this was `group: release` (single global queue). Combined with
-# `cancel-in-progress: false`, GitHub Actions' semantics ("1 running + 1
-# pending max; new arrivals evict the pending one") meant pushing N tags
-# at once kept only the first running + the last pending — middle tags
-# were silently cancelled. Per-ref grouping fixes this; npm-side races
-# are already prevented by scripts/publish-workspaces.mjs filtering on
-# GITHUB_REF (only the triggering tag's package is published), with
-# `isVersionPublished()` as the idempotent backstop.
-#
-# `cancel-in-progress: false` is still important within a single ref:
-# half-finished publishes must never be killed mid-flight.
+# One release run at a time. The Changesets action either opens/updates the
+# "Version Packages" PR (when changesets are pending) or publishes the
+# already-versioned packages (when that PR has merged) — never both in
+# parallel, so a single global queue is what we want here.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write        # create the Version Packages PR + push version-bump commit / git tags
+  pull-requests: write   # open / update the Version Packages PR
+  id-token: write        # npm provenance via OIDC trusted publishing
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
 
     steps:
@@ -77,7 +61,19 @@ jobs:
       - name: Build and test
         run: npm run ci
 
-      - name: Publish public workspaces
+      - name: Create Release PR or publish
+        uses: changesets/action@v1
+        with:
+          # When changesets are pending: open/refresh the "Version Packages" PR
+          # (runs `changeset version` to bump versions + write CHANGELOGs).
+          # When that PR has merged (no pending changesets, versions ahead of
+          # npm): run `npm run release` → `changeset publish` to publish each
+          # bumped package and push its git tag.
+          version: changeset version
+          publish: npm run release
         env:
-          NPM_PUBLISH_PROVENANCE: 'true'
-        run: npm run publish:workspaces
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Keep npm provenance on publish (changeset publish honours this
+          # the same way `npm publish --provenance` does; needs npm >= 9 and
+          # the id-token: write permission above).
+          NPM_CONFIG_PROVENANCE: 'true'

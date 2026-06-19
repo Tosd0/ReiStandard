@@ -8,10 +8,14 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "ci": "npm run check:esm && npm run build && npm run test",
-    "publish:workspaces": "node scripts/publish-workspaces.mjs"
+    "version": "changeset version",
+    "release": "changeset publish"
   },
   "workspaces": [
     "packages/rei-standard-amsg/*",
     "examples"
-  ]
+  ],
+  "devDependencies": {
+    "@changesets/cli": "^2.31.0"
+  }
 }

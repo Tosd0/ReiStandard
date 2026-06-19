@@ -33,7 +33,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@rei-standard/amsg-shared": "0.2.0",
+    "@rei-standard/amsg-shared": "^0.2.0",
     "web-push": "^3.6.7",
     "@netlify/blobs": "^8.1.0"
   },
