@@ -580,7 +580,7 @@ self.addEventListener('push', (e) => e.waitUntil((async () => {
     if (!res.ok) return;                                       // TTL 已过期/失败，不展示
     data = await res.json();
   }
-  if (data.type !== 'tool-request') return handle(data);
+  if (data.messageKind !== 'tool_request') return handle(data);
 
   // 2. fetch 之后 dedup —— claim 永久保留，靠 sweeper 清旧
   const claimKey = `${data.sessionId}:${data.iteration}`;

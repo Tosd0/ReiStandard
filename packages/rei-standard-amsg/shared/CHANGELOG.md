@@ -1,4 +1,4 @@
-# @rei-standard/amsg-shared
+# Changelog — @rei-standard/amsg-shared
 
 ## 0.2.0 — Notification silent support
 

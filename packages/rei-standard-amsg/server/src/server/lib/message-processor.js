@@ -29,6 +29,11 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
+// Pacing between consecutive Web Push deliveries (reasoning → content, and
+// between content sentences) so the client renders a natural typing cadence.
+// Kept equal to amsg-instant's SLEEP_BETWEEN_MESSAGES_MS default.
+const SLEEP_BETWEEN_MESSAGES_MS = 1500;
+
 /**
  * Split a single chunk by one regex; on no-match return [chunk] so a later
  * regex in a cascade can still take a swing at it.
@@ -237,7 +242,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
         metadata,
       });
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
     }
 
     for (let i = 0; i < messages.length; i++) {
@@ -261,7 +266,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
 
       if (i < messages.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
       }
     }
 

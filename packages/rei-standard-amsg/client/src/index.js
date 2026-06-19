@@ -1103,7 +1103,8 @@ export class ReiClient {
       throw err;
     }
 
-    const contentType = res.headers.get('content-type') || '';
+    const rawContentType = res.headers.get('content-type');
+    const contentType = rawContentType || '';
     const kind = classifyContentType(contentType);
     if (kind === 'sse') {
       if (!res.body) throw new Error('Response body is null');
@@ -1113,7 +1114,7 @@ export class ReiClient {
         responseMeta: {
           status: res.status,
           contentEncoding: res.headers.get('content-encoding'),
-          contentType: res.headers.get('content-type'),
+          contentType: rawContentType,
         },
       });
       return { kind: 'sse' };

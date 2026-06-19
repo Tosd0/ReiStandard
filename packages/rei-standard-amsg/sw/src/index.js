@@ -964,7 +964,7 @@ function normalizeMultipartChunk(payload, options) {
   let chunkBytes;
   try {
     chunkBytes = base64UrlToBytes(payload.chunk);
-  } catch (_error) { console.error("RESTORE ERROR", _error);
+  } catch (_error) {
     return null;
   }
 
@@ -1021,7 +1021,7 @@ async function maybeCleanupMultipart(sw, ctx) {
   ctx.setLastMultipartCleanupAt(now);
   try {
     await cleanupMultipartStores(sw, now);
-  } catch (_error) { console.error("RESTORE ERROR", _error);
+  } catch (_error) {
     // Cleanup is observability/housekeeping; never block a fresh push.
   }
 }
@@ -1167,7 +1167,7 @@ function normalizeRequestBody(bodyInput) {
 
   try {
     return JSON.stringify(bodyInput);
-  } catch (_error) { console.error("RESTORE ERROR", _error);
+  } catch (_error) {
     throw new Error('[rei-standard-amsg-sw] request body is not serializable');
   }
 }
@@ -1201,7 +1201,7 @@ async function trySendQueuedRequest(queuedRequest) {
     }
 
     return false;
-  } catch (_error) { console.error("RESTORE ERROR", _error);
+  } catch (_error) {
     return false;
   }
 }
@@ -1212,7 +1212,7 @@ async function registerFlushSync(sw) {
 
   try {
     await syncManager.register(REI_SW_SYNC_TAG);
-  } catch (_error) { console.error("RESTORE ERROR", _error);
+  } catch (_error) {
     // Ignore unsupported/denied sync registration and rely on manual flush.
   }
 }
@@ -1318,10 +1318,6 @@ function deleteMultipartPending(id) {
   return deleteStoreRecord(REI_SW_MULTIPART_STORE, id);
 }
 
-function listMultipartPending() {
-  return listStoreRecords(REI_SW_MULTIPART_STORE);
-}
-
 function readMultipartDone(id) {
   return readStoreRecord(REI_SW_MULTIPART_DONE_STORE, id);
 }
@@ -1332,10 +1328,6 @@ function writeMultipartDone(record) {
 
 function deleteMultipartDone(id) {
   return deleteStoreRecord(REI_SW_MULTIPART_DONE_STORE, id);
-}
-
-function listMultipartDone() {
-  return listStoreRecords(REI_SW_MULTIPART_DONE_STORE);
 }
 
 async function hasMultipartChunk(id_index) {
@@ -1426,18 +1418,6 @@ async function deleteStoreRecord(storeName, id) {
     const request = store.delete(id);
     request.onsuccess = () => resolve(undefined);
     request.onerror = () => reject(request.error || new Error(`Failed to delete ${storeName}`));
-  });
-}
-
-async function listStoreRecords(storeName) {
-  if (!hasIndexedDB()) {
-    return Array.from(memoryStoreFor(storeName).values()).map(cloneRecord);
-  }
-
-  return withDatabaseStore(storeName, 'readonly', (store, resolve, reject) => {
-    const request = store.getAll();
-    request.onsuccess = () => resolve(Array.isArray(request.result) ? request.result : []);
-    request.onerror = () => reject(request.error || new Error(`Failed to list ${storeName}`));
   });
 }
 
