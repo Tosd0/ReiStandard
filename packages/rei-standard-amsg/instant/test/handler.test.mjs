@@ -383,6 +383,60 @@ describe('createInstantHandler — request validation', () => {
   });
 });
 
+// ─── Handler: gzip request body (compressRequest receiver support) ─────
+
+describe('createInstantHandler — gzip request body', () => {
+  // Mirror amsg-client's `deliver({ compressRequest })`: gzip the UTF-8 JSON
+  // and mark it with X-Amsg-Request-Encoding: gzip.
+  async function gzipString(text) {
+    const bytes = new TextEncoder().encode(text);
+    return new Uint8Array(
+      await new Response(
+        new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))
+      ).arrayBuffer()
+    );
+  }
+
+  it('gunzips a body marked X-Amsg-Request-Encoding: gzip and processes it', async () => {
+    const router = llmRouter('compressed hello.');
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const gz = await gzipString(JSON.stringify(makeValidPayload()));
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+        'x-amsg-request-encoding': 'gzip',
+      },
+      body: gz,
+    });
+
+    const res = await handler(req);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(router.pushCalls.length, 1);
+  });
+
+  it('rejects a body marked gzip that is not actually gzip with 400', async () => {
+    const handler = createInstantHandler({ vapid });
+    const req = new Request('http://localhost/instant', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+        'x-amsg-request-encoding': 'gzip',
+      },
+      body: 'not gzip bytes',
+    });
+    const res = await handler(req);
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.code, 'INVALID_PAYLOAD_FORMAT');
+  });
+});
+
 // ─── Handler: clientToken weak auth ────────────────────────────────────
 
 describe('createInstantHandler — clientToken', () => {

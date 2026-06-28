@@ -266,11 +266,16 @@ export function createInstantHandler(options) {
 
     let rawBody;
     try {
-      rawBody = await request.text();
-    } catch (_err) {
+      rawBody = await readRequestBodyText(request);
+    } catch (err) {
       return respond(400, {
         success: false,
-        error: { code: 'INVALID_PAYLOAD_FORMAT', message: '无法读取请求体' }
+        error: {
+          code: 'INVALID_PAYLOAD_FORMAT',
+          message: err && err.unsupportedEncoding
+            ? '运行时不支持解压 gzip 请求体（X-Amsg-Request-Encoding: gzip）'
+            : '无法读取请求体',
+        }
       });
     }
 
@@ -789,6 +794,32 @@ function getHeader(request, name) {
 }
 
 /**
+ * Read the request body as text, transparently gunzip-ing it when the
+ * client opted into request compression. `@rei-standard/amsg-client`'s
+ * `deliver({ compressRequest })` gzips a large request body and marks it
+ * with `X-Amsg-Request-Encoding: gzip` — a non-standard header, deliberately
+ * not `Content-Encoding`, so CDNs / proxies don't decode it out from under us.
+ * No marker ⇒ the body is read verbatim, so uncompressed requests are
+ * unaffected.
+ *
+ * @param {Request} request
+ * @returns {Promise<string>}
+ */
+async function readRequestBodyText(request) {
+  if (getHeader(request, 'x-amsg-request-encoding').toLowerCase() !== 'gzip') {
+    return request.text();
+  }
+  if (typeof DecompressionStream === 'undefined') {
+    const err = new Error('runtime lacks DecompressionStream for gzip request body');
+    err.unsupportedEncoding = true;
+    throw err;
+  }
+  const compressed = await request.arrayBuffer();
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+/**
  * Build the `Access-Control-Allow-*` headers applied to every response.
  *
  * `Vary: Origin` is added only when the allowed origin isn't the wildcard
@@ -806,7 +837,7 @@ function buildCorsHeaders(cors) {
   const headers = {
     'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding',
     'Access-Control-Max-Age': '86400',
   };
   if (allowOrigin !== '*') {
