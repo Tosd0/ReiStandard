@@ -4,7 +4,7 @@
 >
 > 版本日期：2026-05-19
 >
-> 对齐实现（稳定版）：`@rei-standard/amsg-shared` 0.1.0、`@rei-standard/amsg-server` 2.4.0、`@rei-standard/amsg-instant` 0.8.0、`@rei-standard/amsg-client` 2.3.0、`@rei-standard/amsg-sw` 2.1.0。
+> 对齐实现（稳定版）：`@rei-standard/amsg-shared` 0.2.0、`@rei-standard/amsg-server` 2.5.2、`@rei-standard/amsg-instant` 0.9.1、`@rei-standard/amsg-client` 2.7.0、`@rei-standard/amsg-sw` 2.3.1。
 >
 > 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。上层包对 `@rei-standard/amsg-shared` 用脱字号区间（`^0.2.0`）：在 0.x 上只放行同一 minor 内的补丁，shared 出补丁时消费者自动跟随，shared 升 minor 则需消费者显式升级区间。
 
@@ -153,11 +153,22 @@ export const config = {
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
+上表是 `@rei-standard/amsg-server` 的端点。`@rei-standard/amsg-instant` 是另一套无状态 worker，自带 `/instant`（一次性即时推送）与 `/continue`（agentic-loop 工具回执续跑，仅当 handler 配了 `onLLMOutput` 时可用）两个端点，鉴权用可选的 client token，详见 [`amsg-instant` README](../packages/rei-standard-amsg/instant/README.md)。本规范正文提到 `/continue` 时即指这里。
+
 ### 6.1 AI 消息字段约束
 
 当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束适用于 `schedule-message`、`update-message`、`amsg-instant` handler；其中 `splitPattern` 仅适用于 `amsg-server` 的调度任务，`amsg-instant` 0.8.0 的替代方式见本节末尾。
 
-**`apiUrl`（必填，字符串）** — 完整聊天端点 URL（例：`https://api.openai.com/v1/chat/completions`）。实现方可做最小规范化（去首尾空白、去路径尾部多余 `/`），但**不应**自动补全版本路径（`/v1`）或聊天路径（`/chat/completions`）。若上游返回 `405 Method Not Allowed`，应优先判定为 URL 指向错误端点。
+**`apiUrl`（必填，字符串）** — 聊天端点 URL。必须能 `new URL(...)` 解析，否则抛错（缺失 / 空串 / 非法 URL）。实现方按下表对 OpenAI 风格路径做**幂等**补全（跑两次 = 跑一次，传完整 URL 不会被改坏），先去首尾空白、去路径尾部多余 `/`，再按路径形态决定：
+
+| 输入路径形态 | 处理 |
+|---|---|
+| 已以 `/chat/completions` 结尾 | 原样保留 |
+| 裸域名（无路径或仅 `/`） | 补成 `/v1/chat/completions` |
+| 以版本段结尾（`/v1`、`/v2`…） | 仅补 `/chat/completions`，**不重复加 `/v1`** |
+| 其它自定义路径（如 `/v1/messages`、`/openai/api/foo`） | 原样保留，不猜 |
+
+query string 原样保留。要绕开补全（代理路径很特殊时），直接传完整 `…/chat/completions` 即可。若上游返回 `405 Method Not Allowed`，应优先判定为 URL 指向错误端点。`@rei-standard/amsg-server` 与 `@rei-standard/amsg-instant` 各自带一份 `normalizeAiApiUrl`，规则与测试保持一致。
 
 **`completePrompt` 与 `messages`（互斥二选一）**
 
@@ -352,6 +363,27 @@ LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径
 5. **非 LLM 路径不触发**：`fixed` 任务与 `userMessage` 显式路径不产 LLM 响应，自然不发 ReasoningPush。
 6. **`messageIndex` / `totalMessages` 不带**：ReasoningPush 不参与分句 burst 计数；server 端的 `messagesSent` 也只数 ContentPush。
 
+### 6.5 `schedule-message` 的 `instant` 同步发送
+
+`/api/v1/schedule-message` 收到 `messageType: 'instant'` 时，server 在请求内**同步**走完「建任务 → 按 UUID 处理 → 删任务」，不进 cron 队列：
+
+- 发送成功 → HTTP `200`，`data.status = 'sent'`，附 `messagesSent` / `sentAt` / `retriesUsed`。
+- 发送失败 → HTTP `500`，`error.code = MESSAGE_SEND_FAILED`，底层处理错误放在 `error.details`（见 §9）。
+- 其余 `messageType`（`fixed` / `prompted` / `auto`）→ HTTP `201` 的调度响应，任务入库等 cron 触发。
+
+这条 in-server instant 路径要数据库，任务先落库再处理，投递不绑请求连接（客户端断开仍会跑完、可重试）。它与无状态的 `@rei-standard/amsg-instant` worker 是两条都正式支持的路径，按各自特点选用，详见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)。
+
+### 6.6 投递裁决（delivery adjudication）
+
+`@rei-standard/amsg-instant` 0.9.0+ 默认强制开启 Web Push always-on backup：同一条业务消息**总是**同时走 SSE 流式直送 + Web Push 备份两条通道，由 SW 端按 `messageId` 去重收敛（见 [Service Worker 规范](./service-worker-specification.md)）。
+
+因此下面两个信号都**不**代表送达：
+
+- transport 成功（HTTP `200` / SSE enqueue 成功）只说明「发出去了」，不等于消费者收到（push backup 仍可能没到，或反过来）。
+- SSE 这条流断开 / reject 也不等于没送达（push backup 可能已到，常见于 iOS 把后台 fetch 杀掉）。
+
+投递契约：transport 的成败只用来收紧延迟，**不用来判送达**；送达由调用方提供的一条 out-of-band「观察通道」裁决（一个等业务上「真到了」才 resolve 的 Promise）。`@rei-standard/amsg-client` 的 `deliver()` 实现了这套裁决，返回 `delivered` / `cancelled` / `timeout` / `send-failed` / `completed-unconfirmed` 五种 outcome，完整 API 见 [`amsg-client` README](../packages/rei-standard-amsg/client/README.md)。
+
 ## 7. 一体化初始化接口
 
 ### 7.1 请求
@@ -436,25 +468,52 @@ Body:
 
 ## 9. 错误码
 
+错误响应体形如 `{ success: false, error: { code, message, details? } }`。下表是直接返回给 API 调用方的**顶层** `error.code`。
+
 | HTTP | code | 含义 |
 |---|---|---|
-| 400 | `INVALID_JSON` | 请求体 JSON 不合法 |
-| 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法（`schedule-message` 与 `init-tenant` 路径） |
-| 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
-| 400 | `INVALID_PAYLOAD_FORMAT` | `amsg-instant` payload 格式非法（含 §6.1 / §6.2 校验） |
-| 400 | `INVALID_DRIVER` | 不支持的数据库驱动 |
-| 400 | `INVALID_DATABASE_URL` | `databaseUrl` 缺失或为空 |
-| 400 | `INVALID_USER_ID_FORMAT` | `X-User-Id` 非 UUID v4 |
+| 400 | `INVALID_JSON` | 请求体不是有效 JSON |
+| 400 | `INVALID_REQUEST_BODY` | 请求体不是 JSON 对象 |
+| 400 | `INVALID_ENCRYPTED_PAYLOAD` | 加密信封格式错误（缺 `iv` / `authTag` / `encryptedData`） |
 | 400 | `ENCRYPTION_REQUIRED` | 未按规范提交加密请求体 |
 | 400 | `UNSUPPORTED_ENCRYPTION_VERSION` | 不支持的加密版本 |
+| 400 | `DECRYPTION_FAILED` | 请求体解密失败（`schedule-message` / `update-message`） |
+| 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法（`init-tenant` / `schedule-message` / `messages` 查询参数） |
+| 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
+| 400 | `INVALID_PAYLOAD_FORMAT` | 解密后数据非 JSON 对象；或 `amsg-instant` payload 格式非法（含 §6.1 / §6.2 校验） |
+| 400 | `INVALID_DRIVER` | 不支持的数据库驱动 |
+| 400 | `INVALID_DATABASE_URL` | `databaseUrl` 缺失或为空 |
+| 400 | `INVALID_TENANT_ID` | `init-tenant` 传入的 `tenantId` 非 UUID v4 |
+| 400 | `INVALID_USER_ID_FORMAT` | `X-User-Id` 非 UUID v4 |
+| 400 | `USER_ID_REQUIRED` | 缺少 `X-User-Id` 请求头 |
+| 400 | `TASK_ID_REQUIRED` | 缺少任务 id（`cancel-message` / `update-message` 的 `?id=`） |
 | 401 | `INVALID_INIT_AUTH` | 初始化鉴权失败（仅当服务端启用 `INIT_SECRET` 时） |
-| 401 | `INVALID_TENANT_AUTH` | 租户 token 无效或缺失 |
+| 401 | `INVALID_TENANT_AUTH` | 租户 token 无效、过期、类型不匹配或缺失 |
 | 404 | `TASK_NOT_FOUND` | 任务不存在 |
-| 409 | `TASK_UUID_CONFLICT` | UUID 冲突 |
+| 409 | `TASK_UUID_CONFLICT` | 创建任务时 UUID 冲突 |
 | 409 | `TASK_ALREADY_COMPLETED` | 任务已结束，不可更新 |
+| 409 | `UPDATE_CONFLICT` | 任务更新失败（可能已被并发修改或删除） |
+| 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化 |
+| 500 | `TASK_CREATE_FAILED` | 创建任务失败 |
+| 500 | `MESSAGE_SEND_FAILED` | in-server instant 同步发送失败（§6.5）；底层错误见 `error.details` |
 | 500 | `VAPID_CONFIG_ERROR` | VAPID 配置不完整 |
-| 500 | `TENANT_MASTER_KEY_MISSING` | 租户主密钥缺失或配置异常 |
-| 500 | `INTERNAL_SERVER_ERROR` | 未分类内部错误 |
+
+未被上述分类捕获的内部异常不包成统一信封，直接抛给平台适配器（由运行时返回 5xx）。
+
+### 9.1 处理阶段错误码（嵌套，非顶层）
+
+消息处理过程（取任务、调 LLM、发推送、清理）产生的错误码不作为顶层 `error.code`，而是出现在两处：
+
+- **in-server instant 路径（§6.5）**：包在 `MESSAGE_SEND_FAILED` 的 `error.details` 里。
+- **cron `send-notifications` 路径**：HTTP 仍 `200`（除非 VAPID 缺失 → `500 VAPID_CONFIG_ERROR`），逐任务汇总进 `data.details.failedTasks[].reason`。
+
+| code | 含义 |
+|---|---|
+| `TENANT_MASTER_KEY_MISSING` | 租户主密钥缺失或配置异常 |
+| `TASK_NOT_FOUND` | 任务不存在或已处理 |
+| `INTERNAL_ERROR` | 取任务时未分类内部错误（重试耗尽后） |
+| `PROCESSING_ERROR` | 单条消息处理失败（重试耗尽后） |
+| `POST_SEND_CLEANUP_FAILED` | 消息已发送，但任务清理失败 |
 
 ## 10. 对接流程（标准）
 
