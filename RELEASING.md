@@ -16,7 +16,7 @@
 
 2. **合并到 `main`**：你的功能 PR 正常评审、合并。
 
-3. **「Version Packages」PR**：`main` 上一旦有待处理的 changeset，Release workflow 会自动开（或刷新）一个标题为 *Version Packages* 的 PR。它把 changeset 应用掉——按 bump 级别抬版本号、写进各包的 `CHANGELOG.md`、删掉已消费的 changeset 文件。`updateInternalDependencies: patch` 让被依赖包升版时，依赖方的内部依赖区间也跟着对齐。
+3. **「Version Packages」PR**：`main` 上一旦有待处理的 changeset，Release workflow 会自动开（或刷新）一个标题为 *Version Packages* 的 PR。它把 changeset 应用掉——按 bump 级别抬版本号、写进各包的 `CHANGELOG.md`、删掉已消费的 changeset 文件。`updateInternalDependencies: patch` 让被依赖包升版时，依赖方的内部依赖区间也跟着对齐。version 命令在 `changeset version` 之后还会跑 `npm install --package-lock-only` 刷新 `package-lock.json`，让锁文件里的 workspace 版本号与抬版后的 package.json 对齐，否则合并该 PR 后下一次 `npm ci` 会因锁文件过时而失败。
 
 4. **合并「Version Packages」PR 即发版**：合并后，同一个 workflow 跑 `changeset publish`，把版本号领先于 npm 的包逐个发布（带 npm provenance），并推对应的 git tag。
 

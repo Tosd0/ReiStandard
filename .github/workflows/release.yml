@@ -64,12 +64,18 @@ jobs:
       - name: Create Release PR or publish
         uses: changesets/action@v1
         with:
-          # When changesets are pending: open/refresh the "Version Packages" PR
-          # (runs `changeset version` to bump versions + write CHANGELOGs).
+          # When changesets are pending: open/refresh the "Version Packages" PR.
+          # `npm run version` runs `changeset version` (bump versions + write
+          # CHANGELOGs) AND `npm install --package-lock-only`. The lockfile step
+          # is required: `changeset version` only touches package.json/CHANGELOG,
+          # but this repo commits package-lock.json with workspace versions and
+          # internal dep ranges. Without the refresh, the merged Version PR would
+          # leave the lockfile stale and the next `npm ci` (above) would fail
+          # before publishing.
           # When that PR has merged (no pending changesets, versions ahead of
           # npm): run `npm run release` → `changeset publish` to publish each
           # bumped package and push its git tag.
-          version: changeset version
+          version: npm run version
           publish: npm run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
