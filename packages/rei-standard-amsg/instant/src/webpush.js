@@ -22,6 +22,7 @@ import {
   hmacSha256,
   randomBytes,
 } from './utils.js';
+import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
 
 // RFC 8291 fixed labels (each followed by a NUL byte per HKDF "info" framing).
 const KEY_INFO_PREFIX = utf8('WebPush: info\0');
@@ -329,12 +330,6 @@ export async function verifyVapidJwt(jwt, publicKey) {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────
-
-function normalizeVapidSubject(email) {
-  const trimmed = String(email || '').trim();
-  if (!trimmed) return '';
-  return /^mailto:/i.test(trimmed) || /^https?:/i.test(trimmed) ? trimmed : `mailto:${trimmed}`;
-}
 
 function originOf(endpoint) {
   return new URL(endpoint).origin;

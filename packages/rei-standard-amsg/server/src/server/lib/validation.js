@@ -3,6 +3,8 @@
  * ReiStandard SDK v2.0.1
  */
 
+import { validateAvatarUrl } from '@rei-standard/amsg-shared';
+
 /**
  * Validate ISO 8601 date string.
  * @param {string} dateString
@@ -49,43 +51,17 @@ export function isValidUUIDv4(uuid) {
 
 const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
-const AVATAR_URL_MAX_LENGTH = 2048;
-
-/**
- * Validate the optional `avatarUrl` field. Rejects `data:` URIs (typically
- * base64-encoded inline images) and anything longer than 2048 chars, both
- * of which are the dominant trigger for downstream 413 / Web Push 4 KB
- * payload errors. Returns an error message string, or null when valid.
- *
- * Mirrors @rei-standard/amsg-instant's `validateAvatarUrl` (kept in lockstep
- * on purpose — both packages forward `avatarUrl` to the same SW push payload).
- *
- * @param {unknown} value
- * @returns {string | null}
- */
-export function validateAvatarUrl(value) {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'string') {
-    return 'avatarUrl 必须是字符串';
-  }
-  if (/^data:/i.test(value)) {
-    return '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
-  }
-  if (value.length > AVATAR_URL_MAX_LENGTH) {
-    return `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
-  }
-  if (!isValidUrl(value)) {
-    return 'avatarUrl 不是合法 URL';
-  }
-  return null;
-}
+// `validateAvatarUrl` 与其 2048 字符上限现统一在 @rei-standard/amsg-shared，
+// server / instant / client 共用一份规则。此处重导出，保持本模块及
+// `createReiServer` 的公开导出不变。
+export { validateAvatarUrl };
 
 const SPLIT_PATTERN_MAX_LENGTH = 200;
 const SPLIT_PATTERN_MAX_ITEMS = 10;
 
 /**
- * Validate the optional `splitPattern` field. Mirrors
- * @rei-standard/amsg-instant's `validateSplitPattern` (kept in lockstep).
+ * Validate the optional `splitPattern` field (amsg-server scheduled tasks
+ * only; amsg-instant 0.8.0 dropped its request-level `splitPattern`).
  * Accepts `string`, `string[]`, or absent/null. Returns an error message
  * string, or null when valid.
  *

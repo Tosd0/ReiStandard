@@ -28,7 +28,7 @@
  *   await client.scheduleMessage({ ... });
  */
 
-import { base64UrlToBytes } from '@rei-standard/amsg-shared';
+import { base64UrlToBytes, validateAvatarUrl } from '@rei-standard/amsg-shared';
 
 // `TextEncoder` is stateless — hoist once instead of allocating a fresh
 // instance for every encrypt + payload-size check.
@@ -228,14 +228,6 @@ const TEXT_ENCODER = new TextEncoder();
  * @property {string|null} [contentType]        - `res.headers.get('content-type')`. First call only.
  * @property {number}  [status]                 - `res.status`. First call only.
  */
-
-/**
- * Max length of `avatarUrl` accepted by local preflight (2 KB). Mirrors
- * `@rei-standard/amsg-instant` / `@rei-standard/amsg-server` server-side
- * limits — kept in lockstep on purpose so client-side rejects match what
- * the server would reject.
- */
-const AVATAR_URL_MAX_LENGTH = 2048;
 
 function makeLocalError(code, message, details) {
   const err = new Error(`[rei-standard-amsg-client] ${message}`);
@@ -989,16 +981,7 @@ export class ReiClient {
    */
   _sanitizeAvatarUrl(target) {
     if (!target || typeof target !== 'object') return false;
-    const value = target.avatarUrl;
-    if (value === undefined || value === null) return false;
-    let reason = null;
-    if (typeof value !== 'string') {
-      reason = 'avatarUrl 必须是字符串';
-    } else if (/^data:/i.test(value)) {
-      reason = '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
-    } else if (value.length > AVATAR_URL_MAX_LENGTH) {
-      reason = `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
-    }
+    const reason = validateAvatarUrl(target.avatarUrl);
     if (reason) {
       console.warn('[rei-standard-amsg-client] avatarUrl 不合法，已置空：', reason);
       target.avatarUrl = null;
