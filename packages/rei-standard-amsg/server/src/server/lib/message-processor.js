@@ -23,11 +23,18 @@ import { randomUUID } from 'crypto';
 import {
   buildContentPush,
   buildReasoningPush,
+  readReasoningContent,
+  stripReasoningTags,
 } from '@rei-standard/amsg-shared';
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
+
+// Pacing between consecutive Web Push deliveries (reasoning → content, and
+// between content sentences) so the client renders a natural typing cadence.
+// Kept equal to amsg-instant's SLEEP_BETWEEN_MESSAGES_MS default.
+const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 
 /**
  * Split a single chunk by one regex; on no-match return [chunk] so a later
@@ -48,11 +55,10 @@ function splitOnceByRegex(chunk, regex) {
 }
 
 /**
- * Sentence splitter — kept byte-for-byte equivalent to
- * `@rei-standard/amsg-instant`'s `splitMessageIntoSentences`. Server carries
- * its own copy to avoid an architectural dependency on the instant package.
- * Name matches the instant export on purpose so cross-package grep finds
- * both copies; if you fix a bug here, fix it in the instant copy too.
+ * Sentence splitter for amsg-server's scheduled `splitPattern` feature
+ * (see standards §6.1). Server-only: amsg-instant 0.8.0 dropped its
+ * request-level `splitPattern`, so there is no instant counterpart to keep
+ * in lockstep.
  *
  * @param {string} messageContent
  * @param {string | string[] | null} [splitPattern=null]
@@ -74,54 +80,6 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
   }
 
   return chunks.length > 0 ? chunks : [messageContent];
-}
-
-/**
- * Read `choices[0].message.reasoning_content` as a non-empty trimmed
- * string, or null when absent / empty. Mirrors
- * `amsg-instant/src/message-processor.js#readReasoningContent`.
- *
- * @param {unknown} llmResponse
- * @returns {string | null}
- */
-function readReasoningContent(llmResponse) {
-  if (!llmResponse || typeof llmResponse !== 'object') return null;
-  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
-  if (!Array.isArray(choices) || choices.length === 0) return null;
-  const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
-
-  const raw = message?.reasoning_content;
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (trimmed.length > 0) return trimmed;
-  }
-
-  const content = message?.content;
-  if (typeof content === 'string') {
-    const match = content.match(REASONING_TAG_RE);
-    if (match) {
-      const trimmed = match[2].trim();
-      if (trimmed.length > 0) return trimmed;
-    }
-  }
-
-  return null;
-}
-
-const REASONING_TAG_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/i;
-const REASONING_TAG_RE_G = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
-
-/**
- * Mirrors `amsg-instant/src/message-processor.js#stripReasoningTags`.
- * Removes any private chain-of-thought markup leaking through
- * `message.content` so it does not also ship inside ContentPush.
- *
- * @param {string} content
- * @returns {string}
- */
-function stripReasoningTags(content) {
-  if (typeof content !== 'string' || !content.includes('<')) return content;
-  return content.replace(REASONING_TAG_RE_G, '').trim();
 }
 
 /**
@@ -237,7 +195,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
         metadata,
       });
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
     }
 
     for (let i = 0; i < messages.length; i++) {
@@ -261,7 +219,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
 
       if (i < messages.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
       }
     }
 

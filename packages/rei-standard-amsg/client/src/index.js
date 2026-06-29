@@ -28,7 +28,7 @@
  *   await client.scheduleMessage({ ... });
  */
 
-import { base64UrlToBytes } from '@rei-standard/amsg-shared';
+import { base64UrlToBytes, validateAvatarUrl } from '@rei-standard/amsg-shared';
 
 // `TextEncoder` is stateless — hoist once instead of allocating a fresh
 // instance for every encrypt + payload-size check.
@@ -193,15 +193,41 @@ const TEXT_ENCODER = new TextEncoder();
  *   `deliver()` don't silently drop the header.
  * @property {string}   [endpointPath='/instant']  - Path under the resolved instant base URL. Pass
  *   `'/continue'` for tool-result resume on amsg-instant 0.9.0+.
+ * @property {(meta: RawReadMeta) => void} [onRawRead] - Optional raw-read telemetry hook for the
+ *   foreground SSE transport. Fires once per `reader.read()` BEFORE any SSE parsing/filtering, so it
+ *   sees every byte that reached the client — including `: keepalive` comment frames that the parser
+ *   silently drops. Use it to tell "connection alive but no business data" apart from "no bytes flowing
+ *   at all" when diagnosing stalled streams. Purely observational: throws are swallowed and never affect
+ *   transport. Not invoked for the JSON transport.
+ * @property {boolean | { thresholdBytes?: number }} [compressRequest] - Opt-in gzip of the request
+ *   BODY before it is sent (applies to both the SSE and JSON transports — it compresses the request,
+ *   not the response). Omit / falsy = OFF and behavior is fully unchanged (backward compatible).
+ *   `true` or `{}` enables it at the default 16384-byte (16 KB) threshold; `{ thresholdBytes: N }`
+ *   sets a custom threshold. When enabled, the body is gzip-compressed only if its UTF-8 byte length
+ *   exceeds the threshold AND the runtime provides `CompressionStream`; otherwise it is sent as
+ *   plaintext (graceful degradation, never throws). On compression the request gains the custom
+ *   header `X-Amsg-Request-Encoding: gzip` (NOT standard `Content-Encoding`, which CDNs / proxies
+ *   would auto-decompress and double-decode) and the body is the raw gzip bytes — the receiving
+ *   worker is responsible for gunzipping. Use it when delivering large bodies over slow / flaky
+ *   uplinks where a big upload can outrun the connection's send timeout.
  */
 
 /**
- * Max length of `avatarUrl` accepted by local preflight (2 KB). Mirrors
- * `@rei-standard/amsg-instant` / `@rei-standard/amsg-server` server-side
- * limits — kept in lockstep on purpose so client-side rejects match what
- * the server would reject.
+ * Metadata for a single raw `reader.read()` on the SSE body, passed to
+ * `DeliverOptions.onRawRead`. The response-meta fields
+ * (`status` / `contentEncoding` / `contentType`) are only populated on the
+ * first invocation; later calls omit them.
+ *
+ * @typedef {Object} RawReadMeta
+ * @property {number}  ts                       - `Date.now()` at the moment the read resolved.
+ * @property {number}  byteLength               - Bytes in this chunk (`value?.byteLength ?? 0`).
+ * @property {boolean} done                     - The `done` flag from `reader.read()`.
+ * @property {string}  textPreview              - First ~120 chars of this chunk decoded as UTF-8,
+ *   WITHOUT any keepalive/comment filtering (so `:`-prefixed lines stay visible).
+ * @property {string|null} [contentEncoding]    - `res.headers.get('content-encoding')`. First call only.
+ * @property {string|null} [contentType]        - `res.headers.get('content-type')`. First call only.
+ * @property {number}  [status]                 - `res.status`. First call only.
  */
-const AVATAR_URL_MAX_LENGTH = 2048;
 
 function makeLocalError(code, message, details) {
   const err = new Error(`[rei-standard-amsg-client] ${message}`);
@@ -239,6 +265,68 @@ function classifyContentType(contentType) {
   if (main === 'application/json') return 'json';
   if (/^application\/[\w.+-]+\+json$/.test(main)) return 'json';
   return 'unknown';
+}
+
+/**
+ * Default size floor for request-body gzip: bodies at or below this are not
+ * worth compressing (the gzip header/overhead can outweigh the gain on tiny
+ * payloads). 16 KB matches the contract documented on `DeliverOptions.compressRequest`.
+ */
+const COMPRESS_REQUEST_DEFAULT_THRESHOLD = 16384;
+
+/**
+ * Custom request header used to mark a gzip-compressed body. Deliberately NOT
+ * the standard `Content-Encoding` — CDNs / reverse proxies (Cloudflare, etc.)
+ * auto-decompress `Content-Encoding: gzip` on the way in, which would double-
+ * decompress and corrupt the body. The receiving worker keys off this custom
+ * header to know it must gunzip the body itself.
+ */
+const COMPRESS_REQUEST_HEADER = 'X-Amsg-Request-Encoding';
+
+/**
+ * Optionally gzip a request body string before it hits `fetch`.
+ *
+ * Pure optimization with graceful degradation: returns the original plaintext
+ * body (and no extra header) whenever compression is disabled, the body is at
+ * or below the threshold, the runtime lacks `CompressionStream`, or anything
+ * throws. The wire bytes shrink (Chinese / repetitive JSON compresses ~5-8x)
+ * so large uploads finish before flaky links time out — without dropping any
+ * context. Decompression is the receiving worker's job (keyed off
+ * `X-Amsg-Request-Encoding: gzip`).
+ *
+ * @param {string} body - The already-serialized request body (plaintext JSON).
+ * @param {boolean | { thresholdBytes?: number } | undefined} compressRequest
+ *   `undefined`/falsy ⇒ disabled (no-op, backward compatible). `true` / `{}` ⇒
+ *   enabled at the 16 KB default. `{ thresholdBytes: N }` ⇒ enabled at N bytes.
+ * @returns {Promise<{ body: string | Uint8Array, header: string | null }>}
+ *   `header` is the gzip marker header name to set when compression happened,
+ *   or `null` to send plaintext with no extra header.
+ */
+async function maybeCompressRequestBody(body, compressRequest) {
+  // Disabled / no opt-in ⇒ behavior unchanged.
+  if (!compressRequest) return { body, header: null };
+
+  const threshold =
+    typeof compressRequest === 'object' && typeof compressRequest.thresholdBytes === 'number'
+      ? compressRequest.thresholdBytes
+      : COMPRESS_REQUEST_DEFAULT_THRESHOLD;
+
+  try {
+    if (typeof CompressionStream === 'undefined') return { body, header: null };
+
+    const bytes = new TextEncoder().encode(body);
+    if (bytes.length <= threshold) return { body, header: null };
+
+    const gz = new Uint8Array(
+      await new Response(
+        new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))
+      ).arrayBuffer()
+    );
+    return { body: gz, header: COMPRESS_REQUEST_HEADER };
+  } catch {
+    // Compression is an optimization, never a failure mode: fall back to plaintext.
+    return { body, header: null };
+  }
 }
 
 export class ReiClient {
@@ -534,7 +622,8 @@ export class ReiClient {
     }
     const {
       delivery, timeoutMs, onChunk, postTransportGraceMs,
-      signal, headers, authorization, endpointPath,
+      signal, headers, authorization, endpointPath, onRawRead,
+      compressRequest,
     } = opts;
 
     if (!delivery || typeof delivery !== 'object') {
@@ -627,6 +716,8 @@ export class ReiClient {
         const result = await this._runInstantTransport(built, {
           signal: internalAbort.signal,
           onChunk: wrappedOnChunk,
+          onRawRead,
+          compressRequest,
         });
         if (finalized) return;
         transportEnded = true;
@@ -890,16 +981,7 @@ export class ReiClient {
    */
   _sanitizeAvatarUrl(target) {
     if (!target || typeof target !== 'object') return false;
-    const value = target.avatarUrl;
-    if (value === undefined || value === null) return false;
-    let reason = null;
-    if (typeof value !== 'string') {
-      reason = 'avatarUrl 必须是字符串';
-    } else if (/^data:/i.test(value)) {
-      reason = '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
-    } else if (value.length > AVATAR_URL_MAX_LENGTH) {
-      reason = `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
-    }
+    const reason = validateAvatarUrl(target.avatarUrl);
     if (reason) {
       console.warn('[rei-standard-amsg-client] avatarUrl 不合法，已置空：', reason);
       target.avatarUrl = null;
@@ -979,14 +1061,23 @@ export class ReiClient {
    *
    * @private
    * @param {{ url: string, headers: Record<string, string>, body: string }} built
-   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void }} opts
+   * @param {{ signal: AbortSignal, onChunk?: (p: unknown) => Promise<void> | void, onRawRead?: (meta: RawReadMeta) => void, compressRequest?: boolean | { thresholdBytes?: number } }} opts
+   *   `onRawRead` is forwarded to the SSE consumer for raw read-loop telemetry (see `DeliverOptions.onRawRead`).
+   *   `compressRequest` opts the request body into gzip before `fetch` (see `DeliverOptions.compressRequest`).
    * @returns {Promise<{ kind: 'sse' } | { kind: 'json', body: unknown }>}
    */
   async _runInstantTransport(built, opts) {
-    const { signal, onChunk } = opts;
+    const { signal, onChunk, onRawRead, compressRequest } = opts;
     const { url, headers, body } = built;
 
-    const res = await fetch(url, { method: 'POST', headers, body, signal });
+    // Optionally gzip the request body (opt-in, graceful fallback to plaintext).
+    const { body: wireBody, header: compressionHeader } =
+      await maybeCompressRequestBody(body, compressRequest);
+    const wireHeaders = compressionHeader
+      ? { ...headers, [compressionHeader]: 'gzip' }
+      : headers;
+
+    const res = await fetch(url, { method: 'POST', headers: wireHeaders, body: wireBody, signal });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -995,11 +1086,20 @@ export class ReiClient {
       throw err;
     }
 
-    const contentType = res.headers.get('content-type') || '';
+    const rawContentType = res.headers.get('content-type');
+    const contentType = rawContentType || '';
     const kind = classifyContentType(contentType);
     if (kind === 'sse') {
       if (!res.body) throw new Error('Response body is null');
-      await this._consumeSseStream(res, { onPayload: onChunk });
+      await this._consumeSseStream(res, {
+        onPayload: onChunk,
+        onRawRead,
+        responseMeta: {
+          status: res.status,
+          contentEncoding: res.headers.get('content-encoding'),
+          contentType: rawContentType,
+        },
+      });
       return { kind: 'sse' };
     }
     if (kind === 'json') {
@@ -1017,15 +1117,53 @@ export class ReiClient {
    *
    * @private
    * @param {Response} res
-   * @param {{ onPayload?: (p: unknown) => Promise<void> | void }} opts
+   * @param {{
+   *   onPayload?: (p: unknown) => Promise<void> | void,
+   *   onRawRead?: (meta: RawReadMeta) => void,
+   *   responseMeta?: { status?: number, contentEncoding?: string | null, contentType?: string | null }
+   * }} opts
+   *   `onRawRead` (if supplied) fires once per `reader.read()` before any SSE parsing/filtering — it sees
+   *   raw bytes including `: keepalive` comment frames. Throws from it are swallowed. `responseMeta` is
+   *   attached to the FIRST `onRawRead` call only. See `DeliverOptions.onRawRead`.
    * @returns {Promise<void>}
    */
   async _consumeSseStream(res, opts) {
-    const { onPayload } = opts;
+    const { onPayload, onRawRead, responseMeta } = opts;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let thrown;
+
+    // Raw read-loop telemetry (opt-in via onRawRead). Kept completely
+    // separate from the parsing path: a one-shot decoder for the preview so
+    // it never perturbs the streaming `decoder` above, and the first call
+    // carries response meta (status / encoding / content-type).
+    const previewDecoder = onRawRead ? new TextDecoder() : null;
+    let rawReadFired = false;
+    const emitRawRead = (done, value) => {
+      if (!onRawRead) return;
+      try {
+        let textPreview = '';
+        if (value && value.byteLength) {
+          // One-shot decode (no { stream: true }) so we don't carry state
+          // between calls and disturb the main buffer's decoder.
+          textPreview = previewDecoder.decode(value).slice(0, 120);
+        }
+        const meta = {
+          ts: Date.now(),
+          byteLength: value && value.byteLength ? value.byteLength : 0,
+          done: !!done,
+          textPreview,
+        };
+        if (!rawReadFired) {
+          meta.status = responseMeta ? responseMeta.status : undefined;
+          meta.contentEncoding = responseMeta ? responseMeta.contentEncoding : undefined;
+          meta.contentType = responseMeta ? responseMeta.contentType : undefined;
+        }
+        rawReadFired = true;
+        onRawRead(meta);
+      } catch { /* telemetry must never break the transport */ }
+    };
 
     // Parse one SSE frame body (lines between two terminators). Returns
     // `'done'` if the frame signals end-of-stream so the caller can
@@ -1069,6 +1207,7 @@ export class ReiClient {
     try {
       while (true) {
         const { done, value } = await reader.read();
+        emitRawRead(done, value);
         if (done) {
           // Flush any tail bytes the decoder held back (partial UTF-8
           // sequences split across the final chunk boundary).

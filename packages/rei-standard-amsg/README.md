@@ -4,7 +4,7 @@
 
 | Package | 版本 | 用途 |
 |---------|------|------|
-| [`@rei-standard/amsg-shared`](./shared/README.md) | `0.2.0` | 三轴推送契约、builders、类型守卫 |
+| [`@rei-standard/amsg-shared`](./shared/README.md) | `0.2.0` | 推送 schema、builders、类型守卫 |
 | [`@rei-standard/amsg-instant`](./instant/README.md) | `0.9.0` | 一次性即时推送 handler（SSE 默认传输 / always-on Web Push backup） |
 | [`@rei-standard/amsg-server`](./server/README.md) | `2.5.0` | 定时 + 周期消息：Blob 租户配置、token 鉴权、标准 handlers |
 | [`@rei-standard/amsg-client`](./client/README.md) | `2.4.0` | 浏览器 SDK：加密、请求封装、Push 订阅、SSE consumer |

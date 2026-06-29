@@ -84,7 +84,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@rei-standard/amsg-shared": "0.2.0"
+    "@rei-standard/amsg-shared": "^0.2.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",

@@ -10,11 +10,9 @@
 ## 环境变量
 
 - 必需：`TENANT_DATABASE_URL`
-- 可选：`INIT_SECRET`（服务端启用初始化鉴权时再配置）
-
-可选：
-
-- `TEST_USER_ID`
+- 可选：
+  - `INIT_SECRET`（服务端启用初始化鉴权时再配置）
+  - `TEST_USER_ID`
 
 说明：测试端点会先调用 `init-tenant`，然后自动完成 `get-user-key`、`schedule-message`、`send-notifications` 验证。
 

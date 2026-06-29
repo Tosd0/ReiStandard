@@ -62,9 +62,17 @@ const rei = await createReiServer({
 
 当 `messageType` 为 `prompted` / `auto`，或 `instant` 使用 AI 配置时：
 
-- `apiUrl` 必须是完整聊天端点（例如：`https://api.openai.com/v1/chat/completions`）。
-- SDK 会自动做最小规范化：去首尾空白、去路径尾部多余 `/`。
-- SDK **不会**自动补全 `/v1`、`/chat/completions` 等路径。
+- `apiUrl` 是聊天端点 URL（例如：`https://api.openai.com/v1/chat/completions`），必须能 `new URL(...)` 解析。
+- SDK 对 OpenAI 风格路径做**幂等**补全（去首尾空白、去尾部多余 `/` 后）：
+
+  | 输入 | 输出 |
+  |---|---|
+  | `https://api.openai.com`（裸域名） | `https://api.openai.com/v1/chat/completions` |
+  | `https://api.openai.com/v1`（版本段结尾） | `https://api.openai.com/v1/chat/completions`（不重复加 `/v1`） |
+  | `https://api.openai.com/v1/chat/completions` | 原样返回 |
+  | `https://api.anthropic.com/v1/messages`（其他自定义路径） | 原样返回，不猜 |
+
+- 规则幂等，传完整 URL 不会被改坏；代理路径很特殊时直接传完整 `…/chat/completions` 绕开补全。
 - `maxTokens` 为可选字段：传了就映射为 `max_tokens`；不传则不指定（由上游模型默认策略决定）。
 
 如果上游返回 `405 Method Not Allowed`，通常表示 `apiUrl` 指向了基础域名而非聊天端点，请优先检查配置值。

@@ -5,8 +5,8 @@
 
 ## 版本信息
 
-- **版本号**: v2.1.0
-- **最后更新**: 2026-05-25
+- **版本号**: v2.3.1
+- **最后更新**: 2026-06-28
 - **状态**: Stable
 - **关联标准**: [主动消息API端点标准](./active-messaging-api.md)
 
@@ -407,7 +407,9 @@ function buildNotificationOptions(data) {
 }
 ```
 
-**通知数据结构**（与 [主动消息API标准](./active-messaging-api.md#72-字段说明) 一致）:
+> 上面 `buildNotificationOptions` 是「不用包」的手写参考实现，默认值（`vibrate`、`actions`、`renotify: true`）由你自定。SDK 的 `createNotificationFromPayload`（`@rei-standard/amsg-sw`）默认更克制：不带 `vibrate` / `actions`，`renotify` / `requireInteraction` / `silent` 默认 `false`，`tag` 缺省回落到 `payload.messageId`，这些都可被 `payload.notification` 覆盖。
+
+**通知数据结构**（与 [主动消息API标准](./active-messaging-api.md#63-推送-wire-shapeamsgpush-判别联合) 一致）:
 
 ```json
 {
@@ -1374,6 +1376,24 @@ self.addEventListener('notificationclick', (event) => {
 ---
 
 ## 15. 变更日志
+
+### v2.3.1 (2026-06-09)
+
+#### 改进优化
+
+**1. `showNotification` 被拒不卡死 dedupe**
+- 浏览器拒绝展示系统通知（权限被撤、quota / OS 限制等）时，`showNotification(...)` 的 reject 被兜底捕获并记到 `console.error`，dedupe 状态照常推进（`onNotificationSettled` 一定执行）。这样后续同 key 的 backup 重复包不会被当成「首投未决」吞掉，用户仍能看到补出的通知。
+
+### v2.3.0 (2026-06-03)
+
+#### 改进优化
+
+**1. IndexedDB 连接韧性**
+- IndexedDB 连接被浏览器强制关闭（backing store 出错 / 存储压力 / 清数据）后能自愈：缓存连接挂 `onclose` 失效重开，事务命中「连接已关闭」时清缓存并重开重试一次。dedupe 库与 queue / multipart 库一并修复。避免死连接被无限复用导致去重失灵、push 落库受阻。
+
+**2. 业务感知的 DELIVER ack（`businessError`）**
+- DELIVER ack 新增可选字段 `businessError`（非破坏）：`onBusinessPayload` reject 或抛错时，ack 仍是 `ok: true` 但带上 `businessError: <message>`；成功时不出现。`ok` 的含义明确为「已收下并分发」，不代表「业务已落库」。需要严格区分两者的消费方读 `businessError`。
+- 该失败会持久化到 dedupe 记录：之后同 key 的重复包被去重后，ack 仍带首包的 `businessError`，而不是回一个看着干净的 `ok:true, duplicate:true`。去重不会让 `onBusinessPayload` 重跑——这只让信号诚实，要可重试需消费方自做幂等。webpush `push` 路径无 ack，业务失败仅内部 `console.error`。
 
 ### v2.2.0 (2026-05-31)
 

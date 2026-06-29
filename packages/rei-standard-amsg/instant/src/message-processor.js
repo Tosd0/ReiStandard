@@ -21,6 +21,8 @@ import {
   buildContentPush,
   buildReasoningPush,
   buildErrorPush,
+  readReasoningContent,
+  stripReasoningTags,
 } from '@rei-standard/amsg-shared';
 
 import { sendWebPush } from './webpush.js';
@@ -304,61 +306,6 @@ async function callLlmRaw(payload, fetchImpl, requireContent) {
     response: data,
     content: typeof rawContent === 'string' ? rawContent : '',
   };
-}
-
-/**
- * Read `choices[0].message.reasoning_content` as a non-empty trimmed
- * string, or null when absent / empty. Many providers return an
- * empty string instead of omitting the field — treat that the same
- * as missing so we don't emit an empty ReasoningPush.
- *
- * @param {unknown} llmResponse
- * @returns {string | null}
- */
-function readReasoningContent(llmResponse) {
-  if (!llmResponse || typeof llmResponse !== 'object') return null;
-  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
-  if (!Array.isArray(choices) || choices.length === 0) return null;
-  const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
-
-  const raw = message?.reasoning_content;
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (trimmed.length > 0) return trimmed;
-  }
-
-  const content = message?.content;
-  if (typeof content === 'string') {
-    const match = content.match(REASONING_TAG_RE);
-    if (match) {
-      const trimmed = match[2].trim();
-      if (trimmed.length > 0) return trimmed;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Matches `<think>…</think>` / `<thinking>…</thinking>` / `<thought>…</thought>`
- * spans (case-insensitive, lazy multi-line). Mirrored in
- * `amsg-server/src/server/lib/message-processor.js` — keep in lockstep.
- */
-const REASONING_TAG_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/i;
-const REASONING_TAG_RE_G = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
-
-/**
- * Drop any `<think>` / `<thinking>` / `<thought>` spans from a user-facing
- * content string. Used after `readReasoningContent` matched the regex
- * fallback path so the same private chain-of-thought does not also ship
- * inside the ContentPush burst.
- *
- * @param {string} content
- * @returns {string}
- */
-function stripReasoningTags(content) {
-  if (typeof content !== 'string' || !content.includes('<')) return content;
-  return content.replace(REASONING_TAG_RE_G, '').trim();
 }
 
 /**

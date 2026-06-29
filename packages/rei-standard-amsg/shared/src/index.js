@@ -153,24 +153,24 @@ export const PUSH_SOURCE = Object.freeze({
  * out of the upstream response into its own push. Emitted **before**
  * the matching {@link ContentPush} burst when present and non-empty.
  *
- * Reasoning carries two orthogonal "multi-part" axes, both optional —
- * they are *omitted* when the part count is 1 so the wire stays
- * byte-for-byte compatible with single-shot ReasoningPush callers:
+ * Reasoning carries two optional "multi-part" axes, both *omitted* when
+ * the part count is 1 so the wire stays byte-for-byte compatible with
+ * single-shot callers. The type reserves them for forward compatibility;
+ * current producers emit a single ReasoningPush and set neither — oversized
+ * reasoning rides the generic multipart transport, not a reasoning-only
+ * chunk format.
  *
- *   - `messageIndex` / `totalMessages` — set when a semantic
- *     splitter (`reasoningSplitPattern` in amsg-instant) has cut the
- *     reasoning into multiple sentences for typing-bubble UX.
+ *   - `messageIndex` / `totalMessages` — a 1-based part index when a producer
+ *     splits reasoning into multiple sentences for typing-bubble UX.
  *
- *   - `chunkIndex` / `totalChunks` — set when a single segment was
- *     too large for the Web Push payload limit and the producer had
- *     to slice it across multiple pushes at UTF-8 byte boundaries.
- *     Transport-only; SW reassembles the original `reasoningContent`
- *     by sorting on `chunkIndex` within a `(sessionId, messageIndex)`
- *     bucket. See `chunkReasoningByUtf8Bytes` for the safe-edge
- *     splitter helper.
+ *   - `chunkIndex` / `totalChunks` — transport-only slicing when a single
+ *     segment exceeds the Web Push payload limit; SW would reassemble the
+ *     original `reasoningContent` by sorting on `chunkIndex` within a
+ *     `(sessionId, messageIndex)` bucket. See `chunkReasoningByUtf8Bytes`
+ *     for the safe-edge splitter helper.
  *
- * Both axes can coexist on the same push when a sentence-split
- * segment is itself oversized.
+ * Both axes can coexist on the same push when a sentence-split segment is
+ * itself oversized.
  *
  * @typedef {AmsgPushCommon & {
  *   messageKind: 'reasoning',
@@ -685,4 +685,126 @@ export function concatBytes(...chunks) {
     offset += c.byteLength;
   }
   return out;
+}
+
+// ─── Validation & normalization helpers ─────────────────────────────────
+// Shared by amsg-server / amsg-instant / amsg-client so the same rules live
+// in exactly one place. All pure (no side effects).
+
+/**
+ * True when `value` parses as an absolute URL.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isValidUrl(value) {
+  if (typeof value !== 'string') return false;
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Max accepted `avatarUrl` length, in characters. */
+export const AVATAR_URL_MAX_LENGTH = 2048;
+
+/**
+ * Validate the optional `avatarUrl` field. Rejects `data:` URIs (typically
+ * base64-encoded inline images) and anything longer than
+ * {@link AVATAR_URL_MAX_LENGTH} chars — both the dominant trigger for
+ * downstream 413 / Web Push 4 KB payload errors — plus anything that doesn't
+ * parse as a URL. Returns an error message string, or null when valid.
+ *
+ * Pure: callers decide how to act on a non-null result (amsg-server /
+ * amsg-instant / amsg-client soft-strip + console.warn; see standards §6.2).
+ *
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function validateAvatarUrl(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    return 'avatarUrl 必须是字符串';
+  }
+  if (/^data:/i.test(value)) {
+    return '头像不支持传入 data: URI，请改为公网可访问的 https:// 图片 URL';
+  }
+  if (value.length > AVATAR_URL_MAX_LENGTH) {
+    return `头像 URL 长度 ${value.length} 字符超过 ${AVATAR_URL_MAX_LENGTH} 上限，请改为更短的图片 URL`;
+  }
+  if (!isValidUrl(value)) {
+    return 'avatarUrl 不是合法 URL';
+  }
+  return null;
+}
+
+/**
+ * Normalize a VAPID `sub` (subject) claim. Web Push (RFC 8292) accepts a
+ * `mailto:` address or an `http(s):` URL; a bare contact like
+ * `you@example.com` is prefixed with `mailto:`. An already-prefixed
+ * `mailto:` / `http(s):` value is returned untouched. Empty / blank → `''`.
+ *
+ * @param {unknown} email
+ * @returns {string}
+ */
+export function normalizeVapidSubject(email) {
+  const trimmed = String(email || '').trim();
+  if (!trimmed) return '';
+  return /^mailto:/i.test(trimmed) || /^https?:/i.test(trimmed) ? trimmed : `mailto:${trimmed}`;
+}
+
+/**
+ * Matches `<think>…</think>` / `<thinking>…</thinking>` / `<thought>…</thought>`
+ * spans (case-insensitive, lazy multi-line). The plain form captures the inner
+ * text in group 2; the `_G` form is the global stripper.
+ */
+const REASONING_TAG_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/i;
+const REASONING_TAG_RE_G = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
+
+/**
+ * Read `choices[0].message.reasoning_content` as a non-empty trimmed string,
+ * or null when absent / empty. Falls back to the first `<think>` span inside
+ * `message.content` when a provider inlines reasoning there. Many providers
+ * return an empty string instead of omitting the field — treated the same as
+ * missing so callers don't emit an empty ReasoningPush.
+ *
+ * @param {unknown} llmResponse
+ * @returns {string | null}
+ */
+export function readReasoningContent(llmResponse) {
+  if (!llmResponse || typeof llmResponse !== 'object') return null;
+  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const message = /** @type {{ message?: { reasoning_content?: unknown, content?: unknown } }} */ (choices[0])?.message;
+
+  const raw = message?.reasoning_content;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+
+  const content = message?.content;
+  if (typeof content === 'string') {
+    const match = content.match(REASONING_TAG_RE);
+    if (match) {
+      const trimmed = match[2].trim();
+      if (trimmed.length > 0) return trimmed;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Drop any `<think>` / `<thinking>` / `<thought>` spans from a user-facing
+ * content string, so private chain-of-thought leaking through `message.content`
+ * does not also ship inside the ContentPush burst.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+export function stripReasoningTags(content) {
+  if (typeof content !== 'string' || !content.includes('<')) return content;
+  return content.replace(REASONING_TAG_RE_G, '').trim();
 }

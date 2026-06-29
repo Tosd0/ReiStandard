@@ -1,7 +1,7 @@
 # @rei-standard/amsg-shared
 
-Lowest layer of the ReiStandard Active Messaging ecosystem. Defines
-the **three-axis push contract** that `amsg-instant`, `amsg-server`,
+Lowest layer of the ReiStandard Active Messaging stack. Defines
+the **push schema** that `amsg-instant`, `amsg-server`,
 `amsg-sw`, and `amsg-client` all conform to.
 
 Zero runtime deps. Does **not** depend on any other amsg package —
@@ -9,9 +9,9 @@ every other amsg sub-package depends on this one, never the reverse.
 
 ---
 
-## Three axes
+## Push schema
 
-A single push is described by three orthogonal axes:
+A single push is described by three independent dimensions:
 
 | Axis           | Field             | Values                                                | Defined by         |
 |----------------|-------------------|-------------------------------------------------------|--------------------|
@@ -22,7 +22,7 @@ A single push is described by three orthogonal axes:
 `messageType` answers **how this push was produced** (one-shot
 `instant` worker, scheduled `fixed` ping, AI-`prompted` reply, fully
 `auto`-generated cadence). `messageKind` answers **what it carries**.
-The two are intentionally orthogonal: any `messageType` can carry any
+The two are intentionally independent: any `messageType` can carry any
 `messageKind`.
 
 There is also `source: 'instant' | 'scheduled'` — the **routing

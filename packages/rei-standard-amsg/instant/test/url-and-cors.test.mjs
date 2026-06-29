@@ -143,6 +143,9 @@ describe('CORS preflight (OPTIONS)', () => {
     assert.match(res.headers.get('access-control-allow-headers') || '', /Content-Type/i);
     assert.match(res.headers.get('access-control-allow-headers') || '', /Authorization/i);
     assert.match(res.headers.get('access-control-allow-headers') || '', /X-Client-Token/i);
+    // Must allow the client's opt-in gzip marker, else cross-origin preflight
+    // blocks compressed `deliver({ compressRequest })` requests.
+    assert.match(res.headers.get('access-control-allow-headers') || '', /X-Amsg-Request-Encoding/i);
     assert.equal(res.headers.get('access-control-max-age'), '86400');
   });
 

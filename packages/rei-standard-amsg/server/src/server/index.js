@@ -31,12 +31,7 @@ import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
 import { createTenantBlobStore } from './tenant/blob-store.js';
 import { createTenantContextManager } from './tenant/context.js';
-
-function normalizeVapidSubject(email) {
-  const trimmedEmail = String(email || '').trim();
-  if (!trimmedEmail) return '';
-  return /^mailto:/i.test(trimmedEmail) ? trimmedEmail : `mailto:${trimmedEmail}`;
-}
+import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
 
 /**
  * @typedef {Object} VapidConfig

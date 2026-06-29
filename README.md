@@ -4,29 +4,21 @@
 
 ## 📦 包
 
-| 包 | 版本 | 用途 |
-|---|---|---|
-| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | `0.2.0` | 三轴推送契约（`AmsgPush` 判别联合 + builders + 类型守卫） |
-| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | `0.9.0` | 一次性即时推送（SSE 默认传输、always-on Web Push backup） |
-| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | `2.5.0` | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
-| [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | `2.4.0` | 浏览器 SDK：加密、请求封装、Push 订阅、SSE consumer |
-| [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | `2.2.0` | Service Worker：推送展示、离线队列、delivery dedupe |
+| 包 | 用途 |
+|---|---|
+| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | 推送 schema（`AmsgPush` 判别联合 + builders + 类型守卫） |
+| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 一次性即时推送（SSE 默认传输、always-on Web Push backup） |
+| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
+| [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | 浏览器 SDK：加密、请求封装、Push 订阅、deliver() 送达裁决 / SSE consumer |
+| [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
 
 `amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
 
 **怎么挑服务端包**：只发"按钮点了就立刻推一条" → `amsg-instant`；要定时或周期任务 → `amsg-server`；两种都要就都装，共用同一套 VAPID 与 masterKey。
 
-### 协调发布说明：稳定版发布（shared 0.2.0 / instant 0.9.0 / sw 2.2.0 / client 2.4.0 / server 2.5.0）
+### 版本与发布
 
-本轮补上 SSE + Web Push backup 的同 key 去重链路，并将相关包作为稳定版发布。`amsg-server` 没有运行时行为改动，只做 shared 依赖协调发版。
-
-- `@rei-standard/amsg-shared`：`0.1.0` → `0.2.0`
-- `@rei-standard/amsg-instant`：`0.8.2` → `0.9.0`
-- `@rei-standard/amsg-server`：`2.4.1` → `2.5.0`
-- `@rei-standard/amsg-sw`：`2.1.1` → `2.2.0`
-- `@rei-standard/amsg-client`：`2.3.0` → `2.4.0`
-
-包间依赖一律使用**精确版本**（不带 `^`），避免 npm 在生态系统里解析出混版本图。本轮重点是：`amsg-instant` 默认 SSE 传输与 always-on Web Push backup、`amsg-client` 的 SSE consumer、`amsg-sw` 的 delivery dedupe / `REI_AMSG_DELIVER` bridge，以及 shared 的 `notification.silent` 类型补齐。
+版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。五个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
 
 **安装最新版（`latest` dist-tag）**：
 
@@ -34,9 +26,9 @@
 npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
 ```
 
-## 三轴推送语义（Three-axis push schema）
+## 推送 schema
 
-每一条推送都由三个**正交**的维度描述。把"用什么方式发出去"（dispatch）、"业务命名空间"（business）、"载荷里装的是什么"（content）拆开，让一个 axis 加值的时候不需要动另外两个 axis。
+每条推送用三个互不影响的维度描述："用什么方式发出去"（dispatch）、"属于哪个业务"（business）、"载荷里装的是什么"（content）。三者拆开，给某一个维度加新值时，另外两个不用动。
 
 | 轴 | 字段 | 取值 | 由谁定 |
 |---|---|---|---|
@@ -90,7 +82,7 @@ npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 ReiStandard/
 ├── standards/                   # 权威规范文本（端点、字段、错误码）
 ├── packages/rei-standard-amsg/  # 5 个发布到 npm 的 SDK 包
-│   ├── shared/                  # 三轴推送契约（最底层，其他包都依赖）
+│   ├── shared/                  # 推送 schema（最底层，其他包都依赖）
 │   ├── server/                  # 定时 / 周期消息（多租户 Blob + token）
 │   ├── instant/                 # 一次性即时推送（无 DB / 无 cron）
 │   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）
