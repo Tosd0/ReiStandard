@@ -6,7 +6,7 @@
 
 | 包 | 用途 |
 |---|---|
-| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | 三轴推送契约（`AmsgPush` 判别联合 + builders + 类型守卫） |
+| [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | 推送 schema（`AmsgPush` 判别联合 + builders + 类型守卫） |
 | [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 一次性即时推送（SSE 默认传输、always-on Web Push backup） |
 | [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
 | [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | 浏览器 SDK：加密、请求封装、Push 订阅、deliver() 送达裁决 / SSE consumer |
@@ -18,8 +18,6 @@
 
 ### 版本与发布
 
-四个上层包（`client` / `instant` / `server` / `sw`）对 `@rei-standard/amsg-shared` 用脱字号区间 `^0.2.0`。在 0.x 上脱字号只放行同一 minor 内的补丁（`0.2.x`），所以 shared 出补丁时消费者自动跟随、不必为此协调重发；shared 升 minor（如 `0.3.0`）则不会被自动选中，需要消费者显式升级区间。
-
 版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。五个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
 
 **安装最新版（`latest` dist-tag）**：
@@ -28,9 +26,9 @@
 npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
 ```
 
-## 三轴推送语义（Three-axis push schema）
+## 推送 schema
 
-每一条推送都由三个**正交**的维度描述。把"用什么方式发出去"（dispatch）、"业务命名空间"（business）、"载荷里装的是什么"（content）拆开，让一个 axis 加值的时候不需要动另外两个 axis。
+每条推送用三个互不影响的维度描述："用什么方式发出去"（dispatch）、"属于哪个业务"（business）、"载荷里装的是什么"（content）。三者拆开，给某一个维度加新值时，另外两个不用动。
 
 | 轴 | 字段 | 取值 | 由谁定 |
 |---|---|---|---|
@@ -84,7 +82,7 @@ npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 ReiStandard/
 ├── standards/                   # 权威规范文本（端点、字段、错误码）
 ├── packages/rei-standard-amsg/  # 5 个发布到 npm 的 SDK 包
-│   ├── shared/                  # 三轴推送契约（最底层，其他包都依赖）
+│   ├── shared/                  # 推送 schema（最底层，其他包都依赖）
 │   ├── server/                  # 定时 / 周期消息（多租户 Blob + token）
 │   ├── instant/                 # 一次性即时推送（无 DB / 无 cron）
 │   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）

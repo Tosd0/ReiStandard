@@ -134,7 +134,7 @@ data: {}
 
 #### SSE backup push（0.9.0+）
 
-正式环境推荐保持默认链路：SSE 正常流式返回，每条 payload enqueue 成功后也发一份 Web Push backup。它不是“断了才发”，而是 backup 常开；重复处理交给 `@rei-standard/amsg-sw` 的 delivery dedupe 解决。
+正式环境推荐保持默认链路：SSE 正常流式返回，每条 payload enqueue 成功后也发一份 Web Push backup。这份 backup 不是“断了才发”，而是默认常开；重复的部分交给 `@rei-standard/amsg-sw` 的 delivery dedupe 解决。
 
 | 配置 | 默认值 | 行为 | 生产建议 |
 |------|--------|------|----------|

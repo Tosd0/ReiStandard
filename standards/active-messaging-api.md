@@ -266,9 +266,9 @@ createInstantHandler({
 
 预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）—— 返回错误描述字符串或 `null`，**纯函数**，不副作用；上层调用方按软清空策略处理。
 
-### 6.3 推送 wire shape：三轴判别联合
+### 6.3 推送 wire shape：`AmsgPush` 判别联合
 
-自 v2.4 起，所有 amsg 包推出的 Web Push payload 统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合。每条推送由三个**正交**的维度描述：
+自 v2.4 起，所有 amsg 包推出的 Web Push payload 统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合。每条推送由三个互不影响的维度描述：
 
 | 轴 | 字段 | 取值 | 由谁定 |
 |---|---|---|---|

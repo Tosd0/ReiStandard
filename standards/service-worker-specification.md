@@ -409,7 +409,7 @@ function buildNotificationOptions(data) {
 
 > 上面 `buildNotificationOptions` 是「不用包」的手写参考实现，默认值（`vibrate`、`actions`、`renotify: true`）由你自定。SDK 的 `createNotificationFromPayload`（`@rei-standard/amsg-sw`）默认更克制：不带 `vibrate` / `actions`，`renotify` / `requireInteraction` / `silent` 默认 `false`，`tag` 缺省回落到 `payload.messageId`，这些都可被 `payload.notification` 覆盖。
 
-**通知数据结构**（与 [主动消息API标准](./active-messaging-api.md#63-推送-wire-shape三轴判别联合) 一致）:
+**通知数据结构**（与 [主动消息API标准](./active-messaging-api.md#63-推送-wire-shapeamsgpush-判别联合) 一致）:
 
 ```json
 {
