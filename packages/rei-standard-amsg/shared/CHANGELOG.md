@@ -1,5 +1,15 @@
 # Changelog — @rei-standard/amsg-shared
 
+## 0.3.0
+
+### Minor Changes
+
+- 5c0e047: 新增三组共享纯函数，让 server / instant / client 复用同一份规则，不再各自维护副本：
+
+  - `validateAvatarUrl`（含 `isValidUrl` 与 `AVATAR_URL_MAX_LENGTH`）—— 头像 URL 校验
+  - `normalizeVapidSubject` —— VAPID subject 规范化（`mailto:` / `https:` 均保留，裸邮箱补 `mailto:`）
+  - `readReasoningContent` / `stripReasoningTags` —— 读取推理内容与剥离私有 `<think>` 链式思考
+
 ## 0.2.0 — Notification silent support
 
 ### New
@@ -17,6 +27,7 @@
 ## 0.1.0 — NotificationDirective 与 Shared utilities
 
 ### New
+
 - **Shared Utilities**：新增并导出了底层工具函数 `base64UrlToBytes`, `toUint8`, 和 `concatBytes`，统一了底层依赖。
 - **NotificationDirective**：新增了对 `notification.show` (`"auto"` | `"always"` | `"when-hidden"` | `false`) 参数的类型定义与验证逻辑。
 
@@ -75,7 +86,7 @@ the reverse.
 - `MessageKind` / `MessageType` / `PushSource` type aliases + matching
   runtime constants (`MESSAGE_KIND`, `MESSAGE_TYPE`, `PUSH_SOURCE`).
 - Discriminated union `AmsgPush = ContentPush | ReasoningPush |
-  ToolRequestPush | ErrorPush`, with `messageKind` as the literal-type
+ToolRequestPush | ErrorPush`, with `messageKind` as the literal-type
   tag (TS consumers can `switch (push.messageKind)` and narrow).
 - Common-fields `@typedef` `AmsgPushCommon` capturing the universal
   shape (`messageType` / `source` / `messageId` / `sessionId` /
@@ -102,9 +113,9 @@ The 0.7.x `amsg-instant` legacy push (13 fields, no `messageKind`)
 and the standalone `{ type: 'error', code: '...' }` envelope are both
 gone in the upstream packages that consume this. Use:
 
-| Was (0.7.x)                                     | Now (≥ 0.1.0 of shared, ≥ 0.8.0 of instant)     |
-|-------------------------------------------------|--------------------------------------------------|
-| 13-field instant push                           | `buildContentPush({...})`                        |
-| `{ type: 'error', code: 'HOOK_THREW', ...}`     | `buildErrorPush({ code: 'HOOK_THREW', ... })`    |
-| `{ type: 'error', code: 'LOOP_EXCEEDED', ...}`  | `buildErrorPush({ code: 'LOOP_EXCEEDED', ... })` |
-| (no equivalent — reasoning was discarded)       | `buildReasoningPush({ reasoningContent, ... })`  |
+| Was (0.7.x)                                    | Now (≥ 0.1.0 of shared, ≥ 0.8.0 of instant)      |
+| ---------------------------------------------- | ------------------------------------------------ |
+| 13-field instant push                          | `buildContentPush({...})`                        |
+| `{ type: 'error', code: 'HOOK_THREW', ...}`    | `buildErrorPush({ code: 'HOOK_THREW', ... })`    |
+| `{ type: 'error', code: 'LOOP_EXCEEDED', ...}` | `buildErrorPush({ code: 'LOOP_EXCEEDED', ... })` |
+| (no equivalent — reasoning was discarded)      | `buildReasoningPush({ reasoningContent, ... })`  |

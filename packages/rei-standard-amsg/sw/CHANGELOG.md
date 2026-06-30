@@ -1,5 +1,12 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.3.2
+
+### Patch Changes
+
+- Updated dependencies [5c0e047]
+  - @rei-standard/amsg-shared@0.3.0
+
 ## 2.3.1 — `showNotification` 拒绝不再卡死 dedupe 状态
 
 - **Fix**: `dispatchBusinessPayload` 给 `sw.registration.showNotification(...)` 加了 `.catch(...)` 兜底。原链路只挂了成功分支 `.then(() => notificationState.shown = true)`，当浏览器拒绝展示（权限被撤、quota / OS 限制等）时整个 `Promise.all(notificationWork)` 会 reject，`onNotificationSettled` 被跳过，dedupe 记录永远停在 `notificationStatePending: true`。后续同 key 的 backup transport 重复会被 `maybeShowDuplicateNotification` 当成 `first-delivery-pending` 吞掉，用户彻底看不到通知。现在拒绝只记录到 `console.error`，`notificationState.shown` 保持 false，但 `onNotificationSettled` 一定执行，dedupe 状态正常推进。
@@ -24,19 +31,20 @@
 
   原因：同一 dbName 下换 storeName 需要做 IndexedDB 版本升级，本包不打算维护跨 storeName 的 migration 逻辑；继续暴露 storeName 配置只会让用户踩 IDB upgrade 坑（升级一次后 store 永远建不出来，所有 dedupe transaction 都抛 NotFoundError）。
 
-  | 之前配置 | 之前行为 | 现在 |
-  | --- | --- | --- |
-  | 不传 dbName / storeName | 用默认 | 不变 |
-  | 只传 `dbName` | 静默失效（store 建不出来） | 正常隔离 |
-  | 只传 `storeName` | 静默失效 | 装包时抛 Error |
-  | 同时传 `dbName` + `storeName`（首次部署） | OK | 装包时抛 Error |
-  | 同时传 `dbName` + 后续改 `storeName` | 老 client 上 store 建不出来，整条 dedupe 链路挂掉 | 装包时抛 Error |
+  | 之前配置                                  | 之前行为                                          | 现在           |
+  | ----------------------------------------- | ------------------------------------------------- | -------------- |
+  | 不传 dbName / storeName                   | 用默认                                            | 不变           |
+  | 只传 `dbName`                             | 静默失效（store 建不出来）                        | 正常隔离       |
+  | 只传 `storeName`                          | 静默失效                                          | 装包时抛 Error |
+  | 同时传 `dbName` + `storeName`（首次部署） | OK                                                | 装包时抛 Error |
+  | 同时传 `dbName` + 后续改 `storeName`      | 老 client 上 store 建不出来，整条 dedupe 链路挂掉 | 装包时抛 Error |
 
 - **Fix**: 慢的 `onBusinessPayload` 回调不再阻塞 dedupe 的通知补救判定。
 
   之前：业务回调长时间未 resolve + 前台从可见变隐藏 + 同 `messageId` 的 Web Push backup 在窗口内到达 → backup 被判为 "first-delivery-pending" 丢弃，用户看不到通知。
 
   现在：通知决策一确定就解锁补救路径，backup 照常补出系统通知。业务回调依旧 await，`event.waitUntil` 生命周期不变。
+
 - **Changed**: `@rei-standard/amsg-shared` 精确依赖升级到 `0.2.0`，并支持 `notification.silent` 透传到 `showNotification()`。
 
 ## 2.1.1 — multipart 并发与 hook thenable 修复
@@ -47,9 +55,11 @@
 ## 2.1.0 — notification.show 及 Multipart chunk store
 
 ### New
+
 - **`notification.show`** 通知显示策略: 支持 `"auto"` | `"always"` | `"when-hidden"` | `false`。现在可以直接通过包级策略实现 "有可见窗口时静默，无可见窗口时弹通知" (`"when-hidden"`) 等应用场景。
 
 ### Changed
+
 - **性能优化**：`dispatchBusinessPayload` 现在只会调用一次 `sw.clients.matchAll` 从而避免多余的 IPC 开销。
 - **IndexedDB 性能优化**：通过 `cachedDB` 保持 DB 连接，防止碎片化的 `openQueueDatabase` 导致的延迟。`REI_SW_DB_VERSION` 升级至 `3`。
 - **Multipart Chunk Store**：新增 `multipart-chunk` object store 用于独立存储分片的 payload，提升了超大 payload 还原的内存稳定性和入库速度。添加了 `expiresAt` 索引大幅加速清理超时数据的过程。
@@ -92,16 +102,16 @@ next 阶段统一 multipart transport。SW 现在识别 `messageKind: "_multipar
 Cherry-pick stable `2.0.2` 的标题 fallback 修复到 next 预发布线。`createNotificationFromPayload` 的标题链从
 
 ```js
-pushNotification.title || payload.title || 'New notification'
+pushNotification.title || payload.title || "New notification";
 ```
 
 加一档 `contactName` 兜底，与 server / instant 默认 envelope 的 `title: '来自 ${contactName}'` 行为对齐：
 
 ```js
-pushNotification.title
-  || payload.title
-  || (payload.contactName && `来自 ${payload.contactName}`)
-  || 'New notification'
+pushNotification.title ||
+  payload.title ||
+  (payload.contactName && `来自 ${payload.contactName}`) ||
+  "New notification";
 ```
 
 custom hook（0.7.x / 0.8.0-next.x 自定义 envelope）忘了塞 `title` 但塞了 `contactName` 的情况，通知不再掉到 'New notification' 这种英文兜底上。

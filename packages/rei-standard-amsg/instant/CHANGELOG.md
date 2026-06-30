@@ -1,5 +1,16 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.10.0
+
+### Minor Changes
+
+- f4812ce: 接收端支持 gzip 压缩的请求体。带 `X-Amsg-Request-Encoding: gzip` 头的请求会先 gunzip 再解析，不带这个头的请求按原样读取，行为不变。CORS 预检白名单里也加上了这个头。这样 `@rei-standard/amsg-client` 的 `deliver({ compressRequest })` 就能直接发到 `amsg-instant` 的 `/instant` / `/continue`，不用自己在后端解压。
+
+### Patch Changes
+
+- Updated dependencies [5c0e047]
+  - @rei-standard/amsg-shared@0.3.0
+
 ## 0.9.1 — SSE stream lifecycle owns LLM + push completion
 
 - **Fix**: SSE 模式下 LLM 调用与每条 payload 的 Web Push backup / fallback 完整运行在 `ReadableStream.start()` 内——`start()` 先 await 所有 backup 推送，再 `controller.close()`。响应仍在产出期间 runtime 不会施加 wall-clock 上限，慢 LLM + 客户端中途断开（iOS Safari 杀掉后台 SSE socket、页面切走等）的组合下也能把这一轮消息送达。
@@ -191,12 +202,12 @@ Install with `npm install @rei-standard/amsg-instant@next`. Pre-release — brea
 
 ### Migration cheat sheet
 
-| next.3                                                                  | next.4                                                                        |
-|-------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `return { decision: 'finish', pushPayload: { ... } }`                   | `return { decision: 'finish', pushPayloads: [{ ... }] }`                      |
-| Request body `splitPattern: '([。！？!?]+)'`                            | Implement the split in your hook; return one push per segment                 |
-| `pushPayload.splitPattern: null` (per-push disable from next.3)         | Return `pushPayloads: [singleUnsplit]`                                        |
-| `reasoningSplitPattern` request field                                   | Set `autoEmitReasoning: false`, build N reasoning pushes yourself with `buildReasoningPush(...)`, include them at the start of `pushPayloads` |
+| next.3                                                          | next.4                                                                                                                                        |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `return { decision: 'finish', pushPayload: { ... } }`           | `return { decision: 'finish', pushPayloads: [{ ... }] }`                                                                                      |
+| Request body `splitPattern: '([。！？!?]+)'`                    | Implement the split in your hook; return one push per segment                                                                                 |
+| `pushPayload.splitPattern: null` (per-push disable from next.3) | Return `pushPayloads: [singleUnsplit]`                                                                                                        |
+| `reasoningSplitPattern` request field                           | Set `autoEmitReasoning: false`, build N reasoning pushes yourself with `buildReasoningPush(...)`, include them at the start of `pushPayloads` |
 
 ### Why breaking in pre-release
 
@@ -239,19 +250,20 @@ Coordinated with `@rei-standard/amsg-shared@0.1.0-next.2`. Install with `npm ins
 
 - **`reasoningSplitPattern` / `errorSplitPattern` payload 字段** — 按 `messageKind` 独立的句号切配置：
 
-  | `messageKind`  | 字段                      | 默认                |
-  |----------------|---------------------------|---------------------|
-  | `content`      | `splitPattern`            | `/([。！？!?]+)/` (开) |
-  | `tool_request` | `splitPattern`            | `/([。！？!?]+)/` (开) |
-  | `reasoning`    | `reasoningSplitPattern`   | **不切**            |
-  | `error`        | `errorSplitPattern`       | **不切**            |
-  | 自由 payload   | —                         | 不切                |
+  | `messageKind`  | 字段                    | 默认                   |
+  | -------------- | ----------------------- | ---------------------- |
+  | `content`      | `splitPattern`          | `/([。！？!?]+)/` (开) |
+  | `tool_request` | `splitPattern`          | `/([。！？!?]+)/` (开) |
+  | `reasoning`    | `reasoningSplitPattern` | **不切**               |
+  | `error`        | `errorSplitPattern`     | **不切**               |
+  | 自由 payload   | —                       | 不切                   |
 
   四个 kind 共享的「禁用」语义：显式 `null` 或 `[]` 关闭切分。差别在 `undefined`（字段省略）：`content` / `tool_request` 回落默认句号正则；`reasoning` / `error` 保持不切（这俩历史上就没切片 UX，默认 off 才符合预期）。
 
 - **`reasoningChunkBytes` handler option（默认 2000，`null` 禁用）** — `ReasoningPush.reasoningContent` 的 UTF-8 字节上限。reasoning-heavy LLM（DeepSeek-R1 / GLM-4.5 / Qwen3-Thinking）经常输出 3-10 KB reasoning，超 Web Push ~2.6 KB 上限。next.2 内置 transparent 字节切分：超限时按 UTF-8 codepoint 边界切成 N 份，每片带 `chunkIndex` / `totalChunks`，SW 按这两个字段拼回完整字符串。**绝大多数 reasoning-heavy 部署不再需要 BlobStore。** `createInstantHandler` 构造期校验 `reasoningChunkBytes ∈ [500, maxInlineBytes - 600]`（600 B 余量给 push payload 元字段），不合法抛 `TypeError`。
 
 - **两层 cascade（Layer 1 句切 → Layer 2 字节切）** — `reasoningSplitPattern` 先按句切成 M 段，每段单独量字节，超阈值的段再字节切成 N 块。最终 push 同时带两组索引：
+
   - Layer 1：`messageIndex` 1..M / `totalMessages` M（M=1 时不写）
   - Layer 2：`chunkIndex` 1..N / `totalChunks` N（N=1 时不写）
 
@@ -315,15 +327,15 @@ Coordinated minor across the whole amsg ecosystem. This release replaces the leg
 
 ### Migration from 0.7.x
 
-| 0.7.x                                                                  | 0.8.0                                                                                    |
-|------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
-| `buildInstantPushPayload({ message, index, total, contactName, ... })` | `buildContentPush({ messageType: 'instant', source: 'instant', messageId, sessionId, message, messageIndex, totalMessages, contactName, ... })` from `@rei-standard/amsg-instant` |
-| Hook payload `{ type: 'tool-request', ... }` (free-form)               | Either keep it free-form (still legal — `pushPayload: unknown`) or call `buildToolRequestPush({ ... })` for a typed envelope |
-| SW dispatch by ad-hoc field sniffing on push payload                   | SW dispatch by `payload.messageKind` switch (consume the shared `AmsgPush` discriminated union) |
-| `{ type: 'error', code: 'HOOK_THREW', message, sessionId, iteration }` | Auto-built — no caller-side change needed; the wire shape now uses `messageKind: 'error'` instead of `type: 'error'` |
-| Hook fully owned every push (incl. reasoning, if you built one)        | Framework auto-emits `ReasoningPush` before the hook runs. Set `autoEmitReasoning: false` on `createInstantHandler({...})` to restore total hook control. |
+| 0.7.x                                                                  | 0.8.0                                                                                                                                                                                                                                            |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `buildInstantPushPayload({ message, index, total, contactName, ... })` | `buildContentPush({ messageType: 'instant', source: 'instant', messageId, sessionId, message, messageIndex, totalMessages, contactName, ... })` from `@rei-standard/amsg-instant`                                                                |
+| Hook payload `{ type: 'tool-request', ... }` (free-form)               | Either keep it free-form (still legal — `pushPayload: unknown`) or call `buildToolRequestPush({ ... })` for a typed envelope                                                                                                                     |
+| SW dispatch by ad-hoc field sniffing on push payload                   | SW dispatch by `payload.messageKind` switch (consume the shared `AmsgPush` discriminated union)                                                                                                                                                  |
+| `{ type: 'error', code: 'HOOK_THREW', message, sessionId, iteration }` | Auto-built — no caller-side change needed; the wire shape now uses `messageKind: 'error'` instead of `type: 'error'`                                                                                                                             |
+| Hook fully owned every push (incl. reasoning, if you built one)        | Framework auto-emits `ReasoningPush` before the hook runs. Set `autoEmitReasoning: false` on `createInstantHandler({...})` to restore total hook control.                                                                                        |
 | Hook returned `pushPayload` without a `sessionId` field                | **Set `sessionId: ctx.sessionId`** in your hook's `pushPayload`. The framework does NOT auto-inject it (the `pushPayload: unknown` contract is preserved). Without this the SW can't pair your content push with the auto-emitted ReasoningPush. |
-| Legacy path push failure aborted the whole burst                       | Reasoning-push failure is now best-effort (`reasoning_push_failed` event + continue). Content-push failures still abort, same as before. |
+| Legacy path push failure aborted the whole burst                       | Reasoning-push failure is now best-effort (`reasoning_push_failed` event + continue). Content-push failures still abort, same as before.                                                                                                         |
 
 If you have a hook that builds its own pushPayload object, **set `sessionId: ctx.sessionId`** in it so the SW can pair your content push with the auto-emitted ReasoningPush.
 
@@ -423,6 +435,7 @@ If you have a hook that builds its own pushPayload object, **set `sessionId: ctx
 - **CORS 内置**：handler 在入口处短路 `OPTIONS` 预检请求 → `204 No Content`，所有响应（含 200 / 4xx / 5xx）自动叠 `Access-Control-Allow-Origin / -Methods / -Headers` + `Access-Control-Max-Age: 86400`。浏览器跨域调用零配置 work。
 - `options.cors?: { allowOrigin?: string }`：自定义允许来源，默认 `'*'`。配成具体来源时自动附 `Vary: Origin`，避免反向代理缓存把 CORS policy 串到错的站点。
 - **`normalizeAiApiUrl(apiUrl)`** 智能补全 OpenAI 兼容路径，**幂等**（跑两次 = 跑一次）：
+
   - 裸 host（如 `https://api.openai.com`）→ 补 `/v1/chat/completions`
   - 末尾是 `/v1` 或 `/v2` 等版本段 → 只补 `/chat/completions`，**不会重复加 v1**
   - 已含 `/chat/completions` → 原样返回
