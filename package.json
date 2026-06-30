@@ -1,13 +1,15 @@
 {
   "private": true,
+  "packageManager": "npm@11.5.1",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "check:esm": "node scripts/check-esm-syntax.mjs",
+    "check:pm": "node scripts/check-package-manager.mjs",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "ci": "npm run check:esm && npm run build && npm run test",
+    "ci": "npm run check:esm && npm run check:pm && npm run build && npm run test",
     "version": "changeset version && npm install --package-lock-only",
     "release": "changeset publish"
   },
