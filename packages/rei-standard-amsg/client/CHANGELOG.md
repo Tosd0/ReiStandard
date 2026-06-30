@@ -1,5 +1,16 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.8.0
+
+### Minor Changes
+
+- 5c0e047: `avatarUrl` 本地预检改用 `@rei-standard/amsg-shared` 的统一校验，与 server / instant 对齐。现在非法（非 `data:`）URL —— 例如缺少协议的 `foo.com/a.png` —— 也会在客户端被 `console.warn` 并置空；此前 client 只检查 `data:` 与长度，会放行这类 URL（之后由服务端兜底置空）。软清空策略不变：装饰性字段不合法时只做清空，不会让整条请求失败。
+
+### Patch Changes
+
+- Updated dependencies [5c0e047]
+  - @rei-standard/amsg-shared@0.3.0
+
 ## 2.7.0 — `deliver()` 新增 `compressRequest` 请求体 gzip 压缩
 
 给 `deliver()` 加一个**可选**的 `compressRequest`，把要发出去的请求体在上网线之前 gzip 压一下。中文 + 重复结构的 JSON 压缩比很高（实测 ~322KB 能压到 ~50KB），网线上字节小了，大 body 在慢/不稳的上行链路上就能在「发了没回应就杀」的超时之前传完。压的是**请求**，不是响应；上下文内容一字不动，只是传输层省字节。
@@ -63,11 +74,11 @@
 
 ### Migration
 
-| 旧写法 | 新写法 |
-| --- | --- |
+| 旧写法                                                                              | 新写法                                                                                                                                        |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `try { await consumeInstantStream(p, '/instant', { onPayload }) } catch { fail() }` | `const r = await deliver(p, { delivery: { mode: 'observed', observed }, timeoutMs, onChunk: onPayload }); if (r.outcome !== 'delivered') ...` |
-| `const r = await sendInstant(p); if (!r.success) fail()` | `const r = await deliver(p, { delivery: { mode: 'observed', observed }, timeoutMs }); if (r.outcome === 'send-failed') ...` |
-| `sendInstant(p, '/instant', { authorization: 'Bearer ...' })` | `deliver(p, { delivery, timeoutMs, authorization: 'Bearer ...' })` |
+| `const r = await sendInstant(p); if (!r.success) fail()`                            | `const r = await deliver(p, { delivery: { mode: 'observed', observed }, timeoutMs }); if (r.outcome === 'send-failed') ...`                   |
+| `sendInstant(p, '/instant', { authorization: 'Bearer ...' })`                       | `deliver(p, { delivery, timeoutMs, authorization: 'Bearer ...' })`                                                                            |
 
 详见 README 的 `deliver()` 标准用法与「为什么需要 `deliver()`」段。
 
@@ -136,11 +147,11 @@ Self-review 时（仿 ultrareview 多角度分派）抓到的 correctness 修复
 POST 到 amsg-instant 的 `/instant` 或 `/continue` 端点，按 SSE frame 解析 `event: payload` / `event: error` / `event: done`，分发到 `options.onPayload` 回调；可被 `options.signal` 中止。
 
 ```js
-await client.consumeInstantStream(payload, '/instant', {
-  onPayload: async (p) => routeToIDB(p),     // 必填
-  onError:   (err) => log(err),              // 可选；通知用，不抑制 throw
-  onDone:    () => stopSpinner(),            // 可选
-  signal:    abortController.signal,         // 可选
+await client.consumeInstantStream(payload, "/instant", {
+  onPayload: async (p) => routeToIDB(p), // 必填
+  onError: (err) => log(err), // 可选；通知用，不抑制 throw
+  onDone: () => stopSpinner(), // 可选
+  signal: abortController.signal, // 可选
 });
 ```
 

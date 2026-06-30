@@ -1,5 +1,13 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.5.3
+
+### Patch Changes
+
+- 5c0e047: VAPID subject 规范化支持 `https:` 形式：RFC 8292 允许 subject 使用 `https:`，规范化时按原样保留，不另加 `mailto:` 前缀。reasoning 私有思考过滤、`avatarUrl` 校验、VAPID subject 规范化统一改用 `@rei-standard/amsg-shared` 的实现。
+- Updated dependencies [5c0e047]
+  - @rei-standard/amsg-shared@0.3.0
+
 ## 2.5.2 — in-server instant 路径恢复为一等公民
 
 - **文档**：移除 `schedule-message` 中 `messageType: 'instant'` 两处 JSDoc 的 `@deprecated Soft-deprecated` 标记；该路径（create task → process by UUID → delete task）现以正式支持路径身份记录，不再携带弃用暗示。
@@ -50,13 +58,13 @@ Coordinated minor across the whole amsg ecosystem. The server's push wire shape 
 
 ### Migration from 2.3.x
 
-| 2.3.x                                                  | 2.4.0                                                                              |
-|--------------------------------------------------------|-------------------------------------------------------------------------------------|
-| Hand-rolled 13-field `notificationPayload`             | `buildContentPush({...})` from `@rei-standard/amsg-shared`                          |
-| `messagesSent` reflects sentence count                 | Unchanged — still sentence count. ReasoningPush is auxiliary, not counted.          |
-| Push payload has no `messageKind`                      | Push payload carries `messageKind: 'content'`. SW dispatch on `payload.messageKind` |
-| Push payload has no `sessionId`                        | Push payload carries `sessionId`. Same id across ReasoningPush + ContentPush burst  |
-| No reasoning push                                      | If LLM returns non-empty `reasoning_content`, a separate `ReasoningPush` is sent first |
+| 2.3.x                                      | 2.4.0                                                                                  |
+| ------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Hand-rolled 13-field `notificationPayload` | `buildContentPush({...})` from `@rei-standard/amsg-shared`                             |
+| `messagesSent` reflects sentence count     | Unchanged — still sentence count. ReasoningPush is auxiliary, not counted.             |
+| Push payload has no `messageKind`          | Push payload carries `messageKind: 'content'`. SW dispatch on `payload.messageKind`    |
+| Push payload has no `sessionId`            | Push payload carries `sessionId`. Same id across ReasoningPush + ContentPush burst     |
+| No reasoning push                          | If LLM returns non-empty `reasoning_content`, a separate `ReasoningPush` is sent first |
 
 If you have a SW that hand-sniffs push fields, switch to the `messageKind` discriminator. If you have a client that pairs server-sent sentences (e.g. via `messageId` regex), use `sessionId` instead — it's stable and explicit.
 
