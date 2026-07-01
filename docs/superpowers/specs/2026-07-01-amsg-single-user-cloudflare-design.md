@@ -45,7 +45,8 @@ createSingleUserContextManager({ db, masterKey, serverToken })
 
 要点：
 - `db` 和 `masterKey` 由上层（Worker 入口）从 env + binding 拿好后直接传进来，context 内部不再查 Blob。
-- `serverToken` 没配 = 端点开放；配了 = **所有暴露出去的 HTTP 端点**都要带 `X-Client-Token: <serverToken>`，用 `crypto.timingSafeEqual`（或等价的定长比较）防时序侧信道。**没有免验的后门**。
+- `serverToken` 没配 = 端点开放；配了 = **所有暴露出去的 HTTP 端点**都要带 `X-Client-Token: <serverToken>`，用**可移植的 constant-time 比较**防时序侧信道。**没有免验的后门**。
+  - 注意（验证后修正）：别用 Node 的 `crypto.timingSafeEqual`（Worker 上有返回 undefined 的历史 bug），也别用 CF 的 `crypto.subtle.timingSafeEqual`（Node 没有）。这个文件测试跑在 Node、生产跑在 Worker，两边都要过 → 写一个基于 Web Crypto（`crypto.subtle` 两边都有）的双 HMAC 比较，或手写定长常数时间比较。
 - 单用户不暴露 HTTP `send-notifications`，所以不存在「`allowCronToken:true` 要不要放行」这种口子。定时只由 CF `scheduled()` 触发（CF 平台内部直接调，不经过 HTTP，天生外人碰不到）。
 
 ### 单用户入口
