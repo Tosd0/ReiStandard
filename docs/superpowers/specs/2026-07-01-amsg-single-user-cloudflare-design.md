@@ -21,9 +21,12 @@
 
 ## 一、核心思路：只换 context 层
 
-现有 7 个 handler（schedule-message / messages / update-message / cancel-message / get-user-key / send-notifications / init-tenant）全都通过 `ctx.tenantManager.resolveTenant(headers)` 拿到 `{ tenantId, db, masterKey }`。
+现有业务 handler 里，schedule-message / messages / update-message / cancel-message / get-user-key 这 **5 个**都通过 `ctx.tenantManager.resolveTenant(headers)` 拿到 `{ tenantId, db, masterKey }`。只要造一个**接口同构**的单用户版 context，这 5 个一行都不用改。
 
-只要造一个**接口同构**的单用户版 context，handler 一行都不用改。
+另外两个要单独处理（Codex review 后修正，原稿误把它们也算进「零改动」）：
+
+- **init-tenant**：现有 `createInitTenantHandler` 不走 `resolveTenant`，它在调 `initializeTenant` 前就先校验 body 里的 `driver`/`databaseUrl`（多租户要连 Pg/Neon）。D1 单用户没这俩参数，没法零改动复用 → 单用户单独写一个「只建表」的 init 路由。
+- **send-notifications**：它的批处理内核抽成 `runScheduledTick`（第三节）。单用户的定时**只走 CF Cron Trigger（`scheduled()`）**，**不暴露 HTTP 入口**（避免鉴权绕过，见下）。
 
 ### 单用户 context
 
@@ -37,13 +40,13 @@ createSingleUserContextManager({ db, masterKey, serverToken })
 
 | 方法 | 多租户版（现状） | 单用户版（新） |
 |---|---|---|
-| `resolveTenant(headers, opts)` | 验 Bearer JWT → 查 Blob → 拿 db/masterKey | 配了 `serverToken` 就用 timing-safe 比对 `X-Client-Token` 头，没配就直接放行；返回固定 `{ ok:true, context:{ tenantId:'single', tokenType:'tenant'\|'cron', db, masterKey } }` |
+| `resolveTenant(headers, opts)` | 验 Bearer JWT → 查 Blob → 拿 db/masterKey | 配了 `serverToken` 就用 timing-safe 比对 `X-Client-Token` 头，没配就直接放行；返回固定 `{ ok:true, context:{ tenantId:'single', tokenType:'tenant', db, masterKey } }` |
 | `initializeTenant()` | 建租户记录 + 建表 + 发 token | **只调 `db.initSchema()`**，返回 `{ tenantId:'single' }`，不发任何 token |
 
 要点：
 - `db` 和 `masterKey` 由上层（Worker 入口）从 env + binding 拿好后直接传进来，context 内部不再查 Blob。
-- `serverToken` 没配 = 端点开放；配了 = 所有业务请求都要带 `X-Client-Token: <serverToken>`，用 `crypto.timingSafeEqual`（或等价的定长比较）防时序侧信道。
-- `send-notifications` handler 走 HTTP 时会带 `allowCronToken:true`，单用户版直接放行即可（真正的 cron 走 CF `scheduled()`，不经过这里）。
+- `serverToken` 没配 = 端点开放；配了 = **所有暴露出去的 HTTP 端点**都要带 `X-Client-Token: <serverToken>`，用 `crypto.timingSafeEqual`（或等价的定长比较）防时序侧信道。**没有免验的后门**。
+- 单用户不暴露 HTTP `send-notifications`，所以不存在「`allowCronToken:true` 要不要放行」这种口子。定时只由 CF `scheduled()` 触发（CF 平台内部直接调，不经过 HTTP，天生外人碰不到）。
 
 ### 单用户入口
 
@@ -114,10 +117,12 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 runScheduledTick({ db, masterKey, vapid, webpush }) → { totalTasks, successCount, failedCount, ... }
 ```
 
-- HTTP handler（多租户）：`resolveTenant` 拿到 `{db, masterKey}` 后调 `runScheduledTick`。
+- HTTP handler（多租户）：`resolveTenant` 拿到 `{db, masterKey}` 后调 `runScheduledTick`。多租户对外行为不变。
 - CF `scheduled(event, env, ctx)`（单用户）：直接构造 `{ db: createD1Adapter(env.DB), masterKey: env.AMSG_MASTER_KEY, ... }` 调 `runScheduledTick`，**不需要 cron token**（CF 运行时直接触发，没有 HTTP 头）。
 
-多租户 send-notifications 的对外行为不变。抽取前后行为一致，用回归测试锁住（见第六节）。
+单用户**不提供** HTTP `/send-notifications`。原因：那条 HTTP 入口在多租户里靠 cron token 保护，单用户没这套 token，留着就等于一个免验的公开端点——谁都能打进来触发发消息、烧 LLM API key（Codex review 的 P1）。有 CF Cron Trigger 就够了，直接砍掉。
+
+抽取前后多租户行为一致，用回归测试锁住（见第七节）。
 
 ---
 
@@ -154,7 +159,7 @@ export default {
 ```
 
 - `fetch`：一个小路由，按 `METHOD + path` 把 CF `Request` 分发到 `createSingleUserServer(...).handlers` 对应的方法。每请求构造：`db = createD1Adapter(env.DB)`，`masterKey = env.AMSG_MASTER_KEY`，`serverToken = env.AMSG_SERVER_TOKEN`，`vapid` 从 env，`webpush = createWebCryptoWebPush()`。构造开销可忽略（对标 instant `createCloudflareWorker((env)=>config)` 每请求建 config 的做法）。
-- 路由覆盖：`POST /init-tenant`（退化成幂等建表）、`POST /schedule-message`、`GET /messages`、`PUT /update-message`、`DELETE /cancel-message`、`GET /user-key`、`POST /send-notifications`（HTTP 兜底，可选）。
+- 路由覆盖：`POST /init-tenant`（单用户专用建表路由，只跑 `initSchema`，幂等；配了 `serverToken` 也要带 `X-Client-Token`）、`POST /schedule-message`、`GET /messages`、`PUT /update-message`、`DELETE /cancel-message`、`GET /user-key`。**不含 HTTP `/send-notifications`**——定时只走 `scheduled()`。
 - `scheduled`：直接 `runScheduledTick({ db: createD1Adapter(env.DB), masterKey: env.AMSG_MASTER_KEY, vapid, webpush })`，无需 token。
 
 路由把 CF `Request` 适配成现有 handler 期望的入参——实现时对齐现有 handler 的调用约定（参考 `examples/api` 里 handler 是怎么被调的）。
@@ -198,9 +203,9 @@ VAPID / masterKey / serverToken 走 `wrangler secret put`，不写进 toml。
 
 单用户服务端不验租户 token → client 加密路径本来就能原样跑。唯一要加的能力：**把共享密钥也带到 schedule / messages 这些路径**。
 
-改法：`ReiClientConfig` 新增一个字段 `serverToken`（语义清楚、不动老的 `instantClientToken`）。配了 `serverToken` 就给**所有**请求（schedule / list / update / cancel / user-key / instant）加上 `X-Client-Token: <serverToken>` 头。加密、`userId`、`init()` 这些都不动。
+改法：`ReiClientConfig` 新增一个字段 `serverToken`（语义清楚、不动老的 `instantClientToken`）。配了 `serverToken` 就给 **amsg-server 自己的端点**（schedule / messages / update / cancel / user-key / init）加上 `X-Client-Token: <serverToken>` 头。加密、`userId`、`init()` 这些都不动。
 
-`instantClientToken` 保持原样（只管 instant 明文路径），两者互不干扰。
+**serverToken 不加到 instant 路径**（Codex review 的 P2）：instant 可能指向另一个 worker（`customBaseUrls.instant`）、用它自己的 `instantClientToken`，两者都落在同一个 `X-Client-Token` 头上，混用会打架（server 的 token 会顶掉 instant 的，或让 instant 收到错的密钥）。所以 serverToken 只管 amsg-server 端点，instant 路径继续用 `instantClientToken`，井水不犯河水。
 
 ---
 
@@ -209,8 +214,10 @@ VAPID / masterKey / serverToken 走 `wrangler secret put`，不写进 toml。
 - **D1 adapter**：跑 13 方法的 CRUD；重点覆盖 `getPendingTasks` 的时间比较（含混时区输入归一化后仍正确）、`cleanupOldTasks` 的截止时间、`uidx_uuid` 唯一约束冲突。用 better-sqlite3 或 miniflare 的本地 D1 当测试后端。
 - **`runScheduledTick` 抽取**：一个测试锁住多租户 `send-notifications` 抽取前后行为一致（能在抽取破坏行为时挂、抽对时过）。
 - **单用户 context**：配了 `serverToken` → 缺头 / 错头拦截、对头放行；没配 → 直接放行；`initializeTenant` 只建表、不发 token。
+- **鉴权无后门（P1 回归守卫）**：配了 `serverToken` 时，暴露的每个 HTTP 端点都要求带对的 `X-Client-Token`——用一个测试钉住「没有任何端点能免验触发」，防止将来又冒出个 `allowCronToken` 式的口子。
+- **单用户 init 路由**：无参 `POST` 只建表、幂等可重复调；配了 `serverToken` 时缺 / 错 `X-Client-Token` 被拦。
 - **Web Crypto 推送 shim**：接口和失败错误形状（`.statusCode`）与 `web-push` 对齐。
-- **client**：`serverToken` 配了，所有路径的请求都带 `X-Client-Token`；没配则一个都不带（instant 明文路径的 `instantClientToken` 行为不变）。
+- **client**：`serverToken` 配了，**amsg-server 端点**的请求带 `X-Client-Token`，**instant 路径不带**（instant 仍用自己的 `instantClientToken`）；没配 serverToken 则 server 端点都不带。
 
 ---
 
@@ -219,6 +226,7 @@ VAPID / masterKey / serverToken 走 `wrangler secret put`，不写进 toml。
 **新增**
 - `server/src/server/tenant/single-user-context.js`
 - `server/src/server/single-user.js`
+- `server/src/server/handlers/single-user-init.js`（只跑 `initSchema` 的建表路由，不复用 `createInitTenantHandler`）
 - `server/src/server/adapters/d1.js`
 - `server/src/server/adapters/schema.sqlite.js`
 - `server/src/server/lib/run-tick.js`
