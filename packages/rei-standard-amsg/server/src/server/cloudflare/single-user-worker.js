@@ -12,6 +12,10 @@
  *   GET  /messages          → list
  *   PUT  /update-message    → patch
  *   DELETE /cancel-message  → delete
+ *
+ * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
+ * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
+ * Access-Control-* on responses. With no `cors` the Worker stays same-origin.
  */
 
 import { createSingleUserServer } from '../single-user.js';
@@ -24,11 +28,43 @@ function headersToObject(h) {
   return out;
 }
 
-function jsonResponse(status, body) {
+function jsonResponse(status, body, extraHeaders) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...(extraHeaders || {}) }
   });
+}
+
+// The custom headers the amsg-client sends; browsers preflight any request
+// carrying them, so cross-origin callers need them echoed in the CORS response.
+const CORS_ALLOW_HEADERS =
+  'Content-Type, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token';
+const CORS_ALLOW_METHODS = 'GET, POST, PUT, DELETE, OPTIONS';
+
+/**
+ * Resolve the CORS response headers for a request, or null when CORS is off.
+ * Opt-in: with no `cors` config the Worker stays same-origin (no headers, and
+ * OPTIONS falls through to 404) — so nothing is exposed unless asked for.
+ *
+ * @param {undefined | { origin: string | ((requestOrigin: string) => string|null|undefined), allowHeaders?: string, maxAge?: number }} cors
+ * @param {string} requestOrigin - the request's Origin header (may be '')
+ */
+function corsHeadersFor(cors, requestOrigin) {
+  if (!cors || cors.origin == null) return null;
+  const allowOrigin = typeof cors.origin === 'function'
+    ? cors.origin(requestOrigin) || null
+    : cors.origin; // e.g. '*' or a fixed origin like 'https://app.example.com'
+  if (!allowOrigin) return null;
+
+  const headers = {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': CORS_ALLOW_METHODS,
+    'Access-Control-Allow-Headers': cors.allowHeaders || CORS_ALLOW_HEADERS,
+    'Access-Control-Max-Age': String(cors.maxAge ?? 86400)
+  };
+  // A per-origin echo must vary the cache by Origin; '*' does not.
+  if (allowOrigin !== '*') headers['Vary'] = 'Origin';
+  return headers;
 }
 
 export function createSingleUserCloudflareWorker(buildConfig) {
@@ -44,13 +80,22 @@ export function createSingleUserCloudflareWorker(buildConfig) {
     // contract consistent (a JSON envelope, not the runtime's HTML error page).
     try {
       const cfg = await resolveConfig(env);
+      const cors = corsHeadersFor(cfg.cors, request.headers.get('origin') || '');
+      const method = request.method.toUpperCase();
+
+      // CORS preflight: answer OPTIONS directly when CORS is configured.
+      if (method === 'OPTIONS') {
+        return cors
+          ? new Response(null, { status: 204, headers: cors })
+          : jsonResponse(404, { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } });
+      }
+
       const server = createSingleUserServer(cfg);
 
       const url = request.url;
       // Strip trailing slash(es) so `/init-tenant/` routes like `/init-tenant`
       // (endsWith matching is kept so a prefixed mount still resolves).
       const pathname = new URL(url).pathname.replace(/\/+$/, '') || '/';
-      const method = request.method.toUpperCase();
       const headers = headersToObject(request.headers);
 
       let result;
@@ -70,7 +115,7 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }
 
-      return jsonResponse(result.status, result.body);
+      return jsonResponse(result.status, result.body, cors);
     } catch (error) {
       console.error('[amsg single-user] fetch() unhandled error:', error && error.message);
       return jsonResponse(500, { success: false, error: { code: 'INTERNAL_ERROR', message: '服务器内部错误' } });

@@ -114,6 +114,55 @@ test('scheduled() logs and swallows a tick failure so the next cron retries', as
   assert.ok(logged >= 1);
 });
 
+test('CORS off by default: OPTIONS → 404 and no Access-Control header on responses', async () => {
+  const d1 = createTestD1();
+  const worker = makeWorker(d1);
+  const env = { DB: d1 };
+  await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+  const preflight = await worker.fetch(
+    new Request('https://w.dev/messages', { method: 'OPTIONS', headers: { Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(preflight.status, 404);
+
+  const listed = await worker.fetch(
+    new Request('https://w.dev/messages?status=all', { method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(listed.headers.get('Access-Control-Allow-Origin'), null);
+});
+
+test('CORS opt-in: OPTIONS preflight answered, real response echoes the allowed origin', async () => {
+  const d1 = createTestD1();
+  const worker = createSingleUserCloudflareWorker((env) => ({
+    db: createD1Adapter(env.DB),
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} },
+    cors: { origin: 'https://app.example.com' }
+  }));
+  const env = { DB: d1 };
+  await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+  const preflight = await worker.fetch(
+    new Request('https://w.dev/schedule-message', { method: 'OPTIONS', headers: { Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers'), /X-Client-Token/);
+  assert.match(preflight.headers.get('Access-Control-Allow-Methods'), /DELETE/);
+
+  const listed = await worker.fetch(
+    new Request('https://w.dev/messages?status=all', { method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(listed.status, 200);
+  assert.equal(listed.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+  assert.equal(listed.headers.get('Vary'), 'Origin');
+});
+
 // Regression guard (design spec §7): with serverToken set, EVERY exposed HTTP
 // endpoint must require X-Client-Token. Today all handlers funnel through the
 // same resolveTenant, but this pins it down so a future handler that forgets

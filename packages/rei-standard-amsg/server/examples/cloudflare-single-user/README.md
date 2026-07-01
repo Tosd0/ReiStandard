@@ -39,3 +39,12 @@ Worker 从 `@rei-standard/amsg-server/cloudflare` 导入（不是包根）。这
 ## 客户端
 
 `@rei-standard/amsg-client` 配 `baseUrl` 指向本 Worker；若设了 `AMSG_SERVER_TOKEN`，client 也要配同样的 `serverToken`。
+
+前端和 Worker 不同源时，浏览器会对带自定义头的请求发 CORS 预检。默认是同源、不开 CORS；跨源就在 config 里加 `cors`，填你的前端域名：
+
+```js
+export default createSingleUserCloudflareWorker((env) => ({
+  // ...其余 config
+  cors: { origin: 'https://你的前端域名' } // 或 '*'，或 (origin) => 允许的域名
+}));
+```
