@@ -1,7 +1,13 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: { index: 'src/server/index.js' },
+  // Two entries: the root (multi-tenant, Node) and a Cloudflare/D1-only entry
+  // that omits the pg/neon/web-push graph so Worker bundles resolve on a
+  // D1-only install. See src/server/cloudflare.js.
+  entry: {
+    index: 'src/server/index.js',
+    cloudflare: 'src/server/cloudflare.js'
+  },
   format: ['cjs', 'esm'],
   dts: true,
   outDir: 'dist',

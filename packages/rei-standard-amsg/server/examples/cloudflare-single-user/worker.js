@@ -5,7 +5,7 @@
 import {
   createSingleUserCloudflareWorker,
   createWebCryptoWebPush
-} from '@rei-standard/amsg-server';
+} from '@rei-standard/amsg-server/cloudflare';
 
 export default createSingleUserCloudflareWorker((env) => ({
   // db defaults to createD1Adapter(env.DB)
