@@ -9,5 +9,8 @@
     "@rei-standard/amsg-shared": "0.3.0",
     "@rei-standard/amsg-sw": "2.3.2"
   },
-  "changesets": []
+  "changesets": [
+    "amsg-client-server-token",
+    "amsg-server-single-user-cloudflare"
+  ]
 }
