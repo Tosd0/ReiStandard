@@ -1,0 +1,203 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
+import { createTestD1 } from './helpers/sqlite-d1.mjs';
+import { createD1Adapter } from '../src/server/adapters/d1.js';
+import { deriveUserEncryptionKey, encryptPayload, encryptForStorage } from '../src/server/lib/encryption.js';
+
+const USER = '550e8400-e29b-41d4-a716-446655440000';
+const MASTER_KEY = 'a'.repeat(64);
+
+function makeWorker(d1) {
+  return createSingleUserCloudflareWorker((env) => ({
+    db: createD1Adapter(env.DB),
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} }
+  }));
+}
+
+test('fetch routes init + schedule + messages, unknown → 404', async () => {
+  const d1 = createTestD1();
+  const worker = makeWorker(d1);
+  const env = { DB: d1 };
+
+  // build tables via the init route
+  const initRes = await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+  assert.equal(initRes.status, 200);
+
+  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
+  const body = JSON.stringify(encryptPayload({
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi',
+    firstSendTime: '2999-01-01T00:00:00.000Z', recurrenceType: 'none',
+    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+  }, userKey));
+
+  const schedRes = await worker.fetch(new Request('https://w.dev/schedule-message', {
+    method: 'POST',
+    headers: { 'X-User-Id': USER, 'X-Payload-Encrypted': 'true', 'X-Encryption-Version': '1' },
+    body
+  }), env);
+  assert.equal(schedRes.status, 201);
+
+  const listRes = await worker.fetch(new Request('https://w.dev/messages?status=all', {
+    method: 'GET', headers: { 'X-User-Id': USER }
+  }), env);
+  assert.equal(listRes.status, 200);
+
+  const notFound = await worker.fetch(new Request('https://w.dev/nope', { method: 'GET' }), env);
+  assert.equal(notFound.status, 404);
+
+  // A trailing slash routes the same as without it (not a 404).
+  const trailingSlash = await worker.fetch(new Request('https://w.dev/init-tenant/', { method: 'POST' }), env);
+  assert.equal(trailingSlash.status, 200);
+});
+
+test('scheduled() runs the tick over env.DB', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = encryptForStorage(JSON.stringify({
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
+    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+  }), userKey);
+  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: '2020-01-01T00:00:00.000Z', message_type: 'fixed' });
+
+  let sent = 0;
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: adapter,
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() { sent++; } }
+  }));
+
+  await worker.scheduled({}, { DB: d1 });
+  assert.ok(sent >= 1);
+  assert.equal((await adapter.getPendingTasks(50)).length, 0);
+});
+
+test('fetch() turns an unexpected error into a JSON 500 (not the runtime error page)', async () => {
+  const worker = createSingleUserCloudflareWorker(() => { throw new Error('config boom'); });
+  const origErr = console.error;
+  let logged = 0;
+  console.error = () => { logged++; };
+  let res;
+  try {
+    res = await worker.fetch(new Request('https://w.dev/messages', { method: 'GET' }), {});
+  } finally {
+    console.error = origErr;
+  }
+  assert.equal(res.status, 500);
+  assert.equal(res.headers.get('Content-Type'), 'application/json; charset=utf-8');
+  const body = await res.json();
+  assert.equal(body.success, false);
+  assert.equal(body.error.code, 'INTERNAL_ERROR');
+  assert.ok(logged >= 1); // logged, not silently swallowed
+});
+
+test('scheduled() logs and swallows a tick failure so the next cron retries', async () => {
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: { async getPendingTasks() { throw new Error('db down'); } },
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} }
+  }));
+  const origErr = console.error;
+  let logged = 0;
+  console.error = () => { logged++; };
+  try {
+    await worker.scheduled({}, { DB: null }); // must NOT throw
+  } finally {
+    console.error = origErr;
+  }
+  assert.ok(logged >= 1);
+});
+
+test('CORS off by default: OPTIONS → 404 and no Access-Control header on responses', async () => {
+  const d1 = createTestD1();
+  const worker = makeWorker(d1);
+  const env = { DB: d1 };
+  await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+  const preflight = await worker.fetch(
+    new Request('https://w.dev/messages', { method: 'OPTIONS', headers: { Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(preflight.status, 404);
+
+  const listed = await worker.fetch(
+    new Request('https://w.dev/messages?status=all', { method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(listed.headers.get('Access-Control-Allow-Origin'), null);
+});
+
+test('CORS opt-in: OPTIONS preflight answered, real response echoes the allowed origin', async () => {
+  const d1 = createTestD1();
+  const worker = createSingleUserCloudflareWorker((env) => ({
+    db: createD1Adapter(env.DB),
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} },
+    cors: { origin: 'https://app.example.com' }
+  }));
+  const env = { DB: d1 };
+  await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+  const preflight = await worker.fetch(
+    new Request('https://w.dev/schedule-message', { method: 'OPTIONS', headers: { Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers'), /X-Client-Token/);
+  assert.match(preflight.headers.get('Access-Control-Allow-Methods'), /DELETE/);
+
+  const listed = await worker.fetch(
+    new Request('https://w.dev/messages?status=all', { method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' } }),
+    env
+  );
+  assert.equal(listed.status, 200);
+  assert.equal(listed.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+  assert.equal(listed.headers.get('Vary'), 'Origin');
+});
+
+// Regression guard (design spec §7): with serverToken set, EVERY exposed HTTP
+// endpoint must require X-Client-Token. Today all handlers funnel through the
+// same resolveTenant, but this pins it down so a future handler that forgets
+// that call can't silently ship an auth-bypassing route.
+test('serverToken set → every exposed route rejects wrong/missing token with 401', async () => {
+  const d1 = createTestD1();
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: createD1Adapter(d1),
+    masterKey: MASTER_KEY,
+    serverToken: 's3cret',
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} }
+  }));
+  const env = { DB: d1 };
+
+  const routes = [
+    ['POST', 'https://w.dev/init-tenant'],
+    ['GET', 'https://w.dev/get-user-key'],
+    ['POST', 'https://w.dev/schedule-message'],
+    ['GET', 'https://w.dev/messages?status=all'],
+    ['PUT', 'https://w.dev/update-message?id=x'],
+    ['DELETE', 'https://w.dev/cancel-message?id=x']
+  ];
+
+  for (const [method, url] of routes) {
+    const wrong = await worker.fetch(
+      new Request(url, { method, headers: { 'X-Client-Token': 'nope', 'X-User-Id': USER } }),
+      env
+    );
+    assert.equal(wrong.status, 401, `${method} ${url} with a wrong token must be 401`);
+
+    const missing = await worker.fetch(
+      new Request(url, { method, headers: { 'X-User-Id': USER } }),
+      env
+    );
+    assert.equal(missing.status, 401, `${method} ${url} with no token must be 401`);
+  }
+});

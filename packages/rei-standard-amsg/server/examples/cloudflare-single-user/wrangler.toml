@@ -1,0 +1,13 @@
+name = "amsg-single-user"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "amsg"
+database_id = "<你的 D1 database id>"
+
+# CF Cron Trigger（5 段：分 时 日 月 周，UTC）。每分钟跑一次定时投递：
+[triggers]
+crons = ["* * * * *"]

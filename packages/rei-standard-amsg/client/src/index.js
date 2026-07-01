@@ -73,6 +73,11 @@ const TEXT_ENCODER = new TextEncoder();
  *                                                         inside any frontend bundle that uses it, so
  *                                                         devtools can read it. Use for casual URL-direct
  *                                                         abuse only.
+ * @property {string} [serverToken]                       - Optional shared secret for a single-user amsg-server.
+ *                                                         When set, sent as the `X-Client-Token` header on
+ *                                                         amsg-server endpoints (schedule / messages / update /
+ *                                                         cancel / user-key / init). Not applied to the instant
+ *                                                         path (that uses `instantClientToken`).
  * @property {number|null} [maxPayloadBytes=null]        - Optional local UTF-8 byte cap for outgoing request
  *                                                         payloads before encryption. `null` / omitted means
  *                                                         no SDK-level request-size limit.
@@ -365,6 +370,10 @@ export class ReiClient {
       ? config.instantClientToken
       : '';
     /** @private */
+    this._serverToken = typeof config.serverToken === 'string' && config.serverToken
+      ? config.serverToken
+      : '';
+    /** @private */
     this._maxPayloadBytes = normalizeMaxPayloadBytes(config.maxPayloadBytes);
     /**
      * Per-instance latch (set of method names already warned). The
@@ -383,6 +392,18 @@ export class ReiClient {
    */
   _resolveBaseUrl(endpointName) {
     return this._customBaseUrls[endpointName] || this._baseUrl;
+  }
+
+  /**
+   * Attach the single-user shared secret to amsg-server endpoint requests.
+   * Never applied to the instant path (that uses instantClientToken).
+   * @private
+   * @param {Record<string, string>} headers
+   * @returns {Record<string, string>}
+   */
+  _withServerToken(headers) {
+    if (this._serverToken) headers['X-Client-Token'] = this._serverToken;
+    return headers;
   }
 
   // ─── Initialisation ─────────────────────────────────────────────
@@ -405,7 +426,7 @@ export class ReiClient {
 
     const res = await fetch(`${this._baseUrl}/get-user-key`, {
       method: 'GET',
-      headers: { 'X-User-Id': this._userId }
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
     const json = await res.json();
@@ -448,12 +469,12 @@ export class ReiClient {
 
     const res = await fetch(`${this._baseUrl}/schedule-message`, {
       method: 'POST',
-      headers: {
+      headers: this._withServerToken({
         'Content-Type': 'application/json',
         'X-User-Id': this._userId,
         'X-Payload-Encrypted': 'true',
         'X-Encryption-Version': '1'
-      },
+      }),
       body: JSON.stringify(encrypted)
     });
 
@@ -881,12 +902,12 @@ export class ReiClient {
 
     const res = await fetch(`${this._baseUrl}/update-message?id=${encodeURIComponent(uuid)}`, {
       method: 'PUT',
-      headers: {
+      headers: this._withServerToken({
         'Content-Type': 'application/json',
         'X-User-Id': this._userId,
         'X-Payload-Encrypted': 'true',
         'X-Encryption-Version': '1'
-      },
+      }),
       body: JSON.stringify(encrypted)
     });
 
@@ -902,7 +923,7 @@ export class ReiClient {
   async cancelMessage(uuid) {
     const res = await fetch(`${this._baseUrl}/cancel-message?id=${encodeURIComponent(uuid)}`, {
       method: 'DELETE',
-      headers: { 'X-User-Id': this._userId }
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
     return res.json();
@@ -928,11 +949,11 @@ export class ReiClient {
 
     const res = await fetch(url, {
       method: 'GET',
-      headers: {
+      headers: this._withServerToken({
         'X-User-Id': this._userId,
         'X-Response-Encrypted': 'true',
         'X-Encryption-Version': '1'
-      }
+      })
     });
 
     const json = await res.json();
