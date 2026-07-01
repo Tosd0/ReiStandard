@@ -47,6 +47,10 @@ test('fetch routes init + schedule + messages, unknown → 404', async () => {
 
   const notFound = await worker.fetch(new Request('https://w.dev/nope', { method: 'GET' }), env);
   assert.equal(notFound.status, 404);
+
+  // A trailing slash routes the same as without it (not a 404).
+  const trailingSlash = await worker.fetch(new Request('https://w.dev/init-tenant/', { method: 'POST' }), env);
+  assert.equal(trailingSlash.status, 200);
 });
 
 test('scheduled() runs the tick over env.DB', async () => {

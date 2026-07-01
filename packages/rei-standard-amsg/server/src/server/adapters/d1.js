@@ -10,6 +10,14 @@
 
 import { SQLITE_TABLE_SQL, SQLITE_INDEXES } from './schema.sqlite.js';
 
+// Update methods build a dynamic SET clause from object keys. Callers pass only
+// hardcoded column names today, but enforcing a whitelist keeps a future caller
+// from ever turning a caller-supplied key into interpolated SQL.
+const UPDATABLE_COLUMNS = new Set([
+  'user_id', 'uuid', 'encrypted_payload', 'message_type',
+  'next_send_at', 'status', 'retry_count', 'created_at', 'updated_at'
+]);
+
 export class D1Adapter {
   /** @param {{ prepare: (sql: string) => any }} db - Cloudflare D1 binding */
   constructor(db) {
@@ -103,6 +111,9 @@ export class D1Adapter {
     const sets = [];
     const values = [];
     for (const [key, value] of Object.entries(updates)) {
+      if (!UPDATABLE_COLUMNS.has(key)) {
+        throw new Error(`[amsg-server D1] rejected unknown update column: ${key}`);
+      }
       sets.push(`${key} = ?`);
       values.push(key === 'next_send_at' ? this._iso(value) : value);
     }
@@ -126,6 +137,9 @@ export class D1Adapter {
     const values = [encryptedPayload, now];
     if (extraFields) {
       for (const [key, value] of Object.entries(extraFields)) {
+        if (!UPDATABLE_COLUMNS.has(key)) {
+          throw new Error(`[amsg-server D1] rejected unknown update column: ${key}`);
+        }
         sets.push(`${key} = ?`);
         values.push(key === 'next_send_at' ? this._iso(value) : value);
       }

@@ -354,20 +354,29 @@ async function safeReadText(res) {
 // separate import path. Keeps the public surface tight.
 export { hmacSha256 };
 
+// Scheduled reminders must survive an offline device, so default to the same
+// 4-week TTL the web-push npm backend applies. sendWebPush's module-level
+// VAPID_DEFAULT_TTL (60s) is tuned for single-shot instant pushes; using it for
+// durable schedules would drop any reminder whose device was offline > 1 min.
+const SCHEDULED_DEFAULT_TTL = 2419200; // 4 weeks, in seconds
+
 /**
  * web-push-compatible sender backed by the Web Crypto implementation above.
  * message-processor calls `ctx.webpush.sendNotification(subscription, payloadString)`,
  * so we only need that one method. VAPID keys are baked in at construction.
  *
- * @param {{ email: string, publicKey: string, privateKey: string }} vapid
+ * @param {{ email: string, publicKey: string, privateKey: string }} [vapid]
+ * @param {{ ttl?: number }} [options] - Push TTL in seconds; defaults to 4 weeks
+ *   (matches the web-push backend) so scheduled pushes outlive an offline device.
  * @returns {{ sendNotification: (subscription: Object, payload: string) => Promise<any> }}
  */
-export function createWebCryptoWebPush(vapid) {
+export function createWebCryptoWebPush(vapid = {}, { ttl = SCHEDULED_DEFAULT_TTL } = {}) {
   return {
     async sendNotification(subscription, payload) {
       return sendWebPush({
         subscription,
         payload,
+        ttl,
         vapid: {
           email: vapid.email,
           publicKey: vapid.publicKey,

@@ -120,6 +120,15 @@ test('cleanupOldTasks removes only old sent/failed rows', async () => {
   assert.equal(removed, 1);
 });
 
+test('updateTaskById rejects an unknown column instead of interpolating it into SQL', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'wl' }));
+  await assert.rejects(
+    adapter.updateTaskById(row.id, { 'status = 1; DROP TABLE scheduled_messages; --': 'x' }),
+    /unknown update column/i
+  );
+});
+
 test('uuid uniqueness violation surfaces as an error matched by isUniqueViolation', async () => {
   const { adapter } = await freshAdapter();
   await adapter.createTask(baseTask({ uuid: 'dup' }));

@@ -41,6 +41,8 @@ test('sendNotification encrypts + attaches VAPID and posts to the endpoint', asy
   assert.ok(captured, 'fetch was called');
   assert.equal(captured.url, sub.endpoint);
   assert.equal(captured.init.headers['Content-Encoding'], 'aes128gcm');
+  // Scheduled reminders default to a 4-week TTL so an offline device still gets them.
+  assert.equal(captured.init.headers['TTL'], '2419200');
   const authz = captured.init.headers['Authorization'] || captured.init.headers['authorization'];
   assert.match(authz, /^vapid t=/);
   // Extract the JWT and verify it against the VAPID public key (proves the key encoding is correct).
@@ -50,4 +52,19 @@ test('sendNotification encrypts + attaches VAPID and posts to the endpoint', asy
   const decoded = await verifyVapidJwt(jwt, publicKey);
   assert.equal(decoded.aud, 'https://push.example.com');
   assert.equal(decoded.sub, 'mailto:x@example.com');
+});
+
+test('sendNotification honours a custom ttl override', async () => {
+  const { publicKey, privateKey } = await genVapid();
+  const sub = await genSubscription();
+  let captured = null;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { captured = { url, init }; return new Response(null, { status: 201 }); };
+  try {
+    const sender = createWebCryptoWebPush({ email: 'mailto:x@example.com', publicKey, privateKey }, { ttl: 120 });
+    await sender.sendNotification(sub, JSON.stringify({ messageKind: 'content', message: 'hi' }));
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(captured.init.headers['TTL'], '120');
 });

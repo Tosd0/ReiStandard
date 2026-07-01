@@ -47,7 +47,9 @@ export function createSingleUserCloudflareWorker(buildConfig) {
       const server = createSingleUserServer(cfg);
 
       const url = request.url;
-      const { pathname } = new URL(url);
+      // Strip trailing slash(es) so `/init-tenant/` routes like `/init-tenant`
+      // (endsWith matching is kept so a prefixed mount still resolves).
+      const pathname = new URL(url).pathname.replace(/\/+$/, '') || '/';
       const method = request.method.toUpperCase();
       const headers = headersToObject(request.headers);
 
