@@ -33,9 +33,9 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@netlify/blobs": "^8.1.0",
     "@rei-standard/amsg-shared": "^0.3.0",
-    "web-push": "^3.6.7",
-    "@netlify/blobs": "^8.1.0"
+    "web-push": "^3.6.7"
   },
   "peerDependencies": {
     "@neondatabase/serverless": ">=0.9.0",
@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@neondatabase/serverless": "^1.0.2",
+    "better-sqlite3": "^12.11.1",
     "pg": "^8.18.0",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0"
