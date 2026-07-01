@@ -109,3 +109,42 @@ test('scheduled() logs and swallows a tick failure so the next cron retries', as
   }
   assert.ok(logged >= 1);
 });
+
+// Regression guard (design spec §7): with serverToken set, EVERY exposed HTTP
+// endpoint must require X-Client-Token. Today all handlers funnel through the
+// same resolveTenant, but this pins it down so a future handler that forgets
+// that call can't silently ship an auth-bypassing route.
+test('serverToken set → every exposed route rejects wrong/missing token with 401', async () => {
+  const d1 = createTestD1();
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: createD1Adapter(d1),
+    masterKey: MASTER_KEY,
+    serverToken: 's3cret',
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} }
+  }));
+  const env = { DB: d1 };
+
+  const routes = [
+    ['POST', 'https://w.dev/init-tenant'],
+    ['GET', 'https://w.dev/get-user-key'],
+    ['POST', 'https://w.dev/schedule-message'],
+    ['GET', 'https://w.dev/messages?status=all'],
+    ['PUT', 'https://w.dev/update-message?id=x'],
+    ['DELETE', 'https://w.dev/cancel-message?id=x']
+  ];
+
+  for (const [method, url] of routes) {
+    const wrong = await worker.fetch(
+      new Request(url, { method, headers: { 'X-Client-Token': 'nope', 'X-User-Id': USER } }),
+      env
+    );
+    assert.equal(wrong.status, 401, `${method} ${url} with a wrong token must be 401`);
+
+    const missing = await worker.fetch(
+      new Request(url, { method, headers: { 'X-User-Id': USER } }),
+      env
+    );
+    assert.equal(missing.status, 401, `${method} ${url} with no token must be 401`);
+  }
+});
