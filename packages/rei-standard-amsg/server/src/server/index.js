@@ -148,6 +148,7 @@ export async function createReiServer(config) {
 export { createAdapter } from './adapters/factory.js';
 export { createD1Adapter } from './adapters/d1.js';
 export { createSingleUserServer } from './single-user.js';
+export { runScheduledTick } from './lib/run-tick.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
 export { createTenantToken, verifyTenantToken } from './tenant/token.js';
