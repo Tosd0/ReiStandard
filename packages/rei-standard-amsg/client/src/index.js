@@ -440,6 +440,28 @@ export class ReiClient {
     this._userKey = this._hexToUint8Array(userKey);
   }
 
+  /**
+   * Fetch the amsg-server worker's own VAPID public key.
+   *
+   * A browser needs this as `applicationServerKey` when creating a Web Push
+   * subscription. Each self-hosted worker owns its VAPID keypair, so pull the
+   * key at runtime rather than baking it into the frontend. Sends
+   * `X-Client-Token` when a `serverToken` is configured.
+   *
+   * @returns {Promise<string>} The base64url VAPID public key.
+   * @throws {Error} When the worker has no VAPID public key configured (503).
+   */
+  async getVapidPublicKey() {
+    const res = await fetch(`${this._baseUrl}/vapid-public-key`, {
+      method: 'GET',
+      headers: this._withServerToken({})
+    });
+
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error?.message || 'Failed to fetch VAPID public key');
+    return json.publicKey;
+  }
+
   // ─── Public API ─────────────────────────────────────────────────
 
   /**

@@ -12,6 +12,8 @@
  *   GET  /messages          → list
  *   PUT  /update-message    → patch
  *   DELETE /cancel-message  → delete
+ *   GET  /vapid-public-key  → this worker's VAPID public key (for the frontend's
+ *                             Web Push subscription); 503 if VAPID_PUBLIC_KEY unset
  *
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
@@ -111,6 +113,8 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.updateMessage.PUT(url, headers, await request.text());
       } else if (method === 'DELETE' && pathname.endsWith('/cancel-message')) {
         result = await server.handlers.cancelMessage.DELETE(url, headers);
+      } else if (method === 'GET' && pathname.endsWith('/vapid-public-key')) {
+        result = await server.handlers.vapidPublicKey.GET(url, headers);
       } else {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }
