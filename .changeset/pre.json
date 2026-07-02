@@ -11,6 +11,7 @@
   },
   "changesets": [
     "amsg-client-server-token",
-    "amsg-server-single-user-cloudflare"
+    "amsg-server-single-user-cloudflare",
+    "amsg-vapid-public-key"
   ]
 }
