@@ -46,6 +46,45 @@ export function jsonToBase64Url(value) {
   return bytesToBase64Url(utf8(JSON.stringify(value)));
 }
 
+/** Encode bytes as standard base64 (with `=` padding). */
+export function bytesToBase64(buf) {
+  const bytes = toUint8(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin);
+}
+
+/** Decode a standard base64 string into a Uint8Array. */
+export function base64ToBytes(str) {
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+/** Encode bytes as lowercase hex. */
+export function bytesToHex(buf) {
+  const bytes = toUint8(buf);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+/** Decode a hex string into a Uint8Array. */
+export function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
 /**
  * Constant-time byte comparison. Returns true iff `a` and `b` are equal-length
  * sequences with the same bytes. Length is intentionally NOT secret — early

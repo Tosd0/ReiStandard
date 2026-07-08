@@ -50,10 +50,10 @@ export function createMessagesHandler(ctx) {
 
     const { tasks, total } = await db.listTasks(userId, { status, limit, offset });
 
-    const userKey = deriveUserEncryptionKey(userId, masterKey);
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
 
-    const decryptedTasks = tasks.map(task => {
-      const decrypted = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+    const decryptedTasks = await Promise.all(tasks.map(async task => {
+      const decrypted = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
       return {
         id: task.id,
         uuid: task.uuid,
@@ -67,13 +67,13 @@ export function createMessagesHandler(ctx) {
         createdAt: task.created_at,
         updatedAt: task.updated_at
       };
-    });
+    }));
 
     const responsePayload = {
       tasks: decryptedTasks,
       pagination: { total, limit, offset, hasMore: offset + limit < total }
     };
-    const encryptedResponse = encryptPayload(responsePayload, userKey);
+    const encryptedResponse = await encryptPayload(responsePayload, userKey);
 
     return {
       status: 200,

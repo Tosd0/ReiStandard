@@ -15,9 +15,9 @@ async function makeServer() {
   return server;
 }
 
-function encBody(obj) {
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  return JSON.stringify(encryptPayload(obj, userKey));
+async function encBody(obj) {
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  return JSON.stringify(await encryptPayload(obj, userKey));
 }
 
 test('createSingleUserServer exposes the reused handlers + init', async () => {
@@ -44,7 +44,7 @@ test('schedule → list → cancel round-trips through single-user server over D
     recurrenceType: 'none',
     pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } }
   };
-  const created = await server.handlers.scheduleMessage.POST(headers, encBody(payload));
+  const created = await server.handlers.scheduleMessage.POST(headers, await encBody(payload));
   assert.equal(created.status, 201);
   const uuid = created.body.data.uuid;
 
@@ -55,8 +55,8 @@ test('schedule → list → cancel round-trips through single-user server over D
   assert.equal(cancelled.status, 200);
 });
 
-test('masterKey wiring: storage encrypt/decrypt round-trips', () => {
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  const round = JSON.parse(decryptFromStorage(encryptForStorage(JSON.stringify({ a: 1 }), userKey), userKey));
+test('masterKey wiring: storage encrypt/decrypt round-trips', async () => {
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const round = JSON.parse(await decryptFromStorage(await encryptForStorage(JSON.stringify({ a: 1 }), userKey), userKey));
   assert.equal(round.a, 1);
 });

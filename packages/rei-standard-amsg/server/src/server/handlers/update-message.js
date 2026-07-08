@@ -52,11 +52,11 @@ export function createUpdateMessageHandler(ctx) {
     }
 
     const encryptedBody = parsedBody.data;
-    const userKey = deriveUserEncryptionKey(userId, masterKey);
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
     let updates;
 
     try {
-      updates = decryptPayload(encryptedBody, userKey);
+      updates = await decryptPayload(encryptedBody, userKey);
     } catch (_error) {
       return { status: 400, body: { success: false, error: { code: 'DECRYPTION_FAILED', message: '请求体解密失败' } } };
     }
@@ -132,7 +132,7 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 409, body: { success: false, error: { code: 'TASK_ALREADY_COMPLETED', message: '任务已完成或已失败，无法更新' } } };
     }
 
-    const existingData = JSON.parse(decryptFromStorage(existingTask.encrypted_payload, userKey));
+    const existingData = JSON.parse(await decryptFromStorage(existingTask.encrypted_payload, userKey));
 
     // When the caller switches prompt source (completePrompt ↔ messages),
     // null out the other so storage stays one-of (matches schedule-message
@@ -161,7 +161,7 @@ export function createUpdateMessageHandler(ctx) {
       ...(Object.prototype.hasOwnProperty.call(updates, 'splitPattern') && { splitPattern: updates.splitPattern ?? null })
     };
 
-    const encryptedPayload = encryptForStorage(JSON.stringify(updatedData), userKey);
+    const encryptedPayload = await encryptForStorage(JSON.stringify(updatedData), userKey);
     const extraFields = updates.nextSendAt ? { next_send_at: updates.nextSendAt } : undefined;
 
     const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);

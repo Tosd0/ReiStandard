@@ -35,12 +35,14 @@ export function createGetUserKeyHandler(ctx) {
       };
     }
 
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
+
     return {
       status: 200,
       body: {
         success: true,
         data: {
-          userKey: deriveUserEncryptionKey(userId, masterKey),
+          userKey,
           version: 1
         }
       }

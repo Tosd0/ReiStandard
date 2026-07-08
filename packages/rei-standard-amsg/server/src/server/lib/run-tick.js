@@ -75,8 +75,8 @@ export async function runScheduledTick(ctx) {
     }
 
     try {
-      const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
-      const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+      const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
+      const decryptedPayload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
       if (decryptedPayload.recurrenceType === 'none') {
         await db.deleteTaskById(task.id);
