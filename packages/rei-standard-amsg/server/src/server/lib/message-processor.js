@@ -19,7 +19,7 @@
  * count only (reasoning is an auxiliary push, not a sentence).
  */
 
-import { randomUUID } from 'crypto';
+import { randomUUID } from './webcrypto-utils.js';
 import {
   buildContentPush,
   buildReasoningPush,
@@ -104,8 +104,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       return { success: false, messagesSent: 0, error: 'TENANT_MASTER_KEY_MISSING' };
     }
 
-    const userKey = deriveUserEncryptionKey(task.user_id, masterKey);
-    const decryptedPayload = JSON.parse(decryptFromStorage(task.encrypted_payload, userKey));
+    const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
+    const decryptedPayload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
     let messageContent;
     /** @type {unknown} */

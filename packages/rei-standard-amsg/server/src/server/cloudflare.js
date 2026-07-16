@@ -11,8 +11,9 @@
  * the optional `pg` / `@neondatabase/serverless` peers) bundling cleanly: the
  * root entry pulls those in through `createReiServer`, this one does not.
  *
- * node:crypto is the only Node builtin in this subgraph; enable it on Workers
- * with `compatibility_flags = ["nodejs_compat"]` (see the example wrangler.toml).
+ * This subgraph uses no Node builtins — encryption and Web Push signing both
+ * run on `globalThis.crypto` (Web Crypto) — so the bundle needs no
+ * `nodejs_compat` compatibility flag.
  */
 
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';

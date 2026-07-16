@@ -6,7 +6,7 @@
  * @returns {{ POST: function }}
  */
 
-import { randomUUID } from 'crypto';
+import { randomUUID } from '../lib/webcrypto-utils.js';
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../lib/encryption.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
@@ -47,11 +47,11 @@ export function createScheduleMessageHandler(ctx) {
     }
 
     const encryptedBody = parsedBody.data;
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
 
     let payload;
     try {
-      const userKey = deriveUserEncryptionKey(userId, masterKey);
-      payload = decryptPayload(encryptedBody, userKey);
+      payload = await decryptPayload(encryptedBody, userKey);
     } catch (error) {
       if (error instanceof SyntaxError) {
         return { status: 400, body: { success: false, error: { code: 'INVALID_PAYLOAD_FORMAT', message: '解密后的数据不是有效 JSON' } } };
@@ -76,7 +76,6 @@ export function createScheduleMessageHandler(ctx) {
     }
 
     const taskUuid = payload.uuid || randomUUID();
-    const userKey = deriveUserEncryptionKey(userId, masterKey);
 
     const fullTaskData = {
       contactName: payload.contactName,
@@ -104,7 +103,7 @@ export function createScheduleMessageHandler(ctx) {
       metadata: payload.metadata || {}
     };
 
-    const encryptedPayload = encryptForStorage(JSON.stringify(fullTaskData), userKey);
+    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
 
     /**
      * In-server instant path. Delivers an instant message through this

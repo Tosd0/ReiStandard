@@ -178,25 +178,25 @@ describe('encryption utilities', () => {
   const masterKey = 'a'.repeat(64);
   const userId = 'test-user';
 
-  it('deriveUserEncryptionKey returns a 64-char hex string', () => {
-    const key = deriveUserEncryptionKey(userId, masterKey);
+  it('deriveUserEncryptionKey returns a 64-char hex string', async () => {
+    const key = await deriveUserEncryptionKey(userId, masterKey);
     assert.equal(key.length, 64);
     assert.match(key, /^[0-9a-f]{64}$/);
   });
 
-  it('encryptForStorage / decryptFromStorage round-trips', () => {
-    const key = deriveUserEncryptionKey(userId, masterKey);
+  it('encryptForStorage / decryptFromStorage round-trips', async () => {
+    const key = await deriveUserEncryptionKey(userId, masterKey);
     const original = JSON.stringify({ hello: 'world', num: 42 });
-    const encrypted = encryptForStorage(original, key);
-    const decrypted = decryptFromStorage(encrypted, key);
+    const encrypted = await encryptForStorage(original, key);
+    const decrypted = await decryptFromStorage(encrypted, key);
     assert.equal(decrypted, original);
   });
 
-  it('decryptFromStorage fails with wrong key', () => {
-    const key = deriveUserEncryptionKey(userId, masterKey);
-    const wrongKey = deriveUserEncryptionKey('other-user', masterKey);
-    const encrypted = encryptForStorage('secret', key);
-    assert.throws(() => decryptFromStorage(encrypted, wrongKey));
+  it('decryptFromStorage fails with wrong key', async () => {
+    const key = await deriveUserEncryptionKey(userId, masterKey);
+    const wrongKey = await deriveUserEncryptionKey('other-user', masterKey);
+    const encrypted = await encryptForStorage('secret', key);
+    await assert.rejects(() => decryptFromStorage(encrypted, wrongKey));
   });
 });
 
@@ -393,7 +393,7 @@ describe('createReiServer v2.0.1 flow', () => {
       'x-user-id': TEST_USER_ID
     });
 
-    const encryptedBody = encryptPayload(
+    const encryptedBody = await encryptPayload(
       {
         contactName: 'Alice',
         messageType: 'fixed',
@@ -517,7 +517,7 @@ describe('update-message splitPattern round-trip', () => {
     // Step 1: schedule a fixed message WITH a splitPattern set up front.
     const taskUuid = '11111111-2222-4333-8444-555555555555';
     const firstSendTime = new Date(Date.now() + 60_000).toISOString();
-    const scheduleBody = encryptPayload(
+    const scheduleBody = await encryptPayload(
       {
         uuid: taskUuid,
         contactName: 'Alice',
@@ -544,11 +544,11 @@ describe('update-message splitPattern round-trip', () => {
     // Read the encrypted row back via the adapter (decrypt with userKey).
     const taskRow = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
     assert.ok(taskRow, 'task row should exist after schedule');
-    const initial = JSON.parse(decryptFromStorage(taskRow.encrypted_payload, userKey));
+    const initial = JSON.parse(await decryptFromStorage(taskRow.encrypted_payload, userKey));
     assert.equal(initial.splitPattern, '([\\n]+)', 'schedule persists splitPattern');
 
     // Step 2: PUT splitPattern to a NEW value.
-    const updateBody1 = encryptPayload({ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'] }, userKey);
+    const updateBody1 = await encryptPayload({ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'] }, userKey);
     const updateResult1 = await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -563,13 +563,13 @@ describe('update-message splitPattern round-trip', () => {
     assert.deepEqual(updateResult1.body.data.updatedFields, ['splitPattern']);
 
     const afterSet = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
-    const afterSetData = JSON.parse(decryptFromStorage(afterSet.encrypted_payload, userKey));
+    const afterSetData = JSON.parse(await decryptFromStorage(afterSet.encrypted_payload, userKey));
     assert.deepEqual(afterSetData.splitPattern, ['(\\n\\n+)', '([。！？!?]+)']);
 
     // Step 3: PUT splitPattern: null → MUST reset to default (the
     // hasOwnProperty merge is the whole point — a truthy-spread would
     // silently drop null).
-    const updateBody2 = encryptPayload({ splitPattern: null }, userKey);
+    const updateBody2 = await encryptPayload({ splitPattern: null }, userKey);
     const updateResult2 = await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -583,13 +583,13 @@ describe('update-message splitPattern round-trip', () => {
     assert.equal(updateResult2.status, 200);
 
     const afterReset = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
-    const afterResetData = JSON.parse(decryptFromStorage(afterReset.encrypted_payload, userKey));
+    const afterResetData = JSON.parse(await decryptFromStorage(afterReset.encrypted_payload, userKey));
     assert.equal(afterResetData.splitPattern, null, 'explicit null resets the field');
 
     // Step 4: PUT with splitPattern omitted entirely → existing value
     // preserved. First put it back to a concrete value, then patch some
     // other field and verify splitPattern survives.
-    const updateBody3 = encryptPayload({ splitPattern: '(##+)' }, userKey);
+    const updateBody3 = await encryptPayload({ splitPattern: '(##+)' }, userKey);
     await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -601,7 +601,7 @@ describe('update-message splitPattern round-trip', () => {
       updateBody3
     );
 
-    const unrelatedPatch = encryptPayload({ avatarUrl: 'https://example.com/a.png' }, userKey);
+    const unrelatedPatch = await encryptPayload({ avatarUrl: 'https://example.com/a.png' }, userKey);
     await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -614,7 +614,7 @@ describe('update-message splitPattern round-trip', () => {
     );
 
     const preserved = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
-    const preservedData = JSON.parse(decryptFromStorage(preserved.encrypted_payload, userKey));
+    const preservedData = JSON.parse(await decryptFromStorage(preserved.encrypted_payload, userKey));
     assert.equal(preservedData.splitPattern, '(##+)', 'omitted splitPattern preserves prior value');
     assert.equal(preservedData.avatarUrl, 'https://example.com/a.png');
   });
@@ -626,7 +626,7 @@ describe('update-message splitPattern round-trip', () => {
 
     // Need an existing task to update.
     const taskUuid = '22222222-2222-4333-8444-666666666666';
-    const scheduleBody = encryptPayload(
+    const scheduleBody = await encryptPayload(
       {
         uuid: taskUuid,
         contactName: 'Bob',
@@ -647,7 +647,7 @@ describe('update-message splitPattern round-trip', () => {
       scheduleBody
     );
 
-    const badBody = encryptPayload({ splitPattern: '[' }, userKey);
+    const badBody = await encryptPayload({ splitPattern: '[' }, userKey);
     const result = await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`,
       {
@@ -670,7 +670,7 @@ describe('update-message splitPattern round-trip', () => {
     const { tenantToken, userKey } = await bootstrapTenant(server);
 
     const taskUuid = '33333333-2222-4333-8444-777777777777';
-    const scheduleBody = encryptPayload(
+    const scheduleBody = await encryptPayload(
       {
         uuid: taskUuid,
         contactName: 'Carol',
@@ -694,7 +694,7 @@ describe('update-message splitPattern round-trip', () => {
 
     // Update with a bad avatarUrl AND a valid userMessage change. The bad
     // avatar is silently dropped; the other field still gets written.
-    const patchBody = encryptPayload(
+    const patchBody = await encryptPayload(
       { avatarUrl: 'data:image/png;base64,xxx', userMessage: 'updated' },
       userKey
     );
@@ -711,7 +711,7 @@ describe('update-message splitPattern round-trip', () => {
 
     assert.equal(result.status, 200);
     const after = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
-    const afterData = JSON.parse(decryptFromStorage(after.encrypted_payload, userKey));
+    const afterData = JSON.parse(await decryptFromStorage(after.encrypted_payload, userKey));
     assert.equal(afterData.avatarUrl, 'https://example.com/original.png', 'bad avatar stripped → original preserved');
     assert.equal(afterData.userMessage, 'updated', 'sibling field still applied');
   });
