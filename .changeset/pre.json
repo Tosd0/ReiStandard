@@ -12,6 +12,7 @@
   "changesets": [
     "amsg-client-server-token",
     "amsg-server-single-user-cloudflare",
+    "amsg-server-webcrypto-encryption",
     "amsg-vapid-public-key"
   ]
 }
