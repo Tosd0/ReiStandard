@@ -10,8 +10,8 @@ const MASTER_KEY = 'a'.repeat(64);
 const VAPID = { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' };
 
 async function seed(adapter, { uuid, recurrenceType, nextSendAt }) {
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  const enc = encryptForStorage(JSON.stringify({
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = await encryptForStorage(JSON.stringify({
     contactName: 'Rei',
     messageType: 'fixed',
     userMessage: 'hi',

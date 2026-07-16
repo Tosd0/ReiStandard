@@ -27,8 +27,8 @@ test('fetch routes init + schedule + messages, unknown → 404', async () => {
   const initRes = await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
   assert.equal(initRes.status, 200);
 
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  const body = JSON.stringify(encryptPayload({
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const body = JSON.stringify(await encryptPayload({
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi',
     firstSendTime: '2999-01-01T00:00:00.000Z', recurrenceType: 'none',
     pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
@@ -58,8 +58,8 @@ test('scheduled() runs the tick over env.DB', async () => {
   const d1 = createTestD1();
   const adapter = createD1Adapter(d1);
   await adapter.initSchema();
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  const enc = encryptForStorage(JSON.stringify({
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = await encryptForStorage(JSON.stringify({
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
     pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
   }), userKey);
@@ -251,8 +251,8 @@ test('the exposed VAPID public key is the same key push signing actually uses', 
   const d1 = createTestD1();
   const adapter = createD1Adapter(d1);
   await adapter.initSchema();
-  const userKey = deriveUserEncryptionKey(USER, MASTER_KEY);
-  const enc = encryptForStorage(JSON.stringify({
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = await encryptForStorage(JSON.stringify({
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
     pushSubscription: sub
   }), userKey);

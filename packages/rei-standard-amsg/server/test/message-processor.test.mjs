@@ -7,9 +7,9 @@ import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplit
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
 
-function createEncryptedTask(payload) {
-  const userKey = deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
-  const encryptedPayload = encryptForStorage(JSON.stringify(payload), userKey);
+async function createEncryptedTask(payload) {
+  const userKey = await deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
+  const encryptedPayload = await encryptForStorage(JSON.stringify(payload), userKey);
   return {
     id: 1,
     user_id: TEST_USER_ID,
@@ -36,7 +36,7 @@ function createContext(sendNotificationSpy = async () => {}) {
 
 describe('message processor AI apiUrl handling', () => {
   it('normalizes trailing slashes before calling fetch', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'say hi',
@@ -79,7 +79,7 @@ describe('message processor AI apiUrl handling', () => {
   });
 
   it('passes max_tokens only when maxTokens is provided', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'say hi',
@@ -116,7 +116,7 @@ describe('message processor AI apiUrl handling', () => {
   });
 
   it('returns a clear error when AI endpoint responds with 405', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'say hi',
@@ -147,7 +147,7 @@ describe('message processor AI apiUrl handling', () => {
   });
 
   it('auto-completes a bare host to /v1/chat/completions before calling fetch', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'say hi',
@@ -179,7 +179,7 @@ describe('message processor AI apiUrl handling', () => {
   });
 
   it('auto-appends /chat/completions when apiUrl ends in /v1 (no double v1)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'say hi',
@@ -362,7 +362,7 @@ describe('messages array support', () => {
       { role: 'assistant', content: 'sure' },
       { role: 'user', content: 'continue' },
     ];
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       messages,
@@ -396,7 +396,7 @@ describe('messages array support', () => {
   });
 
   it('LLM call: legacy completePrompt path still wraps and defaults temperature 0.8', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'legacy hi',
@@ -429,7 +429,7 @@ describe('messages array support', () => {
   });
 
   it('LLM call: messages mode does NOT inject default temperature when caller omits it', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       messages: [{ role: 'user', content: 'hi' }],
@@ -520,7 +520,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: default regex when splitPattern absent (back-compat)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',
@@ -553,7 +553,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: uses caller-supplied splitPattern (string)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',
@@ -586,7 +586,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: emits ContentPush with messageKind/sessionId (v2.4.0 schema)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',
@@ -638,7 +638,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: auto-emits ReasoningPush before ContentPush when LLM returns reasoning_content', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',
@@ -688,7 +688,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: does NOT emit ReasoningPush for fixed messageType (no LLM call)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'fixed',
       userMessage: '固定消息',
@@ -709,7 +709,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: messageType:"instant" routes to source:"instant" (via-server instant path)', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'instant',
       completePrompt: 'x',
@@ -744,7 +744,7 @@ describe('splitPattern support', () => {
     // Pin the v2.4.0 messageId format: `msg_task_<id>_<i>` for scheduled
     // rows, so a retry produces the same id for the same (task, sentence)
     // pair and downstream dedupers can key on it.
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',
@@ -786,8 +786,8 @@ describe('splitPattern support', () => {
     // The legacy in-server instant path can receive a task row with
     // `id == null`. In that case there's no stable key to derive the
     // sessionId/messageId from, so we fall back to UUIDs.
-    const userKey = deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
-    const encryptedPayload = encryptForStorage(JSON.stringify({
+    const userKey = await deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
+    const encryptedPayload = await encryptForStorage(JSON.stringify({
       contactName: 'Rei',
       messageType: 'instant',
       completePrompt: 'x',
@@ -819,7 +819,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: cascades string[] splitPattern in order', async () => {
-    const task = createEncryptedTask({
+    const task = await createEncryptedTask({
       contactName: 'Rei',
       messageType: 'prompted',
       completePrompt: 'x',

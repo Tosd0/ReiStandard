@@ -40,7 +40,7 @@ export function createGetUserKeyHandler(ctx) {
       body: {
         success: true,
         data: {
-          userKey: deriveUserEncryptionKey(userId, masterKey),
+          userKey: await deriveUserEncryptionKey(userId, masterKey),
           version: 1
         }
       }

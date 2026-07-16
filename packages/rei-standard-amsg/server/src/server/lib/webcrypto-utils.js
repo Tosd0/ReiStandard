@@ -26,18 +26,41 @@ export function utf8Decode(buf) {
 }
 
 
-/** Encode bytes as base64url (no padding). */
-export function bytesToBase64Url(buf) {
+/** Encode bytes as standard base64 (with padding). */
+export function bytesToBase64(buf) {
   const bytes = toUint8(buf);
   let bin = '';
   for (let i = 0; i < bytes.length; i++) {
     bin += String.fromCharCode(bytes[i]);
   }
   // btoa is available in all Web Crypto runtimes (browsers, Workers, Node 16+).
-  const b64 = (typeof btoa === 'function')
+  return (typeof btoa === 'function')
     ? btoa(bin)
     : Buffer.from(bin, 'binary').toString('base64');
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+/** Encode bytes as base64url (no padding). */
+export function bytesToBase64Url(buf) {
+  return bytesToBase64(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+/** Encode bytes as lowercase hex. */
+export function bytesToHex(buf) {
+  const bytes = toUint8(buf);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+/** Decode a hex string into a Uint8Array. */
+export function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 
