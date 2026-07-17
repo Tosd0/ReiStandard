@@ -145,3 +145,18 @@ test('putClientState() before init() throws Not initialised', async () => {
     /Not initialised/
   );
 });
+
+test('putClientState() / getClientState() reject invalid arguments before any network call', async () => {
+  const client = await makeInitializedClient();
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('must not reach the network'); };
+  try {
+    await assert.rejects(() => client.putClientState(), /entries must be a non-empty array/);
+    await assert.rejects(() => client.putClientState([]), /entries must be a non-empty array/);
+    await assert.rejects(() => client.putClientState('nope'), /entries must be a non-empty array/);
+    await assert.rejects(() => client.getClientState(), /namespace must be a non-empty string/);
+    await assert.rejects(() => client.getClientState('   '), /namespace must be a non-empty string/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

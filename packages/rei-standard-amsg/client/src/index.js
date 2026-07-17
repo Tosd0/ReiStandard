@@ -1013,6 +1013,9 @@ export class ReiClient {
    * @returns {Promise<Object>} `{ success, data?: { upserted, skipped }, error? }`
    */
   async putClientState(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new TypeError('[rei-standard-amsg-client] entries must be a non-empty array');
+    }
     const json = JSON.stringify({ entries });
     this._assertPayloadSize(json, 'putClientState');
     const encrypted = await this._encrypt(json);
@@ -1043,6 +1046,9 @@ export class ReiClient {
    *   where `entries` is `Array<{ namespace, key, value, updatedAt }>`.
    */
   async getClientState(namespace) {
+    if (typeof namespace !== 'string' || !namespace.trim()) {
+      throw new TypeError('[rei-standard-amsg-client] namespace must be a non-empty string');
+    }
     const res = await fetch(
       `${this._baseUrl}/client-state?namespace=${encodeURIComponent(namespace)}`,
       {
