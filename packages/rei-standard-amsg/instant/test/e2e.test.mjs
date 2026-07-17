@@ -165,6 +165,7 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     for (const call of router.pushCalls) {
       backups.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
     }
+    backups.sort((a, b) => a.messageIndex - b.messageIndex);
     assert.equal(backups[0].messageId, payloads[0].messageId);
     assert.equal(backups[1].messageId, payloads[1].messageId);
   });
