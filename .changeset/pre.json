@@ -10,6 +10,7 @@
     "@rei-standard/amsg-sw": "2.3.2"
   },
   "changesets": [
+    "amsg-client-client-state",
     "amsg-client-server-token",
     "amsg-server-agentic-fire",
     "amsg-server-single-user-cloudflare",
