@@ -8,7 +8,7 @@
  * equals chronological ordering (mixed offsets like +08:00 vs Z are unified).
  */
 
-import { SQLITE_TABLE_SQL, SQLITE_INDEXES } from './schema.sqlite.js';
+import { SQLITE_TABLE_SQL, SQLITE_INDEXES, CLIENT_STATE_TABLE_SQL } from './schema.sqlite.js';
 
 // Update methods build a dynamic SET clause from object keys. Callers pass only
 // hardcoded column names today, but enforcing a whitelist keeps a future caller
@@ -41,6 +41,7 @@ export class D1Adapter {
 
   async initSchema() {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
+    await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
 
     const indexResults = [];
     for (const index of SQLITE_INDEXES) {
@@ -72,6 +73,7 @@ export class D1Adapter {
 
   async dropSchema() {
     await this._db.prepare('DROP TABLE IF EXISTS scheduled_messages').run();
+    await this._db.prepare('DROP TABLE IF EXISTS client_state').run();
   }
 
   async createTask(params) {
@@ -219,6 +221,83 @@ export class D1Adapter {
       'SELECT status FROM scheduled_messages WHERE uuid = ? AND user_id = ? LIMIT 1'
     ).bind(uuid, userId).first();
     return row ? row.status : null;
+  }
+
+  // ── client_state (single-user cloud state mirror) ──────────────────────
+
+  /**
+   * Batch upsert. Last-write-wins per (namespace, key): an entry older
+   * than the stored row (updatedAt strictly lower) is skipped; equal or
+   * newer overwrites. Values arrive pre-encrypted (the handler encrypts).
+   *
+   * Uses D1's batch() — one network round trip for the whole set (implicit
+   * transaction). The client calls this endpoint inside its few-seconds
+   * background window, so N sequential round trips could eat the whole
+   * window. Bindings without batch() (e.g. the sqlite test shim, custom
+   * adapters) fall back to a sequential loop.
+   *
+   * @param {string} userId
+   * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
+   * @returns {Promise<{ upserted: number, skipped: number }>}
+   */
+  async upsertClientState(userId, entries) {
+    const UPSERT_SQL =
+      `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, namespace, key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at
+       WHERE excluded.updated_at >= client_state.updated_at`;
+
+    let results;
+    if (typeof this._db.batch === 'function') {
+      const statements = entries.map((entry) =>
+        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
+      );
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const entry of entries) {
+        results.push(
+          await this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt).run()
+        );
+      }
+    }
+
+    let upserted = 0;
+    let skipped = 0;
+    for (const res of results) {
+      if (res.meta.changes > 0) upserted++; else skipped++;
+    }
+    return { upserted, skipped };
+  }
+
+  /**
+   * All entries of one namespace (values still encrypted).
+   *
+   * @param {string} userId
+   * @param {string} namespace
+   * @returns {Promise<Array<{ namespace: string, key: string, value: string, updated_at: number }>>}
+   */
+  async getClientState(userId, namespace) {
+    const res = await this._db.prepare(
+      `SELECT namespace, key, value, updated_at
+       FROM client_state
+       WHERE user_id = ? AND namespace = ?
+       ORDER BY key ASC`
+    ).bind(userId, namespace).all();
+    return res.results || [];
+  }
+
+  /**
+   * Wipe every entry of this user.
+   *
+   * @param {string} userId
+   * @returns {Promise<number>} rows deleted
+   */
+  async clearClientState(userId) {
+    const res = await this._db.prepare('DELETE FROM client_state WHERE user_id = ?').bind(userId).run();
+    return res.meta.changes || 0;
   }
 }
 

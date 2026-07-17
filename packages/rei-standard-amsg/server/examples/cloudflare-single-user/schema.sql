@@ -29,3 +29,14 @@ CREATE INDEX IF NOT EXISTS idx_user_id
 CREATE UNIQUE INDEX IF NOT EXISTS uidx_uuid
   ON scheduled_messages (uuid)
   WHERE uuid IS NOT NULL;
+
+-- 客户端状态的云端镜像（/client-state 端点用）。
+-- value 是密文；updated_at 是客户端给的 epoch 毫秒整数，用于 last-write-wins。
+CREATE TABLE IF NOT EXISTS client_state (
+  user_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, namespace, key)
+);

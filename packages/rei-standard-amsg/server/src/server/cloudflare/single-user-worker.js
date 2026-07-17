@@ -14,10 +14,19 @@
  *   DELETE /cancel-message  → delete
  *   GET  /vapid-public-key  → this worker's VAPID public key (for the frontend's
  *                             Web Push subscription); 503 if VAPID_PUBLIC_KEY unset
+ *   PUT  /client-state      → batch upsert client state (last-write-wins on updatedAt)
+ *   GET  /client-state      → read one namespace's entries (?namespace=<ns>)
+ *   DELETE /client-state    → wipe this user's client state
  *
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
  * Access-Control-* on responses. With no `cors` the Worker stays same-origin.
+ *
+ * Fire-time hooks are opt-in too: pass `hooks: { onBeforeFire, onLLMOutput,
+ * executeToolCalls }` (+ optional `maxToolIterations` / `totalTimeoutMs`) in the
+ * config to let scheduled AI tasks assemble their prompt and run a server-side
+ * tool loop at fire time. Omit them and AI tasks replay the schedule-time frozen
+ * prompt exactly as before. See lib/agentic-fire.js.
  */
 
 import { createSingleUserServer } from '../single-user.js';
@@ -115,6 +124,12 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.cancelMessage.DELETE(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/vapid-public-key')) {
         result = await server.handlers.vapidPublicKey.GET(url, headers);
+      } else if (method === 'PUT' && pathname.endsWith('/client-state')) {
+        result = await server.handlers.clientState.PUT(headers, await request.text());
+      } else if (method === 'GET' && pathname.endsWith('/client-state')) {
+        result = await server.handlers.clientState.GET(url, headers);
+      } else if (method === 'DELETE' && pathname.endsWith('/client-state')) {
+        result = await server.handlers.clientState.DELETE(url, headers);
       } else {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }
@@ -136,7 +151,17 @@ export function createSingleUserCloudflareWorker(buildConfig) {
     // Swallow tick failures: pending tasks stay pending, so the next cron tick
     // retries them. Logging keeps the failure visible in the tail log.
     try {
-      await runScheduledTick({ db: cfg.db, masterKey: cfg.masterKey, vapid, webpush: cfg.webpush });
+      await runScheduledTick({
+        db: cfg.db,
+        masterKey: cfg.masterKey,
+        vapid,
+        webpush: cfg.webpush,
+        // Fire-time hooks (optional; see lib/agentic-fire.js). runScheduledTick
+        // spreads its ctx into processSingleMessage, so these ride along.
+        hooks: cfg.hooks || null,
+        maxToolIterations: cfg.maxToolIterations,
+        totalTimeoutMs: cfg.totalTimeoutMs
+      });
     } catch (error) {
       console.error('[amsg single-user] scheduled(): tick failed:', error && error.message);
     }

@@ -808,3 +808,246 @@ export function stripReasoningTags(content) {
   if (typeof content !== 'string' || !content.includes('<')) return content;
   return content.replace(REASONING_TAG_RE_G, '').trim();
 }
+
+// ─── Agentic-loop hook contract ──────────────────────────────────────────────
+// Shared by @rei-standard/amsg-instant (client-executed tools via /continue)
+// and @rei-standard/amsg-server (server-executed tools at fire time). Single
+// source of truth so the two packages' onLLMOutput contracts cannot drift.
+
+/**
+ * @typedef {Object} ChatMessage
+ * @property {'system' | 'user' | 'assistant' | 'tool'} role
+ * @property {string | unknown[] | null} [content]
+ * @property {Array<{ id: string, type: 'function', function: { name: string, arguments: string } }>} [tool_calls]
+ * @property {string} [tool_call_id]
+ * @property {string} [name]
+ */
+
+/**
+ * @typedef {Object} SessionContext
+ * @property {string}                   sessionId
+ * @property {string}                   [charId]
+ * @property {ChatMessage[]}            messages       - Including the just-appended assistant turn.
+ * @property {unknown}                  llmResponse    - Full LLM response (choices, usage, …).
+ * @property {string}                   llmOutputText  - May be '' for pure tool-call responses.
+ * @property {number}                   iteration      - 0-indexed: the round that just finished.
+ * @property {Record<string, unknown>}  metadata
+ * @property {string}                   contactName
+ * @property {string}                   [avatarUrl]
+ */
+
+/**
+ * Build the frozen SessionContext handed to an onLLMOutput hook.
+ *
+ * Credentials (apiKey / apiUrl / pushSubscription / vapid / masterKey) are
+ * intentionally NOT part of the shape: a console.log(ctx) from a hook must
+ * not leak keys, and a third-party hook must not be able to exfiltrate
+ * them. Frozen so a hook cannot mutate the live history — if it chooses
+ * `decision:'continue'`, the caller still owns its copy.
+ *
+ * @param {Object} args
+ * @param {string} args.sessionId
+ * @param {ChatMessage[]} args.messages
+ * @param {unknown} args.llmResponse
+ * @param {number} args.iteration
+ * @param {string} args.contactName
+ * @param {string} [args.avatarUrl]
+ * @param {string} [args.charId]
+ * @param {Record<string, unknown>} [args.metadata]
+ * @returns {SessionContext}
+ */
+export function buildSessionContext({
+  sessionId,
+  messages,
+  llmResponse,
+  iteration,
+  contactName,
+  avatarUrl,
+  charId,
+  metadata,
+}) {
+  const llmOutputText = readLlmOutputText(llmResponse);
+  const ctx = {
+    sessionId,
+    charId,
+    messages,
+    llmResponse,
+    llmOutputText,
+    iteration,
+    metadata: metadata && typeof metadata === 'object' ? metadata : {},
+    contactName,
+    avatarUrl: avatarUrl || undefined,
+  };
+  return Object.freeze(ctx);
+}
+
+/**
+ * Safely read `choices[0].message.content` as a string. Pure tool-call
+ * responses legitimately have empty content, so we return '' rather than
+ * throwing.
+ *
+ * @param {unknown} llmResponse
+ * @returns {string}
+ */
+function readLlmOutputText(llmResponse) {
+  if (!llmResponse || typeof llmResponse !== 'object') return '';
+  const choices = /** @type {{ choices?: unknown }} */ (llmResponse).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return '';
+  const message = /** @type {{ message?: { content?: unknown } }} */ (choices[0])?.message;
+  const content = message?.content;
+  return typeof content === 'string' ? content : '';
+}
+
+/**
+ * Extract the `choices[0].message` whole object — preserving `tool_calls`
+ * / `reasoning_content` / `refusal` etc. — for appending to the running
+ * history. Falls back to a minimal placeholder when the response is
+ * malformed so the hook still gets a chance to react via
+ * `llmOutputText === ''`.
+ *
+ * Critically, we keep the entire message object (not just
+ * `{role, content}`): the next round may need to forward a `tool_calls`
+ * array to OpenAI alongside the matching tool-result messages, and
+ * stripping the field would make the API reject the request.
+ *
+ * @param {unknown} llmResponse
+ * @returns {ChatMessage}
+ */
+export function extractAssistantMessage(llmResponse) {
+  const message =
+    llmResponse &&
+    typeof llmResponse === 'object' &&
+    Array.isArray(/** @type {{ choices?: unknown }} */ (llmResponse).choices) &&
+    /** @type {{ choices: Array<{ message?: unknown }> }} */ (llmResponse).choices[0]?.message;
+  if (message && typeof message === 'object') {
+    return /** @type {ChatMessage} */ (message);
+  }
+  return { role: 'assistant', content: '' };
+}
+
+const VALID_DECISIONS = new Set(['finish', 'tool-request', 'continue', 'skip-push']);
+
+/**
+ * Assert that an onLLMOutput hook returned a structurally valid decision.
+ * TypeScript discriminated unions don't survive into runtime, and a
+ * misbehaving hook can easily return `null` / `{ decision: 'idk' }` /
+ * `undefined` — treat any of those as a hook contract violation.
+ *
+ * Flavors:
+ * - default (amsg-instant): 'tool-request' must carry pushPayloads — the
+ *   tool_request push goes to the client, which executes the tools and
+ *   POSTs /continue.
+ * - `{ inlineToolCalls: true }` (amsg-server fire-time loop): the host
+ *   executes tools in-process, so 'tool-request' may instead carry a
+ *   non-empty `toolCalls` array directly; pushPayloads then become
+ *   optional. pushPayloads-shaped tool-requests stay valid so a
+ *   classifier written for instant drops in unchanged.
+ *
+ * @param {unknown} decision
+ * @param {{ inlineToolCalls?: boolean }} [options]
+ */
+export function assertValidDecision(decision, options = {}) {
+  const inlineToolCalls = options.inlineToolCalls === true;
+
+  if (!decision || typeof decision !== 'object') {
+    throw new TypeError(`onLLMOutput returned invalid decision: ${stringifyDecisionForError(decision)}`);
+  }
+  const tag = /** @type {{ decision?: unknown }} */ (decision).decision;
+  if (typeof tag !== 'string' || !VALID_DECISIONS.has(tag)) {
+    throw new TypeError(`onLLMOutput returned invalid decision tag: ${stringifyDecisionForError(tag)}`);
+  }
+
+  const hasSingular = Object.prototype.hasOwnProperty.call(decision, 'pushPayload');
+  const hasPlural = Object.prototype.hasOwnProperty.call(decision, 'pushPayloads');
+
+  if (hasSingular) {
+    throw new TypeError(
+      hasPlural
+        ? 'pushPayload (singular) is removed in 0.8.0, use pushPayloads'
+        : 'pushPayload (singular) is removed in 0.8.0, use pushPayloads: [yourPayload]'
+    );
+  }
+
+  if (tag === 'continue') {
+    if (!Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
+      throw new TypeError('decision:"continue" requires a nextHistory array');
+    }
+    return;
+  }
+
+  if (tag === 'skip-push') {
+    return;
+  }
+
+  if (tag === 'tool-request' && inlineToolCalls && Object.prototype.hasOwnProperty.call(decision, 'toolCalls')) {
+    const toolCalls = /** @type {{ toolCalls?: unknown }} */ (decision).toolCalls;
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+      throw new TypeError('decision:"tool-request" toolCalls must be a non-empty array when set');
+    }
+    for (let i = 0; i < toolCalls.length; i++) {
+      const t = toolCalls[i];
+      if (!t || typeof t !== 'object' || Array.isArray(t)) {
+        throw new TypeError(`toolCalls[${i}] must be a plain object, got ${stringifyDecisionForError(t)}`);
+      }
+    }
+    if (!hasPlural) return;
+    // pushPayloads also present → validate them below too.
+  }
+
+  // 'finish' / 'tool-request' — both need pushPayloads array
+  if (!hasPlural || !Array.isArray(/** @type {{ pushPayloads?: unknown }} */ (decision).pushPayloads)) {
+    throw new TypeError(`decision:"${tag}" requires a pushPayloads array`);
+  }
+  const pushes = /** @type {Array<unknown>} */ (decision.pushPayloads);
+  if (pushes.length === 0) {
+    throw new TypeError('pushPayloads: [] — use decision: skip-push to skip notification entirely');
+  }
+  for (let i = 0; i < pushes.length; i++) {
+    const p = pushes[i];
+    if (!p || typeof p !== 'object' || Array.isArray(p)) {
+      throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyDecisionForError(p)}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
+      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in 0.8.0; caller is responsible for splitting`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'messageId')) {
+      const id = /** @type {{ messageId?: unknown }} */ (p).messageId;
+      if (typeof id !== 'string' || id === '') {
+        throw new TypeError(`pushPayloads[${i}].messageId must be a non-empty string when set, got ${stringifyDecisionForError(id)}`);
+      }
+    }
+  }
+}
+
+/**
+ * Pull the toolCalls out of a 'tool-request' decision, whichever shape it
+ * came in: `decision.toolCalls` directly (server flavor), or embedded in
+ * tool_request pushPayloads (instant classifier flavor).
+ *
+ * @param {unknown} decision
+ * @returns {Array<Record<string, unknown>>}
+ */
+export function extractToolCallsFromDecision(decision) {
+  if (!decision || typeof decision !== 'object') return [];
+  const direct = /** @type {{ toolCalls?: unknown }} */ (decision).toolCalls;
+  if (Array.isArray(direct) && direct.length > 0) {
+    return direct;
+  }
+  const pushPayloads = /** @type {{ pushPayloads?: unknown }} */ (decision).pushPayloads;
+  if (!Array.isArray(pushPayloads)) return [];
+  const out = [];
+  for (const push of pushPayloads) {
+    if (push && typeof push === 'object' && Array.isArray(/** @type {{ toolCalls?: unknown }} */ (push).toolCalls)) {
+      out.push(.../** @type {{ toolCalls: unknown[] }} */ (push).toolCalls);
+    }
+  }
+  return out;
+}
+
+function stringifyDecisionForError(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}

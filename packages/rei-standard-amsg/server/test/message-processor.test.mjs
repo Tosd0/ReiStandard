@@ -926,3 +926,46 @@ describe('avatarUrl validation', () => {
     assert.equal(payload.avatarUrl, 'https://example.com/a.png');
   });
 });
+
+// Regression guard for the legacy frozen-prompt chain. The fire-time hooks
+// (lib/agentic-fire.js) are strictly additive: a deployment with no hooks
+// configured must keep replaying the schedule-time completePrompt in a
+// single LLM call, byte-for-byte. If someone ever removes or reroutes the
+// legacy chain, this is the test that goes red.
+describe('legacy frozen-prompt chain regression guard', () => {
+  it('no hooks configured → auto task replays the frozen completePrompt in a single LLM call', async () => {
+    const task = await createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'auto',
+      completePrompt: 'FROZEN',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' }
+    });
+
+    const requestBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options) => {
+      requestBodies.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: 'hello world' } }] };
+        }
+      };
+    };
+
+    let pushes = 0;
+    try {
+      const result = await processSingleMessage(task, createContext(async () => { pushes++; }));
+      assert.equal(result.success, true);
+      assert.equal(requestBodies.length, 1);
+      assert.deepEqual(requestBodies[0].messages, [{ role: 'user', content: 'FROZEN' }]);
+      assert.equal(requestBodies[0].temperature, 0.8);
+      assert.equal(pushes, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

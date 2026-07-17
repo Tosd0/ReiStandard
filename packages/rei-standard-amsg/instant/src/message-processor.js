@@ -23,6 +23,7 @@ import {
   buildErrorPush,
   readReasoningContent,
   stripReasoningTags,
+  assertValidDecision,
 } from '@rei-standard/amsg-shared';
 
 import { sendWebPush } from './webpush.js';
@@ -42,7 +43,6 @@ const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 const DEFAULT_MAX_LOOP_ITERATIONS = 10;
 const DEFAULT_MAX_INLINE_BYTES = 2600;
 const DEFAULT_BLOB_TTL_SECONDS = 60;
-const VALID_DECISIONS = new Set(['finish', 'tool-request', 'continue', 'skip-push']);
 const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 
 /**
@@ -684,78 +684,11 @@ async function runAgenticLoop(payload, ctx) {
   return { status: 'loop_exceeded', sessionId, iteration };
 }
 
-/**
- * Assert that the hook returned a structurally valid decision.
- * TypeScript discriminated unions don't survive into runtime, and a
- * misbehaving hook can easily return `null` / `{ decision: 'idk' }`
- * / `undefined`. Treat any of those as a hook contract violation so
- * we route through the same HOOK_THREW pipeline.
- *
- * @param {unknown} decision
+/*
+ * assertValidDecision moved to @rei-standard/amsg-shared (imported above)
+ * so amsg-server's fire-time loop validates the exact same contract.
  */
-function assertValidDecision(decision) {
-  if (!decision || typeof decision !== 'object') {
-    throw new TypeError(`onLLMOutput returned invalid decision: ${stringifyForError(decision)}`);
-  }
-  const tag = /** @type {{ decision?: unknown }} */ (decision).decision;
-  if (typeof tag !== 'string' || !VALID_DECISIONS.has(tag)) {
-    throw new TypeError(`onLLMOutput returned invalid decision tag: ${stringifyForError(tag)}`);
-  }
 
-  const hasSingular = Object.prototype.hasOwnProperty.call(decision, 'pushPayload');
-  const hasPlural = Object.prototype.hasOwnProperty.call(decision, 'pushPayloads');
-
-  if (hasSingular) {
-    throw new TypeError(
-      hasPlural
-        ? 'pushPayload (singular) is removed in 0.8.0, use pushPayloads'
-        : 'pushPayload (singular) is removed in 0.8.0, use pushPayloads: [yourPayload]'
-    );
-  }
-
-  if (tag === 'continue') {
-    if (!Array.isArray(/** @type {{ nextHistory?: unknown }} */ (decision).nextHistory)) {
-      throw new TypeError('decision:"continue" requires a nextHistory array');
-    }
-    return;
-  }
-
-  if (tag === 'skip-push') {
-    return;
-  }
-
-  // 'finish' / 'tool-request' — both need pushPayloads array
-  if (!hasPlural || !Array.isArray(/** @type {{ pushPayloads?: unknown }} */ (decision).pushPayloads)) {
-    throw new TypeError(`decision:"${tag}" requires a pushPayloads array`);
-  }
-  const pushes = /** @type {Array<unknown>} */ (decision.pushPayloads);
-  if (pushes.length === 0) {
-    throw new TypeError('pushPayloads: [] — use decision: skip-push to skip notification entirely');
-  }
-  for (let i = 0; i < pushes.length; i++) {
-    const p = pushes[i];
-    if (!p || typeof p !== 'object' || Array.isArray(p)) {
-      throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyForError(p)}`);
-    }
-    if (Object.prototype.hasOwnProperty.call(p, 'splitPattern')) {
-      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in 0.8.0; caller is responsible for splitting`);
-    }
-    if (Object.prototype.hasOwnProperty.call(p, 'messageId')) {
-      const id = p.messageId;
-      if (typeof id !== 'string' || id === '') {
-        throw new TypeError(`pushPayloads[${i}].messageId must be a non-empty string when set, got ${stringifyForError(id)}`);
-      }
-    }
-  }
-}
-
-function stringifyForError(value) {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
 
 /**
  * Push a payload (any of the four `messageKind` types or a free-form

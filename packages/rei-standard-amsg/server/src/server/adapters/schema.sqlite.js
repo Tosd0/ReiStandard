@@ -68,3 +68,21 @@ export const SQLITE_INDEXES = [
     critical: true
   }
 ];
+
+// client_state: cloud mirror of client-side state for the single-user
+// deployment. One live copy per (user, namespace, key) — not per-task
+// snapshots. The client is the only writer (batch upsert, last-write-wins
+// on updated_at); fire-time hooks are the reader. `value` holds
+// encryptForStorage ciphertext. `updated_at` is a caller-supplied epoch-ms
+// INTEGER (unlike scheduled_messages' ISO TEXT) so conflict resolution
+// compares without parsing. Single-user/SQLite only — no Postgres mirror.
+export const CLIENT_STATE_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS client_state (
+    user_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, namespace, key)
+  )
+`;

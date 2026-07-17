@@ -28,6 +28,8 @@ import {
 } from '@rei-standard/amsg-shared';
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
+import { callLlm } from './llm.js';
+import { runAgenticFire, taskNeedsLlm } from './agentic-fire.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
@@ -107,6 +109,16 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
     const decryptedPayload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
+    // Fire-time hooks: when the host configured onBeforeFire and the task
+    // needs the LLM, offer the agentic path first. onBeforeFire → null
+    // falls straight through to the frozen-prompt chain below, and
+    // deployments without hooks never enter this branch — legacy behavior
+    // is byte-identical.
+    if (ctx.hooks && typeof ctx.hooks.onBeforeFire === 'function' && taskNeedsLlm(decryptedPayload)) {
+      const agentic = await runAgenticFire({ task, decryptedPayload, userKey, ctx });
+      if (agentic.handled) return agentic.result;
+    }
+
     let messageContent;
     /** @type {unknown} */
     let llmResponse = null;
@@ -118,7 +130,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       const hasPrompt = !!decryptedPayload.completePrompt
         || (Array.isArray(decryptedPayload.messages) && decryptedPayload.messages.length > 0);
       if (hasPrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
-        const aiResult = await _callAI(decryptedPayload);
+        const aiResult = await callLlm(decryptedPayload);
         messageContent = aiResult.content;
         llmResponse = aiResult.response;
       } else if (decryptedPayload.userMessage) {
@@ -128,7 +140,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       }
 
     } else if (decryptedPayload.messageType === 'prompted' || decryptedPayload.messageType === 'auto') {
-      const aiResult = await _callAI(decryptedPayload);
+      const aiResult = await callLlm(decryptedPayload);
       messageContent = aiResult.content;
       llmResponse = aiResult.response;
     } else {
@@ -318,148 +330,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
   }
 }
 
-/**
- * Call an OpenAI-compatible API.
- *
- * Returns the full response object alongside the extracted (trimmed)
- * `content` string. Callers that only need the text can ignore
- * `response`; callers that want `reasoning_content` / `tool_calls`
- * read from `response.choices[0].message`.
- *
- * @private
- * @param {Object} payload
- * @returns {Promise<{ response: unknown, content: string }>}
- */
-async function _callAI(payload) {
-  const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
-  const requestBody = buildAiRequestBody(payload);
-
-  const aiResponse = await fetch(normalizedApiUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${payload.apiKey}`
-    },
-    body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(300000)
-  });
-
-  if (!aiResponse.ok) {
-    if (aiResponse.status === 405) {
-      throw new Error(
-        `AI API error: 405 Method Not Allowed. ` +
-        `apiUrl must point to a full chat endpoint (for example: /chat/completions). ` +
-        `Received: ${normalizedApiUrl}`
-      );
-    }
-
-    throw new Error(
-      `AI API error: ${aiResponse.status} ${aiResponse.statusText || 'Unknown Error'}. ` +
-      `Request URL: ${normalizedApiUrl}`
-    );
-  }
-
-  const aiData = await aiResponse.json();
-  const content = aiData?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('AI API error: response missing choices[0].message.content');
-  }
-
-  return { response: aiData, content: content.trim() };
-}
-
-/**
- * Build OpenAI-compatible request body.
- *
- * `max_tokens` is optional:
- * - include it only when payload.maxTokens is provided
- * - omit it when payload.maxTokens is undefined / null
- *
- * @param {Object} payload
- * @returns {Object}
- */
-function buildAiRequestBody(payload) {
-  // messages mode (added in v2.2.0): forward the caller's OpenAI-style array
-  // verbatim — same contract as @rei-standard/amsg-instant 0.5.0+. No auto
-  // role injection, no concatenation back to a single user message. Lets
-  // the upstream app preserve system / multi-turn context byte-for-byte
-  // across the schedule-message path.
-  const llmMessages = Array.isArray(payload.messages) && payload.messages.length > 0
-    ? payload.messages
-    : [{ role: 'user', content: payload.completePrompt }];
-
-  const requestBody = {
-    model: payload.primaryModel,
-    messages: llmMessages,
-  };
-
-  // Match the instant package's behavior: only inject default temperature
-  // for the legacy completePrompt path; messages mode forwards whatever the
-  // upstream app set (or nothing) so behavior matches their main chat path.
-  if (payload.temperature !== undefined && payload.temperature !== null) {
-    requestBody.temperature = payload.temperature;
-  } else if (!Array.isArray(payload.messages)) {
-    requestBody.temperature = 0.8;
-  }
-
-  if (payload.maxTokens === undefined || payload.maxTokens === null) {
-    return requestBody;
-  }
-
-  if (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0) {
-    throw new Error('Invalid maxTokens: maxTokens must be a positive integer when provided.');
-  }
-
-  requestBody.max_tokens = payload.maxTokens;
-  return requestBody;
-}
-
-/**
- * Normalize AI API URL for OpenAI-compatible chat endpoints.
- *
- * **Keep in sync** with `@rei-standard/amsg-instant`'s
- * `src/message-processor.js` `normalizeAiApiUrl` — same rules, same
- * tests. The two packages share this logic but each carry their own copy
- * to avoid an architectural dependency (server should not depend on the
- * stateless worker package).
- *
- * @param {string} apiUrl
- * @returns {string}
- */
-export function normalizeAiApiUrl(apiUrl) {
-  if (typeof apiUrl !== 'string' || !apiUrl.trim()) {
-    throw new Error(
-      'Invalid apiUrl: apiUrl is required. ' +
-      'Please provide a chat endpoint URL ' +
-      '(for example: https://api.openai.com or https://api.openai.com/v1/chat/completions).'
-    );
-  }
-
-  const trimmedApiUrl = apiUrl.trim();
-  let parsedUrl;
-
-  try {
-    parsedUrl = new URL(trimmedApiUrl);
-  } catch {
-    throw new Error(
-      `Invalid apiUrl: "${apiUrl}". Please provide a valid absolute URL.`
-    );
-  }
-
-  let path = parsedUrl.pathname.replace(/\/+$/, '') || '/';
-
-  if (/\/chat\/completions$/.test(path)) {
-    // Already a complete OpenAI-style endpoint. Don't double-suffix.
-  } else if (path === '/') {
-    // Bare host → assume OpenAI shape.
-    path = '/v1/chat/completions';
-  } else if (/\/v\d+$/.test(path)) {
-    // Path ends in `/v1`, `/v2`, … — caller already versioned the URL.
-    // Append only `/chat/completions`; never re-add `/v1`.
-    path = `${path}/chat/completions`;
-  }
-  // Any other custom path is left untouched on purpose.
-
-  parsedUrl.pathname = path;
-  return parsedUrl.toString();
-}
+// LLM call plumbing lives in ./llm.js since the agentic fire loop
+// (./agentic-fire.js) shares it. Re-exported here so existing importers
+// (tests, downstream code) keep working unchanged.
+export { normalizeAiApiUrl } from './llm.js';

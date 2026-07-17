@@ -186,7 +186,10 @@ test('serverToken set → every exposed route rejects wrong/missing token with 4
     ['GET', 'https://w.dev/messages?status=all'],
     ['PUT', 'https://w.dev/update-message?id=x'],
     ['DELETE', 'https://w.dev/cancel-message?id=x'],
-    ['GET', 'https://w.dev/vapid-public-key']
+    ['GET', 'https://w.dev/vapid-public-key'],
+    ['PUT', 'https://w.dev/client-state'],
+    ['GET', 'https://w.dev/client-state?namespace=n'],
+    ['DELETE', 'https://w.dev/client-state']
   ];
 
   for (const [method, url] of routes) {
