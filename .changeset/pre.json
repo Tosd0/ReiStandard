@@ -11,8 +11,10 @@
   },
   "changesets": [
     "amsg-client-server-token",
+    "amsg-server-agentic-fire",
     "amsg-server-single-user-cloudflare",
     "amsg-server-webcrypto-encryption",
+    "amsg-shared-agentic-contract",
     "amsg-vapid-public-key"
   ]
 }

@@ -1,5 +1,12 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.3.3-next.0
+
+### Patch Changes
+
+- Updated dependencies [914ddcf]
+  - @rei-standard/amsg-shared@0.4.0-next.0
+
 ## 2.3.2
 
 ### Patch Changes
