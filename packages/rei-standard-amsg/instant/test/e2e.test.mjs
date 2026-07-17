@@ -165,6 +165,12 @@ describe('e2e: push payload contract parity with amsg-server', () => {
     for (const call of router.pushCalls) {
       backups.push(JSON.parse(await decryptCapturedPushBody(call.body, subKit)));
     }
+    // Backup pushes are fired concurrently (`backupWork` in index.js) —
+    // each races through its own async encryption before calling fetch,
+    // so interception order is NOT the SSE order. Normalize by
+    // messageIndex: the contract under test is that a given index
+    // carries the same messageId on both transports.
+    backups.sort((a, b) => a.messageIndex - b.messageIndex);
     assert.equal(backups[0].messageId, payloads[0].messageId);
     assert.equal(backups[1].messageId, payloads[1].messageId);
   });
