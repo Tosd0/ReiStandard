@@ -1,5 +1,12 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.9.0-next.2
+
+### Patch Changes
+
+- Updated dependencies [914ddcf]
+  - @rei-standard/amsg-shared@0.4.0-next.0
+
 ## 2.9.0-next.1
 
 ### Minor Changes
