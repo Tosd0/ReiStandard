@@ -27,12 +27,85 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /vapid-public-key` 返回本 Worker 的 `VAPID_PUBLIC_KEY`，供前端创建 Web Push 订阅时作 `applicationServerKey`；未配置 VAPID 时返回 503。跟其它端点一样受 CORS 和 `serverToken` 约束。
 
 VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消息都靠它推送，缺了就发不出去。
+
+## 客户端状态同步（/client-state）
+
+这是啥：一张给客户端存状态的云端表。客户端平时把要给「fire 时刻 hooks」用的数据（最近聊天摘要、设置项……存啥由你定）批量同步上来，worker 触发定时任务时就能读到最新状态。一份活状态，按 namespace 组织，客户端是唯一写者。
+
+| 端点 | 语义 |
+|------|------|
+| `PUT /client-state` | 批量 upsert。body =（加密后的）`{ entries: [{ namespace, key, value, updatedAt }] }`。`updatedAt` 是 epoch 毫秒，旧于库内的条目跳过（last-write-wins）；单条 `value` ≤ 200KB，单次 ≤ 200 条 |
+| `GET /client-state?namespace=<ns>` | 取一个 namespace 的全部条目（解密后返回，响应加密） |
+| `DELETE /client-state` | 清空该用户的全部状态（设置页做「清除云端状态」按钮用） |
+
+`value` 是任意字符串（想存对象就自己 `JSON.stringify`），落库前用 per-user key 加密。鉴权和加密头跟其它端点完全一样。
+
+## Fire 时刻 hooks（服务端工具循环）
+
+这是啥：默认情况下，AI 类任务的 prompt 在排程那一刻就冻结进数据库，cron 到点后拿冻结文本调一次 LLM 就推送——上下文停留在排程时。配置 hooks 后，worker 会在**触发那一刻**现场组装 prompt，LLM 要查资料时直接在 worker 里执行工具、多轮循环，最后推送成品，全程不需要客户端在线。
+
+啥时候用：任务触发离排程隔得久（比如每周提醒）、希望消息基于最新状态生成，或生成过程需要查数据（配合 `/client-state`）。不配 hooks 一切照旧。
+
+```js
+export default createSingleUserCloudflareWorker((env) => ({
+  // ...其余 config
+  hooks: {
+    // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
+    // ctx: { task, userId, readState(namespace), now }
+    //   task 是解密后的任务字段（不含 apiKey / pushSubscription）；
+    //   自定义字段排程时放 metadata 里，这里原样读回。
+    async onBeforeFire(ctx) {
+      const notes = await ctx.readState('notes'); // [{ namespace, key, value, updatedAt }]
+      return [
+        { role: 'system', content: '你是一个提醒助手。' },
+        { role: 'user', content: `根据这些记录写一条提醒：${notes.map(n => n.value).join('\n')}` },
+      ];
+      // 也可以返回 { messages, maxToolIterations, totalTimeoutMs } 按次放宽预算
+    },
+
+    // 每轮 LLM 输出后分类。ctx 形状与 @rei-standard/amsg-instant 的
+    // onLLMOutput 一致（sessionId / messages / llmResponse / llmOutputText /
+    // iteration / metadata / contactName / avatarUrl），instant 的
+    // classifier 可以直接拿来用。四种 decision：
+    //   { decision: 'finish', pushPayloads }        → 推送这些 payload，结束
+    //   { decision: 'tool-request', toolCalls }     → 交给 executeToolCalls 执行
+    //     （也接受 instant 形状：pushPayloads 里带 tool_request push）
+    //   { decision: 'continue', nextHistory }       → 换个 history 再来一轮
+    //   { decision: 'skip-push' }                   → 这次不发，结束
+    async onLLMOutput(ctx) {
+      const toolCalls = ctx.llmResponse?.choices?.[0]?.message?.tool_calls;
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        return { decision: 'tool-request', toolCalls };
+      }
+      return {
+        decision: 'finish',
+        pushPayloads: [{ messageKind: 'content', message: ctx.llmOutputText }],
+      };
+    },
+
+    // 工具在 worker 里就地执行（触发时客户端多半不在线，没有人替你执行）。
+    // 返回 OpenAI tool-result 形状；抛错的话错误文本会作为 tool result
+    // 回填给 LLM，让它自己圆场，不会整条链失败。
+    async executeToolCalls(toolCalls, ctx) {
+      return Promise.all(toolCalls.map(async (call) => ({
+        tool_call_id: call.id,
+        role: 'tool',
+        content: await runMyTool(call.function.name, call.function.arguments),
+      })));
+    },
+  },
+  maxToolIterations: 5,    // LLM 轮数上限（默认 5）
+  totalTimeoutMs: 240_000, // 整链墙钟超时（默认 240s）
+}));
+```
+
+预算兜底：轮数到上限、或整链超过 `totalTimeoutMs`，按任务失败处理（沿用现有重试/标记逻辑）。hook 收到的 ctx 里没有 apiKey、pushSubscription、VAPID——`console.log(ctx)` 不会把密钥打进日志。
 
 ## 导入入口
 
