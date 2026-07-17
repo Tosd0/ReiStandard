@@ -13,6 +13,11 @@
  * @param {string} [config.serverToken]  - optional shared secret (X-Client-Token)
  * @param {{ email?: string, publicKey?: string, privateKey?: string }} [config.vapid]
  * @param {{ sendNotification: function }} [config.webpush] - web-push-compatible sender
+ * @param {Object} [config.hooks] - optional fire-time hooks (see lib/agentic-fire.js):
+ *   { onBeforeFire, onLLMOutput, executeToolCalls }. When omitted, AI tasks
+ *   replay the schedule-time frozen prompt (legacy behavior, unchanged).
+ * @param {number} [config.maxToolIterations] - factory default LLM-round cap for the agentic loop (default 5).
+ * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
@@ -24,6 +29,7 @@ import { createUpdateMessageHandler } from './handlers/update-message.js';
 import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
 import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
+import { createClientStateHandler } from './handlers/client-state.js';
 
 export function createSingleUserServer(config) {
   if (!config || !config.db) throw new Error('[amsg-server single-user] config.db is required');
@@ -43,7 +49,13 @@ export function createSingleUserServer(config) {
       privateKey: vapid.privateKey || ''
     },
     webpush: config.webpush || null,
-    tenantManager
+    tenantManager,
+    // Fire-time hooks (optional): the in-server instant path fires through
+    // processMessagesByUuid with this ctx, so instant-type tasks can take
+    // the agentic path too.
+    hooks: config.hooks || null,
+    maxToolIterations: config.maxToolIterations,
+    totalTimeoutMs: config.totalTimeoutMs
   };
 
   return {
@@ -55,7 +67,8 @@ export function createSingleUserServer(config) {
       updateMessage: createUpdateMessageHandler(ctx),
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx),
-      vapidPublicKey: createVapidPublicKeyHandler(ctx)
+      vapidPublicKey: createVapidPublicKeyHandler(ctx),
+      clientState: createClientStateHandler(ctx)
     }
   };
 }

@@ -66,6 +66,12 @@
  *   Delete completed / failed tasks older than `days` (default 7).
  * @property {(uuid: string, userId: string) => Promise<string|null>} getTaskStatus
  *   Return the status string of a task (used to distinguish 404 from 409).
+ * @property {(userId: string, entries: Array<{namespace: string, key: string, value: string, updatedAt: number}>) => Promise<{upserted: number, skipped: number}>} [upsertClientState]
+ *   (optional; single-user/D1 only) Batch upsert of client state, last-write-wins on updatedAt.
+ * @property {(userId: string, namespace: string) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
+ *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
+ * @property {(userId: string) => Promise<number>} [clearClientState]
+ *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
  */
 
 export {};
