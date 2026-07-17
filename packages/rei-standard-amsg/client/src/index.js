@@ -990,6 +990,98 @@ export class ReiClient {
     };
   }
 
+  // ─── Client state (single-user cloud mirror) ────────────────────
+
+  /**
+   * Batch-upsert client-state entries (single-user worker,
+   * amsg-server 2.6.0+ `/client-state`).
+   *
+   * The worker keeps one live copy per (namespace, key); this client is
+   * the only writer. Send everything that changed in ONE call — e.g.
+   * inside the few-seconds window before iOS backgrounds the page — the
+   * server upserts the whole batch in a single DB round trip. Upserts
+   * are last-write-wins on `updatedAt`: entries older than the stored
+   * row are skipped, so re-sending a stale batch is harmless.
+   *
+   * The payload is encrypted like every other amsg-server call
+   * (requires `init()`); the worker re-encrypts each value at rest
+   * under the per-user key.
+   *
+   * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
+   *   - `value`: pre-serialized string (the SDK does not stringify it for you).
+   *   - `updatedAt`: epoch milliseconds.
+   * @returns {Promise<Object>} `{ success, data?: { upserted, skipped }, error? }`
+   */
+  async putClientState(entries) {
+    const json = JSON.stringify({ entries });
+    this._assertPayloadSize(json, 'putClientState');
+    const encrypted = await this._encrypt(json);
+
+    const res = await fetch(`${this._baseUrl}/client-state`, {
+      method: 'PUT',
+      headers: this._withServerToken({
+        'Content-Type': 'application/json',
+        'X-User-Id': this._userId,
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      }),
+      body: JSON.stringify(encrypted)
+    });
+
+    return res.json();
+  }
+
+  /**
+   * Read every entry of one client-state namespace.
+   *
+   * The response rides the encrypted-response envelope (same as
+   * `listMessages`); this method decrypts it and returns plaintext
+   * values.
+   *
+   * @param {string} namespace
+   * @returns {Promise<Object>} `{ success, data?: { namespace, entries }, error? }`
+   *   where `entries` is `Array<{ namespace, key, value, updatedAt }>`.
+   */
+  async getClientState(namespace) {
+    const res = await fetch(
+      `${this._baseUrl}/client-state?namespace=${encodeURIComponent(namespace)}`,
+      {
+        method: 'GET',
+        headers: this._withServerToken({
+          'X-User-Id': this._userId,
+          'X-Response-Encrypted': 'true',
+          'X-Encryption-Version': '1'
+        })
+      }
+    );
+
+    const json = await res.json();
+    if (!json?.success || json?.encrypted !== true) return json;
+
+    const decrypted = await this._decrypt(json.data);
+    return {
+      success: true,
+      encrypted: true,
+      version: json.version || 1,
+      data: decrypted
+    };
+  }
+
+  /**
+   * Wipe every client-state entry of this user, across all namespaces —
+   * e.g. behind a "clear cloud state" settings action.
+   *
+   * @returns {Promise<Object>} `{ success, data?: { deleted }, error? }`
+   */
+  async clearClientState() {
+    const res = await fetch(`${this._baseUrl}/client-state`, {
+      method: 'DELETE',
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
+    });
+
+    return res.json();
+  }
+
   // ─── Push Subscription ──────────────────────────────────────────
 
   /**
