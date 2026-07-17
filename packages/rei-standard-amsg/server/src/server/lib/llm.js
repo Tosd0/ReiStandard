@@ -16,16 +16,22 @@
  * read from `response.choices[0].message`.
  *
  * @param {Object} payload
- * @param {{ requireContent?: boolean }} [options]
+ * @param {{ requireContent?: boolean, timeoutMs?: number }} [options]
  *   requireContent defaults to true (legacy single-shot behavior:
  *   throw when the response carries no content). Tool rounds legitimately
  *   return no content (pure tool_calls), so the agentic loop passes
  *   `{ requireContent: false }` — same precedent as amsg-instant's
  *   callLlmRaw.
+ *   timeoutMs defaults to 300000 (the legacy per-call ceiling). The
+ *   agentic loop passes its remaining wall-time budget so a hung LLM
+ *   request cannot outlive totalTimeoutMs.
  * @returns {Promise<{ response: unknown, content: string }>}
  */
 export async function callLlm(payload, options = {}) {
   const requireContent = options.requireContent !== false;
+  const timeoutMs = typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+    ? options.timeoutMs
+    : 300000;
   const normalizedApiUrl = normalizeAiApiUrl(payload.apiUrl);
   const requestBody = buildAiRequestBody(payload);
 
@@ -36,7 +42,7 @@ export async function callLlm(payload, options = {}) {
       'Authorization': `Bearer ${payload.apiKey}`
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(300000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
 
   if (!aiResponse.ok) {

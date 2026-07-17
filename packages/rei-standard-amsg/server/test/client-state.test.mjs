@@ -45,6 +45,40 @@ describe('D1 adapter client_state', () => {
     assert.deepEqual(await adapter.getClientState(USER, 'n'), []);
     assert.equal((await adapter.getClientState(OTHER, 'n')).length, 1);
   });
+
+  // The client uploads inside its few-seconds background window, so the
+  // whole batch must go out in ONE D1 round trip when the binding supports
+  // batch(). Bindings without batch() (custom adapters) must still work.
+  test('upsertClientState uses db.batch when available, sequential fallback otherwise', async () => {
+    // batch path: spy on the shim's batch — one call for the whole set
+    const d1 = createTestD1();
+    let batchCalls = 0;
+    const origBatch = d1.batch;
+    d1.batch = async (statements) => { batchCalls++; return origBatch(statements); };
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    const r = await adapter.upsertClientState(USER, [
+      { namespace: 'n', key: 'a', value: 'v1', updatedAt: 2 },
+      { namespace: 'n', key: 'b', value: 'v2', updatedAt: 2 },
+      { namespace: 'n', key: 'a', value: 'old', updatedAt: 1 }, // stale → skipped
+    ]);
+    assert.deepEqual(r, { upserted: 2, skipped: 1 });
+    assert.equal(batchCalls, 1);
+
+    // fallback path: binding without batch() gives identical results
+    const d1b = createTestD1();
+    const adapter2 = createD1Adapter({ prepare: d1b.prepare });
+    await adapter2.initSchema();
+    const r2 = await adapter2.upsertClientState(USER, [
+      { namespace: 'n', key: 'a', value: 'v1', updatedAt: 2 },
+      { namespace: 'n', key: 'a', value: 'old', updatedAt: 1 },
+    ]);
+    assert.deepEqual(r2, { upserted: 1, skipped: 1 });
+    assert.deepEqual(
+      (await adapter2.getClientState(USER, 'n')).map((x) => [x.key, x.value]),
+      [['a', 'v1']]
+    );
+  });
 });
 
 // ─── /client-state endpoints ─────────────────────────────────────────────────

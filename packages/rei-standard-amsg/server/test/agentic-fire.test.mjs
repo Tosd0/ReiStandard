@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage } from '../src/server/lib/message-processor.js';
+import { callLlm } from '../src/server/lib/llm.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
@@ -222,6 +223,50 @@ describe('agentic fire loop', () => {
       assert.match(result.error, /AGENTIC_TOTAL_TIMEOUT/);
       assert.equal(llm.calls.length, 2); // tightened deadline 150s: t=0,100k pass; t=200k breaks
     } finally {
+      llm.restore();
+    }
+  });
+
+  // A hung LLM request must not outlive totalTimeoutMs waiting for its own
+  // legacy 300s abort: each round's fetch timeout shrinks to the remaining
+  // wall-time budget.
+  test('LLM per-round fetch timeout shrinks to the remaining totalTimeoutMs budget', async () => {
+    let fakeNow = 0;
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'tool-request', toolCalls: [TOOL_CALL] }),
+      executeToolCalls: async () => [{ tool_call_id: 'call_1', role: 'tool', content: 'x' }],
+    };
+    const captured = [];
+    const origTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = (ms) => { captured.push(ms); return origTimeout.call(AbortSignal, 300000); };
+    const llm = stubLlm([toolRound], () => { fakeNow += 100_000; });
+    try {
+      const result = await processSingleMessage(task, makeCtx({
+        hooks, maxToolIterations: 10, totalTimeoutMs: 250_000, now: () => fakeNow,
+      }));
+      assert.equal(result.success, false);
+      assert.match(result.error, /AGENTIC_TOTAL_TIMEOUT/);
+      assert.deepEqual(captured, [250_000, 150_000, 50_000]);
+    } finally {
+      AbortSignal.timeout = origTimeout;
+      llm.restore();
+    }
+  });
+
+  test('callLlm: default per-call timeout stays 300s; custom timeoutMs is honored', async () => {
+    const captured = [];
+    const origTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = (ms) => { captured.push(ms); return origTimeout.call(AbortSignal, 300000); };
+    const llm = stubLlm([finishRound]);
+    try {
+      const payload = { apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'k', primaryModel: 'm', completePrompt: 'p' };
+      await callLlm(payload);
+      await callLlm(payload, { timeoutMs: 1234 });
+      assert.deepEqual(captured, [300_000, 1234]);
+    } finally {
+      AbortSignal.timeout = origTimeout;
       llm.restore();
     }
   });

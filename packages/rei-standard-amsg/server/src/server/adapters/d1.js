@@ -230,22 +230,43 @@ export class D1Adapter {
    * than the stored row (updatedAt strictly lower) is skipped; equal or
    * newer overwrites. Values arrive pre-encrypted (the handler encrypts).
    *
+   * Uses D1's batch() — one network round trip for the whole set (implicit
+   * transaction). The client calls this endpoint inside its few-seconds
+   * background window, so N sequential round trips could eat the whole
+   * window. Bindings without batch() (e.g. the sqlite test shim, custom
+   * adapters) fall back to a sequential loop.
+   *
    * @param {string} userId
    * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
    * @returns {Promise<{ upserted: number, skipped: number }>}
    */
   async upsertClientState(userId, entries) {
+    const UPSERT_SQL =
+      `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, namespace, key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at
+       WHERE excluded.updated_at >= client_state.updated_at`;
+
+    let results;
+    if (typeof this._db.batch === 'function') {
+      const statements = entries.map((entry) =>
+        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
+      );
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const entry of entries) {
+        results.push(
+          await this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt).run()
+        );
+      }
+    }
+
     let upserted = 0;
     let skipped = 0;
-    for (const entry of entries) {
-      const res = await this._db.prepare(
-        `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (user_id, namespace, key) DO UPDATE SET
-           value = excluded.value,
-           updated_at = excluded.updated_at
-         WHERE excluded.updated_at >= client_state.updated_at`
-      ).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt).run();
+    for (const res of results) {
       if (res.meta.changes > 0) upserted++; else skipped++;
     }
     return { upserted, skipped };

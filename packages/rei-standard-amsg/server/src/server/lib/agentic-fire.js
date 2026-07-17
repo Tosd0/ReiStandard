@@ -185,9 +185,13 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
     }
 
+    // Shrink each round's fetch timeout to the remaining wall-time budget
+    // (capped at the legacy 300s single-call ceiling) — a hung LLM request
+    // must not outlive totalTimeoutMs waiting for its own 300s abort.
+    const roundTimeoutMs = Math.max(1, Math.min(300_000, deadline - nowFn()));
     const { response: llmResponse } = await callLlm(
       { ...decryptedPayload, messages },
-      { requireContent: false }
+      { requireContent: false, timeoutMs: roundTimeoutMs }
     );
 
     const assistantMessage = extractAssistantMessage(llmResponse);
