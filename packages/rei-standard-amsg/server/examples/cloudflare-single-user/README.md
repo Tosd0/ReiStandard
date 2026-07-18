@@ -27,10 +27,12 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /vapid-public-key` 返回本 Worker 的 `VAPID_PUBLIC_KEY`，供前端创建 Web Push 订阅时作 `applicationServerKey`；未配置 VAPID 时返回 503。跟其它端点一样受 CORS 和 `serverToken` 约束。
+
+`GET /capabilities` 返回 `{ serverVersion, features }`，给前端做特性探测：worker 部署版本落后时新功能只是探测不到，前端（`client.getCapabilities()`，打到老 worker 时返回 `null`）可以据此在设置页提示重新部署。feature 名如 `client-state` / `client-state-chunking` / `agentic-hooks`，随版本追加。
 
 VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消息都靠它推送，缺了就发不出去。
 
@@ -40,11 +42,13 @@ VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消�
 
 | 端点 | 语义 |
 |------|------|
-| `PUT /client-state` | 批量 upsert。body =（加密后的）`{ entries: [{ namespace, key, value, updatedAt }] }`。`updatedAt` 是 epoch 毫秒，旧于库内的条目跳过（last-write-wins）；单条 `value` ≤ 200KB，单次 ≤ 200 条 |
+| `PUT /client-state` | 批量 upsert。body =（加密后的）`{ entries: [{ namespace, key, value, updatedAt }] }`。`updatedAt` 是 epoch 毫秒，旧于库内的条目跳过（last-write-wins）；单条 `value` 默认最大 5MB（工厂配置 `maxStateValueBytes` 可调），单次 ≤ 200 条 |
 | `GET /client-state?namespace=<ns>` | 取一个 namespace 的全部条目（解密后返回，响应加密） |
 | `DELETE /client-state` | 清空该用户的全部状态（设置页做「清除云端状态」按钮用） |
 
 `value` 是任意字符串（想存对象就自己 `JSON.stringify`），落库前用 per-user key 加密。鉴权和加密头跟其它端点完全一样。
+
+大值不用自己切：超过 200KB 的 `value` 由 worker 切片跨行存储，读取（`GET` 和 hooks 的 `ctx.readState()`）拿到的是拼好的原值，客户端无感。批量上传里某条超限/非法只拒它自己，其余照常入库——有拒绝时响应带 `data.rejected`（逐条给 `index / namespace / key / code / message`），全部成功时响应形状不变。namespace / key 里不能带控制字符（`\u0000`-`\u001f`，库内部保留）。
 
 ## Fire 时刻 hooks（服务端工具循环）
 
@@ -57,9 +61,12 @@ export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   hooks: {
     // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
-    // ctx: { task, userId, readState(namespace), now }
+    // ctx: { task, userId, readState(namespace), now, scratch }
     //   task 是解密后的任务字段（不含 apiKey / pushSubscription）；
     //   自定义字段排程时放 metadata 里，这里原样读回。
+    //   scratch 是本次 fire 的便签对象：在这里塞的东西，同一次 fire 的
+    //   onLLMOutput / executeToolCalls 从 ctx.scratch 拿到同一个引用；
+    //   fire 结束即丢弃，不落库、不跨 fire 共享。
     async onBeforeFire(ctx) {
       const notes = await ctx.readState('notes'); // [{ namespace, key, value, updatedAt }]
       return [
