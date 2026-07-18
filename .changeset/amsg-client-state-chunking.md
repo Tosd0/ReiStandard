@@ -8,3 +8,4 @@ client_state 大值透明分块 + 整批局部失败（单用户 worker）
 - 整批局部失败：批里某条超限 / 非法只拒它自己，其余照常入库。有拒绝时响应带 `data.rejected: [{ index, namespace, key, code, message }]`；全部成功时响应形状与之前完全一致。
 - namespace / key 里的控制字符（`\u0000`-`\u001f`）为库内部保留，逐条拒绝。
 - adapter 的 `upsertClientState` 新增可选第三参 `cleanups` 与返回值 `outcomes`；自定义 adapter 不实现也能工作（只损失存储卫生，不影响正确性）。
+- `DELETE /client-state` 返回的 `deleted` 计数包含内部切片行（有分块值时会大于逻辑条目数）。
