@@ -10,8 +10,11 @@
     "@rei-standard/amsg-sw": "2.3.2"
   },
   "changesets": [
+    "amsg-agentic-scratch",
+    "amsg-capabilities",
     "amsg-client-client-state",
     "amsg-client-server-token",
+    "amsg-client-state-chunking",
     "amsg-server-agentic-fire",
     "amsg-server-single-user-cloudflare",
     "amsg-server-webcrypto-encryption",

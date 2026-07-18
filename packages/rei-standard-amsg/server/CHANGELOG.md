@@ -1,5 +1,30 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.4
+
+### Minor Changes
+
+- f13f2f1: fire 级 scratch：hook 之间传上下文不再自己维护 Map
+
+  单次 fire 开始时库创建一个空对象，`onBeforeFire` 的 fireCtx 和同一次 fire 里每轮 `onLLMOutput` / `executeToolCalls` 的 sessionCtx 都拿到同一个 `scratch` 引用；fire 结束（finish / skip-push / 抛错 / 轮数超限）后随之丢弃。不落库、不进日志、不跨 fire 共享。amsg-shared 的 `buildSessionContext` 新增可选 `scratch` 参数（不传则字段缺席，amsg-instant 行为不变）。
+
+- f13f2f1: `GET /capabilities` 特性探测端点 + 客户端 `getCapabilities()`
+
+  worker 部署版本落后时，新功能只是「探测不到」而不是静默失效。单用户 worker 新增 `GET /capabilities`，返回 `{ serverVersion, features }`（feature 名如 `client-state` / `client-state-chunking` / `agentic-hooks`，随版本演进追加；表达代码能力，不反映部署配置）；鉴权与 `/vapid-public-key` 一致。客户端 SDK 新增 `getCapabilities()`：打到没有该路由的老 worker（404）返回 `null` 不抛错，前端可据此在设置里提示「worker 需要重新部署」。
+
+- f13f2f1: client_state 大值透明分块 + 整批局部失败（单用户 worker）
+
+  - `PUT /client-state` 单条 value 不再受 200KB 整批 413 的限制：超过 200KB 的值由服务端切片跨行存储，`GET /client-state` 与 hook 的 `ctx.readState()` 返回拼好的原值，客户端和 hook 作者无感。单条总上限默认 5MB，工厂配置 `maxStateValueBytes` 可调。切片在码点边界（中文 / emoji 不会被劈开）；覆盖写变小不残留旧切片；块不齐全（写到一半断了）时该 key 视为不存在，读方走自己的兜底。
+  - 整批局部失败：批里某条超限 / 非法只拒它自己，其余照常入库。有拒绝时响应带 `data.rejected: [{ index, namespace, key, code, message }]`；全部成功时响应形状与之前完全一致。
+  - namespace / key 里的控制字符（`\u0000`-`\u001f`）为库内部保留，逐条拒绝。
+  - adapter 的 `upsertClientState` 新增可选第三参 `cleanups` 与返回值 `outcomes`；自定义 adapter 不实现也能工作（只损失存储卫生，不影响正确性）。
+  - `DELETE /client-state` 返回的 `deleted` 计数包含内部切片行（有分块值时会大于逻辑条目数）。
+
+### Patch Changes
+
+- Updated dependencies [f13f2f1]
+  - @rei-standard/amsg-shared@0.4.0-next.1
+
 ## 2.6.0-next.3
 
 ### Minor Changes
