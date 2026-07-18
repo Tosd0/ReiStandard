@@ -18,6 +18,7 @@
  *   replay the schedule-time frozen prompt (legacy behavior, unchanged).
  * @param {number} [config.maxToolIterations] - factory default LLM-round cap for the agentic loop (default 5).
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
+ * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
@@ -55,7 +56,8 @@ export function createSingleUserServer(config) {
     // the agentic path too.
     hooks: config.hooks || null,
     maxToolIterations: config.maxToolIterations,
-    totalTimeoutMs: config.totalTimeoutMs
+    totalTimeoutMs: config.totalTimeoutMs,
+    maxStateValueBytes: config.maxStateValueBytes
   };
 
   return {

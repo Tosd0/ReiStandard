@@ -92,7 +92,7 @@ describe('D1 adapter client_state', () => {
       { namespace: chunkNs, key: chunkKeyFor('a%b', 0), value: 'pct-key', updatedAt: 100 },
     ]);
 
-    // 清 key 'a' 的切片：'ab' / 'a%b' 的不受影响（ 分隔符挡住前缀误伤）
+    // 清 key 'a' 的切片：'ab' / 'a%b' 的不受影响（\u001f 分隔符挡住前缀误伤）
     await adapter.upsertClientState(USER, [], [
       { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('a'), updatedAt: 150 },
     ]);
@@ -193,16 +193,158 @@ describe('/client-state endpoints', () => {
     assert.deepEqual(data2.entries, []);
   });
 
-  test('value over 200KB → 413 with a clear error code', async () => {
+  // 读一个 namespace 并解密（拼回后的逻辑条目视图）
+  async function getEntries(worker, env, namespace) {
+    const getRes = await worker.fetch(new Request(
+      `https://w.dev/client-state?namespace=${encodeURIComponent(namespace)}`,
+      { method: 'GET', headers: { 'X-User-Id': USER } }
+    ), env);
+    assert.equal(getRes.status, 200);
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const data = await decryptPayload((await getRes.json()).data, userKey);
+    return data.entries;
+  }
+
+  test('刚超 200KB：不再整批 413，分块入库后 GET 读回原值', async () => {
     const d1 = createTestD1();
     const worker = makeWorker(d1);
     const env = { DB: d1 };
     await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const value = 'x'.repeat(200 * 1024 + 1);
     const res = await putState(worker, env, [
-      { namespace: 'n', key: 'big', value: 'x'.repeat(200 * 1024 + 1), updatedAt: 1 },
+      { namespace: 'n', key: 'big', value, updatedAt: 1 },
     ]);
-    assert.equal(res.status, 413);
-    assert.equal((await res.json()).error.code, 'STATE_VALUE_TOO_LARGE');
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).data, { upserted: 1, skipped: 0 });
+
+    const entries = await getEntries(worker, env, 'n');
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].value, value);
+  });
+
+  test('中文大值分块：GET 拼回原值；物理存储 = 根 marker + 保留 ns 里的加密切片', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+    const bigValue = JSON.stringify({ v: 1, doc: '记'.repeat(120_000) }); // ~360KB → 2 片
+    await putState(worker, env, [
+      { namespace: 'notes', key: 'big', value: bigValue, updatedAt: 100 },
+      { namespace: 'notes', key: 'small', value: 'tiny', updatedAt: 100 },
+    ]);
+
+    const entries = await getEntries(worker, env, 'notes');
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0].key, 'big');
+    assert.equal(entries[0].value, bigValue);
+    assert.deepEqual(entries[1], { namespace: 'notes', key: 'small', value: 'tiny', updatedAt: 100 });
+
+    const adapter = createD1Adapter(d1);
+    const userRows = await adapter.getClientState(USER, 'notes');
+    assert.equal(userRows.length, 2); // 用户 namespace 里只有逻辑条目的行
+    const rootRow = userRows.find((r) => r.key === 'big');
+    assert.equal(rootRow.value.charCodeAt(0), 0x1f, '分块根行是 marker');
+    const chunkRows = await adapter.getClientState(USER, chunkNamespaceFor('notes'));
+    assert.equal(chunkRows.length, 2);
+    for (const row of chunkRows) assert.match(row.value, /^[0-9a-f]+:[0-9a-f]+:/); // 切片是密文
+  });
+
+  test('覆盖写变小 / 缩块：旧切片行清干净，读到的始终是最新值', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const adapter = createD1Adapter(d1);
+    const chunkNs = chunkNamespaceFor('n');
+
+    // 大(2片) → 小(单行)：切片全清
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: '记'.repeat(120_000), updatedAt: 100 }]);
+    assert.equal((await adapter.getClientState(USER, chunkNs)).length, 2);
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: 'small-now', updatedAt: 200 }]);
+    assert.deepEqual(await adapter.getClientState(USER, chunkNs), []);
+    let entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => [e.key, e.value]), [['k', 'small-now']]);
+
+    // 大(3片) → 大(2片)：尾片不残留
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: '记'.repeat(200_000), updatedAt: 300 }]);
+    assert.equal((await adapter.getClientState(USER, chunkNs)).length, 3);
+    const two = '记'.repeat(120_000);
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: two, updatedAt: 400 }]);
+    assert.equal((await adapter.getClientState(USER, chunkNs)).length, 2);
+    entries = await getEntries(worker, env, 'n');
+    assert.equal(entries[0].value, two);
+  });
+
+  test('陈旧的分块写入动不了更新的值（LWW 对分块路径成立）', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: 'fresh', updatedAt: 500 }]);
+    const stale = await putState(worker, env, [
+      { namespace: 'n', key: 'k', value: '记'.repeat(120_000), updatedAt: 100 },
+    ]);
+    assert.deepEqual((await stale.json()).data, { upserted: 0, skipped: 1 });
+    const entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => [e.key, e.value]), [['k', 'fresh']]);
+  });
+
+  test('整批局部失败：坏条目逐条拒绝，好条目照常入库；全成功响应不带 rejected', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'good', value: 'v', updatedAt: 100 },
+      { namespace: 'n', key: 'bad-ts', value: 'v', updatedAt: -1 },
+      { namespace: 'n', key: 'huge', value: 'x'.repeat(6 * 1024 * 1024), updatedAt: 100 },
+      { namespace: 'n\u0000ctl', key: 'k', value: 'v', updatedAt: 100 },
+    ]);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.data.upserted, 1);
+    assert.deepEqual(
+      body.data.rejected.map((r) => [r.index, r.code]),
+      [[1, 'INVALID_STATE_UPDATED_AT'], [2, 'STATE_VALUE_TOO_LARGE'], [3, 'INVALID_STATE_NAMESPACE']]
+    );
+    const oversized = body.data.rejected.find((r) => r.code === 'STATE_VALUE_TOO_LARGE');
+    assert.equal(oversized.maxBytes, 5 * 1024 * 1024);
+    assert.equal(oversized.key, 'huge');
+
+    const entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => e.key), ['good']);
+
+    // 全成功响应形状不变（老客户端无感）
+    const okRes = await putState(worker, env, [{ namespace: 'n', key: 'k2', value: 'v', updatedAt: 1 }]);
+    assert.deepEqual(Object.keys((await okRes.json()).data).sort(), ['skipped', 'upserted']);
+  });
+
+  test('工厂配置 maxStateValueBytes 调总上限；GET 保留 namespace → 400', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1, { maxStateValueBytes: 1024 });
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'over', value: 'x'.repeat(2000), updatedAt: 1 },
+      { namespace: 'n', key: 'under', value: 'x'.repeat(500), updatedAt: 1 },
+    ]);
+    const body = await res.json();
+    assert.equal(body.data.upserted, 1);
+    assert.deepEqual(
+      body.data.rejected.map((r) => [r.key, r.code, r.maxBytes]),
+      [['over', 'STATE_VALUE_TOO_LARGE', 1024]]
+    );
+
+    const badNs = await worker.fetch(new Request(
+      `https://w.dev/client-state?namespace=${encodeURIComponent(chunkNamespaceFor('n'))}`,
+      { method: 'GET', headers: { 'X-User-Id': USER } }
+    ), env);
+    assert.equal(badNs.status, 400);
+    assert.equal((await badNs.json()).error.code, 'INVALID_STATE_NAMESPACE');
   });
 
   test('validation: non-array/empty entries → 400; missing namespace → 400; stored value is ciphertext', async () => {
