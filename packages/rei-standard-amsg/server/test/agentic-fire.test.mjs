@@ -367,7 +367,7 @@ describe('agentic fire loop', () => {
 
       const allowedSessionKeys = new Set([
         'sessionId', 'charId', 'messages', 'llmResponse', 'llmOutputText',
-        'iteration', 'metadata', 'contactName', 'avatarUrl',
+        'iteration', 'metadata', 'contactName', 'avatarUrl', 'scratch',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);
@@ -571,5 +571,106 @@ describe('agentic fire via the single-user worker (scheduled e2e)', () => {
     }
     assert.equal(llm.calls.length, 1);
     assert.deepEqual(llm.calls[0].body.messages, [{ role: 'user', content: 'frozen prompt' }]);
+  });
+});
+
+describe('readState 分块拼回', () => {
+  test('分块的 client_state 值拼回原文；写到一半断掉的 key 不出现', async () => {
+    const { buildChunkedRootValue, chunkNamespaceFor, chunkKeyFor } =
+      await import('../src/server/lib/state-chunks.js');
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    await adapter.upsertClientState(USER, [
+      { namespace: 'ns', key: 'big', value: buildChunkedRootValue(2), updatedAt: 100 },
+      { namespace: chunkNamespaceFor('ns'), key: chunkKeyFor('big', 0), value: await encryptForStorage('前半', userKey), updatedAt: 100 },
+      { namespace: chunkNamespaceFor('ns'), key: chunkKeyFor('big', 1), value: await encryptForStorage('后半', userKey), updatedAt: 100 },
+      { namespace: 'ns', key: 'torn', value: buildChunkedRootValue(2), updatedAt: 200 },
+      { namespace: chunkNamespaceFor('ns'), key: chunkKeyFor('torn', 0), value: await encryptForStorage('半截', userKey), updatedAt: 200 },
+    ]);
+
+    const { task } = await makeTask();
+    let seen;
+    const hooks = {
+      onBeforeFire: async (fireCtx) => {
+        seen = await fireCtx.readState('ns');
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async () => ({ decision: 'skip-push' }),
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks, db: adapter }));
+      assert.equal(result.success, true);
+      assert.deepEqual(seen, [{ namespace: 'ns', key: 'big', value: '前半后半', updatedAt: 100 }]);
+    } finally {
+      llm.restore();
+    }
+  });
+});
+
+describe('fire 级 scratch', () => {
+  test('同一次 fire 的 onBeforeFire / onLLMOutput / executeToolCalls 拿到同一引用；跨 fire 隔离', async () => {
+    const { task } = await makeTask();
+    const seen = [];
+    let llmOutputCalls = 0;
+    const decisions = [
+      { decision: 'tool-request', toolCalls: [TOOL_CALL] },
+      { decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'ok' }] },
+    ];
+    const hooks = {
+      onBeforeFire: async (fireCtx) => {
+        fireCtx.scratch.token = (fireCtx.scratch.token || 0) + 1;
+        seen.push(fireCtx.scratch);
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async (sessionCtx) => { seen.push(sessionCtx.scratch); return decisions[llmOutputCalls++]; },
+      executeToolCalls: async (_toolCalls, sessionCtx) => {
+        seen.push(sessionCtx.scratch);
+        return [{ tool_call_id: 'call_1', role: 'tool', content: 'ok' }];
+      },
+    };
+    const llm = stubLlm([toolRound, finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks }));
+      // before / llm轮1 / tools / llm轮2 —— 4 次全部同一引用，token 只加了一次
+      assert.equal(seen.length, 4);
+      for (const s of seen) assert.equal(s, seen[0]);
+      assert.equal(seen[0].token, 1);
+
+      // 第二次 fire（重试语义）：新对象，token 重新从 1 开始
+      llmOutputCalls = 0;
+      seen.length = 0;
+      await processSingleMessage(task, makeCtx({ hooks }));
+      assert.equal(seen[0].token, 1);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('fire 抛错后 scratch 不带到下一次 fire', async () => {
+    const { task } = await makeTask();
+    const scratches = [];
+    const hooks = {
+      onBeforeFire: async (fireCtx) => {
+        scratches.push(fireCtx.scratch);
+        fireCtx.scratch.poisoned = true;
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async () => { throw new Error('boom'); },
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      const r1 = await processSingleMessage(task, makeCtx({ hooks }));
+      const r2 = await processSingleMessage(task, makeCtx({ hooks }));
+      assert.equal(r1.success, false);
+      assert.equal(r2.success, false);
+      assert.equal(scratches.length, 2);
+      assert.notEqual(scratches[0], scratches[1]);
+      assert.equal(scratches[1].poisoned, true); // 本次 hook 自己写的，不是上次残留
+    } finally {
+      llm.restore();
+    }
   });
 });

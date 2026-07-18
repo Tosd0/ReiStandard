@@ -25,6 +25,11 @@
  * pushSubscription / vapid / masterKey (same rationale as instant's
  * SessionContext — a console.log(ctx) in a hook must not leak keys).
  *
+ * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx 与同一次
+ * fire 每轮的 sessionCtx 都持有同一个引用，hook 之间借它传工具上下文，
+ * 不用再自己维护 Map<sessionId, state>。fire 结束（finish / skip-push /
+ * 抛错 / 轮数超限）后随调用栈丢弃；库不读不写、不落库、不打日志。
+ *
  * Budget guards, both factory-level (ctx.maxToolIterations /
  * ctx.totalTimeoutMs) and per-fire (onBeforeFire may return
  * { messages, maxToolIterations?, totalTimeoutMs? } to override for one
@@ -44,6 +49,7 @@ import {
 import { randomUUID } from './webcrypto-utils.js';
 import { decryptFromStorage } from './encryption.js';
 import { callLlm } from './llm.js';
+import { chunkNamespaceFor, resolveClientStateEntries } from './state-chunks.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -146,19 +152,27 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     }
     if (!ctx.db || typeof ctx.db.getClientState !== 'function') return [];
     const rows = await ctx.db.getClientState(task.user_id, namespace);
-    return Promise.all(rows.map(async (row) => ({
-      namespace: row.namespace,
-      key: row.key,
-      value: await decryptFromStorage(row.value, userKey),
-      updatedAt: row.updated_at,
-    })));
+    // 分块存储的值在这里拼回原文（见 state-chunks.js）；块不齐全的 key 视为
+    // 不存在 —— hook 作者拿到的与客户端写入的一致，永远不会是半截数据。
+    return resolveClientStateEntries(
+      rows,
+      () => ctx.db.getClientState(task.user_id, chunkNamespaceFor(namespace)),
+      (value) => decryptFromStorage(value, userKey)
+    );
   };
+
+  // 单次 fire 的宿主便签：onBeforeFire 的 fireCtx 和同一次 fire 每轮的
+  // sessionCtx（onLLMOutput / executeToolCalls）拿到同一个对象引用，fire 结束
+  // （finish / skip-push / 抛错 / 轮数超限）随调用栈丢弃。库自己不读不写、
+  // 不落库、不打日志、不跨 fire 共享 —— 重试产生的新 fire 拿到的是新对象。
+  const scratch = {};
 
   const fireCtx = Object.freeze({
     task: buildHookTask(task, decryptedPayload),
     userId: task.user_id,
     readState,
     now: new Date(nowFn()),
+    scratch,
   });
 
   const before = await hooks.onBeforeFire(fireCtx);
@@ -206,6 +220,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       avatarUrl: decryptedPayload.avatarUrl || undefined,
       charId: decryptedPayload.charId,
       metadata: decryptedPayload.metadata,
+      scratch,
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
