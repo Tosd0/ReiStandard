@@ -834,6 +834,7 @@ export function stripReasoningTags(content) {
  * @property {Record<string, unknown>}  metadata
  * @property {string}                   contactName
  * @property {string}                   [avatarUrl]
+ * @property {Record<string, unknown>}  [scratch]      - Per-fire host scratch object. Producers that run several hooks within one fire (amsg-server's fire-time loop) pass the same mutable object to every hook of that fire, so hooks can hand context to each other without a module-level Map. The library never reads, writes, logs, or persists it, and never shares it across fires. Absent when the producer does not supply one (amsg-instant).
  */
 
 /**
@@ -854,6 +855,7 @@ export function stripReasoningTags(content) {
  * @param {string} [args.avatarUrl]
  * @param {string} [args.charId]
  * @param {Record<string, unknown>} [args.metadata]
+ * @param {Record<string, unknown>} [args.scratch]
  * @returns {SessionContext}
  */
 export function buildSessionContext({
@@ -865,6 +867,7 @@ export function buildSessionContext({
   avatarUrl,
   charId,
   metadata,
+  scratch,
 }) {
   const llmOutputText = readLlmOutputText(llmResponse);
   const ctx = {
@@ -878,6 +881,9 @@ export function buildSessionContext({
     contactName,
     avatarUrl: avatarUrl || undefined,
   };
+  // The ctx object is frozen, but the scratch object it references stays
+  // mutable on purpose — that mutability is the whole point of the field.
+  if (scratch !== undefined) ctx.scratch = scratch;
   return Object.freeze(ctx);
 }
 
