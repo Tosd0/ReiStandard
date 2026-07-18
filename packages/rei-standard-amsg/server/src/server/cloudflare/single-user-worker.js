@@ -14,6 +14,7 @@
  *   DELETE /cancel-message  → delete
  *   GET  /vapid-public-key  → this worker's VAPID public key (for the frontend's
  *                             Web Push subscription); 503 if VAPID_PUBLIC_KEY unset
+ *   GET  /capabilities      → { serverVersion, features }（特性探测；老部署无此路由 → 404）
  *   PUT  /client-state      → batch upsert client state (last-write-wins on updatedAt)
  *   GET  /client-state      → read one namespace's entries (?namespace=<ns>)
  *   DELETE /client-state    → wipe this user's client state
@@ -124,6 +125,8 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.cancelMessage.DELETE(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/vapid-public-key')) {
         result = await server.handlers.vapidPublicKey.GET(url, headers);
+      } else if (method === 'GET' && pathname.endsWith('/capabilities')) {
+        result = await server.handlers.capabilities.GET(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.PUT(headers, await request.text());
       } else if (method === 'GET' && pathname.endsWith('/client-state')) {

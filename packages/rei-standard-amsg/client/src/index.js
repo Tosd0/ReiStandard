@@ -462,6 +462,43 @@ export class ReiClient {
     return json.publicKey;
   }
 
+  /**
+   * Fetch the worker's capability manifest (single-user amsg-server 2.7.0+,
+   * `GET /capabilities`).
+   *
+   * Feature detection for deploy drift: an outdated worker lacks newer
+   * endpoints/behaviors silently, so the frontend can call this once and
+   * show a "worker needs a redeploy" hint instead of leaving new features
+   * dead. Feature names are library-defined strings (e.g. `client-state`,
+   * `client-state-chunking`, `agentic-hooks`) that grow over time.
+   *
+   * Sends `X-Client-Token` when a `serverToken` is configured.
+   *
+   * @returns {Promise<{ serverVersion: string, features: string[] } | null>}
+   *   `null` when the worker predates the endpoint (HTTP 404) or the
+   *   response is not JSON (e.g. a proxy error page). Other failures
+   *   (wrong token, 5xx with a JSON envelope) throw.
+   */
+  async getCapabilities() {
+    const res = await fetch(`${this._baseUrl}/capabilities`, {
+      method: 'GET',
+      headers: this._withServerToken({})
+    });
+    if (res.status === 404) return null;
+
+    let json;
+    try {
+      json = await res.json();
+    } catch {
+      return null;
+    }
+    if (!json?.success) throw new Error(json?.error?.message || 'Failed to fetch capabilities');
+    return {
+      serverVersion: typeof json.serverVersion === 'string' ? json.serverVersion : '',
+      features: Array.isArray(json.features) ? json.features : []
+    };
+  }
+
   // ─── Public API ─────────────────────────────────────────────────
 
   /**
@@ -1007,10 +1044,23 @@ export class ReiClient {
    * (requires `init()`); the worker re-encrypts each value at rest
    * under the per-user key.
    *
+   * Large values: on amsg-server 2.7.0+ a value over 200KB is stored
+   * chunked across rows by the worker itself — no client-side splitting
+   * needed, and reads return the original value reassembled. The default
+   * per-value ceiling is 5MB (worker factory config `maxStateValueBytes`).
+   * Older workers reject the whole batch for oversized values; probe with
+   * `getCapabilities()` (feature `client-state-chunking`) when you need
+   * to know which behavior you'll get.
+   *
+   * Partial failure: an invalid/oversized entry only rejects itself.
+   * When at least one entry is rejected the response carries
+   * `data.rejected: [{ index, namespace, key, code, message }]`; when all
+   * entries are accepted the response shape is unchanged (no `rejected`).
+   *
    * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
    *   - `value`: pre-serialized string (the SDK does not stringify it for you).
    *   - `updatedAt`: epoch milliseconds.
-   * @returns {Promise<Object>} `{ success, data?: { upserted, skipped }, error? }`
+   * @returns {Promise<Object>} `{ success, data?: { upserted, skipped, rejected? }, error? }`
    */
   async putClientState(entries) {
     if (!Array.isArray(entries) || entries.length === 0) {

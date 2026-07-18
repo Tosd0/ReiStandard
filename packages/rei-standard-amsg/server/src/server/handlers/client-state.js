@@ -11,6 +11,12 @@
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
  *   DELETE /client-state                 wipe every entry of this user
  *
+ * 单条 value 超过 200KB 时由服务端透明分块（见 lib/state-chunks.js）：写入时
+ * 切片跨行存储，GET / readState 返回拼好的原值，客户端与 hook 作者无感。
+ * 单条总上限默认 5MB，工厂配置 maxStateValueBytes 可调。批内某条超限/非法
+ * 只拒它自己：有拒绝时响应带 data.rejected 逐条给原因，全部成功时响应形状
+ * 与单值时代完全一致。
+ *
  * Auth & crypto follow the existing endpoints exactly: X-Client-Token is
  * all-or-nothing via resolveTenant, PUT bodies must be encrypted
  * (X-Payload-Encrypted / X-Encryption-Version), values are stored as
@@ -21,11 +27,21 @@
 import { deriveUserEncryptionKey, decryptPayload, encryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
 import { isValidUUIDv4 } from '../lib/validation.js';
+import {
+  STATE_CHUNK_SLICE_BYTES,
+  DEFAULT_MAX_STATE_VALUE_BYTES,
+  INTERNAL_STATE_CHAR_RE,
+  chunkNamespaceFor,
+  chunkKeyFor,
+  chunkKeyPrefixFor,
+  buildChunkedRootValue,
+  splitStateValue,
+  resolveClientStateEntries,
+} from '../lib/state-chunks.js';
 
-// One value may hold a serialized state chunk, but must stay well under
-// D1's per-row limits — reject early with a clear error instead of an
-// opaque DB failure.
-export const MAX_STATE_VALUE_BYTES = 200 * 1024;
+// 单个存储行的 plaintext 上限 = 分块切片大小：≤ 此值的 value 走历史单行路径
+// （存储字节级不变），超过的由服务端透明分块（见 lib/state-chunks.js）。
+export const MAX_STATE_VALUE_BYTES = STATE_CHUNK_SLICE_BYTES;
 // "a few dozen entries in one background-window request" is the design
 // load; 200 bounds a single request with generous headroom.
 export const MAX_STATE_ENTRIES_PER_REQUEST = 200;
@@ -46,23 +62,41 @@ function requireUserId(headers) {
   return { userId };
 }
 
-function validateEntry(entry, index) {
-  if (!isPlainObject(entry)) return err(400, 'INVALID_STATE_ENTRY', `entries[${index}] 必须是对象`);
+function rejectEntry(entry, index, code, message, extra) {
+  const rejection = { index, code, message, ...(extra || {}) };
+  if (entry && typeof entry === 'object') {
+    if (typeof entry.namespace === 'string') rejection.namespace = entry.namespace;
+    if (typeof entry.key === 'string') rejection.key = entry.key;
+  }
+  return rejection;
+}
+
+// 逐条校验：返回 null（合法）或拒绝对象（进 data.rejected，只拒这一条）。
+function validateEntry(entry, index, maxValueBytes) {
+  if (!isPlainObject(entry)) {
+    return rejectEntry(entry, index, 'INVALID_STATE_ENTRY', `entries[${index}] 必须是对象`);
+  }
   if (typeof entry.namespace !== 'string' || !entry.namespace.trim() || entry.namespace.length > MAX_NAMESPACE_CHARS) {
-    return err(400, 'INVALID_STATE_NAMESPACE', `entries[${index}].namespace 必须是 1-${MAX_NAMESPACE_CHARS} 字符的字符串`);
+    return rejectEntry(entry, index, 'INVALID_STATE_NAMESPACE', `entries[${index}].namespace 必须是 1-${MAX_NAMESPACE_CHARS} 字符的字符串`);
+  }
+  if (INTERNAL_STATE_CHAR_RE.test(entry.namespace)) {
+    return rejectEntry(entry, index, 'INVALID_STATE_NAMESPACE', `entries[${index}].namespace 不能包含控制字符（\\u0000-\\u001f 为库内部保留）`);
   }
   if (typeof entry.key !== 'string' || !entry.key.trim() || entry.key.length > MAX_KEY_CHARS) {
-    return err(400, 'INVALID_STATE_KEY', `entries[${index}].key 必须是 1-${MAX_KEY_CHARS} 字符的字符串`);
+    return rejectEntry(entry, index, 'INVALID_STATE_KEY', `entries[${index}].key 必须是 1-${MAX_KEY_CHARS} 字符的字符串`);
+  }
+  if (INTERNAL_STATE_CHAR_RE.test(entry.key)) {
+    return rejectEntry(entry, index, 'INVALID_STATE_KEY', `entries[${index}].key 不能包含控制字符（\\u0000-\\u001f 为库内部保留）`);
   }
   if (typeof entry.value !== 'string') {
-    return err(400, 'INVALID_STATE_VALUE', `entries[${index}].value 必须是字符串（宿主自行序列化）`);
+    return rejectEntry(entry, index, 'INVALID_STATE_VALUE', `entries[${index}].value 必须是字符串（宿主自行序列化）`);
   }
   const bytes = utf8.encode(entry.value).length;
-  if (bytes > MAX_STATE_VALUE_BYTES) {
-    return err(413, 'STATE_VALUE_TOO_LARGE', `entries[${index}].value 超过单条上限`, { index, key: entry.key, bytes, maxBytes: MAX_STATE_VALUE_BYTES });
+  if (bytes > maxValueBytes) {
+    return rejectEntry(entry, index, 'STATE_VALUE_TOO_LARGE', `entries[${index}].value 超过单条总上限`, { bytes, maxBytes: maxValueBytes });
   }
   if (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0) {
-    return err(400, 'INVALID_STATE_UPDATED_AT', `entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
+    return rejectEntry(entry, index, 'INVALID_STATE_UPDATED_AT', `entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
   }
   return null;
 }
@@ -105,24 +139,82 @@ export function createClientStateHandler(ctx) {
     if (entries.length > MAX_STATE_ENTRIES_PER_REQUEST) {
       return err(400, 'TOO_MANY_STATE_ENTRIES', `单次最多 ${MAX_STATE_ENTRIES_PER_REQUEST} 条`, { count: entries.length });
     }
+    const maxValueBytes = Number.isInteger(ctx.maxStateValueBytes) && ctx.maxStateValueBytes > 0
+      ? ctx.maxStateValueBytes
+      : DEFAULT_MAX_STATE_VALUE_BYTES;
+
+    // 逐条校验：坏条目只拒它自己（进 rejected），好条目照常入库。
+    const accepted = [];
+    const rejected = [];
     for (let i = 0; i < entries.length; i++) {
-      const invalid = validateEntry(entries[i], i);
-      if (invalid) return invalid;
+      const rejection = validateEntry(entries[i], i, maxValueBytes);
+      if (rejection) rejected.push(rejection); else accepted.push(entries[i]);
     }
 
     if (typeof db.upsertClientState !== 'function') {
       return err(501, 'CLIENT_STATE_NOT_SUPPORTED', '当前数据库适配器不支持 client_state');
     }
 
-    const encryptedEntries = await Promise.all(entries.map(async (entry) => ({
-      namespace: entry.namespace,
-      key: entry.key,
-      value: await encryptForStorage(entry.value, userKey),
-      updatedAt: entry.updatedAt,
-    })));
+    // 展开成物理行：小值 1 行（历史路径，字节级不变），大值 = 根 marker 行 +
+    // 保留 namespace 里的 N 个加密切片行。每条 accepted 条目都配一条 cleanup
+    // （同一 batch 里先删后写），把这个 key 旧写入留下的切片清干净 —— 覆盖写
+    // 变小 / 缩块都不留尾巴；陈旧批次的 cleanup 因 updated_at 条件删不动新行。
+    const physicalRows = [];
+    const cleanups = [];
+    const rootRowIndexes = [];
+    for (const entry of accepted) {
+      cleanups.push({
+        namespace: chunkNamespaceFor(entry.namespace),
+        keyPrefix: chunkKeyPrefixFor(entry.key),
+        updatedAt: entry.updatedAt,
+      });
+      rootRowIndexes.push(physicalRows.length);
+      if (utf8.encode(entry.value).length <= STATE_CHUNK_SLICE_BYTES) {
+        physicalRows.push({
+          namespace: entry.namespace,
+          key: entry.key,
+          value: await encryptForStorage(entry.value, userKey),
+          updatedAt: entry.updatedAt,
+        });
+      } else {
+        const slices = splitStateValue(entry.value);
+        physicalRows.push({
+          namespace: entry.namespace,
+          key: entry.key,
+          value: buildChunkedRootValue(slices.length),
+          updatedAt: entry.updatedAt,
+        });
+        const encryptedSlices = await Promise.all(slices.map((slice) => encryptForStorage(slice, userKey)));
+        for (let c = 0; c < encryptedSlices.length; c++) {
+          physicalRows.push({
+            namespace: chunkNamespaceFor(entry.namespace),
+            key: chunkKeyFor(entry.key, c),
+            value: encryptedSlices[c],
+            updatedAt: entry.updatedAt,
+          });
+        }
+      }
+    }
 
-    const { upserted, skipped } = await db.upsertClientState(userId, encryptedEntries);
-    return { status: 200, body: { success: true, data: { upserted, skipped } } };
+    let upserted = 0;
+    let skipped = 0;
+    if (physicalRows.length > 0) {
+      const result = await db.upsertClientState(userId, physicalRows, cleanups);
+      if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
+        // 逻辑计数：一条 entry 的 upserted/skipped 看它的根行（切片行不计数）。
+        for (const rootIndex of rootRowIndexes) {
+          if (result.outcomes[rootIndex]) upserted++; else skipped++;
+        }
+      } else {
+        // 自定义 adapter 只回老形状 { upserted, skipped } 时按物理行计数兜底。
+        upserted = result.upserted;
+        skipped = result.skipped;
+      }
+    }
+
+    const data = { upserted, skipped };
+    if (rejected.length > 0) data.rejected = rejected;
+    return { status: 200, body: { success: true, data } };
   }
 
   async function GET(url, headers) {
@@ -136,6 +228,9 @@ export function createClientStateHandler(ctx) {
 
     const namespace = new URL(url, 'https://dummy').searchParams.get('namespace') || '';
     if (!namespace.trim()) return err(400, 'NAMESPACE_REQUIRED', '必须提供 namespace 查询参数');
+    if (INTERNAL_STATE_CHAR_RE.test(namespace)) {
+      return err(400, 'INVALID_STATE_NAMESPACE', 'namespace 不能包含控制字符（\\u0000-\\u001f 为库内部保留）');
+    }
 
     if (typeof db.getClientState !== 'function') {
       return err(501, 'CLIENT_STATE_NOT_SUPPORTED', '当前数据库适配器不支持 client_state');
@@ -143,12 +238,12 @@ export function createClientStateHandler(ctx) {
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
     const rows = await db.getClientState(userId, namespace);
-    const decrypted = await Promise.all(rows.map(async (row) => ({
-      namespace: row.namespace,
-      key: row.key,
-      value: await decryptFromStorage(row.value, userKey),
-      updatedAt: row.updated_at,
-    })));
+    // 分块存储的值在这里拼回原文；块不齐全的 key 视为不存在（不抛错）。
+    const decrypted = await resolveClientStateEntries(
+      rows,
+      () => db.getClientState(userId, chunkNamespaceFor(namespace)),
+      (value) => decryptFromStorage(value, userKey)
+    );
 
     const encryptedResponse = await encryptPayload({ namespace, entries: decrypted }, userKey);
     return { status: 200, body: { success: true, encrypted: true, version: 1, data: encryptedResponse } };

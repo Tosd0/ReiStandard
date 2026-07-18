@@ -121,3 +121,22 @@ describe('extractToolCallsFromDecision', () => {
     assert.deepEqual(extractToolCallsFromDecision(null), []);
   });
 });
+
+describe('buildSessionContext scratch', () => {
+  test('scratch 原样透传同一引用；ctx 冻结但 scratch 本体可变', () => {
+    const scratch = { a: 1 };
+    const ctx = buildSessionContext({
+      sessionId: 's', messages: [], llmResponse: null, iteration: 0, contactName: 'C', scratch,
+    });
+    assert.equal(ctx.scratch, scratch);
+    ctx.scratch.b = 2;
+    assert.equal(scratch.b, 2);
+  });
+
+  test('不传 scratch → 字段缺席（instant 现有形状不变）', () => {
+    const ctx = buildSessionContext({
+      sessionId: 's', messages: [], llmResponse: null, iteration: 0, contactName: 'C',
+    });
+    assert.ok(!('scratch' in ctx));
+  });
+});
