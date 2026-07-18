@@ -4,6 +4,7 @@ import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
 import { deriveUserEncryptionKey, encryptPayload, decryptPayload, encryptForStorage } from '../src/server/lib/encryption.js';
+import { chunkNamespaceFor, chunkKeyFor, chunkKeyPrefixFor } from '../src/server/lib/state-chunks.js';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -17,14 +18,14 @@ describe('D1 adapter client_state', () => {
       { namespace: 'notes', key: 'k1', value: 'enc-v1', updatedAt: 100 },
       { namespace: 'notes', key: 'k2', value: 'enc-v2', updatedAt: 100 },
     ]);
-    assert.deepEqual(r, { upserted: 2, skipped: 0 });
+    assert.deepEqual(r, { upserted: 2, skipped: 0, outcomes: [true, true] });
 
     // older than stored → skip; equal-or-newer → overwrite
     r = await adapter.upsertClientState(USER, [
       { namespace: 'notes', key: 'k1', value: 'enc-old', updatedAt: 50 },
       { namespace: 'notes', key: 'k2', value: 'enc-new', updatedAt: 200 },
     ]);
-    assert.deepEqual(r, { upserted: 1, skipped: 1 });
+    assert.deepEqual(r, { upserted: 1, skipped: 1, outcomes: [false, true] });
 
     const rows = await adapter.getClientState(USER, 'notes');
     assert.deepEqual(
@@ -62,7 +63,7 @@ describe('D1 adapter client_state', () => {
       { namespace: 'n', key: 'b', value: 'v2', updatedAt: 2 },
       { namespace: 'n', key: 'a', value: 'old', updatedAt: 1 }, // stale → skipped
     ]);
-    assert.deepEqual(r, { upserted: 2, skipped: 1 });
+    assert.deepEqual(r, { upserted: 2, skipped: 1, outcomes: [true, true, false] });
     assert.equal(batchCalls, 1);
 
     // fallback path: binding without batch() gives identical results
@@ -73,10 +74,55 @@ describe('D1 adapter client_state', () => {
       { namespace: 'n', key: 'a', value: 'v1', updatedAt: 2 },
       { namespace: 'n', key: 'a', value: 'old', updatedAt: 1 },
     ]);
-    assert.deepEqual(r2, { upserted: 1, skipped: 1 });
+    assert.deepEqual(r2, { upserted: 1, skipped: 1, outcomes: [true, false] });
     assert.deepEqual(
       (await adapter2.getClientState(USER, 'n')).map((x) => [x.key, x.value]),
       [['a', 'v1']]
+    );
+  });
+
+  test('cleanups：LIKE 前缀删除只删自己 key 的切片、尊重 LWW、% 通配符被转义', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const chunkNs = chunkNamespaceFor('n');
+    await adapter.upsertClientState(USER, [
+      { namespace: chunkNs, key: chunkKeyFor('a', 0), value: 'c0', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor('a', 1), value: 'c1', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor('ab', 0), value: 'other-key', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor('a%b', 0), value: 'pct-key', updatedAt: 100 },
+    ]);
+
+    // 清 key 'a' 的切片：'ab' / 'a%b' 的不受影响（ 分隔符挡住前缀误伤）
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('a'), updatedAt: 150 },
+    ]);
+    let keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key).sort();
+    assert.deepEqual(keys, [chunkKeyFor('a%b', 0), chunkKeyFor('ab', 0)].sort());
+
+    // 清 'a%b' 的切片：% 不能当通配符把 'ab' 的也带走
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('a%b'), updatedAt: 150 },
+    ]);
+    keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key);
+    assert.deepEqual(keys, [chunkKeyFor('ab', 0)]);
+
+    // 陈旧批次（updatedAt 更老）的 cleanup 删不动更新的行
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('ab'), updatedAt: 50 },
+    ]);
+    assert.equal((await adapter.getClientState(USER, chunkNs)).length, 1);
+
+    // cleanup + upsert 同批：先删后写，同一 key 的新切片完整落库
+    const r = await adapter.upsertClientState(USER, [
+      { namespace: chunkNs, key: chunkKeyFor('ab', 0), value: 'new0', updatedAt: 200 },
+      { namespace: chunkNs, key: chunkKeyFor('ab', 1), value: 'new1', updatedAt: 200 },
+    ], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('ab'), updatedAt: 200 },
+    ]);
+    assert.deepEqual(r, { upserted: 2, skipped: 0, outcomes: [true, true] });
+    assert.deepEqual(
+      (await adapter.getClientState(USER, chunkNs)).map((x) => [x.key, x.value]),
+      [[chunkKeyFor('ab', 0), 'new0'], [chunkKeyFor('ab', 1), 'new1']]
     );
   });
 });

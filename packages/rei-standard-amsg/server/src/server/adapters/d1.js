@@ -18,6 +18,11 @@ const UPDATABLE_COLUMNS = new Set([
   'next_send_at', 'status', 'retry_count', 'created_at', 'updated_at'
 ]);
 
+// LIKE 前缀转义：用户 key 里的 % _ \ 不能变成通配符/转义符。
+function escapeLikePrefix(prefix) {
+  return prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
 export class D1Adapter {
   /** @param {{ prepare: (sql: string) => any }} db - Cloudflare D1 binding */
   constructor(db) {
@@ -230,6 +235,10 @@ export class D1Adapter {
    * than the stored row (updatedAt strictly lower) is skipped; equal or
    * newer overwrites. Values arrive pre-encrypted (the handler encrypts).
    *
+   * `cleanups` 是分块存储的清理项（见 lib/state-chunks.js）：在同一 batch 里
+   * 先于 upsert 执行，按 (namespace, key 前缀) 删掉旧写入留下的切片行；
+   * `updated_at <= ?` 条件保证陈旧批次删不动更新写入的行。
+   *
    * Uses D1's batch() — one network round trip for the whole set (implicit
    * transaction). The client calls this endpoint inside its few-seconds
    * background window, so N sequential round trips could eat the whole
@@ -238,9 +247,11 @@ export class D1Adapter {
    *
    * @param {string} userId
    * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
-   * @returns {Promise<{ upserted: number, skipped: number }>}
+   * @param {Array<{ namespace: string, keyPrefix: string, updatedAt: number }>} [cleanups]
+   * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[] }>}
+   *   `outcomes[i]` 对应 entries[i] 是否真的写入（changes > 0）。
    */
-  async upsertClientState(userId, entries) {
+  async upsertClientState(userId, entries, cleanups = []) {
     const UPSERT_SQL =
       `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
        VALUES (?, ?, ?, ?, ?)
@@ -248,28 +259,37 @@ export class D1Adapter {
          value = excluded.value,
          updated_at = excluded.updated_at
        WHERE excluded.updated_at >= client_state.updated_at`;
+    const CLEANUP_SQL =
+      `DELETE FROM client_state
+       WHERE user_id = ? AND namespace = ? AND key LIKE ? ESCAPE '\\' AND updated_at <= ?`;
+
+    const buildStatements = () => [
+      ...cleanups.map((c) =>
+        this._db.prepare(CLEANUP_SQL).bind(userId, c.namespace, `${escapeLikePrefix(c.keyPrefix)}%`, c.updatedAt)
+      ),
+      ...entries.map((entry) =>
+        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
+      ),
+    ];
 
     let results;
     if (typeof this._db.batch === 'function') {
-      const statements = entries.map((entry) =>
-        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
-      );
-      results = await this._db.batch(statements);
+      results = await this._db.batch(buildStatements());
     } else {
       results = [];
-      for (const entry of entries) {
-        results.push(
-          await this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt).run()
-        );
+      for (const stmt of buildStatements()) {
+        results.push(await stmt.run());
       }
     }
 
+    // cleanup 语句不计数：upserted/skipped/outcomes 只看 entries 对应的语句。
+    const outcomes = results.slice(cleanups.length).map((res) => res.meta.changes > 0);
     let upserted = 0;
     let skipped = 0;
-    for (const res of results) {
-      if (res.meta.changes > 0) upserted++; else skipped++;
+    for (const wrote of outcomes) {
+      if (wrote) upserted++; else skipped++;
     }
-    return { upserted, skipped };
+    return { upserted, skipped, outcomes };
   }
 
   /**
