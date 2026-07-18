@@ -31,6 +31,7 @@ import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
 import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
 import { createClientStateHandler } from './handlers/client-state.js';
+import { createCapabilitiesHandler } from './handlers/capabilities.js';
 
 export function createSingleUserServer(config) {
   if (!config || !config.db) throw new Error('[amsg-server single-user] config.db is required');
@@ -70,7 +71,8 @@ export function createSingleUserServer(config) {
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx),
       vapidPublicKey: createVapidPublicKeyHandler(ctx),
-      clientState: createClientStateHandler(ctx)
+      clientState: createClientStateHandler(ctx),
+      capabilities: createCapabilitiesHandler(ctx)
     }
   };
 }

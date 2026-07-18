@@ -1,4 +1,7 @@
 import { defineConfig } from 'tsup';
+import { readFileSync } from 'node:fs';
+
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export default defineConfig({
   // Two entries: the root (multi-tenant, Node) and a Cloudflare/D1-only entry
@@ -17,5 +20,10 @@ export default defineConfig({
   platform: 'node',
   target: 'node20',
   splitting: true,
-  clean: true
+  clean: true,
+  // GET /capabilities 的 serverVersion：构建期把版本号焊进产物，
+  // 避免手工维护一个会漂移的常量。
+  define: {
+    __AMSG_SERVER_VERSION__: JSON.stringify(pkg.version)
+  }
 });
