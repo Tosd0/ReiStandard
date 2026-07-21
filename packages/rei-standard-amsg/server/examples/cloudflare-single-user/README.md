@@ -74,6 +74,9 @@ export default createSingleUserCloudflareWorker((env) => ({
         { role: 'user', content: `根据这些记录写一条提醒：${notes.map(n => n.value).join('\n')}` },
       ];
       // 也可以返回 { messages, maxToolIterations, totalTimeoutMs } 按次放宽预算
+      // 或返回 { skip: true }：这次不生成，零推送直接算成功结束（不调 LLM）。
+      //   一次性任务照删、循环任务照推进到下次。适合排程后对话已有新进展、
+      //   这条到点已多余的情况。
     },
 
     // 每轮 LLM 输出后分类。ctx 形状与 @rei-standard/amsg-instant 的
