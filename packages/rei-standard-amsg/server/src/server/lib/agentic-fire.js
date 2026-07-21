@@ -4,7 +4,7 @@
  * When the host configures fire-time hooks, an LLM task stops replaying
  * the completePrompt frozen at schedule time. At fire time instead:
  *
- *   onBeforeFire(fireCtx) → fresh messages (may read client_state)
+ *   onBeforeFire(fireCtx) → fresh messages (may read client_state) | { skip: true }
  *     → callLlm → onLLMOutput(sessionCtx) → decision
  *         ├─ 'finish'       → push decision.pushPayloads, done
  *         ├─ 'skip-push'    → record, done (task counts as delivered)
@@ -105,7 +105,7 @@ function normalizeBeforeFireResult(result) {
     };
   }
   throw new TypeError(
-    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs? } | null'
+    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs? } | { skip: true } | null'
   );
 }
 
@@ -132,7 +132,11 @@ function firstPositiveNumber(values, fallback) {
  * @param {string} args.userKey - per-user storage key (for readState decryption)
  * @param {Object} args.ctx - processor ctx ({ db, webpush, vapid, hooks, maxToolIterations, totalTimeoutMs })
  * @returns {Promise<{ handled: false } | { handled: true, result: { success: true, messagesSent: number, status: 'finished'|'skipped', iterations: number } }>}
- *   `handled: false` → caller falls back to the legacy frozen-prompt path.
+ *   `handled: false` → caller falls back to the legacy frozen-prompt path
+ *   (onBeforeFire returned null).
+ *   `onBeforeFire` may also return `{ skip: true }` to complete the fire
+ *   before the first LLM call → `status: 'skipped', iterations: 0`, same
+ *   success handling as the post-LLM skip-push path.
  *   Failures (timeout / loop exceeded / config errors) throw — the caller's
  *   existing error handling turns them into task retry/failure.
  */
@@ -177,6 +181,14 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
+
+  // Pre-LLM skip: the host judged this fire moot before generation (e.g. the
+  // conversation moved on after the task was scheduled). Shaped exactly like
+  // the post-LLM 'skipped' result, so run-tick's success handling (delete
+  // once-off / advance recurrence) applies unchanged — and zero tokens spent.
+  if (typeof before === 'object' && before.skip === true) {
+    return { handled: true, result: { success: true, messagesSent: 0, status: 'skipped', iterations: 0 } };
+  }
 
   const normalized = normalizeBeforeFireResult(before);
   const maxToolIterations = firstPositiveInt(

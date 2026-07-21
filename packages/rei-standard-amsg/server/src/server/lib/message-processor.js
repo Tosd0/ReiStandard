@@ -113,7 +113,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     // needs the LLM, offer the agentic path first. onBeforeFire → null
     // falls straight through to the frozen-prompt chain below, and
     // deployments without hooks never enter this branch — legacy behavior
-    // is byte-identical.
+    // is byte-identical. onBeforeFire → { skip: true } completes the fire
+    // here as a zero-push success (no LLM call, no frozen-prompt fallback):
+    // use it when the host can tell at fire time the message is moot.
     if (ctx.hooks && typeof ctx.hooks.onBeforeFire === 'function' && taskNeedsLlm(decryptedPayload)) {
       const agentic = await runAgenticFire({ task, decryptedPayload, userKey, ctx });
       if (agentic.handled) return agentic.result;

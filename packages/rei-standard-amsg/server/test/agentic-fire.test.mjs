@@ -288,6 +288,27 @@ describe('agentic fire loop', () => {
     }
   });
 
+  test('onBeforeFire { skip: true }: fire ends before the first LLM call; zero-push success', async () => {
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async () => ({ skip: true }),
+      // If the skip ever leaked into the LLM loop, onLLMOutput would run and
+      // this throw would flip result.success to false — the deepEqual guards it.
+      onLLMOutput: async () => { throw new Error('onLLMOutput must not run when onBeforeFire skips'); },
+    };
+    const pushes = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks, pushSpy: (_s, p) => pushes.push(p) }));
+      // Same shape as the post-LLM skip-push path, but iterations: 0 — no round ran.
+      assert.deepEqual(result, { success: true, messagesSent: 0, status: 'skipped', iterations: 0 });
+      assert.equal(llm.calls.length, 0);   // never reached the LLM
+      assert.equal(pushes.length, 0);
+    } finally {
+      llm.restore();
+    }
+  });
+
   test('continue: nextHistory replaces the running messages', async () => {
     const { task } = await makeTask();
     const nextHistory = [{ role: 'user', content: '重来' }];
