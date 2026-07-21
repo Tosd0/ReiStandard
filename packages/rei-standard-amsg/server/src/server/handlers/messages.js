@@ -65,7 +65,14 @@ export function createMessagesHandler(ctx) {
         status: task.status,
         retryCount: task.retry_count,
         createdAt: task.created_at,
-        updatedAt: task.updated_at
+        updatedAt: task.updated_at,
+        // Character ownership / client-side task identity, pulled from the
+        // scheduling host's metadata so it can filter tasks by character
+        // (contactName can collide across characters). Only these two
+        // metadata fields are surfaced — the rest of metadata may hold
+        // host-private data and stays server-side. Absent → null.
+        charId: decrypted.metadata?.charId ?? null,
+        clientTaskId: decrypted.metadata?.amsgClientTaskId ?? null
       };
     }));
 
