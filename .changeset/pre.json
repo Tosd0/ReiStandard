@@ -19,6 +19,7 @@
     "amsg-server-before-fire-skip",
     "amsg-server-messages-identity",
     "amsg-server-single-user-cloudflare",
+    "amsg-server-tick-claim",
     "amsg-server-webcrypto-encryption",
     "amsg-shared-agentic-contract",
     "amsg-vapid-public-key"
