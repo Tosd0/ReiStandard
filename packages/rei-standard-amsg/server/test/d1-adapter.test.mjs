@@ -73,6 +73,45 @@ test('updateTaskByUuid updates only pending rows and returns {uuid, updated_at}'
   assert.equal(await adapter.updateTaskByUuid('missing', USER, 'enc2'), null);
 });
 
+test('claimTask 领到一次后，同一个期望值再领就领不到了', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'c', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  const lease = '2020-01-01T00:10:00.000Z';
+
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', lease), true);
+  // 第二个 tick 拿着同一批读到的旧值来领 —— 行已经被顶走，领不到。
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', lease), false);
+
+  const after = await adapter.getTaskByUuidOnly('c');
+  assert.equal(after.next_send_at, lease);
+});
+
+test('claimTask 领不动非 pending 的行', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'cf', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  await adapter.updateTaskById(row.id, { status: 'failed' });
+  assert.equal(
+    await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', '2020-01-01T00:10:00.000Z'),
+    false
+  );
+});
+
+test('claimTask 按读到的原值比对，不做时区归一化', async () => {
+  // 老部署里可能留着没归一化的行；如果比对前先归一化成 Z 形式就永远对不上，
+  // 那条任务会一直领不到、再也不触发。
+  const { adapter, db } = await freshAdapter();
+  const now = '2020-01-01T00:00:00.000Z';
+  db._raw.prepare(
+    `INSERT INTO scheduled_messages
+      (user_id, uuid, encrypted_payload, next_send_at, message_type, status, retry_count, created_at, updated_at)
+     VALUES (?, 'legacy', 'enc', '2020-01-01T08:00:00+08:00', 'fixed', 'pending', 0, ?, ?)`
+  ).run(USER, now, now);
+
+  const [row] = await adapter.getPendingTasks(50);
+  assert.equal(row.uuid, 'legacy');
+  assert.equal(await adapter.claimTask(row.id, row.next_send_at, '2020-01-01T00:10:00.000Z'), true);
+});
+
 test('delete + getTaskStatus', async () => {
   const { adapter } = await freshAdapter();
   const row = await adapter.createTask(baseTask({ uuid: 'd' }));

@@ -117,6 +117,14 @@ export default createSingleUserCloudflareWorker((env) => ({
 
 预算兜底：轮数到上限、或整链超过 `totalTimeoutMs`，按任务失败处理（沿用现有重试/标记逻辑）。hook 收到的 ctx 里没有 apiKey、pushSubscription、VAPID——`console.log(ctx)` 不会把密钥打进日志。
 
+## 慢任务与 cron 占位
+
+cron 一分钟一跳，跳与跳之间互不相让；带工具的任务跑过一分钟是常态。所以 `scheduled()` 每条任务开跑前会先占位：把库里的 `next_send_at` 顶到「现在 + 租期」，这一行在本次投递期间对下一跳不再是「到点待发」，抢不到的那一跳直接跳过这条。
+
+租期默认 10 分钟，配了 `totalTimeoutMs` 就按它 + 2 分钟往上抬。想自己定就在 config 里加 `claimLeaseMs: 900_000`。`onBeforeFire` 里按次放宽的 `totalTimeoutMs` 占位时看不到，那种情况请显式设 `claimLeaseMs`。
+
+`ctx.task.nextSendAt` 拿到的始终是这条任务原本的触发时刻，不是占位后的租期时间——拿它当时间锚点（窗口判断、缓存键）对得上。循环任务也按原始触发时刻推进到下一次。
+
 ## 导入入口
 
 Worker 从 `@rei-standard/amsg-server/cloudflare` 导入（不是包根）。这个子路径只含单用户 + D1 + Web Crypto 推送那条路径，不牵扯 pg / neon / web-push，所以只装了 D1 的环境也能打包通过。

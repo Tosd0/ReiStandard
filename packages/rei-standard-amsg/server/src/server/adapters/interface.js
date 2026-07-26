@@ -60,6 +60,13 @@
  *   Delete a task by uuid + user_id. Returns true if a row was affected.
  * @property {(limit?: number) => Promise<TaskRow[]>} getPendingTasks
  *   Fetch pending tasks whose next_send_at <= NOW(), ordered ASC.
+ * @property {(taskId: number, expectedNextSendAt: string|Date, leaseUntil: string|Date) => Promise<boolean>} [claimTask]
+ *   领取一条到点的任务：只有当行仍是 pending 且 next_send_at 还等于
+ *   `expectedNextSendAt`（读这行时拿到的值）时，才把 next_send_at 顶到
+ *   `leaseUntil`，返回是否改到了行。cron 每分钟一跳而一次投递可能跑几分钟，
+ *   runScheduledTick 靠它保证同一行同时只被一个 tick 跑。
+ *   自定义适配器可以不实现（runScheduledTick 会退回不占位的老行为，代价是
+ *   慢任务可能被下一跳重复触发）。
  * @property {(userId: string, opts: {status?: string, limit?: number, offset?: number}) => Promise<{tasks: TaskRow[], total: number}>} listTasks
  *   List tasks for a user with optional filters and pagination.
  * @property {(days?: number) => Promise<number>} cleanupOldTasks

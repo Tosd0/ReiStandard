@@ -78,7 +78,14 @@ export function taskNeedsLlm(decryptedPayload) {
   return false;
 }
 
-/** Frozen, credential-free view of the task for hook authors. */
+/**
+ * Frozen, credential-free view of the task for hook authors.
+ *
+ * nextSendAt 始终是这条任务原始的触发时刻。run-tick 领取任务时会把库里的
+ * next_send_at 顶到租期末尾防重复触发，但传进来的 task 是领取前读到的那一
+ * 行——宿主拿 nextSendAt 当时间锚点（窗口判断、缓存键）时对得上。别在这里
+ * 改成回库里重读。
+ */
 function buildHookTask(task, decryptedPayload) {
   const safe = {};
   for (const [key, value] of Object.entries(decryptedPayload)) {

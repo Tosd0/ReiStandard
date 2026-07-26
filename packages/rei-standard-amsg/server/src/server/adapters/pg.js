@@ -192,6 +192,35 @@ export class PgAdapter {
     );
   }
 
+  /**
+   * 领取一条到点的任务：把 next_send_at 顶到租期末尾，本次投递期间这一行
+   * 对其他 tick 不再是「到点待发」。
+   *
+   * WHERE 里带上读这行时看到的 next_send_at，两个 tick 抢同一行时只有一个
+   * 改得动，另一个拿不到 RETURNING 行，据此跳过。用 next_send_at 做比对值
+   * 而不是加一个 'sending' 状态：status 上有 CHECK 约束，加值要改表。
+   *
+   * 两边都截到毫秒再比：列是 timestamptz（微秒精度），驱动读出来是 JS Date
+   * （毫秒精度），原值送回去可能因为亚毫秒差对不上。
+   *
+   * @param {number} taskId
+   * @param {string|Date} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
+   * @param {string|Date} leaseUntil - 租期末尾
+   * @returns {Promise<boolean>} true = 领到了；false = 已被别人领走或行已不是 pending
+   */
+  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+    const rows = await this._query(
+      `UPDATE scheduled_messages
+          SET next_send_at = $1, updated_at = NOW()
+        WHERE id = $2 AND status = 'pending'
+          AND date_trunc('milliseconds', next_send_at)
+            = date_trunc('milliseconds', $3::timestamptz)
+       RETURNING id`,
+      [leaseUntil, taskId, expectedNextSendAt]
+    );
+    return rows.length > 0;
+  }
+
   async listTasks(userId, opts = {}) {
     const { status = 'all', limit = 20, offset = 0 } = opts;
 

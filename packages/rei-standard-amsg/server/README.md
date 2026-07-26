@@ -123,6 +123,14 @@ AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
 - `send-notifications`
   - `Authorization: Bearer <cronToken>` 或 `?token=<cronToken>`
 
+## 触发任务时的占位
+
+`send-notifications`（以及单用户 Worker 的 `scheduled()`）每条任务开跑前会先占位：把库里的 `next_send_at` 顶到「现在 + 租期」，这一行在本次投递期间对其他调用不再是「到点待发」；占位改到 0 行说明别人先领走了，本次直接跳过。cron 一分钟一跳而带工具的 AI 任务常常跑过一分钟，没有这层占位同一条任务会被相邻几跳重复触发。
+
+租期默认 10 分钟；配了 `totalTimeoutMs` 的话按它 + 2 分钟往上抬。想自己定就在 `runScheduledTick` 的 ctx（或单用户 Worker 的 config）里传 `claimLeaseMs`。`onBeforeFire` 里按次放宽的预算占位时看不到，那种情况要显式设 `claimLeaseMs`。
+
+内置适配器都实现了占位。自定义适配器可以不实现 `claimTask`，跑得动，只是回到不占位的行为。
+
 ## 导出 API（Exports）
 
 - `createReiServer`

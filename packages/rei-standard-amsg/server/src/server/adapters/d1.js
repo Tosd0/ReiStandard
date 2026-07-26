@@ -185,6 +185,37 @@ export class D1Adapter {
     return res.results || [];
   }
 
+  /**
+   * 领取一条到点的任务：把 next_send_at 顶到租期末尾，本次投递期间这一行
+   * 对其他 tick 不再是「到点待发」。
+   *
+   * WHERE 里带上读这行时看到的 next_send_at，两个 tick 抢同一行时只有一个
+   * 能改到行，另一个拿到 changes = 0，据此跳过。
+   *
+   * 用 next_send_at 做比对值而不是加一个 'sending' 状态：建表语句里 status
+   * 有 CHECK (status IN ('pending','sent','failed'))，加值要重建表。
+   *
+   * expectedNextSendAt 按读到的原样比对，不做时区归一化——老部署里可能还留
+   * 着非归一化写法的行（如 +08:00 结尾），归一化后反而对不上，那条任务会永
+   * 远领不到。
+   *
+   * @param {number} taskId
+   * @param {string} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
+   * @param {string|Date} leaseUntil - 租期末尾
+   * @returns {Promise<boolean>} true = 领到了；false = 已被别人领走或行已不是 pending
+   */
+  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+    const expected = typeof expectedNextSendAt === 'string'
+      ? expectedNextSendAt
+      : this._iso(expectedNextSendAt);
+    const res = await this._db.prepare(
+      `UPDATE scheduled_messages
+          SET next_send_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending' AND next_send_at = ?`
+    ).bind(this._iso(leaseUntil), this._now(), taskId, expected).run();
+    return (res.meta.changes || 0) > 0;
+  }
+
   async listTasks(userId, opts = {}) {
     const { status = 'all', limit = 20, offset = 0 } = opts;
     const conditions = ['user_id = ?'];
