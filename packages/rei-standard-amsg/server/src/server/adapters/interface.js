@@ -78,11 +78,13 @@
  *   Delete completed / failed tasks older than `days` (default 7).
  * @property {(uuid: string, userId: string) => Promise<string|null>} getTaskStatus
  *   Return the status string of a task (used to distinguish 404 from 409).
- * @property {(userId: string, entries: Array<{namespace: string, key: string, value: string, updatedAt: number}>, cleanups?: Array<{namespace: string, keyPrefix: string, updatedAt: number}>) => Promise<{upserted: number, skipped: number, outcomes?: boolean[]}>} [upsertClientState]
+ * @property {(userId: string, entries: Array<{namespace: string, key: string, value: string, updatedAt: number}>, cleanups?: Array<{namespace: string, key?: string, keyPrefix?: string, updatedAt: number}>) => Promise<{upserted: number, skipped: number, outcomes?: boolean[]}>} [upsertClientState]
  *   (optional; single-user/D1 only) Batch upsert of client state, last-write-wins on updatedAt.
- *   `cleanups` 先于 upsert 在同一事务里按 key 前缀删旧切片行（分块存储清理，见 lib/state-chunks.js；
- *   自定义 adapter 可忽略，只损失存储卫生不影响正确性）；`outcomes` 逐条报告 entries[i] 是否真的
- *   写入（缺席时 handler 按物理行计数兜底）。
+ *   `cleanups` 先于 upsert 在同一事务里删旧行，两种形态：带 `keyPrefix` 的按 key 前缀删（清理大值
+ *   旧写入留下的切片行，见 lib/state-chunks.js），带 `key` 的删这一个 key（删整条状态；前缀会连带
+ *   删掉同前缀的兄弟 key）。两种都只删 `updated_at <= updatedAt` 的行。自定义 adapter 忽略前缀形态
+ *   只损失存储卫生；忽略精确 key 形态则删不掉状态，`ctx.writeState()` 的删除会失效。
+ *   `outcomes` 逐条报告 entries[i] 是否真的写入（缺席时调用方按物理行计数兜底）。
  * @property {(userId: string, namespace: string) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]

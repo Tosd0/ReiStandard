@@ -25,6 +25,11 @@
  * pushSubscription / vapid / masterKey (same rationale as instant's
  * SessionContext — a console.log(ctx) in a hook must not leak keys).
  *
+ * client_state 读写：fireCtx 和每轮的 sessionCtx 上都挂着 readState /
+ * writeState，读到和写出的都是客户端 `GET/PUT /client-state` 那套数据。写口
+ * 在 sessionCtx 上也给，是因为「这条内容太大、塞不进 push」往往到工具跑完、
+ * 组 pushPayloads 时才知道，那时 onBeforeFire 早已返回。
+ *
  * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx 与同一次
  * fire 每轮的 sessionCtx 都持有同一个引用，hook 之间借它传工具上下文，
  * 不用再自己维护 Map<sessionId, state>。fire 结束（finish / skip-push /
@@ -49,7 +54,19 @@ import {
 import { randomUUID } from './webcrypto-utils.js';
 import { decryptFromStorage } from './encryption.js';
 import { callLlm } from './llm.js';
-import { chunkNamespaceFor, resolveClientStateEntries } from './state-chunks.js';
+import {
+  DEFAULT_MAX_STATE_VALUE_BYTES,
+  INTERNAL_STATE_CHAR_RE,
+  chunkNamespaceFor,
+  resolveClientStateEntries,
+} from './state-chunks.js';
+import {
+  MAX_STATE_ENTRIES_PER_BATCH,
+  MAX_NAMESPACE_CHARS,
+  MAX_KEY_CHARS,
+  stateValueBytes,
+  writeClientStateEntries,
+} from './client-state-store.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -171,6 +188,90 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     );
   };
 
+  const maxStateValueBytes = Number.isInteger(ctx.maxStateValueBytes) && ctx.maxStateValueBytes > 0
+    ? ctx.maxStateValueBytes
+    : DEFAULT_MAX_STATE_VALUE_BYTES;
+
+  /**
+   * writeState(namespace, entries) —— readState 的写入口，落库走的是
+   * `PUT /client-state` 那条路径的同一份实现（加密、大值分块、切片清理，见
+   * lib/client-state-store.js），所以 hook 写下的东西客户端 `GET /client-state`
+   * 能原样读回，反过来也一样。
+   *
+   * 典型用法是「大内容旁路」：一条 Web Push 的正文只有 4KB 出头（见
+   * lib/webpush-webcrypto.js 的 MAX_PUSH_PAYLOAD_BYTES），塞不下的内容先写进
+   * client_state，push 里只带一个引用键，客户端上线后按键取回。
+   *
+   * @param {string} namespace
+   * @param {Array<{ key: string, value: string|null, updatedAt?: number }>} entries
+   *   `value` 是字符串 → 整条覆盖写（不是追加，宿主自己负责序列化）；
+   *   `value` 为 `null` → 删掉这个 key（含它的切片行）。
+   *   `updatedAt` 默认取当前时刻，语义与客户端同步一致：比库里已有值旧的写入
+   *   （或删除）不生效，客户端后写的数据不会被这次 fire 盖回去。
+   * @returns {Promise<{ upserted: number, skipped: number, deleted: number }>}
+   *
+   * 谁清、什么时候清：库不做 TTL 也不自动回收，写进去的东西一直在，直到有人
+   * 覆盖或删除它。旁路内容建议放在固定的少量 key 上（例如每个角色一个），下次
+   * 写同一个 key 直接覆盖，存量天然有上限；一次性的大内容在确认客户端取走后，
+   * 用 `{ key, value: null }` 删掉。`DELETE /client-state` 仍然是清空这个用户
+   * 全部状态的兜底。
+   */
+  const writeState = async (namespace, entries) => {
+    if (typeof namespace !== 'string' || !namespace.trim()) {
+      throw new TypeError('writeState(namespace, entries) requires a non-empty string namespace');
+    }
+    if (namespace.length > MAX_NAMESPACE_CHARS || INTERNAL_STATE_CHAR_RE.test(namespace)) {
+      throw new TypeError(
+        `writeState: namespace 必须是 1-${MAX_NAMESPACE_CHARS} 字符且不含控制字符（\\u0000-\\u001f 为库内部保留）`
+      );
+    }
+    if (!Array.isArray(entries)) {
+      throw new TypeError('writeState(namespace, entries) requires an array of { key, value }');
+    }
+    if (entries.length === 0) return { upserted: 0, skipped: 0, deleted: 0 };
+    if (entries.length > MAX_STATE_ENTRIES_PER_BATCH) {
+      throw new RangeError(`writeState: 单次最多 ${MAX_STATE_ENTRIES_PER_BATCH} 条，收到 ${entries.length} 条`);
+    }
+    // readState 在适配器不支持时返回空数组（读不到状态，hook 走自己的兜底）。
+    // 写不一样：静默成功会让 push 带上一个指向不存在数据的引用键，所以这里报错。
+    if (!ctx.db || typeof ctx.db.upsertClientState !== 'function') {
+      throw new Error('AGENTIC_STATE_WRITE_UNSUPPORTED: 当前数据库适配器不支持 client_state 写入');
+    }
+
+    const now = nowFn();
+    const normalized = entries.map((entry, index) => {
+      if (!entry || typeof entry !== 'object') {
+        throw new TypeError(`writeState: entries[${index}] 必须是对象`);
+      }
+      if (typeof entry.key !== 'string' || !entry.key.trim() || entry.key.length > MAX_KEY_CHARS) {
+        throw new TypeError(`writeState: entries[${index}].key 必须是 1-${MAX_KEY_CHARS} 字符的字符串`);
+      }
+      if (INTERNAL_STATE_CHAR_RE.test(entry.key)) {
+        throw new TypeError(`writeState: entries[${index}].key 不能包含控制字符（\\u0000-\\u001f 为库内部保留）`);
+      }
+      if (entry.value !== null && typeof entry.value !== 'string') {
+        throw new TypeError(`writeState: entries[${index}].value 必须是字符串（宿主自行序列化），或 null 表示删除`);
+      }
+      if (typeof entry.value === 'string') {
+        const bytes = stateValueBytes(entry.value);
+        if (bytes > maxStateValueBytes) {
+          throw new RangeError(`writeState: entries[${index}].value 为 ${bytes} 字节，超过单条上限 ${maxStateValueBytes} 字节`);
+        }
+      }
+      if (entry.updatedAt !== undefined && (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0)) {
+        throw new TypeError(`writeState: entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
+      }
+      return {
+        namespace,
+        key: entry.key,
+        value: entry.value,
+        updatedAt: entry.updatedAt ?? now,
+      };
+    });
+
+    return writeClientStateEntries({ db: ctx.db, userId: task.user_id, userKey, entries: normalized });
+  };
+
   // 单次 fire 的宿主便签：onBeforeFire 的 fireCtx 和同一次 fire 每轮的
   // sessionCtx（onLLMOutput / executeToolCalls）拿到同一个对象引用，fire 结束
   // （finish / skip-push / 抛错 / 轮数超限）随调用栈丢弃。库自己不读不写、
@@ -181,6 +282,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     task: buildHookTask(task, decryptedPayload),
     userId: task.user_id,
     readState,
+    writeState,
     now: new Date(nowFn()),
     scratch,
   });
@@ -229,16 +331,23 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     const assistantMessage = extractAssistantMessage(llmResponse);
     messages = [...messages, assistantMessage];
 
-    const sessionCtx = buildSessionContext({
-      sessionId,
-      messages,
-      llmResponse,
-      iteration,
-      contactName: decryptedPayload.contactName,
-      avatarUrl: decryptedPayload.avatarUrl || undefined,
-      charId: decryptedPayload.charId,
-      metadata: decryptedPayload.metadata,
-      scratch,
+    // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂两个状态访问器：
+    // 大内容要不要旁路存，往往到工具跑完、组 push 时才知道，而那正是
+    // onLLMOutput / executeToolCalls 的位置，onBeforeFire 早就返回了。
+    const sessionCtx = Object.freeze({
+      ...buildSessionContext({
+        sessionId,
+        messages,
+        llmResponse,
+        iteration,
+        contactName: decryptedPayload.contactName,
+        avatarUrl: decryptedPayload.avatarUrl || undefined,
+        charId: decryptedPayload.charId,
+        metadata: decryptedPayload.metadata,
+        scratch,
+      }),
+      readState,
+      writeState,
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);

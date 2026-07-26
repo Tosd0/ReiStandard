@@ -287,9 +287,15 @@ export class D1Adapter {
    * than the stored row (updatedAt strictly lower) is skipped; equal or
    * newer overwrites. Values arrive pre-encrypted (the handler encrypts).
    *
-   * `cleanups` 是分块存储的清理项（见 lib/state-chunks.js）：在同一 batch 里
-   * 先于 upsert 执行，按 (namespace, key 前缀) 删掉旧写入留下的切片行；
-   * `updated_at <= ?` 条件保证陈旧批次删不动更新写入的行。
+   * `cleanups` 是删除项：在同一 batch 里先于 upsert 执行，`updated_at <= ?`
+   * 条件保证陈旧批次删不动更新写入的行。两种形态——
+   *   - `{ namespace, keyPrefix, updatedAt }` 删 key 前缀下的所有行，用来清掉
+   *     大值旧写入留下的切片行（见 lib/state-chunks.js）；
+   *   - `{ namespace, key, updatedAt }` 删这一个 key，用来删整条状态（前缀会
+   *     连带删掉同前缀的兄弟 key，删单条必须走精确匹配）。
+   *
+   * 删掉一整条状态就是这两种各来一条（切片行走前缀、根行走精确 key），
+   * `entries` 传空数组即可——见 lib/client-state-store.js。
    *
    * Uses D1's batch() — one network round trip for the whole set (implicit
    * transaction). The client calls this endpoint inside its few-seconds
@@ -299,7 +305,7 @@ export class D1Adapter {
    *
    * @param {string} userId
    * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
-   * @param {Array<{ namespace: string, keyPrefix: string, updatedAt: number }>} [cleanups]
+   * @param {Array<{ namespace: string, key?: string, keyPrefix?: string, updatedAt: number }>} [cleanups]
    * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[] }>}
    *   `outcomes[i]` 对应 entries[i] 是否真的写入（changes > 0）。
    */
@@ -311,14 +317,19 @@ export class D1Adapter {
          value = excluded.value,
          updated_at = excluded.updated_at
        WHERE excluded.updated_at >= client_state.updated_at`;
-    const CLEANUP_SQL =
+    const CLEANUP_PREFIX_SQL =
       `DELETE FROM client_state
        WHERE user_id = ? AND namespace = ? AND key LIKE ? ESCAPE '\\' AND updated_at <= ?`;
+    const CLEANUP_KEY_SQL =
+      `DELETE FROM client_state
+       WHERE user_id = ? AND namespace = ? AND key = ? AND updated_at <= ?`;
 
     const buildStatements = () => [
-      ...cleanups.map((c) =>
-        this._db.prepare(CLEANUP_SQL).bind(userId, c.namespace, `${escapeLikePrefix(c.keyPrefix)}%`, c.updatedAt)
-      ),
+      ...cleanups.map((c) => (
+        typeof c.key === 'string'
+          ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt)
+          : this._db.prepare(CLEANUP_PREFIX_SQL).bind(userId, c.namespace, `${escapeLikePrefix(c.keyPrefix)}%`, c.updatedAt)
+      )),
       ...entries.map((entry) =>
         this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
       ),

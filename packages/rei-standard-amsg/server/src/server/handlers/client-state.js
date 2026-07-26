@@ -5,7 +5,11 @@
  * client batch-syncs entries up (PUT) whenever convenient — e.g. in the
  * few-seconds window before iOS backgrounds the page — and fire-time
  * hooks read them back via ctx.readState(namespace). One live copy per
- * (user, namespace, key); the client is the only writer.
+ * (user, namespace, key).
+ *
+ * 反方向也通：hook 用 ctx.writeState() 写进来的条目和这里写的完全同构
+ * （落库共用 lib/client-state-store.js），客户端 GET 回去读得到，读的时候
+ * 不区分是谁写的。
  *
  *   PUT    /client-state                 batch upsert, last-write-wins on updatedAt
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
@@ -24,7 +28,7 @@
  * ride the existing encrypted-response envelope.
  */
 
-import { deriveUserEncryptionKey, decryptPayload, encryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
+import { deriveUserEncryptionKey, decryptPayload, encryptPayload, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
 import { isValidUUIDv4 } from '../lib/validation.js';
 import {
@@ -32,23 +36,22 @@ import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
   INTERNAL_STATE_CHAR_RE,
   chunkNamespaceFor,
-  chunkKeyFor,
-  chunkKeyPrefixFor,
-  buildChunkedRootValue,
-  splitStateValue,
   resolveClientStateEntries,
 } from '../lib/state-chunks.js';
+import {
+  MAX_STATE_ENTRIES_PER_BATCH,
+  MAX_NAMESPACE_CHARS,
+  MAX_KEY_CHARS,
+  stateValueBytes,
+  writeClientStateEntries,
+} from '../lib/client-state-store.js';
 
 // 单个存储行的 plaintext 上限 = 分块切片大小：≤ 此值的 value 走历史单行路径
 // （存储字节级不变），超过的由服务端透明分块（见 lib/state-chunks.js）。
 export const MAX_STATE_VALUE_BYTES = STATE_CHUNK_SLICE_BYTES;
 // "a few dozen entries in one background-window request" is the design
 // load; 200 bounds a single request with generous headroom.
-export const MAX_STATE_ENTRIES_PER_REQUEST = 200;
-const MAX_NAMESPACE_CHARS = 128;
-const MAX_KEY_CHARS = 256;
-
-const utf8 = new TextEncoder();
+export const MAX_STATE_ENTRIES_PER_REQUEST = MAX_STATE_ENTRIES_PER_BATCH;
 
 function err(status, code, message, details) {
   const error = details === undefined ? { code, message } : { code, message, details };
@@ -91,7 +94,7 @@ function validateEntry(entry, index, maxValueBytes) {
   if (typeof entry.value !== 'string') {
     return rejectEntry(entry, index, 'INVALID_STATE_VALUE', `entries[${index}].value 必须是字符串（宿主自行序列化）`);
   }
-  const bytes = utf8.encode(entry.value).length;
+  const bytes = stateValueBytes(entry.value);
   if (bytes > maxValueBytes) {
     return rejectEntry(entry, index, 'STATE_VALUE_TOO_LARGE', `entries[${index}].value 超过单条总上限`, { bytes, maxBytes: maxValueBytes });
   }
@@ -155,62 +158,9 @@ export function createClientStateHandler(ctx) {
       return err(501, 'CLIENT_STATE_NOT_SUPPORTED', '当前数据库适配器不支持 client_state');
     }
 
-    // 展开成物理行：小值 1 行（历史路径，字节级不变），大值 = 根 marker 行 +
-    // 保留 namespace 里的 N 个加密切片行。每条 accepted 条目都配一条 cleanup
-    // （同一 batch 里先删后写），把这个 key 旧写入留下的切片清干净 —— 覆盖写
-    // 变小 / 缩块都不留尾巴；陈旧批次的 cleanup 因 updated_at 条件删不动新行。
-    const physicalRows = [];
-    const cleanups = [];
-    const rootRowIndexes = [];
-    for (const entry of accepted) {
-      cleanups.push({
-        namespace: chunkNamespaceFor(entry.namespace),
-        keyPrefix: chunkKeyPrefixFor(entry.key),
-        updatedAt: entry.updatedAt,
-      });
-      rootRowIndexes.push(physicalRows.length);
-      if (utf8.encode(entry.value).length <= STATE_CHUNK_SLICE_BYTES) {
-        physicalRows.push({
-          namespace: entry.namespace,
-          key: entry.key,
-          value: await encryptForStorage(entry.value, userKey),
-          updatedAt: entry.updatedAt,
-        });
-      } else {
-        const slices = splitStateValue(entry.value);
-        physicalRows.push({
-          namespace: entry.namespace,
-          key: entry.key,
-          value: buildChunkedRootValue(slices.length),
-          updatedAt: entry.updatedAt,
-        });
-        const encryptedSlices = await Promise.all(slices.map((slice) => encryptForStorage(slice, userKey)));
-        for (let c = 0; c < encryptedSlices.length; c++) {
-          physicalRows.push({
-            namespace: chunkNamespaceFor(entry.namespace),
-            key: chunkKeyFor(entry.key, c),
-            value: encryptedSlices[c],
-            updatedAt: entry.updatedAt,
-          });
-        }
-      }
-    }
-
-    let upserted = 0;
-    let skipped = 0;
-    if (physicalRows.length > 0) {
-      const result = await db.upsertClientState(userId, physicalRows, cleanups);
-      if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
-        // 逻辑计数：一条 entry 的 upserted/skipped 看它的根行（切片行不计数）。
-        for (const rootIndex of rootRowIndexes) {
-          if (result.outcomes[rootIndex]) upserted++; else skipped++;
-        }
-      } else {
-        // 自定义 adapter 只回老形状 { upserted, skipped } 时按物理行计数兜底。
-        upserted = result.upserted;
-        skipped = result.skipped;
-      }
-    }
+    // 落库（加密 + 大值分块 + 旧切片清理）与 hook 的 ctx.writeState() 共用
+    // lib/client-state-store.js。这条路径只写不删，所以 deleted 恒为 0。
+    const { upserted, skipped } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
 
     const data = { upserted, skipped };
     if (rejected.length > 0) data.rejected = rejected;

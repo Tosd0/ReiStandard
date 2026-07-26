@@ -389,6 +389,8 @@ describe('agentic fire loop', () => {
       const allowedSessionKeys = new Set([
         'sessionId', 'charId', 'messages', 'llmResponse', 'llmOutputText',
         'iteration', 'metadata', 'contactName', 'avatarUrl', 'scratch',
+        // server 侧在共享 SessionContext 之上加的状态访问器
+        'readState', 'writeState',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);
@@ -628,6 +630,255 @@ describe('readState 分块拼回', () => {
     } finally {
       llm.restore();
     }
+  });
+});
+
+describe('writeState', () => {
+  // 跑一次 fire，把 fireCtx / sessionCtx 交给回调折腾，返回 processSingleMessage 的结果。
+  async function fireWith(adapter, { onFire, onSession } = {}) {
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async (fireCtx) => {
+        if (onFire) await onFire(fireCtx);
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async (sessionCtx) => {
+        if (onSession) await onSession(sessionCtx);
+        return { decision: 'skip-push' };
+      },
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      return await processSingleMessage(task, makeCtx({ hooks, db: adapter }));
+    } finally {
+      llm.restore();
+    }
+  }
+
+  async function freshAdapter() {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    return adapter;
+  }
+
+  test('写入 → readState 读回原文；覆盖写换掉旧值；value:null 删掉这一条', async () => {
+    const adapter = await freshAdapter();
+    let seen = [];
+
+    let result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        const r = await ctx.writeState('bypass', [
+          { key: 'note-1', value: '第一版', updatedAt: 100 },
+          { key: 'note-2', value: 'keep me', updatedAt: 100 },
+        ]);
+        assert.deepEqual(r, { upserted: 2, skipped: 0, deleted: 0 });
+        seen = await ctx.readState('bypass');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen.map((e) => [e.key, e.value]), [['note-1', '第一版'], ['note-2', 'keep me']]);
+
+    // 覆盖写：整条换掉，不是追加
+    result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await ctx.writeState('bypass', [{ key: 'note-1', value: '第二版', updatedAt: 200 }]);
+        seen = await ctx.readState('bypass');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen.map((e) => [e.key, e.value]), [['note-1', '第二版'], ['note-2', 'keep me']]);
+
+    // 删除
+    result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        const r = await ctx.writeState('bypass', [{ key: 'note-1', value: null, updatedAt: 300 }]);
+        assert.deepEqual(r, { upserted: 0, skipped: 0, deleted: 1 });
+        seen = await ctx.readState('bypass');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen.map((e) => e.key), ['note-2']);
+  });
+
+  // 前缀删会把 'note' 的删除请求变成「删掉所有以 note 开头的 key」，
+  // 顺手带走 'notes' —— 删除必须走精确 key 匹配。
+  test('删除只命中这一个 key，同前缀的兄弟 key 不受影响', async () => {
+    const adapter = await freshAdapter();
+    let seen = [];
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await ctx.writeState('ns', [
+          { key: 'note', value: 'A', updatedAt: 100 },
+          { key: 'notes', value: 'B', updatedAt: 100 },
+          { key: 'note-extra', value: 'C', updatedAt: 100 },
+        ]);
+        await ctx.writeState('ns', [{ key: 'note', value: null, updatedAt: 200 }]);
+        seen = await ctx.readState('ns');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen.map((e) => [e.key, e.value]), [['note-extra', 'C'], ['notes', 'B']]);
+  });
+
+  // 旁路数据无限堆积的守卫：大值走分块存储，删除必须把切片行也带走，
+  // 不然 D1 里会留下一堆没人引用得到的切片。
+  test('大值分块写入 → readState 拼回原文；删除后切片行不残留', async () => {
+    const adapter = await freshAdapter();
+    const { chunkNamespaceFor } = await import('../src/server/lib/state-chunks.js');
+    const big = '笔'.repeat(120_000); // UTF-8 360KB，超过 200KB 单行上限
+    let seen = [];
+
+    let result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await ctx.writeState('bypass', [{ key: 'xhs-note', value: big, updatedAt: 100 }]);
+        seen = await ctx.readState('bypass');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen.map((e) => [e.key, e.value.length]), [['xhs-note', big.length]]);
+    assert.equal(seen[0].value, big);
+    assert.ok((await adapter.getClientState(USER, chunkNamespaceFor('bypass'))).length >= 2, '大值应当被切片存储');
+
+    result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await ctx.writeState('bypass', [{ key: 'xhs-note', value: null, updatedAt: 200 }]);
+        seen = await ctx.readState('bypass');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(seen, []);
+    assert.deepEqual(await adapter.getClientState(USER, 'bypass'), []);
+    assert.deepEqual(await adapter.getClientState(USER, chunkNamespaceFor('bypass')), []);
+  });
+
+  test('last-write-wins：updatedAt 比库里旧的写入被跳过', async () => {
+    const adapter = await freshAdapter();
+    let outcome = null;
+    let seen = [];
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await ctx.writeState('ns', [{ key: 'k', value: 'new', updatedAt: 500 }]);
+        outcome = await ctx.writeState('ns', [{ key: 'k', value: 'stale', updatedAt: 100 }]);
+        seen = await ctx.readState('ns');
+      },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(outcome, { upserted: 0, skipped: 1, deleted: 0 });
+    assert.deepEqual(seen.map((e) => e.value), ['new']);
+  });
+
+  // 大内容要不要旁路，往往到组 pushPayloads 时才知道——那时 onBeforeFire 早已返回，
+  // 所以 sessionCtx 上也得有写口。
+  test('sessionCtx 上也能写：onLLMOutput 里存下大内容，push 只带引用键', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    const long = '正文'.repeat(5000);
+
+    const pushes = [];
+    const worker = createSingleUserCloudflareWorker(() => ({
+      db: adapter,
+      masterKey: MASTER_KEY,
+      vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+      webpush: { async sendNotification(_sub, payload) { pushes.push(JSON.parse(payload)); } },
+      hooks: {
+        onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+        onLLMOutput: async (sessionCtx) => {
+          await sessionCtx.writeState('bypass', [{ key: 'ref-1', value: long, updatedAt: 100 }]);
+          return {
+            decision: 'finish',
+            pushPayloads: [{ messageKind: 'content', message: '发你了', bypassRef: 'bypass/ref-1' }],
+          };
+        },
+      },
+    }));
+
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    await adapter.createTask({
+      user_id: USER,
+      uuid: 'due-writestate',
+      encrypted_payload: await encryptForStorage(JSON.stringify({
+        contactName: 'Rei', messageType: 'auto', completePrompt: 'frozen prompt',
+        apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'sk-secret',
+        primaryModel: 'model-x',
+        pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'k', auth: 'a' } },
+      }), userKey),
+      next_send_at: '2020-01-01T00:00:00.000Z',
+      message_type: 'auto',
+    });
+
+    const llm = stubLlm([finishRound]);
+    try {
+      await worker.scheduled({}, { DB: d1 });
+    } finally {
+      llm.restore();
+    }
+
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].bypassRef, 'bypass/ref-1');
+    assert.equal(JSON.stringify(pushes[0]).length < long.length, true, 'push 里只带引用键，不带正文');
+
+    // 客户端上线后走现成的 GET /client-state 取回
+    const getRes = await worker.fetch(new Request('https://w.dev/client-state?namespace=bypass', {
+      method: 'GET', headers: { 'X-User-Id': USER },
+    }), { DB: d1 });
+    const { decryptPayload } = await import('../src/server/lib/encryption.js');
+    const data = await decryptPayload((await getRes.json()).data, userKey);
+    assert.deepEqual(data.entries.map((e) => [e.key, e.value]), [['ref-1', long]]);
+  });
+
+  test('参数校验：namespace / entries / value / updatedAt 非法都当场抛错', async () => {
+    const adapter = await freshAdapter();
+    const errors = [];
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        const US = String.fromCharCode(0x1f); // 库内部保留的分隔符
+        const cases = [
+          () => ctx.writeState('', [{ key: 'k', value: 'v' }]),
+          () => ctx.writeState(`ns${US}x`, [{ key: 'k', value: 'v' }]),
+          () => ctx.writeState('ns', 'not-an-array'),
+          () => ctx.writeState('ns', [{ key: '', value: 'v' }]),
+          () => ctx.writeState('ns', [{ key: `k${US}0`, value: 'v' }]),
+          () => ctx.writeState('ns', [{ key: 'k', value: 42 }]),
+          () => ctx.writeState('ns', [{ key: 'k', value: 'v', updatedAt: -1 }]),
+        ];
+        for (const run of cases) {
+          await assert.rejects(run, TypeError);
+          errors.push('ok');
+        }
+        // 超出单条上限 → RangeError，且没有半条数据落库
+        await assert.rejects(
+          () => ctx.writeState('ns', [{ key: 'k', value: 'x'.repeat(6 * 1024 * 1024) }]),
+          (err) => err instanceof RangeError && /6291456 字节/.test(err.message)
+        );
+        assert.deepEqual(await ctx.readState('ns'), []);
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(errors.length, 7);
+  });
+
+  test('适配器不支持 client_state 写入 → 明确报错，不静默成功', async () => {
+    const { task } = await makeTask();
+    let caught = null;
+    const hooks = {
+      onBeforeFire: async (ctx) => {
+        try {
+          await ctx.writeState('ns', [{ key: 'k', value: 'v' }]);
+        } catch (error) {
+          caught = error;
+        }
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async () => ({ decision: 'skip-push' }),
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, db: {} }));
+    } finally {
+      llm.restore();
+    }
+    assert.match(caught.message, /AGENTIC_STATE_WRITE_UNSUPPORTED/);
   });
 });
 

@@ -33,6 +33,53 @@ const VAPID_DEFAULT_TTL = 60;          // seconds — short, matches single-shot
 const VAPID_TOKEN_LIFETIME = 12 * 3600; // 12h — comfortably under the 24h RFC 8292 cap.
 const RECORD_SIZE = 4096;               // arbitrary — must be ≥ ciphertext length.
 
+// ─── Payload budget ────────────────────────────────────────────────────
+//
+// 推送服务（FCM / APNs / Mozilla autopush）限的是 POST 上去的**密文** body，
+// 上限 4096 字节，超了当场 413，消息就没了。明文能塞多少要把 aes128gcm 的固
+// 定开销减掉：
+//
+//   密文 body = header(86) + 明文 + 填充分隔符(1) + GCM auth tag(16)
+//   header    = salt(16) + record size(4) + keyid 长度(1) + keyid(65)
+//
+// keyid 是应用服务器的 P-256 公钥，恒定 65 字节；单记录只带一个 0x02 分隔符
+// （RFC 8188 §2），不额外填充。所以开销是固定的 103 字节，明文上限
+// 4096 - 103 = 3993 字节（UTF-8 计，不是字符数）。
+// 这个换算由 webpush-webcrypto.test.mjs 钉住：上限大小的 payload 编出来的
+// body 恰好 4096 字节。
+
+/** 推送服务对加密后 body 的上限（字节）。 */
+export const WEB_PUSH_MAX_BODY_BYTES = 4096;
+/** aes128gcm 固定开销：header 86 + 填充分隔符 1 + GCM tag 16。 */
+export const WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES = 16 + 4 + 1 + 65 + 1 + 16;
+/** 一条 push 的明文（JSON 字符串）上限，UTF-8 字节数。 */
+export const MAX_PUSH_PAYLOAD_BYTES = WEB_PUSH_MAX_BODY_BYTES - WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES;
+
+const payloadEncoder = new TextEncoder();
+
+/**
+ * 组 payload 前做预算用：先量骨架有多大，剩下多少字节才是能塞附加数据的额度。
+ *
+ * @example
+ * const { remainingBytes } = measurePushPayload(JSON.stringify(basePush));
+ * const excerpt = remainingBytes > 0 ? text.slice(0, remainingBytes) : '';
+ *
+ * @param {string} payload - 待发送的 payload 字符串（通常是 JSON.stringify 的结果）。
+ * @returns {{ bytes: number, maxBytes: number, remainingBytes: number, withinLimit: boolean }}
+ *   `bytes` 是 payload 的 UTF-8 字节数；`remainingBytes` 是还能加多少字节
+ *   （已超限时为负）；`withinLimit` 为 false 时 sendWebPush 会抛
+ *   `PUSH_PAYLOAD_TOO_LARGE`。
+ */
+export function measurePushPayload(payload) {
+  const bytes = payloadEncoder.encode(typeof payload === 'string' ? payload : String(payload)).length;
+  return {
+    bytes,
+    maxBytes: MAX_PUSH_PAYLOAD_BYTES,
+    remainingBytes: MAX_PUSH_PAYLOAD_BYTES - bytes,
+    withinLimit: bytes <= MAX_PUSH_PAYLOAD_BYTES,
+  };
+}
+
 /**
  * Send a single Web Push notification.
  *
@@ -50,7 +97,9 @@ const RECORD_SIZE = 4096;               // arbitrary — must be ≥ ciphertext 
  * @param {number}  [args.ttl=60]       - Push service TTL header, seconds.
  * @param {typeof fetch} [args.fetch]   - Override fetch impl (testing / proxy).
  * @returns {Promise<{ statusCode: number, body: string, headers: Headers }>}
- * @throws  {Error}  err.code = 'PUSH_SEND_FAILED' on push-service error.
+ * @throws  {Error}  err.code = 'PUSH_PAYLOAD_TOO_LARGE' when the payload
+ *                   exceeds MAX_PUSH_PAYLOAD_BYTES (nothing is sent);
+ *                   err.code = 'PUSH_SEND_FAILED' on push-service error.
  */
 export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl }) {
   if (!subscription || typeof subscription.endpoint !== 'string') {
@@ -66,6 +115,21 @@ export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fe
   const subscriptionKeys = subscription.keys || {};
   if (typeof subscriptionKeys.p256dh !== 'string' || typeof subscriptionKeys.auth !== 'string') {
     throw new Error('sendWebPush: subscription.keys.p256dh and .auth are required');
+  }
+
+  // 超限的 payload 发出去只会被推送服务 413 掉，用户什么也收不到。加密之前就
+  // 拦下来，让调用方拿到一个说得清的错误（宿主可以退回一条短消息 + 引用键）。
+  const size = measurePushPayload(payload);
+  if (!size.withinLimit) {
+    const err = new Error(
+      `sendWebPush: payload is ${size.bytes} bytes, over the ${MAX_PUSH_PAYLOAD_BYTES}-byte limit ` +
+      `(push services cap the encrypted body at ${WEB_PUSH_MAX_BODY_BYTES} bytes; ` +
+      `aes128gcm adds ${WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES} bytes)`
+    );
+    err.code = 'PUSH_PAYLOAD_TOO_LARGE';
+    err.bytes = size.bytes;
+    err.maxBytes = MAX_PUSH_PAYLOAD_BYTES;
+    throw err;
   }
 
   const encryptedBody = await encryptPushPayload({
