@@ -104,10 +104,32 @@ AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
 - 限制：每项 ≤ 200 字符，数组 ≤ 10 项；非法或无法 `new RegExp(...)` 通过 → `400 INVALID_PARAMETERS`（schedule）/ `400 INVALID_UPDATE_DATA`（update）。
 - `update-message` 显式传 `splitPattern: null` 可重置回默认；不传则保留原值。
 
+## 一条 Web Push 能塞多少
+
+推送服务（FCM / APNs / Mozilla autopush）限的是**加密后** body 的 4096 字节，超了当场 413 拒收，用户什么也收不到。明文额度要把 aes128gcm 的固定开销减掉——header 86（salt 16 + record size 4 + keyid 长度 1 + 应用服务器公钥 65）+ 填充分隔符 1 + GCM auth tag 16 = 103 字节——所以**一条 push 的 payload 上限是 3993 字节**，按 UTF-8 字节算，不是字符数。
+
+`sendWebPush` 会在发出去之前挡下超限的 payload，抛出 `err.code === 'PUSH_PAYLOAD_TOO_LARGE'` 的错误，消息里带实际字节数和上限。
+
+组 payload 之前想自己做预算，用导出的常量和工具函数，别写死魔法数字：
+
+```js
+import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from '@rei-standard/amsg-server';
+
+const { bytes, remainingBytes, withinLimit } = measurePushPayload(JSON.stringify(push));
+// remainingBytes = 还能再塞多少字节（已超限时为负）
+```
+
+装不下的内容（长文、附件详情）建议走旁路：正文存进 `client_state`，push 里只带一个引用键，客户端上线后用 `GET /client-state` 取回。单用户 Worker 的 fire-time hook 用 `ctx.writeState()` 写，见 [`examples/cloudflare-single-user/README.md`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/examples/cloudflare-single-user/README.md)。
+
 ## 导出（新增）
 
 - `validateLlmMessagesArray(messages)` — 同步预校验 messages 数组，返回 `string | null`（错误信息 / 通过）。和 `@rei-standard/amsg-instant` 的校验规则字节级一致。
 - `validateSplitPattern(value)` — 同步预校验 splitPattern（string / string[] / null），返回 `string | null`。
+- `MAX_PUSH_PAYLOAD_BYTES` — 一条 push 的明文上限，3993 字节。
+- `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES` — 推送服务的密文 body 上限（4096）与 aes128gcm 固定开销（103），上面那个数就是两者相减。
+- `measurePushPayload(payload)` — 量一段 payload 的字节数与剩余额度，返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`。
+
+以上四个在包根和 `@rei-standard/amsg-server/cloudflare` 两个入口都有。
 
 ## 一体化初始化流程
 
@@ -150,6 +172,10 @@ AI 配置消息的提示词可以用两种形态之一，**互斥二选一**：
 - `encryptForStorage`
 - `decryptFromStorage`
 - `validateScheduleMessagePayload`
+- `measurePushPayload`
+- `MAX_PUSH_PAYLOAD_BYTES`
+- `WEB_PUSH_MAX_BODY_BYTES`
+- `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
 - `isValidISO8601`
 - `isValidUrl`
 - `isValidUUID`

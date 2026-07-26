@@ -149,7 +149,13 @@ export { createAdapter } from './adapters/factory.js';
 export { createD1Adapter } from './adapters/d1.js';
 export { createSingleUserServer } from './single-user.js';
 export { runScheduledTick } from './lib/run-tick.js';
-export { createWebCryptoWebPush } from './lib/webpush-webcrypto.js';
+export {
+  createWebCryptoWebPush,
+  measurePushPayload,
+  MAX_PUSH_PAYLOAD_BYTES,
+  WEB_PUSH_MAX_BODY_BYTES,
+  WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
+} from './lib/webpush-webcrypto.js';
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
