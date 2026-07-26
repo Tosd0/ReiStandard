@@ -1,5 +1,53 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.7
+
+### Minor Changes
+
+- 79da9e4: fire 时刻的 hook 能往 client_state 写了：`ctx.writeState(namespace, entries)`
+
+  `onBeforeFire` / `onLLMOutput` / `executeToolCalls` 三处 ctx 上都有它，和已有的 `ctx.readState()` 配成一对。写口在后两处也给，是因为「这条内容太大、塞不进 push」往往到工具跑完、组 pushPayloads 时才知道，那时 `onBeforeFire` 早已返回。
+
+  ```js
+  await ctx.writeState("bypass", [
+    { key: "note-42", value: JSON.stringify(detail) }, // 整条覆盖写
+    { key: "note-41", value: null }, // 删掉这个 key
+  ]);
+  // → { upserted, skipped, deleted }
+  ```
+
+  - 落库走的是 `PUT /client-state` 那条路径的同一份实现：per-user key 加密、超过 200KB 自动分块、覆盖写清掉旧切片。所以 hook 写下的东西客户端 `GET /client-state` 能原样读回，反过来也一样。
+  - `updatedAt` 不给就取当前时刻，语义仍是 last-write-wins：比库里已有值旧的写入或删除不生效（记在 `skipped` 里），客户端后写的数据不会被这次 fire 盖回去。
+  - 限制与 HTTP 端点同一套：单条 `value` 默认 5MB（`maxStateValueBytes` 可调）、单次 ≤ 200 条、namespace / key 不能带控制字符。不合规当场抛 `TypeError` / `RangeError`，一条也不落库；适配器不支持 `client_state` 时抛 `AGENTIC_STATE_WRITE_UNSUPPORTED`（写不进去必须让 hook 知道，不能静默成功）。
+  - **谁清、什么时候清**：库不做 TTL 也不自动回收，写进去的东西一直在。旁路内容建议放在固定的少量 key 上，下次写同一个 key 直接覆盖；一次性的大内容在确认客户端取走后用 `{ key, value: null }` 删掉，切片行会跟着一起清干净。
+
+  适配器接口的 `upsertClientState` 第三参 `cleanups` 多认一种形态：`{ namespace, key, updatedAt }` 按精确 key 删（原来的 `{ namespace, keyPrefix, updatedAt }` 按前缀删不变）。删单条状态必须走精确匹配，否则 `note` 的删除会连带删掉 `notes`。D1 适配器已实现；自定义适配器不认这种形态的话 `writeState` 的删除会失效。
+
+  `GET /capabilities` 的 features 追加 `agentic-write-state`。
+
+- f1c6104: Web Push payload 加大小护栏，并导出预算用的常量与工具函数
+
+  推送服务（FCM / APNs / Mozilla autopush）限的是**加密后** body 的 4096 字节，超了直接 413。之前库里对 payload 长度没有任何检查，超限的消息一路发到推送服务被拒 → 投递失败 → 重试三次 → 任务标 failed，用户完全收不到，只有服务端日志里有痕迹。
+
+  现在 `sendWebPush` 在加密前就挡下来，抛出 `err.code === 'PUSH_PAYLOAD_TOO_LARGE'` 的错误，消息里带实际字节数和上限（`err.bytes` / `err.maxBytes` 也可直接读）。
+
+  明文额度是 4096 减掉 aes128gcm 的固定开销——header 86（salt 16 + record size 4 + keyid 长度 1 + 应用服务器公钥 65）+ 填充分隔符 1 + GCM auth tag 16 = 103 字节——即 **3993 字节**，按 UTF-8 计。新增导出（包根与 `/cloudflare` 两个入口都有）：
+
+  - `MAX_PUSH_PAYLOAD_BYTES` — 3993，一条 push 的明文上限
+  - `WEB_PUSH_MAX_BODY_BYTES` — 4096，推送服务对密文 body 的上限
+  - `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES` — 103，aes128gcm 固定开销
+  - `measurePushPayload(payload)` — 返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`，组 payload 前量骨架、算还能塞多少
+
+  ```js
+  const { remainingBytes } = measurePushPayload(
+    JSON.stringify({ ...basePush, message: "" })
+  );
+  const message =
+    body.length <= remainingBytes ? body : body.slice(0, remainingBytes);
+  ```
+
+  装不下的内容走旁路：正文存进 `client_state`（单用户 Worker 的 hook 用 `ctx.writeState()`），push 里只带引用键，客户端上线后 `GET /client-state` 取回。
+
 ## 2.6.0-next.6
 
 ### Minor Changes
