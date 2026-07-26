@@ -22,6 +22,7 @@ export const SERVER_FEATURES = Object.freeze([
   'client-state-partial-failure',
   'agentic-hooks',
   'agentic-scratch',
+  'agentic-write-state',
   'vapid-public-key',
 ]);
 

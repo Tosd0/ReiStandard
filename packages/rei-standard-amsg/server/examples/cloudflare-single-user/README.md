@@ -38,7 +38,9 @@ VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消�
 
 ## 客户端状态同步（/client-state）
 
-这是啥：一张给客户端存状态的云端表。客户端平时把要给「fire 时刻 hooks」用的数据（最近聊天摘要、设置项……存啥由你定）批量同步上来，worker 触发定时任务时就能读到最新状态。一份活状态，按 namespace 组织，客户端是唯一写者。
+这是啥：一张给客户端存状态的云端表。客户端平时把要给「fire 时刻 hooks」用的数据（最近聊天摘要、设置项……存啥由你定）批量同步上来，worker 触发定时任务时就能读到最新状态。一份活状态，按 namespace 组织。
+
+两个方向都通：客户端用下面的端点写、hooks 用 `ctx.readState()` 读；hooks 也能用 `ctx.writeState()` 往回写（比如把塞不进 push 的大内容存下来），客户端再用 `GET /client-state` 取回。两边写出来的数据同构，读的时候不分是谁写的。
 
 | 端点 | 语义 |
 |------|------|
@@ -49,6 +51,25 @@ VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消�
 `value` 是任意字符串（想存对象就自己 `JSON.stringify`），落库前用 per-user key 加密。鉴权和加密头跟其它端点完全一样。
 
 大值不用自己切：超过 200KB 的 `value` 由 worker 切片跨行存储，读取（`GET` 和 hooks 的 `ctx.readState()`）拿到的是拼好的原值，客户端无感。批量上传里某条超限/非法只拒它自己，其余照常入库——有拒绝时响应带 `data.rejected`（逐条给 `index / namespace / key / code / message`），全部成功时响应形状不变。namespace / key 里不能带控制字符（`\u0000`-`\u001f`，库内部保留）。
+
+### 从 hooks 里写：`ctx.writeState(namespace, entries)`
+
+`onBeforeFire` / `onLLMOutput` / `executeToolCalls` 的 ctx 上都有它：
+
+```js
+await ctx.writeState('bypass', [
+  { key: 'note-42', value: JSON.stringify(detail) },  // 整条覆盖写
+  { key: 'note-41', value: null },                    // 删掉这个 key
+]);
+// → { upserted, skipped, deleted }
+```
+
+- `value` 是字符串就整条覆盖（不是追加，序列化自己来）；`value` 为 `null` 就删掉这个 key，连带它的分块切片行一起清干净。
+- `updatedAt` 可以显式给（epoch 毫秒），不给就取当前时刻。规则和客户端同步一样是 last-write-wins：比库里已有值旧的写入或删除不生效（落在 `skipped` 里），客户端后写的数据不会被这次 fire 盖回去。
+- 限制与 `PUT /client-state` 同一套：单条 `value` 默认 5MB（`maxStateValueBytes` 可调）、单次 ≤ 200 条、namespace / key 不能带控制字符。不合规当场抛 `TypeError` / `RangeError`，一条也不会落库。
+- 数据库适配器不支持 `client_state` 时抛 `AGENTIC_STATE_WRITE_UNSUPPORTED`。写不进去必须让 hook 知道，否则 push 里带的引用键会指向不存在的数据。
+
+**谁清、什么时候清**：写进去的东西一直在，库不做 TTL 也不自动回收。两种收尾挑一种——旁路内容放在固定的少量 key 上（比如每个角色一个），下次写同一个 key 直接覆盖，存量天然有上限；或者一次性的大内容在确认客户端取走之后，用 `{ key, value: null }` 删掉。两样都不做的话 D1 会一直涨。`DELETE /client-state` 是清空这个用户全部状态的兜底。
 
 ## Fire 时刻 hooks（服务端工具循环）
 
@@ -61,7 +82,7 @@ export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   hooks: {
     // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
-    // ctx: { task, userId, readState(namespace), now, scratch }
+    // ctx: { task, userId, readState(ns), writeState(ns, entries), now, scratch }
     //   task 是解密后的任务字段（不含 apiKey / pushSubscription）；
     //   自定义字段排程时放 metadata 里，这里原样读回。
     //   scratch 是本次 fire 的便签对象：在这里塞的东西，同一次 fire 的
@@ -82,7 +103,8 @@ export default createSingleUserCloudflareWorker((env) => ({
     // 每轮 LLM 输出后分类。ctx 形状与 @rei-standard/amsg-instant 的
     // onLLMOutput 一致（sessionId / messages / llmResponse / llmOutputText /
     // iteration / metadata / contactName / avatarUrl），instant 的
-    // classifier 可以直接拿来用。四种 decision：
+    // classifier 可以直接拿来用；另外这里还多两个状态访问器
+    // readState / writeState，和 onBeforeFire 拿到的是同一对。四种 decision：
     //   { decision: 'finish', pushPayloads }        → 推送这些 payload，结束
     //   { decision: 'tool-request', toolCalls }     → 交给 executeToolCalls 执行
     //     （也接受 instant 形状：pushPayloads 里带 tool_request push）
@@ -116,6 +138,22 @@ export default createSingleUserCloudflareWorker((env) => ({
 ```
 
 预算兜底：轮数到上限、或整链超过 `totalTimeoutMs`，按任务失败处理（沿用现有重试/标记逻辑）。hook 收到的 ctx 里没有 apiKey、pushSubscription、VAPID——`console.log(ctx)` 不会把密钥打进日志。
+
+## 一条 push 能塞多少
+
+推送服务（FCM / APNs / Mozilla autopush）限的是加密后 body 的 4096 字节，超了当场 413 拒收。明文额度要减掉 aes128gcm 的固定开销（header 86 + 填充分隔符 1 + auth tag 16 = 103），所以**一条 push 的 payload 上限是 3993 字节**（UTF-8 计，不是字符数）。这两个数字从包里导出，别自己写死：
+
+```js
+import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from '@rei-standard/amsg-server/cloudflare';
+
+// 组 payload 前先量骨架，剩下的额度才是能塞正文的
+const { remainingBytes } = measurePushPayload(JSON.stringify({ ...basePush, message: '' }));
+const message = body.length <= remainingBytes ? body : body.slice(0, remainingBytes);
+```
+
+`measurePushPayload(payload)` 返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`。超限的 payload 不会被发出去等 413：`sendWebPush` 当场抛错，`err.code === 'PUSH_PAYLOAD_TOO_LARGE'`，消息里带实际字节数和上限。
+
+内容天生装不下（长文、笔记详情、图片描述）就走旁路：正文用 `ctx.writeState()` 存进 `/client-state`，push 里只带一个引用键，客户端收到后用 `GET /client-state?namespace=...` 取回全文。
 
 ## 慢任务与 cron 占位
 

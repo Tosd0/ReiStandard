@@ -168,6 +168,8 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         hooks: cfg.hooks || null,
         maxToolIterations: cfg.maxToolIterations,
         totalTimeoutMs: cfg.totalTimeoutMs,
+        // hook 的 ctx.writeState() 用它判断单条 value 的上限，和 PUT /client-state 同一个配置。
+        maxStateValueBytes: cfg.maxStateValueBytes,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs
       });
