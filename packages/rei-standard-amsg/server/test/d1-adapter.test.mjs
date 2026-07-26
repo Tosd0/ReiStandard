@@ -73,6 +73,112 @@ test('updateTaskByUuid updates only pending rows and returns {uuid, updated_at}'
   assert.equal(await adapter.updateTaskByUuid('missing', USER, 'enc2'), null);
 });
 
+// lease_until 是占位用的内部列，适配器的取任务方法不返回它，测试直接读行。
+function readRow(db, uuid) {
+  return db._raw.prepare('SELECT next_send_at, lease_until FROM scheduled_messages WHERE uuid = ?').get(uuid);
+}
+
+test('claimTask 领到一次后，租约没到期之前别人领不到', async () => {
+  const { adapter, db } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'c', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  const lease = new Date(Date.now() + 600_000).toISOString();
+
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', lease), true);
+  // 第二个 tick 拿着同一批读到的旧值来领 —— 租约还在别人手上，领不到。
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', lease), false);
+
+  // 占位只写租约，用户设的触发时刻原样不动。
+  const after = readRow(db, 'c');
+  assert.equal(after.next_send_at, '2020-01-01T00:00:00.000Z');
+  assert.equal(after.lease_until, lease);
+});
+
+// 领了任务的 tick 中途没了，没人来放租约。租约到期后这条任务要能被接手，
+// 否则它就永远卡在那儿再也不触发。
+test('租约到期后这条任务可以被重新领取', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'expired', next_send_at: '2020-01-01T00:00:00.000Z' }));
+
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', '2020-01-01T00:10:00.000Z'), true);
+  const lease = new Date(Date.now() + 600_000).toISOString();
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', lease), true);
+});
+
+// 租约没到期的行不该再出现在待发列表里：每跳都把它捞出来再领一次失败，
+// 白占 limit 名额，还会把真正到点的任务挤掉。
+test('getPendingTasks 跳过租约还没到期的行', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'held', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  await adapter.createTask(baseTask({ uuid: 'free', next_send_at: '2020-01-01T00:00:00.000Z' }));
+
+  await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', new Date(Date.now() + 600_000).toISOString());
+
+  const uuids = (await adapter.getPendingTasks(50)).map((t) => t.uuid);
+  assert.deepEqual(uuids, ['free']);
+});
+
+// 2.5.x 建的表没有 lease_until，initSchema 要把它补上，老数据原样保留。
+test('initSchema 给老表补上 lease_until 列', async () => {
+  const db = createTestD1();
+  await db.prepare(`
+    CREATE TABLE scheduled_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      uuid TEXT,
+      encrypted_payload TEXT NOT NULL,
+      message_type TEXT NOT NULL,
+      next_send_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+  await db.prepare(
+    `INSERT INTO scheduled_messages
+      (user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at)
+     VALUES (?, 'old', 'enc', 'fixed', '2020-01-01T00:00:00.000Z', 'pending', 0, ?, ?)`
+  ).bind(USER, '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z').run();
+
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+
+  const [row] = await adapter.getPendingTasks(50);
+  assert.equal(row.uuid, 'old');
+  assert.equal(
+    await adapter.claimTask(row.id, row.next_send_at, new Date(Date.now() + 600_000).toISOString()),
+    true
+  );
+  // initSchema 跑第二遍不该因为列已存在就炸。
+  await adapter.initSchema();
+});
+
+test('claimTask 领不动非 pending 的行', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'cf', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  await adapter.updateTaskById(row.id, { status: 'failed' });
+  assert.equal(
+    await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', '2020-01-01T00:10:00.000Z'),
+    false
+  );
+});
+
+test('claimTask 按读到的原值比对，不做时区归一化', async () => {
+  // 老部署里可能留着没归一化的行；如果比对前先归一化成 Z 形式就永远对不上，
+  // 那条任务会一直领不到、再也不触发。
+  const { adapter, db } = await freshAdapter();
+  const now = '2020-01-01T00:00:00.000Z';
+  db._raw.prepare(
+    `INSERT INTO scheduled_messages
+      (user_id, uuid, encrypted_payload, next_send_at, message_type, status, retry_count, created_at, updated_at)
+     VALUES (?, 'legacy', 'enc', '2020-01-01T08:00:00+08:00', 'fixed', 'pending', 0, ?, ?)`
+  ).run(USER, now, now);
+
+  const [row] = await adapter.getPendingTasks(50);
+  assert.equal(row.uuid, 'legacy');
+  assert.equal(await adapter.claimTask(row.id, row.next_send_at, '2020-01-01T00:10:00.000Z'), true);
+});
+
 test('delete + getTaskStatus', async () => {
   const { adapter } = await freshAdapter();
   const row = await adapter.createTask(baseTask({ uuid: 'd' }));

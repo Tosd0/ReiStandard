@@ -9,6 +9,7 @@ import { neon } from '@neondatabase/serverless';
 import {
   TABLE_SQL,
   INDEXES,
+  MIGRATIONS,
   VERIFY_TABLE_SQL,
   COLUMNS_SQL
 } from './schema.js';
@@ -34,6 +35,9 @@ export class NeonAdapter {
     const sql = this._getSql();
 
     await sql.query(TABLE_SQL);
+    for (const migration of MIGRATIONS) {
+      await sql.query(migration.sql);
+    }
     const indexResults = [];
     for (const index of INDEXES) {
       try {
@@ -188,10 +192,51 @@ export class NeonAdapter {
       `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= NOW()
+         AND (lease_until IS NULL OR lease_until <= NOW())
        ORDER BY next_send_at ASC
        LIMIT $1`,
       [limit]
     );
+  }
+
+  /**
+   * 领取一条到点的任务：在 lease_until 上写下「这条归我管到什么时候」，
+   * 本次投递期间别的 tick 领不走它。
+   *
+   * 租约写在自己的列上，next_send_at 全程不动——那一列是用户设的触发时刻，
+   * 任务列表要读它、循环任务推进下一次也要拿它当基准。
+   *
+   * 两个 tick 抢同一行时只有一个改得动，另一个拿不到 RETURNING 行，据此跳
+   * 过。WHERE 里的两个条件各管一件事：
+   *   - lease_until 为空或已过期：没人正在跑这条。领了任务的 tick 中途没了
+   *     也不会把行焊死，租约到期后自然可以被接手。
+   *   - next_send_at 等于读这行时看到的值：读出来之后用户又改了排期的话，
+   *     这一跳就不该再按旧时刻发。
+   *
+   * 不加一个 'sending' 状态来表达「正在跑」：status 上有 CHECK 约束，加值
+   * 要改表。
+   *
+   * 比 next_send_at 时两边都截到毫秒：列是 timestamptz（微秒精度），驱动读
+   * 出来是 JS Date（毫秒精度），原值送回去可能因为亚毫秒差对不上。
+   *
+   * @param {number} taskId
+   * @param {string|Date} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
+   * @param {string|Date} leaseUntil - 租期末尾
+   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、排期被改过、或行已不是 pending
+   */
+  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+    const sql = this._getSql();
+    const rows = await sql.query(
+      `UPDATE scheduled_messages
+          SET lease_until = $1, updated_at = NOW()
+        WHERE id = $2 AND status = 'pending'
+          AND date_trunc('milliseconds', next_send_at)
+            = date_trunc('milliseconds', $3::timestamptz)
+          AND (lease_until IS NULL OR lease_until <= NOW())
+       RETURNING id`,
+      [leaseUntil, taskId, expectedNextSendAt]
+    );
+    return rows.length > 0;
   }
 
   async listTasks(userId, opts = {}) {

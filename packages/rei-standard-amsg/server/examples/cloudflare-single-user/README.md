@@ -117,6 +117,18 @@ export default createSingleUserCloudflareWorker((env) => ({
 
 预算兜底：轮数到上限、或整链超过 `totalTimeoutMs`，按任务失败处理（沿用现有重试/标记逻辑）。hook 收到的 ctx 里没有 apiKey、pushSubscription、VAPID——`console.log(ctx)` 不会把密钥打进日志。
 
+## 慢任务与 cron 占位
+
+cron 一分钟一跳，跳与跳之间互不相让；带工具的任务跑过一分钟是常态。所以 `scheduled()` 每条任务开跑前会先占位：在这一行的 `lease_until` 上写下「归我管到现在 + 租期为止」，本次投递期间下一跳领不走它，抢不到的那一跳直接跳过这条。
+
+租期默认 10 分钟，配了 `totalTimeoutMs` 就按它 + 2 分钟往上抬。想自己定就在 config 里加 `claimLeaseMs: 900_000`。`onBeforeFire` 里按次放宽的 `totalTimeoutMs` 占位时看不到，那种情况请显式设 `claimLeaseMs`。
+
+租约写在自己的列上，`next_send_at` 全程不动。`ctx.task.nextSendAt` 拿到的就是这条任务原本的触发时刻，拿它当时间锚点（窗口判断、缓存键）对得上；循环任务也按它推进到下一次。投递收尾时租约就放掉。
+
+Worker 中途被回收就没人来放租约，这条任务会等到租约到期才被后面的 tick 接手。所以租期要比最慢的一次投递长一点，但也别设太长——它同时也是「崩了之后多久能重来」的等待时间。
+
+`lease_until` 是这次新加的列。部署后 `POST /init-tenant` 会自动给已有的表补上；手工建表的看 `schema.sql`。
+
 ## 导入入口
 
 Worker 从 `@rei-standard/amsg-server/cloudflare` 导入（不是包根）。这个子路径只含单用户 + D1 + Web Crypto 推送那条路径，不牵扯 pg / neon / web-push，所以只装了 D1 的环境也能打包通过。

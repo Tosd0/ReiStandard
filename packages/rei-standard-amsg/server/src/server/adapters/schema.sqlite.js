@@ -20,12 +20,25 @@ export const SQLITE_TABLE_SQL = `
     encrypted_payload TEXT NOT NULL,
     message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TEXT NOT NULL,
+    lease_until TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )
 `;
+
+/**
+ * 建表语句用的是 CREATE TABLE IF NOT EXISTS，已经存在的表不会被改动，所以
+ * 后加的列要单独补。initSchema 每次都会跑一遍，列已经在了就跳过。
+ */
+export const SQLITE_MIGRATIONS = [
+  {
+    name: 'add_lease_until',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT',
+    description: 'Task claim lease (2.6.0)'
+  }
+];
 
 export const SQLITE_INDEXES = [
   {

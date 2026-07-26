@@ -28,6 +28,10 @@
  * config to let scheduled AI tasks assemble their prompt and run a server-side
  * tool loop at fire time. Omit them and AI tasks replay the schedule-time frozen
  * prompt exactly as before. See lib/agentic-fire.js.
+ *
+ * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
+ * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。租期默认 10 分钟，可以
+ * 用 config 里的 `claimLeaseMs` 调整。
  */
 
 import { createSingleUserServer } from '../single-user.js';
@@ -163,7 +167,9 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         // spreads its ctx into processSingleMessage, so these ride along.
         hooks: cfg.hooks || null,
         maxToolIterations: cfg.maxToolIterations,
-        totalTimeoutMs: cfg.totalTimeoutMs
+        totalTimeoutMs: cfg.totalTimeoutMs,
+        // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
+        claimLeaseMs: cfg.claimLeaseMs
       });
     } catch (error) {
       console.error('[amsg single-user] scheduled(): tick failed:', error && error.message);

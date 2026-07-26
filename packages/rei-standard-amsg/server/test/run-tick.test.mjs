@@ -9,21 +9,64 @@ const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
 const VAPID = { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' };
 
-async function seed(adapter, { uuid, recurrenceType, nextSendAt }) {
+async function seed(adapter, { uuid, recurrenceType, nextSendAt, payload = {} }) {
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const enc = await encryptForStorage(JSON.stringify({
     contactName: 'Rei',
     messageType: 'fixed',
     userMessage: 'hi',
     recurrenceType,
-    pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } }
+    pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } },
+    ...payload
   }), userKey);
-  await adapter.createTask({ user_id: USER, uuid, encrypted_payload: enc, next_send_at: nextSendAt, message_type: 'fixed' });
+  await adapter.createTask({
+    user_id: USER,
+    uuid,
+    encrypted_payload: enc,
+    next_send_at: nextSendAt,
+    message_type: payload.messageType || 'fixed'
+  });
 }
 
 function fakeWebpush() {
   const sent = [];
   return { sent, async sendNotification(sub, payload) { sent.push(payload); } };
+}
+
+/**
+ * 让 getPendingTasks 每次都返回同一批预先读好的行，其余方法照常走真适配器。
+ * 用来复现「上一跳还在跑，下一跳已经把同一行捞出来了」的时序。
+ */
+function replayingPendingTasks(adapter, rows) {
+  return new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'getPendingTasks') return async () => rows.map((row) => ({ ...row }));
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
+/** 模拟没实现 claimTask 的自定义适配器。 */
+function withoutClaimTask(adapter) {
+  return new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') return undefined;
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
+/** 模拟占位这一步就报错（库挂了、适配器有 bug）。 */
+function claimTaskThrows(adapter, error) {
+  return new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') return async () => { throw error; };
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
 }
 
 test('one-off task: delivered then deleted', async () => {
@@ -40,6 +83,8 @@ test('one-off task: delivered then deleted', async () => {
   assert.equal((await adapter.getPendingTasks(50)).length, 0);
 });
 
+// 基准是排程时的触发时刻，不是占位时写进库的租期时间——否则这里会变成
+// 「现在 + 租期 + 24h」。
 test('daily task: delivered then rescheduled +24h, retry reset', async () => {
   const adapter = createD1Adapter(createTestD1());
   await adapter.initSchema();
@@ -66,4 +111,181 @@ test('delivery failure increments retry_count', async () => {
   assert.equal(res.failedCount, 1);
   const row = await adapter.getTaskByUuidOnly('fail');
   assert.equal(row.retry_count, 1);
+});
+
+// cron 每分钟一跳、跳与跳之间互不相让，一次投递跑过 60 秒就会被下一跳再捞
+// 一遍。占位（CAS next_send_at）就是拦这个的。
+test('上一跳还在推送时，下一跳捞到同一条任务也不会重复发', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'race', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  // 两跳读到的是同一批行（第二跳在第一跳占位之前就把行捞出来了）。
+  const rows = await adapter.getPendingTasks(50);
+  const db = replayingPendingTasks(adapter, rows);
+
+  let sends = 0;
+  let markPushing;
+  const pushing = new Promise((resolve) => { markPushing = resolve; });
+  let releasePush;
+  const held = new Promise((resolve) => { releasePush = resolve; });
+  // 只卡住第一条推送：没有占位时第二跳会照发不误，测试要在断言上挂掉，
+  // 而不是两跳一起等门闩把自己等死。
+  const webpush = {
+    async sendNotification() {
+      sends++;
+      if (sends === 1) {
+        markPushing();
+        await held;
+      }
+    }
+  };
+
+  const firstTick = runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+  await pushing; // 第一跳卡在推送里
+
+  const second = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+  assert.equal(second.details.claimSkippedTasks, 1);
+  assert.equal(second.successCount, 0);
+
+  releasePush();
+  const first = await firstTick;
+  assert.equal(first.successCount, 1);
+  assert.equal(sends, 1);
+
+  // 第一跳跑完后仍按原始触发时刻推进到下一次。
+  const row = await adapter.getTaskByUuidOnly('race');
+  assert.equal(row.next_send_at, '2020-01-02T00:00:00.000Z');
+});
+
+// 占位写的是 lease_until，next_send_at 全程不动——投递期间任务列表读到的
+// 还是用户设的那个时刻，不是租期末尾。
+test('投递期间库里的 next_send_at 保持原本的触发时刻', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'lease', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  let seenDuringSend = null;
+  const webpush = {
+    async sendNotification() {
+      seenDuringSend = (await adapter.getTaskByUuidOnly('lease')).next_send_at;
+    }
+  };
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, claimLeaseMs: 600_000
+  });
+
+  assert.equal(seenDuringSend, '2020-01-01T00:00:00.000Z');
+
+  // 投递收尾时租约要放掉：下一次的时间一到就能被领走，而不是干等租期结束。
+  const row = await adapter.getTaskByUuidOnly('lease');
+  assert.equal(row.next_send_at, '2020-01-02T00:00:00.000Z');
+  assert.equal(
+    await adapter.claimTask(row.id, row.next_send_at, new Date(Date.now() + 600_000).toISOString()),
+    true
+  );
+});
+
+// 领了任务的那一跳中途没了（Worker 被回收、进程被杀），投递和后续写库都没
+// 发生。租约过期后这条任务由后面的 tick 接手，推进排期的基准必须还是用户设
+// 的那个时刻——按租期末尾去推，每断一次就永久往后挪一个租期。
+test('投递中途断掉后，接手的 tick 仍按原始触发时刻推进排期', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'abandoned', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const [row] = await adapter.getPendingTasks(50);
+  // 租期末尾用一个已经过去的时刻，等价于「租约早就到期了」。
+  assert.equal(await adapter.claimTask(row.id, row.next_send_at, '2020-01-01T00:10:00.000Z'), true);
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.successCount, 1);
+  assert.equal((await adapter.getTaskByUuidOnly('abandoned')).next_send_at, '2020-01-02T00:00:00.000Z');
+});
+
+// 第一次重试的退避是 2 分钟，比默认租期(10 分钟)短得多。投递结束后不把租约
+// 放掉，这条任务要等租约到期才动得了，退避时间就形同虚设。
+test('投递失败后的重试退避不会被租约压住', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'retry', recurrenceType: 'none', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const webpush = { async sendNotification() { throw new Error('push failed'); } };
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, claimLeaseMs: 600_000
+  });
+
+  const row = await adapter.getTaskByUuidOnly('retry');
+  assert.equal(row.retry_count, 1);
+  const lease = new Date(Date.now() + 600_000).toISOString();
+  assert.equal(
+    await adapter.claimTask(row.id, row.next_send_at, lease), true,
+    '退避时间一到就该能被下一跳领走'
+  );
+});
+
+// 占位失败时宁可不发：此时不知道有没有别的 tick 正在跑这条。
+test('占位这一步报错时一条都不投递，任务行保持原样等下一跳', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'claimerr', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({
+    db: claimTaskThrows(adapter, new Error('db down')),
+    masterKey: MASTER_KEY, vapid: VAPID, webpush
+  });
+
+  assert.equal(webpush.sent.length, 0);
+  assert.equal(res.successCount, 0);
+  assert.equal(res.failedCount, 1);
+  assert.equal(res.details.failedTasks[0].status, 'claim_failed');
+
+  const row = await adapter.getTaskByUuidOnly('claimerr');
+  assert.equal(row.status, 'pending');
+  assert.equal(row.next_send_at, '2020-01-01T00:00:00.000Z');
+  assert.equal(row.retry_count, 0);
+});
+
+test('适配器没实现 claimTask 时照常投递（自定义适配器兼容）', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'noclaim', recurrenceType: 'none', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({
+    db: withoutClaimTask(adapter), masterKey: MASTER_KEY, vapid: VAPID, webpush
+  });
+
+  assert.equal(res.successCount, 1);
+  assert.equal(res.details.claimSkippedTasks, 0);
+  assert.ok(webpush.sent.length >= 1);
+});
+
+test('hook 拿到的 nextSendAt 是原始触发时刻，不是占位后的租期', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'hooked',
+    recurrenceType: 'daily',
+    nextSendAt: '2020-01-01T00:00:00.000Z',
+    payload: { messageType: 'prompted', completePrompt: 'p', apiUrl: 'https://x', apiKey: 'k', primaryModel: 'm' }
+  });
+
+  let seenNextSendAt = null;
+  const hooks = {
+    async onBeforeFire(hookCtx) {
+      seenNextSendAt = hookCtx.task.nextSendAt;
+      return { skip: true };
+    },
+    async onLLMOutput() { throw new Error('不该走到这里'); }
+  };
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, hooks });
+
+  assert.equal(res.successCount, 1);
+  assert.equal(seenNextSendAt, '2020-01-01T00:00:00.000Z');
 });

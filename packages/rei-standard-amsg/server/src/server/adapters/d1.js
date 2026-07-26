@@ -8,14 +8,14 @@
  * equals chronological ordering (mixed offsets like +08:00 vs Z are unified).
  */
 
-import { SQLITE_TABLE_SQL, SQLITE_INDEXES, CLIENT_STATE_TABLE_SQL } from './schema.sqlite.js';
+import { SQLITE_TABLE_SQL, SQLITE_INDEXES, SQLITE_MIGRATIONS, CLIENT_STATE_TABLE_SQL } from './schema.sqlite.js';
 
 // Update methods build a dynamic SET clause from object keys. Callers pass only
 // hardcoded column names today, but enforcing a whitelist keeps a future caller
 // from ever turning a caller-supplied key into interpolated SQL.
 const UPDATABLE_COLUMNS = new Set([
   'user_id', 'uuid', 'encrypted_payload', 'message_type',
-  'next_send_at', 'status', 'retry_count', 'created_at', 'updated_at'
+  'next_send_at', 'lease_until', 'status', 'retry_count', 'created_at', 'updated_at'
 ]);
 
 // LIKE 前缀转义：用户 key 里的 % _ \ 不能变成通配符/转义符。
@@ -48,6 +48,17 @@ export class D1Adapter {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
     await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
 
+    // SQLite 的 ALTER TABLE 没有 ADD COLUMN IF NOT EXISTS，列已经在了就会
+    // 报 duplicate column name。那正是「这一步不用做」的意思，跳过即可；
+    // 其他错误照常抛出去。
+    for (const migration of SQLITE_MIGRATIONS) {
+      try {
+        await this._db.prepare(migration.sql).run();
+      } catch (error) {
+        if (!/duplicate column name/i.test(error.message || '')) throw error;
+      }
+    }
+
     const indexResults = [];
     for (const index of SQLITE_INDEXES) {
       try {
@@ -68,7 +79,7 @@ export class D1Adapter {
     }
 
     return {
-      columnsCreated: 10,
+      columnsCreated: 11,
       indexesCreated: indexResults.filter((r) => r.status === 'success').length,
       indexesFailed: indexResults.filter((r) => r.status === 'failed').length,
       columns: [],
@@ -175,14 +186,55 @@ export class D1Adapter {
   }
 
   async getPendingTasks(limit = 50) {
+    const now = this._now();
     const res = await this._db.prepare(
       `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= ?
+         AND (lease_until IS NULL OR lease_until <= ?)
        ORDER BY next_send_at ASC
        LIMIT ?`
-    ).bind(this._now(), limit).all();
+    ).bind(now, now, limit).all();
     return res.results || [];
+  }
+
+  /**
+   * 领取一条到点的任务：在 lease_until 上写下「这条归我管到什么时候」，
+   * 本次投递期间别的 tick 领不走它。
+   *
+   * 租约写在自己的列上，next_send_at 全程不动——那一列是用户设的触发时刻，
+   * 任务列表要读它、循环任务推进下一次也要拿它当基准。
+   *
+   * 两个 tick 抢同一行时只有一个能改到行，另一个拿到 changes = 0，据此跳过。
+   * WHERE 里的两个条件各管一件事：
+   *   - lease_until 为空或已过期：没人正在跑这条。领了任务的 tick 中途没了
+   *     也不会把行焊死，租约到期后自然可以被接手。
+   *   - next_send_at 等于读这行时看到的值：读出来之后用户又改了排期的话，
+   *     这一跳就不该再按旧时刻发。
+   *
+   * 不加一个 'sending' 状态来表达「正在跑」：建表语句里 status 有
+   * CHECK (status IN ('pending','sent','failed'))，加值要重建表。
+   *
+   * expectedNextSendAt 按读到的原样比对，不做时区归一化——老部署里可能还留
+   * 着非归一化写法的行（如 +08:00 结尾），归一化后反而对不上，那条任务会永
+   * 远领不到。
+   *
+   * @param {number} taskId
+   * @param {string} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
+   * @param {string|Date} leaseUntil - 租期末尾
+   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、排期被改过、或行已不是 pending
+   */
+  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+    const expected = typeof expectedNextSendAt === 'string'
+      ? expectedNextSendAt
+      : this._iso(expectedNextSendAt);
+    const res = await this._db.prepare(
+      `UPDATE scheduled_messages
+          SET lease_until = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending' AND next_send_at = ?
+          AND (lease_until IS NULL OR lease_until <= ?)`
+    ).bind(this._iso(leaseUntil), this._now(), taskId, expected, this._now()).run();
+    return (res.meta.changes || 0) > 0;
   }
 
   async listTasks(userId, opts = {}) {

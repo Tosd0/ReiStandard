@@ -52,6 +52,8 @@
  *   Fetch a single pending task by uuid only (used by instant processing).
  * @property {(taskId: number, updates: Object) => Promise<TaskRow|null>} updateTaskById
  *   Partially update a task row by its numeric id.
+ *   实现了 `claimTask` 的适配器还要认 `lease_until`（含写 null）：投递收尾
+ *   时 runScheduledTick 用它把租约放掉。
  * @property {(uuid: string, userId: string, encryptedPayload: string, extraFields?: Object) => Promise<TaskRow|null>} updateTaskByUuid
  *   Update a pending task's encrypted_payload (and optional index fields) by uuid + user_id.
  * @property {(taskId: number) => Promise<boolean>} deleteTaskById
@@ -60,6 +62,16 @@
  *   Delete a task by uuid + user_id. Returns true if a row was affected.
  * @property {(limit?: number) => Promise<TaskRow[]>} getPendingTasks
  *   Fetch pending tasks whose next_send_at <= NOW(), ordered ASC.
+ *   跳过租约还没到期的行（`lease_until` 为空或已过期才算待发）。
+ * @property {(taskId: number, expectedNextSendAt: string|Date, leaseUntil: string|Date) => Promise<boolean>} [claimTask]
+ *   领取一条到点的任务，返回是否领到。cron 每分钟一跳而一次投递可能跑几分
+ *   钟，runScheduledTick 靠它保证同一行同时只被一个 tick 跑。
+ *   三个条件同时成立才领得走：行仍是 pending；`lease_until` 为空或已过期
+ *   （没别人正在跑）；`next_send_at` 还等于 `expectedNextSendAt`（读这行时
+ *   拿到的值，用户中途改了排期就不发了）。领到就把 `lease_until` 写成
+ *   `leaseUntil`，`next_send_at` 不动。
+ *   自定义适配器可以不实现（runScheduledTick 会退回不占位的行为，代价是慢
+ *   任务可能被下一跳重复触发）。
  * @property {(userId: string, opts: {status?: string, limit?: number, offset?: number}) => Promise<{tasks: TaskRow[], total: number}>} listTasks
  *   List tasks for a user with optional filters and pagination.
  * @property {(days?: number) => Promise<number>} cleanupOldTasks

@@ -9,11 +9,16 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
   encrypted_payload TEXT NOT NULL,
   message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
   next_send_at TEXT NOT NULL,
+  lease_until TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
   retry_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- 2.5.x 建的表没有 lease_until。这句给老库补列，新库会报「列已存在」，
+-- 忽略即可；走 POST /init-tenant 的话服务端会自动处理。
+-- ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pending_tasks_optimized
   ON scheduled_messages (status, next_send_at, id, retry_count)
