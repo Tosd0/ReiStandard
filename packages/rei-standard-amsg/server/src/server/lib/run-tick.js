@@ -5,12 +5,18 @@
  *
  * 每个 tick 是一次独立调用（cron 每分钟一跳，不会因为上一跳还没跑完就跳过
  * 这一跳），而一次投递「组 prompt → 调 LLM → 跑工具 → 推送」可能要几分钟。
- * 所以每条任务开跑前先占位：把库里的 next_send_at 顶到租期末尾，这一行在本
- * 次投递期间对其他 tick 不再是「到点待发」。占位失败（0 行）说明别人先领走
- * 了，直接跳过。
+ * 所以每条任务开跑前先占位：在这一行的 lease_until 上写下「归我管到什么时
+ * 候」，本次投递期间别的 tick 领不走它。占位失败（0 行）说明别人先领走了，
+ * 直接跳过。
  *
- * 占位只动库里的行。内存里的 task.next_send_at 保持原始触发时刻，hook 拿到的
- * nextSendAt、循环任务推进下一次的基准都以它为准。
+ * 租约写在自己的列上，next_send_at 全程不动——那一列是用户设的触发时刻，
+ * 任务列表要读它、循环任务推进下一次也要拿它当基准。投递收尾时把租约放掉，
+ * 这条任务立刻可以被下一跳接手（失败重试的退避只有 2 分钟，比租期短得多，
+ * 不放掉的话退避就白设了）。
+ *
+ * 领了任务的 tick 中途没了（Worker 被回收之类）就没人来放租约，这条任务要
+ * 等租约到期才会被接手——这是租约本身的代价，把租期设得比最慢的一次投递长
+ * 一点就行。
  *
  * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs? }
  * @returns {Promise<Object>} summary { totalTasks, successCount, failedCount, processedAt, executionTime, details }
@@ -57,21 +63,34 @@ export async function runScheduledTick(ctx) {
 
   // 适配器没实现 claimTask（自定义适配器）→ 退回不占位的老行为：跑得动，只是
   // 超过一跳间隔的慢任务仍可能被下一跳重复触发。
+  const supportsClaim = typeof db.claimTask === 'function';
+
   async function claimForThisTick(task) {
-    if (typeof db.claimTask !== 'function') return true;
+    if (!supportsClaim) return true;
     const leaseUntil = new Date(Date.now() + claimLeaseMs).toISOString();
     return !!(await db.claimTask(task.id, task.next_send_at, leaseUntil));
+  }
+
+  /**
+   * 投递收尾时写库，顺手把租约放掉。占位之后的每一次写库都要走这里，漏掉
+   * 一条那条任务就得等租约到期才动得了。
+   *
+   * 没实现 claimTask 的适配器不会有 lease_until 这一列，就别往它的
+   * updateTaskById 里塞这个字段了。
+   */
+  async function updateAndRelease(taskId, fields) {
+    return db.updateTaskById(taskId, supportsClaim ? { ...fields, lease_until: null } : fields);
   }
 
   async function handleDeliveryFailure(task, reason) {
     results.failedCount++;
     try {
       if (task.retry_count >= 3) {
-        await db.updateTaskById(task.id, { status: 'failed' });
+        await updateAndRelease(task.id, { status: 'failed' });
         results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed' });
       } else {
         const nextRetryTime = new Date(Date.now() + (task.retry_count + 1) * 2 * 60 * 1000);
-        await db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
+        await updateAndRelease(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
         results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count + 1, nextRetryAt: nextRetryTime.toISOString() });
       }
     } catch (updateError) {
@@ -83,7 +102,7 @@ export async function runScheduledTick(ctx) {
     results.failedCount++;
     let markedSent = false;
     try {
-      await db.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
+      await updateAndRelease(task.id, { status: 'sent', retry_count: 0 });
       markedSent = true;
     } catch (_markSentError) {
       markedSent = false;
@@ -135,15 +154,14 @@ export async function runScheduledTick(ctx) {
         results.deletedOnceOffTasks++;
       } else {
         let nextSendAt;
-        // 以原始触发时刻为基准往后推，不是占位时写进库的租期时间——否则每
-        // 循环一次都会被租期长度顶偏。
+        // 以这条任务原本的触发时刻为基准往后推。
         const currentSendAt = new Date(task.next_send_at);
         if (decryptedPayload.recurrenceType === 'daily') {
           nextSendAt = new Date(currentSendAt.getTime() + 24 * 60 * 60 * 1000);
         } else if (decryptedPayload.recurrenceType === 'weekly') {
           nextSendAt = new Date(currentSendAt.getTime() + 7 * 24 * 60 * 60 * 1000);
         }
-        await db.updateTaskById(task.id, { next_send_at: nextSendAt.toISOString(), retry_count: 0 });
+        await updateAndRelease(task.id, { next_send_at: nextSendAt.toISOString(), retry_count: 0 });
         results.updatedRecurringTasks++;
       }
 

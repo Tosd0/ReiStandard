@@ -58,6 +58,17 @@ function withoutClaimTask(adapter) {
   });
 }
 
+/** 模拟占位这一步就报错（库挂了、适配器有 bug）。 */
+function claimTaskThrows(adapter, error) {
+  return new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') return async () => { throw error; };
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
 test('one-off task: delivered then deleted', async () => {
   const adapter = createD1Adapter(createTestD1());
   await adapter.initSchema();
@@ -147,23 +158,95 @@ test('上一跳还在推送时，下一跳捞到同一条任务也不会重复�
   assert.equal(row.next_send_at, '2020-01-02T00:00:00.000Z');
 });
 
-test('占位期间库里的 next_send_at 被顶到未来，投递完才回到正常排期', async () => {
+// 占位写的是 lease_until，next_send_at 全程不动——投递期间任务列表读到的
+// 还是用户设的那个时刻，不是租期末尾。
+test('投递期间库里的 next_send_at 保持原本的触发时刻', async () => {
   const adapter = createD1Adapter(createTestD1());
   await adapter.initSchema();
   await seed(adapter, { uuid: 'lease', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
 
-  let leasedAt = null;
+  let seenDuringSend = null;
   const webpush = {
     async sendNotification() {
-      leasedAt = (await adapter.getTaskByUuidOnly('lease')).next_send_at;
+      seenDuringSend = (await adapter.getTaskByUuidOnly('lease')).next_send_at;
     }
   };
   await runScheduledTick({
-    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, claimLeaseMs: 60_000
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, claimLeaseMs: 600_000
   });
 
-  assert.ok(new Date(leasedAt).getTime() > Date.now(), '推送期间这一行不该再是「到点待发」');
-  assert.equal((await adapter.getTaskByUuidOnly('lease')).next_send_at, '2020-01-02T00:00:00.000Z');
+  assert.equal(seenDuringSend, '2020-01-01T00:00:00.000Z');
+
+  // 投递收尾时租约要放掉：下一次的时间一到就能被领走，而不是干等租期结束。
+  const row = await adapter.getTaskByUuidOnly('lease');
+  assert.equal(row.next_send_at, '2020-01-02T00:00:00.000Z');
+  assert.equal(
+    await adapter.claimTask(row.id, row.next_send_at, new Date(Date.now() + 600_000).toISOString()),
+    true
+  );
+});
+
+// 领了任务的那一跳中途没了（Worker 被回收、进程被杀），投递和后续写库都没
+// 发生。租约过期后这条任务由后面的 tick 接手，推进排期的基准必须还是用户设
+// 的那个时刻——按租期末尾去推，每断一次就永久往后挪一个租期。
+test('投递中途断掉后，接手的 tick 仍按原始触发时刻推进排期', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'abandoned', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const [row] = await adapter.getPendingTasks(50);
+  // 租期末尾用一个已经过去的时刻，等价于「租约早就到期了」。
+  assert.equal(await adapter.claimTask(row.id, row.next_send_at, '2020-01-01T00:10:00.000Z'), true);
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.successCount, 1);
+  assert.equal((await adapter.getTaskByUuidOnly('abandoned')).next_send_at, '2020-01-02T00:00:00.000Z');
+});
+
+// 第一次重试的退避是 2 分钟，比默认租期(10 分钟)短得多。投递结束后不把租约
+// 放掉，这条任务要等租约到期才动得了，退避时间就形同虚设。
+test('投递失败后的重试退避不会被租约压住', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'retry', recurrenceType: 'none', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const webpush = { async sendNotification() { throw new Error('push failed'); } };
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, claimLeaseMs: 600_000
+  });
+
+  const row = await adapter.getTaskByUuidOnly('retry');
+  assert.equal(row.retry_count, 1);
+  const lease = new Date(Date.now() + 600_000).toISOString();
+  assert.equal(
+    await adapter.claimTask(row.id, row.next_send_at, lease), true,
+    '退避时间一到就该能被下一跳领走'
+  );
+});
+
+// 占位失败时宁可不发：此时不知道有没有别的 tick 正在跑这条。
+test('占位这一步报错时一条都不投递，任务行保持原样等下一跳', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'claimerr', recurrenceType: 'daily', nextSendAt: '2020-01-01T00:00:00.000Z' });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({
+    db: claimTaskThrows(adapter, new Error('db down')),
+    masterKey: MASTER_KEY, vapid: VAPID, webpush
+  });
+
+  assert.equal(webpush.sent.length, 0);
+  assert.equal(res.successCount, 0);
+  assert.equal(res.failedCount, 1);
+  assert.equal(res.details.failedTasks[0].status, 'claim_failed');
+
+  const row = await adapter.getTaskByUuidOnly('claimerr');
+  assert.equal(row.status, 'pending');
+  assert.equal(row.next_send_at, '2020-01-01T00:00:00.000Z');
+  assert.equal(row.retry_count, 0);
 });
 
 test('适配器没实现 claimTask 时照常投递（自定义适配器兼容）', async () => {

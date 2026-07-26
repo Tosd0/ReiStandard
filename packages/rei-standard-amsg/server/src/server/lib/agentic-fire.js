@@ -81,10 +81,9 @@ export function taskNeedsLlm(decryptedPayload) {
 /**
  * Frozen, credential-free view of the task for hook authors.
  *
- * nextSendAt 始终是这条任务原始的触发时刻。run-tick 领取任务时会把库里的
- * next_send_at 顶到租期末尾防重复触发，但传进来的 task 是领取前读到的那一
- * 行——宿主拿 nextSendAt 当时间锚点（窗口判断、缓存键）时对得上。别在这里
- * 改成回库里重读。
+ * nextSendAt 是这条任务原本的触发时刻。run-tick 领取任务时写的是 lease_until，
+ * next_send_at 那一列不动，所以这里给出去的和库里的是同一个值——宿主拿它当
+ * 时间锚点（窗口判断、缓存键）时对得上。
  */
 function buildHookTask(task, decryptedPayload) {
   const safe = {};

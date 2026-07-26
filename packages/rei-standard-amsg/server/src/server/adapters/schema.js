@@ -11,12 +11,26 @@ export const TABLE_SQL = `
     encrypted_payload TEXT NOT NULL,
     message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    lease_until TIMESTAMP WITH TIME ZONE,
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
   )
 `;
+
+/**
+ * 建表语句用的是 CREATE TABLE IF NOT EXISTS，已经存在的表不会被改动，所以
+ * 后加的列要单独补。initSchema 每次都会跑一遍，Postgres 的 IF NOT EXISTS
+ * 让重复执行也没事。
+ */
+export const MIGRATIONS = [
+  {
+    name: 'add_lease_until',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS lease_until TIMESTAMP WITH TIME ZONE',
+    description: 'Task claim lease (2.6.0)'
+  }
+];
 
 export const INDEXES = [
   {
