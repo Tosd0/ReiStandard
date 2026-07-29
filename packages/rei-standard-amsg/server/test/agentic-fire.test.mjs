@@ -501,6 +501,76 @@ describe('agentic fire loop', () => {
       llm.restore();
     }
   });
+
+  test('onBeforeFire may return { messages, tools }: every round carries them', async () => {
+    const { task } = await makeTask();
+    const tools = [
+      { type: 'function', function: { name: 'lookup_notes', parameters: { type: 'object', properties: {} } } },
+    ];
+    let llmOutputCalls = 0;
+    const decisions = [
+      { decision: 'tool-request', toolCalls: [TOOL_CALL] },
+      { decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'done' }] },
+    ];
+    const hooks = {
+      onBeforeFire: async () => ({ messages: [{ role: 'user', content: 'U' }], tools, toolChoice: 'auto' }),
+      onLLMOutput: async () => decisions[llmOutputCalls++],
+      executeToolCalls: async () => [{ tool_call_id: 'call_1', role: 'tool', content: 'ok' }],
+    };
+    const llm = stubLlm([toolRound, finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks }));
+      assert.equal(result.success, true);
+      assert.equal(llm.calls.length, 2);
+      // 工具声明每轮都要带上：补完那轮 LLM 还可能再发起调用
+      assert.deepEqual(llm.calls[0].body.tools, tools);
+      assert.deepEqual(llm.calls[1].body.tools, tools);
+      assert.equal(llm.calls[0].body.tool_choice, 'auto');
+      assert.equal(llm.calls[1].body.tool_choice, 'auto');
+    } finally {
+      llm.restore();
+    }
+  });
+
+  // native 调用和文本协议合成的调用同轮出现时，assistant 上两边的 id 都要在，
+  // 否则那半边的 role:'tool' 结果没有归属，严格的 OpenAI 兼容中转会拒掉下一轮。
+  test('assistant stamping merges native tool_calls with synthesized ones (no orphan role:tool)', async () => {
+    const { task } = await makeTask();
+    const nativeCall = { id: 'call_native', type: 'function', function: { name: 'lookup_notes', arguments: '{}' } };
+    const tagCall = { id: 'call_tag', type: 'function', function: { name: 'mcp__weather', arguments: '{"city":"Shanghai"}' } };
+    const mixedRound = {
+      choices: [{ message: { role: 'assistant', content: '<tool>weather</tool>', tool_calls: [nativeCall] } }],
+    };
+    let llmOutputCalls = 0;
+    const decisions = [
+      // 分类器把正文里的调用也认出来，和 native 的一起交回来
+      { decision: 'tool-request', toolCalls: [nativeCall, tagCall] },
+      { decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'done' }] },
+    ];
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => decisions[llmOutputCalls++],
+      executeToolCalls: async (toolCalls) =>
+        toolCalls.map((tc) => ({ tool_call_id: tc.id, role: 'tool', content: 'ok' })),
+    };
+    const llm = stubLlm([mixedRound, finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks }));
+      assert.equal(result.success, true);
+      const round2 = llm.calls[1].body.messages;
+      const assistant = round2.find((m) => m.role === 'assistant');
+      assert.deepEqual(assistant.tool_calls.map((tc) => tc.id), ['call_native', 'call_tag']);
+      // 每条 role:'tool' 都能在 assistant.tool_calls 里找到归属，一条不落
+      const stampedIds = new Set(assistant.tool_calls.map((tc) => tc.id));
+      const toolResults = round2.filter((m) => m.role === 'tool');
+      assert.equal(toolResults.length, 2);
+      for (const m of toolResults) {
+        assert.ok(stampedIds.has(m.tool_call_id), `orphan tool result: ${m.tool_call_id}`);
+      }
+    } finally {
+      llm.restore();
+    }
+  });
 });
 
 describe('agentic fire via the single-user worker (scheduled e2e)', () => {

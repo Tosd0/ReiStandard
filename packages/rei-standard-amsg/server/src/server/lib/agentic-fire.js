@@ -35,6 +35,11 @@
  * 不用再自己维护 Map<sessionId, state>。fire 结束（finish / skip-push /
  * 抛错 / 轮数超限）后随调用栈丢弃；库不读不写、不落库、不打日志。
  *
+ * 工具声明：onBeforeFire 的返回值里可以带 `tools`（OpenAI 的 tools 数组，
+ * 另有可选的 `toolChoice`），本次 fire 的每一轮 LLM 请求都原样带上它们——
+ * 补完那轮模型仍可能再发起调用。库不看 tools 的内容，执行照旧是
+ * executeToolCalls 的事。
+ *
  * Budget guards, both factory-level (ctx.maxToolIterations /
  * ctx.totalTimeoutMs) and per-fire (onBeforeFire may return
  * { messages, maxToolIterations?, totalTimeoutMs? } to override for one
@@ -125,10 +130,12 @@ function normalizeBeforeFireResult(result) {
       messages: result.messages,
       maxToolIterations: result.maxToolIterations,
       totalTimeoutMs: result.totalTimeoutMs,
+      tools: Array.isArray(result.tools) && result.tools.length > 0 ? result.tools : undefined,
+      toolChoice: result.toolChoice,
     };
   }
   throw new TypeError(
-    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs? } | { skip: true } | null'
+    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
   );
 }
 
@@ -324,7 +331,11 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     // must not outlive totalTimeoutMs waiting for its own 300s abort.
     const roundTimeoutMs = Math.max(1, Math.min(300_000, deadline - nowFn()));
     const { response: llmResponse } = await callLlm(
-      { ...decryptedPayload, messages },
+      {
+        ...decryptedPayload,
+        messages,
+        ...(normalized.tools ? { tools: normalized.tools, toolChoice: normalized.toolChoice } : {}),
+      },
       { requireContent: false, timeoutMs: roundTimeoutMs }
     );
 
@@ -399,10 +410,17 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 
     // Text-protocol classifiers synthesize toolCalls the raw assistant
     // message doesn't carry; stamp them on so the appended role:'tool'
-    // results stay valid for OpenAI-compatible APIs.
-    const assistantWithTools = Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length > 0
+    // results stay valid for OpenAI-compatible APIs. Merge rather than pick
+    // one side: when a native tool_call and a synthesized one land in the
+    // same round, both need their id on the assistant turn, or the half
+    // that's missing leaves an orphan role:'tool' and a strict relay
+    // rejects the next round.
+    const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
+    const nativeIds = new Set(nativeCalls.map((tc) => tc && tc.id));
+    const synthesized = toolCalls.filter((tc) => !nativeIds.has(tc && tc.id));
+    const assistantWithTools = synthesized.length === 0
       ? assistantMessage
-      : { ...assistantMessage, tool_calls: toolCalls };
+      : { ...assistantMessage, tool_calls: [...nativeCalls, ...synthesized] };
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 

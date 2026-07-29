@@ -76,6 +76,9 @@ export async function callLlm(payload, options = {}) {
  * - include it only when payload.maxTokens is provided
  * - omit it when payload.maxTokens is undefined / null
  *
+ * `tools` / `tool_choice` are optional as well: forwarded only when the
+ * caller passes a non-empty payload.tools.
+ *
  * @param {Object} payload
  * @returns {Object}
  */
@@ -101,6 +104,18 @@ export function buildAiRequestBody(payload) {
     requestBody.temperature = payload.temperature;
   } else if (!Array.isArray(payload.messages)) {
     requestBody.temperature = 0.8;
+  }
+
+  // tools mode (added in v2.6.0): forward the caller's OpenAI tools array
+  // verbatim — same philosophy as messages mode above. The agentic loop
+  // already appends assistant tool_calls + role:'tool' results; this is
+  // the request-side half of the same protocol. An empty array is treated
+  // as "no tools" because some OpenAI-compatible relays reject `tools: []`.
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    requestBody.tools = payload.tools;
+    if (payload.toolChoice !== undefined && payload.toolChoice !== null) {
+      requestBody.tool_choice = payload.toolChoice;
+    }
   }
 
   if (payload.maxTokens === undefined || payload.maxTokens === null) {
