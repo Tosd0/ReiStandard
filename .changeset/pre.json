@@ -15,6 +15,7 @@
     "amsg-client-client-state",
     "amsg-client-server-token",
     "amsg-client-state-chunking",
+    "amsg-server-agentic-fire-tools",
     "amsg-server-agentic-fire",
     "amsg-server-before-fire-skip",
     "amsg-server-hook-write-state",
