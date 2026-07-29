@@ -97,6 +97,8 @@ export default createSingleUserCloudflareWorker((env) => ({
       // 也可以返回 { messages, maxToolIterations, totalTimeoutMs } 按次放宽预算
       // 返回值里带上 tools（OpenAI 的 tools 数组，可选 toolChoice），本次 fire
       //   每一轮 LLM 请求都会带着它们，模型可以走原生 function calling。
+      //   tools 缺席、是空数组、或者压根不是数组，都按「这次不带工具」处理，
+      //   toolChoice 也随之不发（它单独出现没有意义）。
       // 或返回 { skip: true }：这次不生成，零推送直接算成功结束（不调 LLM）。
       //   一次性任务照删、循环任务照推进到下次。适合排程后对话已有新进展、
       //   这条到点已多余的情况。
@@ -112,6 +114,11 @@ export default createSingleUserCloudflareWorker((env) => ({
     //     （也接受 instant 形状：pushPayloads 里带 tool_request push）
     //   { decision: 'continue', nextHistory }       → 换个 history 再来一轮
     //   { decision: 'skip-push' }                   → 这次不发，结束
+    // 返回 tool-request 时，toolCalls 要盖住模型这一轮声明的每一个原生
+    //   tool_call：漏掉的那条仍然会写在 assistant 消息上（它是模型自己发的），
+    //   却没有配对的 role:'tool' 结果，严格的中转会拿这个没人应答的
+    //   tool_call_id 拒掉下一轮。真想放弃某个调用，就给它回一条说明放弃的
+    //   结果，别直接不提它。
     async onLLMOutput(ctx) {
       const toolCalls = ctx.llmResponse?.choices?.[0]?.message?.tool_calls;
       if (Array.isArray(toolCalls) && toolCalls.length > 0) {

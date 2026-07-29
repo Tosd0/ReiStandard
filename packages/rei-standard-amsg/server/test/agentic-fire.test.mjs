@@ -571,6 +571,50 @@ describe('agentic fire loop', () => {
       llm.restore();
     }
   });
+
+  // 纯文本协议：模型一个 native tool_call 都没声明，调用全靠 classifier 从正文
+  // 里认出来。这时 assistant 上本来空空如也，补章要把合成的那份整个盖上去，
+  // 后面的 role:'tool' 才有归属。
+  test('assistant stamping: synthesized-only round gets the full tool_calls stamped on', async () => {
+    const { task } = await makeTask();
+    const tagCalls = [
+      { id: 'call_tag_1', type: 'function', function: { name: 'mcp__weather', arguments: '{"city":"Shanghai"}' } },
+      { id: 'call_tag_2', type: 'function', function: { name: 'mcp__notes', arguments: '{}' } },
+    ];
+    // 正文里写着调用，choices[0].message 上没有 tool_calls 这个字段
+    const textOnlyRound = {
+      choices: [{ message: { role: 'assistant', content: '<tool>weather</tool><tool>notes</tool>' } }],
+    };
+    let llmOutputCalls = 0;
+    const decisions = [
+      { decision: 'tool-request', toolCalls: tagCalls },
+      { decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'done' }] },
+    ];
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => decisions[llmOutputCalls++],
+      executeToolCalls: async (toolCalls) =>
+        toolCalls.map((tc) => ({ tool_call_id: tc.id, role: 'tool', content: 'ok' })),
+    };
+    const llm = stubLlm([textOnlyRound, finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks }));
+      assert.equal(result.success, true);
+      const round2 = llm.calls[1].body.messages;
+      const assistant = round2.find((m) => m.role === 'assistant');
+      assert.deepEqual(assistant.tool_calls, tagCalls);
+      // 正文照留，补章只是多加了 tool_calls 这一个字段
+      assert.equal(assistant.content, '<tool>weather</tool><tool>notes</tool>');
+      const stampedIds = new Set(assistant.tool_calls.map((tc) => tc.id));
+      const toolResults = round2.filter((m) => m.role === 'tool');
+      assert.equal(toolResults.length, 2);
+      for (const m of toolResults) {
+        assert.ok(stampedIds.has(m.tool_call_id), `orphan tool result: ${m.tool_call_id}`);
+      }
+    } finally {
+      llm.restore();
+    }
+  });
 });
 
 describe('agentic fire via the single-user worker (scheduled e2e)', () => {
