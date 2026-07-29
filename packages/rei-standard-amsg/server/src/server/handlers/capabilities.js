@@ -23,6 +23,7 @@ export const SERVER_FEATURES = Object.freeze([
   'agentic-hooks',
   'agentic-scratch',
   'agentic-write-state',
+  'agentic-fire-tools',
   'vapid-public-key',
 ]);
 

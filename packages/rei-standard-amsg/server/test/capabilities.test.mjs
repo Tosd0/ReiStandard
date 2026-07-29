@@ -32,6 +32,7 @@ describe('GET /capabilities', () => {
       'client-state-partial-failure',
       'agentic-hooks',
       'agentic-scratch',
+      'agentic-fire-tools',
       'vapid-public-key',
     ]) {
       assert.ok(body.features.includes(f), `features 应包含 ${f}`);

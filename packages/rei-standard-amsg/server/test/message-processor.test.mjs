@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage, normalizeAiApiUrl } from '../src/server/lib/message-processor.js';
+import { buildAiRequestBody } from '../src/server/lib/llm.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../src/server/lib/validation.js';
 
@@ -458,6 +459,23 @@ describe('messages array support', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('buildAiRequestBody forwards tools/tool_choice verbatim; absent when not provided', () => {
+    const tools = [{ type: 'function', function: { name: 'mcp__x', parameters: { type: 'object' } } }];
+    const withTools = buildAiRequestBody({
+      primaryModel: 'm', messages: [{ role: 'user', content: 'hi' }], tools, toolChoice: 'auto',
+    });
+    assert.deepEqual(withTools.tools, tools);
+    assert.equal(withTools.tool_choice, 'auto');
+
+    const without = buildAiRequestBody({ primaryModel: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal('tools' in without, false);
+    assert.equal('tool_choice' in without, false);
+
+    // 空数组不透传：部分中转把 tools: [] 当协议错误直接拒掉
+    const empty = buildAiRequestBody({ primaryModel: 'm', messages: [{ role: 'user', content: 'hi' }], tools: [] });
+    assert.equal('tools' in empty, false);
   });
 });
 

@@ -95,6 +95,8 @@ export default createSingleUserCloudflareWorker((env) => ({
         { role: 'user', content: `根据这些记录写一条提醒：${notes.map(n => n.value).join('\n')}` },
       ];
       // 也可以返回 { messages, maxToolIterations, totalTimeoutMs } 按次放宽预算
+      // 返回值里带上 tools（OpenAI 的 tools 数组，可选 toolChoice），本次 fire
+      //   每一轮 LLM 请求都会带着它们，模型可以走原生 function calling。
       // 或返回 { skip: true }：这次不生成，零推送直接算成功结束（不调 LLM）。
       //   一次性任务照删、循环任务照推进到下次。适合排程后对话已有新进展、
       //   这条到点已多余的情况。
