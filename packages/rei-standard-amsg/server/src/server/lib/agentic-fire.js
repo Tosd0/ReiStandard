@@ -130,6 +130,9 @@ function normalizeBeforeFireResult(result) {
       messages: result.messages,
       maxToolIterations: result.maxToolIterations,
       totalTimeoutMs: result.totalTimeoutMs,
+      // 归一成「有就是非空数组，否则 undefined」，让下面每轮的透传判断能直接
+      // 用真值。真正决定请求体带不带 tools 的规则住在 llm.js 的
+      // buildAiRequestBody（那边有测试钉着），这层只是不把空数组往下传。
       tools: Array.isArray(result.tools) && result.tools.length > 0 ? result.tools : undefined,
       toolChoice: result.toolChoice,
     };
@@ -415,6 +418,13 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     // same round, both need their id on the assistant turn, or the half
     // that's missing leaves an orphan role:'tool' and a strict relay
     // rejects the next round.
+    //
+    // Contract for onLLMOutput: the toolCalls it returns must cover every
+    // native tool_call the model declared. A native call left out still
+    // gets declared on the assistant turn (it came from the model) but has
+    // no matching role:'tool' result, and a strict relay rejects the next
+    // round over the unanswered id. Drop a call on purpose → return a
+    // result for it saying so, don't just omit it.
     const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
     const nativeIds = new Set(nativeCalls.map((tc) => tc && tc.id));
     const synthesized = toolCalls.filter((tc) => !nativeIds.has(tc && tc.id));
