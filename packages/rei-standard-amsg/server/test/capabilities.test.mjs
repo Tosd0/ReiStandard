@@ -17,6 +17,7 @@ const EXPECTED_FEATURES = [
   'agentic-scratch',
   'agentic-write-state',
   'agentic-fire-tools',
+  'agentic-schedule-task',
   'vapid-public-key',
 ];
 
