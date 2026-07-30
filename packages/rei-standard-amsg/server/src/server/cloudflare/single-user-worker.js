@@ -24,10 +24,11 @@
  * Access-Control-* on responses. With no `cors` the Worker stays same-origin.
  *
  * Fire-time hooks are opt-in too: pass `hooks: { onBeforeFire, onLLMOutput,
- * executeToolCalls }` (+ optional `maxToolIterations` / `totalTimeoutMs`) in the
- * config to let scheduled AI tasks assemble their prompt and run a server-side
- * tool loop at fire time. Omit them and AI tasks replay the schedule-time frozen
- * prompt exactly as before. See lib/agentic-fire.js.
+ * executeToolCalls }` (+ optional `maxToolIterations` / `totalTimeoutMs` /
+ * `maxScheduledTasksPerFire`) in the config to let scheduled AI tasks assemble
+ * their prompt and run a server-side tool loop at fire time. Omit them and AI
+ * tasks replay the schedule-time frozen prompt exactly as before. See
+ * lib/agentic-fire.js.
  *
  * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
  * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。租期默认 10 分钟，可以
@@ -170,6 +171,8 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         totalTimeoutMs: cfg.totalTimeoutMs,
         // hook 的 ctx.writeState() 用它判断单条 value 的上限，和 PUT /client-state 同一个配置。
         maxStateValueBytes: cfg.maxStateValueBytes,
+        // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
+        maxScheduledTasksPerFire: cfg.maxScheduledTasksPerFire,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs
       });

@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { processSingleMessage } from '../src/server/lib/message-processor.js';
 import { callLlm } from '../src/server/lib/llm.js';
-import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
+import { decryptFromStorage, deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
@@ -34,7 +34,7 @@ async function makeTask(payloadOverrides = {}) {
   };
 }
 
-function makeCtx({ hooks, maxToolIterations, totalTimeoutMs, db, pushSpy, now } = {}) {
+function makeCtx({ hooks, maxToolIterations, totalTimeoutMs, db, pushSpy, now, maxScheduledTasksPerFire } = {}) {
   return {
     masterKey: MASTER_KEY,
     webpush: { async sendNotification(sub, payload) { if (pushSpy) pushSpy(sub, payload); } },
@@ -43,6 +43,7 @@ function makeCtx({ hooks, maxToolIterations, totalTimeoutMs, db, pushSpy, now } 
     hooks: hooks || null,
     maxToolIterations,
     totalTimeoutMs,
+    maxScheduledTasksPerFire,
     _agenticSleep: async () => {},   // don't actually sleep 1.5s in tests
     _agenticNow: now,
   };
@@ -389,8 +390,8 @@ describe('agentic fire loop', () => {
       const allowedSessionKeys = new Set([
         'sessionId', 'charId', 'messages', 'llmResponse', 'llmOutputText',
         'iteration', 'metadata', 'contactName', 'avatarUrl', 'scratch',
-        // server 侧在共享 SessionContext 之上加的状态访问器
-        'readState', 'writeState',
+        // server 侧在共享 SessionContext 之上加的状态访问器与建任务口
+        'readState', 'writeState', 'scheduleTask',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);
@@ -993,6 +994,303 @@ describe('writeState', () => {
       llm.restore();
     }
     assert.match(caught.message, /AGENTIC_STATE_WRITE_UNSUPPORTED/);
+  });
+});
+
+describe('scheduleTask（fire 里给自己排后续任务）', () => {
+  // 固定时钟：护栏是「至少比现在晚 60 秒」，现在得是个说得准的数
+  const NOW = Date.parse('2020-06-01T12:00:00.000Z');
+  const IN_30S = new Date(NOW + 30_000).toISOString();
+  const IN_2MIN = new Date(NOW + 120_000).toISOString();
+  const IN_90MIN = new Date(NOW + 90 * 60_000).toISOString();
+  const PAST = new Date(NOW - 60 * 60_000).toISOString();
+
+  async function freshAdapter() {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    return { d1, adapter };
+  }
+
+  async function countTasks(d1) {
+    const row = await d1.prepare('SELECT COUNT(*) AS n FROM scheduled_messages').first();
+    return row.n;
+  }
+
+  // 跑一次 fire，把 fireCtx / sessionCtx 交给回调折腾。
+  async function fireWith(adapter, { onFire, onSession, maxScheduledTasksPerFire, taskOverrides } = {}) {
+    const { task } = await makeTask(taskOverrides);
+    const hooks = {
+      onBeforeFire: async (fireCtx) => {
+        if (onFire) await onFire(fireCtx);
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async (sessionCtx) => {
+        if (onSession) await onSession(sessionCtx);
+        return { decision: 'skip-push' };
+      },
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      return await processSingleMessage(task, makeCtx({
+        hooks, db: adapter, now: () => NOW, maxScheduledTasksPerFire,
+      }));
+    } finally {
+      llm.restore();
+    }
+  }
+
+  async function readStoredPayload(adapter, uuid) {
+    const row = await adapter.getTaskByUuidOnly(uuid);
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    return { row, payload: JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)) };
+  }
+
+  test('新任务继承凭据与投递配置；hook 拿到的 ctx 里一个凭据都没有', async () => {
+    const { adapter } = await freshAdapter();
+    let outcome = null;
+    let seenFireCtx = null;
+    let seenSessionCtx = null;
+
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        seenFireCtx = ctx;
+        outcome = await ctx.scheduleTask({ firstSendTime: IN_90MIN });
+      },
+      onSession: async (ctx) => { seenSessionCtx = ctx; },
+    });
+    assert.equal(result.success, true);
+    assert.equal(outcome.created, true);
+    assert.equal(typeof outcome.id, 'number');
+    assert.equal(outcome.nextSendAt, IN_90MIN);
+
+    // 落库的 payload 里凭据齐全，新任务到点能自己发出去
+    const { row, payload } = await readStoredPayload(adapter, outcome.uuid);
+    assert.deepEqual(payload.pushSubscription, {
+      endpoint: 'https://push.example.com/sub', keys: { p256dh: 'k', auth: 'a' },
+    });
+    assert.equal(payload.apiKey, 'sk-secret');
+    assert.equal(payload.apiUrl, 'https://api.example.com/v1/chat/completions');
+    assert.equal(payload.primaryModel, 'model-x');
+    assert.equal(row.user_id, USER);
+    assert.equal(row.next_send_at, IN_90MIN);
+
+    // 而 hook 自己从头到尾看不到这些
+    for (const k of ['apiKey', 'pushSubscription']) {
+      assert.equal(k in seenFireCtx.task, false, `fireCtx.task 不该带 ${k}`);
+      assert.equal(k in seenFireCtx, false, `fireCtx 不该带 ${k}`);
+      assert.equal(k in seenSessionCtx, false, `sessionCtx 不该带 ${k}`);
+    }
+  });
+
+  test('宿主传的 firstSendTime / metadata / messageType 生效；不传就继承当前任务', async () => {
+    const { adapter } = await freshAdapter();
+    let explicit = null;
+    let inherited = null;
+
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        explicit = await ctx.scheduleTask({
+          firstSendTime: IN_90MIN,
+          messageType: 'prompted',
+          recurrenceType: 'daily',
+          metadata: { charId: 'char-2', beat: 'followup' },
+          contactName: 'Rei（续）',
+          messageSubtype: 'forum',
+        });
+        inherited = await ctx.scheduleTask({ firstSendTime: IN_2MIN });
+      },
+    });
+    assert.equal(result.success, true);
+
+    const a = await readStoredPayload(adapter, explicit.uuid);
+    assert.equal(a.row.message_type, 'prompted');
+    assert.equal(a.row.next_send_at, IN_90MIN);
+    assert.equal(a.payload.messageType, 'prompted');
+    assert.equal(a.payload.recurrenceType, 'daily');
+    assert.equal(a.payload.firstSendTime, IN_90MIN);
+    assert.equal(a.payload.contactName, 'Rei（续）');
+    assert.equal(a.payload.messageSubtype, 'forum');
+    // metadata 是整体替换，不是深合并：原来的 charId: 'char-1' 不该渗过来
+    assert.deepEqual(a.payload.metadata, { charId: 'char-2', beat: 'followup' });
+
+    const b = await readStoredPayload(adapter, inherited.uuid);
+    assert.equal(b.row.message_type, 'auto');            // 继承当前任务
+    assert.equal(b.payload.contactName, 'Rei');
+    assert.equal(b.payload.recurrenceType, 'none');      // 默认一次性
+    assert.deepEqual(b.payload.metadata, { charId: 'char-1' });
+  });
+
+  // fire-time hook 每次现场重组 prompt。把排程时冻结的旧 prompt 带过去，
+  // 新任务万一走回老链路就会静默发出一条谁也没打算发的文案。
+  test('completePrompt / messages 不继承，两者都是 null', async () => {
+    const { adapter } = await freshAdapter();
+    let outcome = null;
+    const result = await fireWith(adapter, {
+      taskOverrides: { completePrompt: '排程时冻结的老 prompt' },
+      onFire: async (ctx) => { outcome = await ctx.scheduleTask({ firstSendTime: IN_90MIN }); },
+    });
+    assert.equal(result.success, true);
+    const { payload } = await readStoredPayload(adapter, outcome.uuid);
+    assert.equal(payload.completePrompt, null);
+    assert.equal(payload.messages, null);
+  });
+
+  test('firstSendTime：缺席 / 解析不了 / 过去 / 60 秒内，全被拒且一行都没建', async () => {
+    const { d1, adapter } = await freshAdapter();
+    const caught = [];
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        for (const bad of [undefined, '', 'not-a-time', PAST, IN_30S]) {
+          await assert.rejects(
+            () => ctx.scheduleTask(bad === undefined ? {} : { firstSendTime: bad }),
+            RangeError
+          );
+          caught.push(bad);
+        }
+        // 60 秒整这条边界是收的
+        const ok = await ctx.scheduleTask({ firstSendTime: new Date(NOW + 60_000).toISOString() });
+        assert.equal(ok.created, true);
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(caught.length, 5);
+    assert.equal(await countTasks(d1), 1); // 只有边界那条落了库
+  });
+
+  test("messageType: 'instant' 被拒（合法的三种照常）", async () => {
+    const { d1, adapter } = await freshAdapter();
+    let ok = null;
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await assert.rejects(
+          () => ctx.scheduleTask({ firstSendTime: IN_90MIN, messageType: 'instant' }),
+          (err) => err instanceof TypeError && /instant/.test(err.message)
+        );
+        await assert.rejects(
+          () => ctx.scheduleTask({ firstSendTime: IN_90MIN, messageType: 'whatever' }),
+          (err) => err instanceof TypeError && /auto \/ prompted \/ fixed/.test(err.message)
+        );
+        ok = await ctx.scheduleTask({ firstSendTime: IN_90MIN, messageType: 'prompted' });
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(ok.created, true);
+    assert.equal(await countTasks(d1), 1);
+  });
+
+  test("messageType 'fixed' 没有 userMessage → 拒（继承到正文就放行）", async () => {
+    const { d1, adapter } = await freshAdapter();
+    let created = null;
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        await assert.rejects(
+          () => ctx.scheduleTask({ firstSendTime: IN_90MIN, messageType: 'fixed' }),
+          (err) => err instanceof TypeError && /userMessage/.test(err.message)
+        );
+        created = await ctx.scheduleTask({
+          firstSendTime: IN_90MIN, messageType: 'fixed', userMessage: '晚安。',
+        });
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(created.created, true);
+    assert.equal(await countTasks(d1), 1);
+    const { payload } = await readStoredPayload(adapter, created.uuid);
+    assert.equal(payload.userMessage, '晚安。');
+  });
+
+  // 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键。
+  test('单次 fire 的建任务上限：默认 2 条，第 3 条被拒；factory 配置能调', async () => {
+    const { d1, adapter } = await freshAdapter();
+    let result = await fireWith(adapter, {
+      onFire: async (ctx) => {
+        assert.equal((await ctx.scheduleTask({ firstSendTime: IN_2MIN })).created, true);
+        assert.equal((await ctx.scheduleTask({ firstSendTime: IN_90MIN })).created, true);
+        await assert.rejects(
+          () => ctx.scheduleTask({ firstSendTime: IN_90MIN }),
+          (err) => err instanceof RangeError && /最多建 2 条/.test(err.message)
+        );
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(await countTasks(d1), 2);
+
+    const second = await freshAdapter();
+    result = await fireWith(second.adapter, {
+      maxScheduledTasksPerFire: 1,
+      onFire: async (ctx) => {
+        assert.equal((await ctx.scheduleTask({ firstSendTime: IN_2MIN })).created, true);
+        await assert.rejects(
+          () => ctx.scheduleTask({ firstSendTime: IN_90MIN }),
+          (err) => err instanceof RangeError && /最多建 1 条/.test(err.message)
+        );
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(await countTasks(second.d1), 1);
+  });
+
+  // fire 失败会整条重跑；宿主传确定性 uuid 就天然幂等，不该每重试一次多排一条。
+  test('uuid 撞车返回 { created: false, reason: "duplicate" }，不抛错也不重复建行', async () => {
+    const { d1, adapter } = await freshAdapter();
+    const uuid = 'fire-7-2020-01-01T00:00:00.000Z';
+
+    let first = null;
+    await fireWith(adapter, {
+      onFire: async (ctx) => { first = await ctx.scheduleTask({ firstSendTime: IN_90MIN, uuid }); },
+    });
+    assert.equal(first.created, true);
+    assert.equal(first.uuid, uuid);
+
+    // 同一次任务重跑：同样的 uuid 再来一次
+    let retry = null;
+    const result = await fireWith(adapter, {
+      onFire: async (ctx) => { retry = await ctx.scheduleTask({ firstSendTime: IN_90MIN, uuid }); },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(retry, { created: false, reason: 'duplicate', uuid });
+    assert.equal(await countTasks(d1), 1);
+  });
+
+  // 要不要接着说，往往是看完这轮 LLM 输出才定的——那时 onBeforeFire 早已返回。
+  test('sessionCtx 上也拿得到 scheduleTask', async () => {
+    const { d1, adapter } = await freshAdapter();
+    let outcome = null;
+    const result = await fireWith(adapter, {
+      onSession: async (ctx) => {
+        assert.equal(typeof ctx.scheduleTask, 'function');
+        outcome = await ctx.scheduleTask({ firstSendTime: IN_90MIN, metadata: { beat: 'followup' } });
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(outcome.created, true);
+    assert.equal(await countTasks(d1), 1);
+    const { payload } = await readStoredPayload(adapter, outcome.uuid);
+    assert.deepEqual(payload.metadata, { beat: 'followup' });
+  });
+
+  test('适配器不支持建任务 → 明确报错，不静默成功', async () => {
+    const { task } = await makeTask();
+    let caught = null;
+    const hooks = {
+      onBeforeFire: async (ctx) => {
+        try {
+          await ctx.scheduleTask({ firstSendTime: IN_90MIN });
+        } catch (error) {
+          caught = error;
+        }
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async () => ({ decision: 'skip-push' }),
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, db: {}, now: () => NOW }));
+    } finally {
+      llm.restore();
+    }
+    assert.match(caught.message, /AGENTIC_SCHEDULE_UNSUPPORTED/);
   });
 });
 

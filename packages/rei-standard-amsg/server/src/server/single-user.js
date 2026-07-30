@@ -19,6 +19,7 @@
  * @param {number} [config.maxToolIterations] - factory default LLM-round cap for the agentic loop (default 5).
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
+ * @param {number} [config.maxScheduledTasksPerFire] - 一次 fire 里 hook 用 ctx.scheduleTask() 最多能建几条后续任务（默认 2，0 表示不许自排）。
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
@@ -58,7 +59,9 @@ export function createSingleUserServer(config) {
     hooks: config.hooks || null,
     maxToolIterations: config.maxToolIterations,
     totalTimeoutMs: config.totalTimeoutMs,
-    maxStateValueBytes: config.maxStateValueBytes
+    maxStateValueBytes: config.maxStateValueBytes,
+    // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
+    maxScheduledTasksPerFire: config.maxScheduledTasksPerFire
   };
 
   return {

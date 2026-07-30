@@ -82,7 +82,8 @@ export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   hooks: {
     // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
-    // ctx: { task, userId, readState(ns), writeState(ns, entries), now, scratch }
+    // ctx: { task, userId, readState(ns), writeState(ns, entries),
+    //        scheduleTask(options), now, scratch }
     //   task 是解密后的任务字段（不含 apiKey / pushSubscription）；
     //   自定义字段排程时放 metadata 里，这里原样读回。
     //   scratch 是本次 fire 的便签对象：在这里塞的东西，同一次 fire 的
@@ -108,7 +109,8 @@ export default createSingleUserCloudflareWorker((env) => ({
     // onLLMOutput 一致（sessionId / messages / llmResponse / llmOutputText /
     // iteration / metadata / contactName / avatarUrl），instant 的
     // classifier 可以直接拿来用；另外这里还多两个状态访问器
-    // readState / writeState，和 onBeforeFire 拿到的是同一对。四种 decision：
+    // readState / writeState 和一个 scheduleTask，都跟 onBeforeFire 拿到的
+    // 是同一份。四种 decision：
     //   { decision: 'finish', pushPayloads }        → 推送这些 payload，结束
     //   { decision: 'tool-request', toolCalls }     → 交给 executeToolCalls 执行
     //     （也接受 instant 形状：pushPayloads 里带 tool_request push）
@@ -143,10 +145,46 @@ export default createSingleUserCloudflareWorker((env) => ({
   },
   maxToolIterations: 5,    // LLM 轮数上限（默认 5）
   totalTimeoutMs: 240_000, // 整链墙钟超时（默认 240s）
+  maxScheduledTasksPerFire: 2, // 一次 fire 里最多能自排几条后续任务（默认 2，0 = 不许自排）
 }));
 ```
 
 预算兜底：轮数到上限、或整链超过 `totalTimeoutMs`，按任务失败处理（沿用现有重试/标记逻辑）。hook 收到的 ctx 里没有 apiKey、pushSubscription、VAPID——`console.log(ctx)` 不会把密钥打进日志。
+
+### 排一条后续任务：`ctx.scheduleTask(options)`
+
+这是啥：让角色在这次 fire 里给自己再排一条定时任务——「这条发完，一个半小时后我再接着说一句」。建出来的是一条正常的任务行，到点由 cron 触发，用户全程离线也不影响。`onBeforeFire` / `onLLMOutput` / `executeToolCalls` 的 ctx 上都有它，因为「要不要接着说」往往是看完这轮 LLM 输出才定的。
+
+```js
+async onLLMOutput(ctx) {
+  const result = await ctx.scheduleTask({
+    firstSendTime: new Date(Date.now() + 90 * 60_000).toISOString(), // 必填，ISO 字符串
+    messageType: 'auto',            // 可选，默认继承当前任务
+    recurrenceType: 'none',         // 可选，默认 none
+    metadata: { beat: 'followup' }, // 可选，整体替换当前任务的 metadata（不是深合并）
+    // contactName / avatarUrl / messageSubtype / userMessage 也都能覆盖，不传就继承
+    uuid: `fire-${ctx.sessionId}`,  // 可选，默认随机；传确定性 uuid 可做重试幂等
+  });
+  // result: { created: true, id, uuid, nextSendAt }
+  //      或 { created: false, reason: 'duplicate', uuid }
+  return { decision: 'finish', pushPayloads: [...] };
+}
+```
+
+凭据和投递配置（`pushSubscription` / `apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern`）从当前任务继承，宿主只说「什么时候、说什么方向」——和 ctx 里看不到 apiKey 是同一个原则。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回老链路就会静默发出一条谁也没打算发的文案。
+
+护栏，以及它们各自在防什么：
+
+| 护栏 | 阈值 / 规则 | 不满足时 | 为什么 |
+|---|---|---|---|
+| `firstSendTime` | 必填、能解析成合法时间、至少比现在晚 **60 秒** | `RangeError` | cron 一分钟一跳，排在 60 秒内等于让下一跳立刻捡走，容易变成自己触发自己的紧密循环 |
+| `messageType` | 只收 `auto` / `prompted` / `fixed` | `TypeError` | `instant` 的语义是「建行的那一刻就投递」，那条路径归 `POST /schedule-message` 管；从 fire 里造这么一行，投递时机反而说不清 |
+| `messageType: 'fixed'` | 必须有 `userMessage`（自己传或继承到） | `TypeError` | 固定文本任务没有正文，就是一条永远发空的任务 |
+| 单次 fire 的建任务条数 | 默认 **2 条**，config 里的 `maxScheduledTasksPerFire` 可调（`0` = 不许自排） | `RangeError` | 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键 |
+| `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid }` | fire 失败会整条重跑（见「慢任务与 cron 占位」），宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等，重试不会多排一条 |
+| 数据库适配器没有 `createTask` | — | 抛 `AGENTIC_SCHEDULE_UNSUPPORTED` | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
+
+`recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。新任务的触发靠 cron，所以自排的时间点也受 cron 精度约束——排在 `x:xx:30` 会等到下一跳才发出去。
 
 ## 一条 push 能塞多少
 

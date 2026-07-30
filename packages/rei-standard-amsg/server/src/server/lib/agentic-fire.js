@@ -40,6 +40,32 @@
  * 补完那轮模型仍可能再发起调用。库不看 tools 的内容，执行照旧是
  * executeToolCalls 的事。
  *
+ * 自排后续任务：fireCtx 和每轮的 sessionCtx 上都挂着 scheduleTask，宿主用它
+ * 在这次 fire 里给同一个用户再建一条定时任务（「这条发完，一个半小时后我再
+ * 接着说一句」）。写口在 sessionCtx 上也给，是因为要不要接着说往往是看完
+ * LLM 输出才定的，那时 onBeforeFire 早已返回。凭据（pushSubscription /
+ * apiKey）和投递配置从当前任务继承、宿主全程看不到（与 buildHookTask 屏蔽
+ * 凭据同一个原则），宿主只提供「什么时候、说什么方向」。
+ *
+ * 新任务不继承 completePrompt / messages，两者都置 null：fire-time hook 每次
+ * 现场重组 prompt，把排程时冻结的旧 prompt 带过去，会在新任务万一走回老链路
+ * （onBeforeFire 返回 null、或那次部署没配 hooks）时静默顶替宿主的意图——
+ * 与其发一条来路不明的旧文案，不如让它当场失败、走既有的重试/标记逻辑。
+ *
+ * 护栏（几条都是这个能力能不能上线的关键）：
+ *   - firstSendTime 至少比现在晚 MIN_SCHEDULE_LEAD_MS（60 秒）。cron 每分钟
+ *     一跳，排在 60 秒内等于让下一跳立刻捡走，容易变成自己触发自己的紧密循环。
+ *   - messageType 只收 auto / prompted / fixed，不收 instant。instant 的语义是
+ *     「建行的那一刻就投递」，那条路径归 POST /schedule-message 管；从 fire 里
+ *     造这么一行，投递时机反而说不清（这里不投，要等 cron 捞到才发）。
+ *   - 单次 fire 的建任务上限默认 DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE 条，
+ *     factory 配置 ctx.maxScheduledTasksPerFire 可覆盖（0 表示不许自排）。模型
+ *     自排后续本质上是个可以无限延伸的链：没有上限的话，一次 fire 里连排十条、
+ *     或者每条任务都排下一条，就成了谁也没按下停止键的循环。
+ *   - uuid 冲突不抛错，返回 { created: false, reason: 'duplicate' }。fire 失败
+ *     会整条重跑（run-tick 的重试语义），宿主传一个由「任务 id + 触发时刻」推
+ *     出来的确定性 uuid 就天然幂等，不会每重试一次多排一条。
+ *
  * Budget guards, both factory-level (ctx.maxToolIterations /
  * ctx.totalTimeoutMs) and per-fire (onBeforeFire may return
  * { messages, maxToolIterations?, totalTimeoutMs? } to override for one
@@ -57,7 +83,8 @@ import {
   extractToolCallsFromDecision,
 } from '@rei-standard/amsg-shared';
 import { randomUUID } from './webcrypto-utils.js';
-import { decryptFromStorage } from './encryption.js';
+import { decryptFromStorage, encryptForStorage } from './encryption.js';
+import { isUniqueViolation } from './db-errors.js';
 import { callLlm } from './llm.js';
 import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
@@ -75,6 +102,17 @@ import {
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
+
+// 一次 fire 里最多能给自己排几条后续任务（ctx.maxScheduledTasksPerFire 可覆盖）。
+export const DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE = 2;
+// 自排任务的最小提前量：cron 一分钟一跳，比这更近等于让下一跳立刻捡走。
+export const MIN_SCHEDULE_LEAD_MS = 60_000;
+
+// 自排任务允许的类型。instant 归 POST /schedule-message 那条同步路径管。
+const SCHEDULABLE_MESSAGE_TYPES = new Set(['auto', 'prompted', 'fixed']);
+// 与 validateScheduleMessagePayload 同一套；run-tick 只认得这三种，别的值会让
+// 任务发完之后推进不到下一次。
+const SCHEDULABLE_RECURRENCE_TYPES = new Set(['none', 'daily', 'weekly']);
 
 // Same pacing as the legacy path / amsg-instant.
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
@@ -163,7 +201,7 @@ function firstPositiveNumber(values, fallback) {
  * @param {import('../adapters/interface.js').TaskRow} args.task
  * @param {Object} args.decryptedPayload - decrypted task payload (has credentials; they stop here)
  * @param {string} args.userKey - per-user storage key (for readState decryption)
- * @param {Object} args.ctx - processor ctx ({ db, webpush, vapid, hooks, maxToolIterations, totalTimeoutMs })
+ * @param {Object} args.ctx - processor ctx ({ db, webpush, vapid, hooks, maxToolIterations, totalTimeoutMs, maxScheduledTasksPerFire })
  * @returns {Promise<{ handled: false } | { handled: true, result: { success: true, messagesSent: number, status: 'finished'|'skipped', iterations: number } }>}
  *   `handled: false` → caller falls back to the legacy frozen-prompt path
  *   (onBeforeFire returned null).
@@ -282,6 +320,174 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     return writeClientStateEntries({ db: ctx.db, userId: task.user_id, userKey, entries: normalized });
   };
 
+  const maxScheduledTasksPerFire =
+    Number.isInteger(ctx.maxScheduledTasksPerFire) && ctx.maxScheduledTasksPerFire >= 0
+      ? ctx.maxScheduledTasksPerFire
+      : DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE;
+  // 本次 fire 已经用掉的建任务额度。校验通过、真的要写库时才 +1，参数不合法的
+  // 调用不占额度；uuid 撞车（那条任务其实已经建出来了）照样占。
+  let scheduledTaskCount = 0;
+
+  /**
+   * scheduleTask(options) —— 在这次 fire 里给**同一个用户**再建一条定时任务。
+   *
+   * 典型用法：角色发完这条，想过一个半小时再接着说一句。以前只能写进
+   * client_state 等客户端上线重放，用户一直不上线这条链就断了；建成任务行之后，
+   * 到点由 cron 直接触发，跟别的定时消息一样。
+   *
+   * 凭据与投递配置（pushSubscription / apiUrl / apiKey / primaryModel /
+   * maxTokens / temperature / splitPattern）以及 contactName / avatarUrl /
+   * messageSubtype / userMessage 从当前任务继承，宿主只说「什么时候、说什么
+   * 方向」——hook 全程看不到凭据。completePrompt / messages 不继承（都置 null），
+   * 见文件头。
+   *
+   * @param {Object} options
+   * @param {string} options.firstSendTime      - 必填，ISO 8601；至少比现在晚 60 秒
+   * @param {'none'|'daily'|'weekly'} [options.recurrenceType='none']
+   * @param {'auto'|'prompted'|'fixed'} [options.messageType]  - 默认继承当前任务
+   * @param {Object} [options.metadata]         - 整体替换（不是深合并）当前任务的 metadata
+   * @param {string} [options.contactName]      - 默认继承
+   * @param {string|null} [options.avatarUrl]   - 默认继承
+   * @param {string} [options.messageSubtype]   - 默认继承
+   * @param {string|null} [options.userMessage] - 默认继承；messageType 'fixed' 时必须有
+   * @param {string} [options.uuid]             - 默认 randomUUID()；传确定性 uuid 可做重试幂等
+   * @returns {Promise<{ created: true, id: number|null, uuid: string, nextSendAt: string }
+   *   | { created: false, reason: 'duplicate', uuid: string }>}
+   */
+  const scheduleTask = async (options) => {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('scheduleTask(options) 需要一个对象，至少包含 { firstSendTime }');
+    }
+
+    // ---- 触发时刻 ----
+    if (typeof options.firstSendTime !== 'string' || !options.firstSendTime.trim()) {
+      throw new RangeError('scheduleTask: firstSendTime 必填，且必须是 ISO 8601 字符串');
+    }
+    const firstSendAt = new Date(options.firstSendTime);
+    if (Number.isNaN(firstSendAt.getTime())) {
+      throw new RangeError(`scheduleTask: firstSendTime 解析不出合法时间：${options.firstSendTime}`);
+    }
+    const earliest = nowFn() + MIN_SCHEDULE_LEAD_MS;
+    if (firstSendAt.getTime() < earliest) {
+      throw new RangeError(
+        `scheduleTask: firstSendTime 至少要比现在晚 ${MIN_SCHEDULE_LEAD_MS / 1000} 秒` +
+        `（最早可排 ${new Date(earliest).toISOString()}，收到 ${firstSendAt.toISOString()}）` +
+        '——cron 一分钟一跳，排得更近等于让下一跳立刻捡走'
+      );
+    }
+    const nextSendAt = firstSendAt.toISOString();
+
+    // ---- 类型 ----
+    const inheritedType = options.messageType == null;
+    const messageType = inheritedType ? decryptedPayload.messageType : options.messageType;
+    if (messageType === 'instant') {
+      throw new TypeError(
+        "scheduleTask: messageType 不能是 'instant'——instant 的语义是「建行的那一刻就投递」，" +
+        '那条路径归 POST /schedule-message 管；从 fire 里建一条 instant，投递时机反而说不清。' +
+        (inheritedType ? '（这个 instant 是从当前任务继承来的，显式传 auto / prompted / fixed 覆盖它。）' : '')
+      );
+    }
+    if (!SCHEDULABLE_MESSAGE_TYPES.has(messageType)) {
+      throw new TypeError(
+        `scheduleTask: messageType 只能是 auto / prompted / fixed，收到 ${JSON.stringify(messageType)}`
+      );
+    }
+
+    const recurrenceType = options.recurrenceType == null ? 'none' : options.recurrenceType;
+    if (!SCHEDULABLE_RECURRENCE_TYPES.has(recurrenceType)) {
+      throw new TypeError(
+        `scheduleTask: recurrenceType 只能是 none / daily / weekly，收到 ${JSON.stringify(recurrenceType)}`
+      );
+    }
+
+    // ---- 继承 + 覆盖 ----
+    const contactName = options.contactName === undefined ? decryptedPayload.contactName : options.contactName;
+    if (typeof contactName !== 'string' || !contactName.trim()) {
+      throw new TypeError('scheduleTask: contactName 必须是非空字符串（默认继承当前任务）');
+    }
+    const userMessage = options.userMessage === undefined
+      ? (decryptedPayload.userMessage ?? null)
+      : options.userMessage;
+    if (messageType === 'fixed' && (typeof userMessage !== 'string' || !userMessage.trim())) {
+      throw new TypeError(
+        "scheduleTask: messageType 'fixed' 必须有 userMessage（自己传，或从当前任务继承到）" +
+        '——固定文本任务没有正文，就是一条永远发空的任务'
+      );
+    }
+    const metadata = options.metadata === undefined ? (decryptedPayload.metadata || {}) : options.metadata;
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new TypeError('scheduleTask: metadata 必须是普通对象（整体替换当前任务的 metadata，不做深合并）');
+    }
+    const uuid = options.uuid == null ? randomUUID() : options.uuid;
+    if (typeof uuid !== 'string' || !uuid.trim()) {
+      throw new TypeError('scheduleTask: uuid 必须是非空字符串');
+    }
+
+    // ---- 额度 ----
+    if (scheduledTaskCount >= maxScheduledTasksPerFire) {
+      throw new RangeError(
+        `scheduleTask: 单次 fire 最多建 ${maxScheduledTasksPerFire} 条任务` +
+        `（factory 配置 maxScheduledTasksPerFire 可调），这是第 ${scheduledTaskCount + 1} 条`
+      );
+    }
+    // readState 在适配器不支持时降级成空数组；建任务不一样，静默成功会让宿主
+    // 以为后续那条已经排上了，其实谁也不会触发它。
+    if (!ctx.db || typeof ctx.db.createTask !== 'function') {
+      throw new Error('AGENTIC_SCHEDULE_UNSUPPORTED: 当前数据库适配器不支持建任务（缺 createTask）');
+    }
+    scheduledTaskCount++;
+
+    // 字段构成与 POST /schedule-message 落库的那份保持一致，只是走库内部、不经 HTTP。
+    const fullTaskData = {
+      contactName,
+      avatarUrl: options.avatarUrl === undefined ? (decryptedPayload.avatarUrl || null) : (options.avatarUrl || null),
+      messageType,
+      messageSubtype: (options.messageSubtype === undefined ? decryptedPayload.messageSubtype : options.messageSubtype) || 'chat',
+      userMessage: userMessage || null,
+      firstSendTime: nextSendAt,
+      recurrenceType,
+      apiUrl: decryptedPayload.apiUrl || null,
+      apiKey: decryptedPayload.apiKey || null,
+      primaryModel: decryptedPayload.primaryModel || null,
+      // 见文件头：fire-time hook 每次现场重组 prompt，旧 prompt 带过去只会在新
+      // 任务走回老链路时顶替宿主的意图。
+      completePrompt: null,
+      messages: null,
+      maxTokens: decryptedPayload.maxTokens ?? null,
+      temperature: decryptedPayload.temperature ?? null,
+      splitPattern: decryptedPayload.splitPattern ?? null,
+      pushSubscription: decryptedPayload.pushSubscription,
+      metadata,
+    };
+
+    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
+
+    let created;
+    try {
+      created = await ctx.db.createTask({
+        user_id: task.user_id,
+        uuid,
+        encrypted_payload: encryptedPayload,
+        next_send_at: nextSendAt,
+        message_type: messageType,
+      });
+    } catch (error) {
+      // 撞 uuid 不算错：fire 失败会整条重跑，宿主用确定性 uuid（任务 id + 触发
+      // 时刻推出来的那种）就天然幂等，重试不会多排一条。
+      if (isUniqueViolation(error)) return { created: false, reason: 'duplicate', uuid };
+      throw error;
+    }
+    if (!created) {
+      throw new Error('AGENTIC_SCHEDULE_FAILED: createTask 没有返回新建的任务行');
+    }
+    return {
+      created: true,
+      id: created.id ?? null,
+      uuid: created.uuid ?? uuid,
+      nextSendAt: created.next_send_at ?? nextSendAt,
+    };
+  };
+
   // 单次 fire 的宿主便签：onBeforeFire 的 fireCtx 和同一次 fire 每轮的
   // sessionCtx（onLLMOutput / executeToolCalls）拿到同一个对象引用，fire 结束
   // （finish / skip-push / 抛错 / 轮数超限）随调用栈丢弃。库自己不读不写、
@@ -293,6 +499,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     userId: task.user_id,
     readState,
     writeState,
+    scheduleTask,
     now: new Date(nowFn()),
     scratch,
   });
@@ -345,9 +552,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     const assistantMessage = extractAssistantMessage(llmResponse);
     messages = [...messages, assistantMessage];
 
-    // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂两个状态访问器：
-    // 大内容要不要旁路存，往往到工具跑完、组 push 时才知道，而那正是
-    // onLLMOutput / executeToolCalls 的位置，onBeforeFire 早就返回了。
+    // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂两个状态访问器
+    // 和 scheduleTask：大内容要不要旁路存、要不要给自己排条后续，往往到工具跑完、
+    // 组 push 时才知道，而那正是 onLLMOutput / executeToolCalls 的位置，
+    // onBeforeFire 早就返回了。
     const sessionCtx = Object.freeze({
       ...buildSessionContext({
         sessionId,
@@ -362,6 +570,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       }),
       readState,
       writeState,
+      scheduleTask,
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
