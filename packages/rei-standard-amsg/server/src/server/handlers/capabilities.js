@@ -26,6 +26,11 @@ export const SERVER_FEATURES = Object.freeze([
   'agentic-fire-tools',
   'agentic-schedule-task',
   'vapid-public-key',
+  'tick-stale-guard',
+  'recurring-skip-occurrence',
+  'occurrence-scoped-push-ids',
+  'after-send-hook',
+  'update-message-credentials',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

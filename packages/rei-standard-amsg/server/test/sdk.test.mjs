@@ -715,4 +715,112 @@ describe('update-message splitPattern round-trip', () => {
     assert.equal(afterData.avatarUrl, 'https://example.com/original.png', 'bad avatar stripped → original preserved');
     assert.equal(afterData.userMessage, 'updated', 'sibling field still applied');
   });
+
+  // ─── 凭据 / 推送订阅刷新（2.6.0-next.10）────────────────────────────
+  //
+  // 白名单不认这四个字段时它们会被静默丢弃：消费方换了聊天 API 配置或重新
+  // 订阅推送，已挂任务里冻结的旧值刷不掉。回归守卫：旧行为下三个 assert
+  // （apiUrl/apiKey/primaryModel/pushSubscription 更新后落库）会挂。
+  it('PUT 可刷新 apiUrl / apiKey / primaryModel / pushSubscription；null 不清空', async () => {
+    globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
+    const { server, adapter } = await buildServerAndAdapter();
+    const { tenantToken, userKey } = await bootstrapTenant(server);
+
+    const taskUuid = '44444444-2222-4333-8444-888888888888';
+    const scheduleBody = await encryptPayload(
+      {
+        uuid: taskUuid,
+        contactName: 'Dana',
+        messageType: 'prompted',
+        firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+        pushSubscription: { endpoint: 'https://push.example.com/old' },
+        completePrompt: 'say hi',
+        apiUrl: 'https://old.example.com/v1/chat/completions',
+        apiKey: 'sk-old',
+        primaryModel: 'model-old'
+      },
+      userKey
+    );
+    const headers = {
+      authorization: `Bearer ${tenantToken}`,
+      'x-user-id': TEST_USER_ID,
+      'x-payload-encrypted': 'true',
+      'x-encryption-version': '1'
+    };
+    const scheduled = await server.handlers.scheduleMessage.POST(headers, scheduleBody);
+    assert.equal(scheduled.status, 201);
+
+    // 一次性刷新四个字段。
+    const newSub = { endpoint: 'https://push.example.com/new', keys: { p256dh: 'k', auth: 'a' } };
+    const patchBody = await encryptPayload(
+      {
+        apiUrl: 'https://new.example.com/v1/chat/completions',
+        apiKey: 'sk-new',
+        primaryModel: 'model-new',
+        pushSubscription: newSub
+      },
+      userKey
+    );
+    const patched = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`, headers, patchBody
+    );
+    assert.equal(patched.status, 200);
+
+    const row = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const data = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+    assert.equal(data.apiUrl, 'https://new.example.com/v1/chat/completions');
+    assert.equal(data.apiKey, 'sk-new');
+    assert.equal(data.primaryModel, 'model-new');
+    assert.deepEqual(data.pushSubscription, newSub);
+    assert.equal(data.completePrompt, 'say hi', '未提及的字段保持不变');
+
+    // truthy spread 语义钉住：显式 null 不清空、只是忽略——这些字段清掉
+    // 任务就发不出去，「清空」没有合法用途。
+    const nullBody = await encryptPayload(
+      { apiUrl: null, apiKey: null, primaryModel: null, pushSubscription: null },
+      userKey
+    );
+    const nulled = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`, headers, nullBody
+    );
+    assert.equal(nulled.status, 200);
+    const rowAfterNull = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
+    const dataAfterNull = JSON.parse(await decryptFromStorage(rowAfterNull.encrypted_payload, userKey));
+    assert.equal(dataAfterNull.apiKey, 'sk-new', 'null 不清空凭据');
+    assert.deepEqual(dataAfterNull.pushSubscription, newSub, 'null 不清空订阅');
+  });
+
+  it('PUT pushSubscription 非对象 → 400 INVALID_UPDATE_DATA（口径同 schedule-message）', async () => {
+    globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
+    const { server } = await buildServerAndAdapter();
+    const { tenantToken, userKey } = await bootstrapTenant(server);
+
+    const taskUuid = '55555555-2222-4333-8444-999999999999';
+    const headers = {
+      authorization: `Bearer ${tenantToken}`,
+      'x-user-id': TEST_USER_ID,
+      'x-payload-encrypted': 'true',
+      'x-encryption-version': '1'
+    };
+    const scheduleBody = await encryptPayload(
+      {
+        uuid: taskUuid,
+        contactName: 'Eve',
+        messageType: 'fixed',
+        firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+        pushSubscription: { endpoint: 'https://push.example.com' },
+        userMessage: 'hi'
+      },
+      userKey
+    );
+    await server.handlers.scheduleMessage.POST(headers, scheduleBody);
+
+    const badBody = await encryptPayload({ pushSubscription: 'not-an-object' }, userKey);
+    const result = await server.handlers.updateMessage.PUT(
+      `/api/v1/update-message?id=${taskUuid}`, headers, badBody
+    );
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
+    assert.deepEqual(result.body.error.details.invalidFields, ['pushSubscription']);
+  });
 });

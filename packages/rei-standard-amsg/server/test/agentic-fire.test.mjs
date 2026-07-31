@@ -104,12 +104,15 @@ describe('agentic fire loop', () => {
 
       assert.deepEqual(executed, [[TOOL_CALL]]);
 
-      // pushes: index/total overwritten, session pinned to the task, ids stamped
+      // pushes: index/total overwritten, session pinned to (task id + 名义触发
+      // 时刻), ids stamped —— 掺 occurrence 是为了循环任务跨天不同 occurrence
+      // 的推送不在 SW/收件箱端互相去重覆盖
+      const occurrenceMs = Date.parse('2020-01-01T00:00:00.000Z');
       assert.equal(pushes.length, 2);
       assert.deepEqual(pushes.map((p) => [p.messageIndex, p.totalMessages]), [[1, 2], [2, 2]]);
-      for (const p of pushes) {
-        assert.equal(p.sessionId, 'sess_task_7');
-        assert.ok(typeof p.messageId === 'string' && p.messageId.length > 0);
+      for (const [i, p] of pushes.entries()) {
+        assert.equal(p.sessionId, `sess_task_7@${occurrenceMs}`);
+        assert.equal(p.messageId, `msg_task_7@${occurrenceMs}_hook_${i}`);
       }
       assert.deepEqual(pushes.map((p) => p.message), ['A', 'B']);
     } finally {
@@ -619,6 +622,9 @@ describe('agentic fire loop', () => {
 });
 
 describe('agentic fire via the single-user worker (scheduled e2e)', () => {
+  // 「刚到点」的触发时刻：run-tick 的补发新鲜度守卫只放行 60 分钟内的任务。
+  const dueAt = () => new Date(Date.now() - 30_000).toISOString();
+
   async function seedDueTask(adapter, payloadOverrides = {}) {
     const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
     const payload = {
@@ -631,7 +637,7 @@ describe('agentic fire via the single-user worker (scheduled e2e)', () => {
     return adapter.createTask({
       user_id: USER, uuid: 'due-agentic',
       encrypted_payload: await encryptForStorage(JSON.stringify(payload), userKey),
-      next_send_at: '2020-01-01T00:00:00.000Z', message_type: payload.messageType,
+      next_send_at: dueAt(), message_type: payload.messageType,
     });
   }
 
@@ -643,7 +649,7 @@ describe('agentic fire via the single-user worker (scheduled e2e)', () => {
     await adapter.upsertClientState(USER, [
       { namespace: 'notes', key: 'latest', value: await encryptForStorage('state-derived context', userKey), updatedAt: 1 },
     ]);
-    await seedDueTask(adapter);
+    const seeded = await seedDueTask(adapter);
 
     const pushes = [];
     const worker = createSingleUserCloudflareWorker(() => ({
@@ -680,7 +686,7 @@ describe('agentic fire via the single-user worker (scheduled e2e)', () => {
 
     // recurring task rescheduled +24h, retry counter reset
     const row = await adapter.getTaskByUuidOnly('due-agentic');
-    assert.equal(row.next_send_at, '2020-01-02T00:00:00.000Z');
+    assert.equal(row.next_send_at, new Date(Date.parse(seeded.next_send_at) + 24 * 60 * 60 * 1000).toISOString());
     assert.equal(row.retry_count, 0);
   });
 
@@ -918,7 +924,7 @@ describe('writeState', () => {
         primaryModel: 'model-x',
         pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'k', auth: 'a' } },
       }), userKey),
-      next_send_at: '2020-01-01T00:00:00.000Z',
+      next_send_at: new Date(Date.now() - 30_000).toISOString(),
       message_type: 'auto',
     });
 
@@ -1356,5 +1362,169 @@ describe('fire 级 scratch', () => {
     } finally {
       llm.restore();
     }
+  });
+});
+
+describe('推送 id 掺名义触发时刻（occurrence）', () => {
+  const finishTwo = {
+    decision: 'finish',
+    pushPayloads: [{ messageKind: 'content', message: 'A' }, { messageKind: 'content', message: 'B' }],
+  };
+  const hooksFinishTwo = {
+    onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+    onLLMOutput: async () => finishTwo,
+  };
+
+  test('同一条循环任务的两个 occurrence，默认 messageId/sessionId 各不相同', async () => {
+    async function fireAt(nextSendAt) {
+      const { task } = await makeTask();
+      task.next_send_at = nextSendAt;
+      const pushes = [];
+      const llm = stubLlm([finishRound]);
+      try {
+        await processSingleMessage(task, makeCtx({ hooks: hooksFinishTwo, pushSpy: (_s, p) => pushes.push(JSON.parse(p)) }));
+      } finally {
+        llm.restore();
+      }
+      return pushes;
+    }
+
+    const day1 = await fireAt('2020-01-01T00:00:00.000Z');
+    const day2 = await fireAt('2020-01-02T00:00:00.000Z');
+
+    // 每个 occurrence 一套 id：离线设备一次性收到两天的积压推送时不会互相去重。
+    assert.notEqual(day1[0].messageId, day2[0].messageId);
+    assert.notEqual(day1[0].sessionId, day2[0].sessionId);
+    // 同一 occurrence 重发（重试）拿到同一套 id：已送达的段照旧被去重。
+    const day1Again = await fireAt('2020-01-01T00:00:00.000Z');
+    assert.deepEqual(day1.map((p) => p.messageId), day1Again.map((p) => p.messageId));
+    assert.equal(day1[0].sessionId, day1Again[0].sessionId);
+  });
+
+  test('调用方显式传的 messageId / sessionId 不被默认值覆盖', async () => {
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({
+        decision: 'finish',
+        pushPayloads: [{ messageKind: 'content', message: 'A', messageId: 'my-id', sessionId: 'my-sess' }],
+      }),
+    };
+    const pushes = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, pushSpy: (_s, p) => pushes.push(JSON.parse(p)) }));
+    } finally {
+      llm.restore();
+    }
+    assert.equal(pushes[0].messageId, 'my-id');
+    assert.equal(pushes[0].sessionId, 'my-sess');
+  });
+});
+
+describe('onAfterSend（推送发出之后的 hook）', () => {
+  const hooksFinishTwo = {
+    onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+    onLLMOutput: async () => ({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'A' }, { messageKind: 'content', message: 'B' }],
+    }),
+  };
+
+  test('全部发成功：调用一次，{ task, sentCount, total, error: null }', async () => {
+    const { task } = await makeTask();
+    const calls = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, {
+        ...makeCtx({ hooks: hooksFinishTwo }),
+        onAfterSend: async (info) => { calls.push(info); },
+      });
+      assert.equal(result.success, true);
+      assert.equal(result.messagesSent, 2);
+    } finally {
+      llm.restore();
+    }
+    // 载荷带任务身份：宿主按任务写回自述日志时靠 task 对号入座。
+    assert.deepEqual(calls, [{ task, sentCount: 2, total: 2, error: null }]);
+    assert.equal(calls[0].task, task);
+  });
+
+  test('tick 内多任务并发：每次回执的 task 各是各的，能区分开', async () => {
+    const calls = [];
+    const onAfterSend = async (info) => { calls.push(info); };
+    const { task: taskA } = await makeTask();
+    const { task: taskB } = await makeTask();
+    taskB.id = 8;
+    taskB.uuid = 'u8';
+    const llm = stubLlm([finishRound]);
+    try {
+      await Promise.all([
+        processSingleMessage(taskA, { ...makeCtx({ hooks: hooksFinishTwo }), onAfterSend }),
+        processSingleMessage(taskB, { ...makeCtx({ hooks: hooksFinishTwo }), onAfterSend }),
+      ]);
+    } finally {
+      llm.restore();
+    }
+    assert.equal(calls.length, 2);
+    // 两条回执的 task 一一对应到各自的任务行（顺序不保证，按 id 集合断言）。
+    assert.deepEqual(calls.map((c) => c.task.id).sort(), [7, 8]);
+    for (const c of calls) {
+      assert.ok(c.task === taskA || c.task === taskB, '载荷里的 task 必须是传入的任务行本身');
+    }
+  });
+
+  test('第 2 段发挂：hook 在错误往上抛之前收到 { task, sentCount: 1, total: 2, error }', async () => {
+    const { task } = await makeTask();
+    const calls = [];
+    let sends = 0;
+    const ctx = {
+      ...makeCtx({ hooks: hooksFinishTwo }),
+      webpush: {
+        async sendNotification() {
+          sends++;
+          if (sends === 2) throw new Error('push endpoint gone');
+        },
+      },
+      onAfterSend: async (info) => { calls.push(info); },
+    };
+    const llm = stubLlm([finishRound]);
+    let result;
+    try {
+      result = await processSingleMessage(task, ctx);
+    } finally {
+      llm.restore();
+    }
+    // fire 整体按失败处理（走 run-tick 的重试语义）……
+    assert.equal(result.success, false);
+    assert.match(result.error, /push endpoint gone/);
+    // ……但宿主已经先拿到了「发出去 1 段」的事实。
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].task, task);
+    assert.equal(calls[0].sentCount, 1);
+    assert.equal(calls[0].total, 2);
+    assert.ok(calls[0].error instanceof Error);
+    assert.match(calls[0].error.message, /push endpoint gone/);
+  });
+
+  test('hook 自己抛错只 console.warn，不影响投递结果', async () => {
+    const { task } = await makeTask();
+    const origWarn = console.warn;
+    let warned = 0;
+    console.warn = () => { warned++; };
+    const llm = stubLlm([finishRound]);
+    let result;
+    try {
+      result = await processSingleMessage(task, {
+        ...makeCtx({ hooks: hooksFinishTwo }),
+        onAfterSend: async () => { throw new Error('hook boom'); },
+      });
+    } finally {
+      llm.restore();
+      console.warn = origWarn;
+    }
+    assert.equal(result.success, true);
+    assert.equal(result.messagesSent, 2);
+    assert.ok(warned >= 1);
   });
 });

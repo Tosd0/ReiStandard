@@ -120,6 +120,20 @@ export function createUpdateMessageHandler(ctx) {
       }
     }
 
+    // 凭据 / 推送订阅刷新：消费方换了聊天 API 配置或重新订阅推送后，用这
+    // 几个字段刷新任务里冻结的旧值。校验口径对齐 schedule-message：
+    // apiUrl / apiKey / primaryModel 那边只要求 truthy、不做格式校验，这里
+    // 同样不加；pushSubscription 那边要求是对象，这里带值时同样检查。四个
+    // 字段都走 truthy spread——传 null 不清空、只是忽略（清掉任何一个，任
+    // 务到点就发不出去，「清空」没有合法用途）。
+    if (
+      updates.pushSubscription !== undefined &&
+      updates.pushSubscription !== null &&
+      typeof updates.pushSubscription !== 'object'
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['pushSubscription'] } } } };
+    }
+
     // Fetch existing task
     const existingTask = await db.getTaskByUuid(taskUuid, userId);
 
@@ -152,6 +166,10 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
       ...(updates.metadata && { metadata: updates.metadata }),
+      ...(updates.apiUrl && { apiUrl: updates.apiUrl }),
+      ...(updates.apiKey && { apiKey: updates.apiKey }),
+      ...(updates.primaryModel && { primaryModel: updates.primaryModel }),
+      ...(updates.pushSubscription && { pushSubscription: updates.pushSubscription }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null }),
       // splitPattern: hasOwnProperty so that explicit `null` (= revert to

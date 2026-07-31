@@ -28,7 +28,7 @@ import {
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
-import { runAgenticFire, taskNeedsLlm } from './agentic-fire.js';
+import { runAgenticFire, taskNeedsLlm, occurrenceSuffix } from './agentic-fire.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
@@ -170,11 +170,12 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
 
     const pushSubscription = decryptedPayload.pushSubscription;
     // sessionId is shared across the optional ReasoningPush and every
-    // ContentPush from this LLM round. Pin it to the task id when
-    // available (scheduled tasks) so retries reuse the same id;
-    // otherwise mint a UUID.
+    // ContentPush from this LLM round. Pin it to (task id + 名义触发时刻)
+    // when available (scheduled tasks) so retries of the same occurrence
+    // reuse the same id while循环任务的不同 occurrence 各有一套（见
+    // agentic-fire.js 的 occurrenceSuffix）; otherwise mint a UUID.
     const sessionId = task.id != null
-      ? `sess_task_${task.id}`
+      ? `sess_task_${task.id}${occurrenceSuffix(task)}`
       : `sess_${randomUUID()}`;
     const source = decryptedPayload.messageType === 'instant' ? 'instant' : 'scheduled';
     const messageSubtype = decryptedPayload.messageSubtype || 'chat';
@@ -182,11 +183,12 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     const metadata = decryptedPayload.metadata || {};
 
     // `messageId` format — deterministic when we have a task.id so a
-    // retry produces the same id for the same (task, sentence) pair
-    // (downstream dedupers can key on it). Falls back to a UUID for
-    // the in-server instant path that has no row id.
+    // retry produces the same id for the same (task, occurrence, sentence)
+    // tuple (downstream dedupers can key on it); different occurrences of
+    // a recurring task get distinct ids (see occurrenceSuffix). Falls back
+    // to a UUID for the in-server instant path that has no row id.
     const messageIdBase = task.id != null
-      ? `msg_task_${task.id}`
+      ? `msg_task_${task.id}${occurrenceSuffix(task)}`
       : `msg_${randomUUID()}_instant`;
 
     // ReasoningPush — auto-emitted before the content burst when the

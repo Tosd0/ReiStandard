@@ -1019,3 +1019,44 @@ describe('legacy frozen-prompt chain regression guard', () => {
     }
   });
 });
+
+describe('messageId/sessionId 掺名义触发时刻（occurrence）', () => {
+  // 循环任务跨天复用同一条任务行。id 只用 task.id 的话，离线设备一次性收到
+  // 多天积压推送（push TTL 四周）时会在 SW 端互相去重、收件箱按 messageId
+  // 覆盖，几天的消息只剩一条。
+  async function fireFixedAt(nextSendAt) {
+    const task = {
+      ...(await createEncryptedTask({
+        contactName: 'Rei',
+        messageType: 'fixed',
+        userMessage: '固定消息',
+        pushSubscription: { endpoint: 'https://push.example.com/sub' },
+      })),
+      next_send_at: nextSendAt,
+    };
+    const pushed = [];
+    const ctx = createContext(async (_sub, payload) => { pushed.push(JSON.parse(payload)); });
+    const result = await processSingleMessage(task, ctx);
+    assert.equal(result.success, true);
+    return pushed;
+  }
+
+  it('行上带 next_send_at 时，默认 id 是 msg_task_<id>@<occurrenceMs>_<i> / sess_task_<id>@<occurrenceMs>', async () => {
+    const occurrence = '2020-01-01T00:00:00.000Z';
+    const occurrenceMs = Date.parse(occurrence);
+    const pushed = await fireFixedAt(occurrence);
+    assert.equal(pushed[0].messageId, `msg_task_1@${occurrenceMs}_0`);
+    assert.equal(pushed[0].sessionId, `sess_task_1@${occurrenceMs}`);
+  });
+
+  it('同一任务不同 occurrence 的 id 各不相同；同一 occurrence 重发 id 不变', async () => {
+    const day1 = await fireFixedAt('2020-01-01T00:00:00.000Z');
+    const day2 = await fireFixedAt('2020-01-02T00:00:00.000Z');
+    assert.notEqual(day1[0].messageId, day2[0].messageId);
+    assert.notEqual(day1[0].sessionId, day2[0].sessionId);
+
+    const day1Again = await fireFixedAt('2020-01-01T00:00:00.000Z');
+    assert.equal(day1[0].messageId, day1Again[0].messageId);
+    assert.equal(day1[0].sessionId, day1Again[0].sessionId);
+  });
+});

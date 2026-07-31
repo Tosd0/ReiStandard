@@ -63,7 +63,7 @@ test('scheduled() runs the tick over env.DB', async () => {
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
     pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
   }), userKey);
-  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: '2020-01-01T00:00:00.000Z', message_type: 'fixed' });
+  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
 
   let sent = 0;
   const worker = createSingleUserCloudflareWorker(() => ({
@@ -259,7 +259,7 @@ test('the exposed VAPID public key is the same key push signing actually uses', 
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
     pushSubscription: sub
   }), userKey);
-  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: '2020-01-01T00:00:00.000Z', message_type: 'fixed' });
+  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
 
   const worker = createSingleUserCloudflareWorker(() => ({
     db: adapter,
@@ -361,4 +361,42 @@ test('CORS: OPTIONS /vapid-public-key preflight answered, GET echoes the allowed
   );
   assert.equal(got.status, 200);
   assert.equal(got.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+});
+
+// 过期任务被判定不再补发后，GET /messages 要能看到原因（lastError），
+// 前端才知道那条是「错过了」而不是无声消失。
+test('scheduled() 过期跳过后，GET /messages 透出 lastError', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const missedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 两小时前
+  const enc = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
+    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+  }), userKey);
+  await adapter.createTask({ user_id: USER, uuid: 'missed', encrypted_payload: enc, next_send_at: missedAt, message_type: 'fixed' });
+
+  let sent = 0;
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: adapter,
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() { sent++; } }
+  }));
+  const env = { DB: d1 };
+  await worker.scheduled({}, env);
+
+  assert.equal(sent, 0, '过期任务不该补发');
+
+  const res = await worker.fetch(new Request('https://w.dev/messages?status=all', {
+    method: 'GET', headers: { 'X-User-Id': USER }
+  }), env);
+  assert.equal(res.status, 200);
+  const { decryptPayload } = await import('../src/server/lib/encryption.js');
+  const data = await decryptPayload((await res.json()).data, userKey);
+  assert.equal(data.tasks.length, 1);
+  assert.equal(data.tasks[0].status, 'failed');
+  assert.equal(data.tasks[0].lastError.reason, 'stale');
+  assert.equal(data.tasks[0].lastError.occurrence, missedAt);
 });
