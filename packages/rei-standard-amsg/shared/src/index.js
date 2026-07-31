@@ -696,6 +696,22 @@ export function concatBytes(...chunks) {
 // 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
 export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js';
 
+// Web Push 加密栈（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID），
+// 纯 WebCrypto 实现，instant 与 server 的 webpush 模块共用这一份。
+// 一并导出它依赖的 runtime-neutral 编码 / crypto 帮手（utf8、hmacSha256
+// 等），instant / server 的 utils 模块从这里 re-export 而不再各自拷贝。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  sendWebPush,
+  buildVapidJwt,
+  verifyVapidJwt,
+  utf8,
+  bytesToBase64Url,
+  jsonToBase64Url,
+  hmacSha256,
+  randomBytes,
+} from './webpush.js';
+
 /**
  * True when `value` parses as an absolute URL.
  * @param {unknown} value
