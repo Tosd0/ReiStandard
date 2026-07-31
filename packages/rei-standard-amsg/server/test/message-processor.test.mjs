@@ -356,6 +356,38 @@ describe('messages array support', () => {
     assert.match(validateLlmMessagesArray([{ role: 'user', content: 42 }]), /non-empty/);
   });
 
+  // agentic 会话回放（assistant 带 tool_calls + tool 结果）此前会被本包
+  // 误拒 — 形状规则现统一在 @rei-standard/amsg-shared，与 amsg-instant 一致。
+  it('validateLlmMessagesArray: accepts agentic tool_calls conversation', () => {
+    const agentic = [
+      { role: 'system', content: 'you are Rei' },
+      { role: 'user', content: 'check my notes' },
+      {
+        role: 'assistant',
+        content: null, // OpenAI 协议: 带 tool_calls 时 content 可为 null / 空串 / 缺省
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_notes', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: '{"notes":[]}' },
+      { role: 'assistant', content: 'no notes found' },
+    ];
+    assert.equal(validateLlmMessagesArray(agentic), null);
+
+    // 整条 scheduleMessage 校验链同样放行（bug 场景：此前这里会 400）
+    const result = validateScheduleMessagePayload(basePromptedPayload({ messages: agentic }));
+    assert.equal(result.valid, true);
+  });
+
+  it('validateLlmMessagesArray: still rejects malformed tool shapes', () => {
+    assert.match(
+      validateLlmMessagesArray([{ role: 'assistant', content: '', tool_calls: [{ id: 'c' }] }]), // 缺 function
+      /tool_calls\[0\] is malformed/
+    );
+    assert.match(
+      validateLlmMessagesArray([{ role: 'tool', content: 'result' }]), // 缺 tool_call_id
+      /tool_call_id is required/
+    );
+  });
+
   it('LLM call: forwards messages array verbatim (no role injection)', async () => {
     const messages = [
       { role: 'system', content: 'you are Rei' },

@@ -2,7 +2,7 @@
  * Validation utility library (SDK version)
  */
 
-import { validateAvatarUrl } from '@rei-standard/amsg-shared';
+import { validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
 
 /**
  * Validate ISO 8601 date string.
@@ -47,8 +47,6 @@ export function isValidUUIDv4(uuid) {
   const uuidV4Regex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   return uuidV4Regex.test(uuid);
 }
-
-const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
 // `validateAvatarUrl` 与其 2048 字符上限现统一在 @rei-standard/amsg-shared，
 // server / instant / client 共用一份规则。此处重导出，保持本模块及
@@ -97,35 +95,41 @@ export function validateSplitPattern(value) {
 }
 
 /**
- * Validate an OpenAI-style messages array. Same shape contract as
- * `@rei-standard/amsg-instant` (kept in lockstep on purpose — both packages
- * end up forwarding this to the same LLM body).
+ * Validate an OpenAI-style messages array. 形状规则统一在
+ * `@rei-standard/amsg-shared` 的 `validateLlmMessagesShape`（amsg-instant
+ * 的 `validateMessagesArray` 走同一实现，两包接受的形状不会漂移）——
+ * 因此 agentic 会话回放（assistant 带 `tool_calls` 时 content 可空、
+ * `role:'tool'` 消息要求 `tool_call_id`）在这里同样合法。本函数只把
+ * 结构化错误码映射成本包既有的英文错误文案，返回形状不变。
  *
  * @param {unknown} messages
  * @returns {string | null}   Error message, or null if valid.
  */
 export function validateLlmMessagesArray(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return 'messages must be a non-empty array';
-  }
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+  const err = validateLlmMessagesShape(messages);
+  if (!err) return null;
+  const { code, index: i, toolCallIndex: j } = err;
+  switch (code) {
+    case 'MESSAGES_NOT_ARRAY':
+      return 'messages must be a non-empty array';
+    case 'MESSAGE_NOT_OBJECT':
       return `messages[${i}] must be an object`;
-    }
-    if (!VALID_LLM_MESSAGE_ROLES.has(m.role)) {
+    case 'INVALID_ROLE':
       return `messages[${i}].role must be one of system / user / assistant / tool`;
-    }
-    if (typeof m.content === 'string') {
-      if (!m.content) return `messages[${i}].content must be a non-empty string`;
-    } else if (Array.isArray(m.content)) {
-      if (m.content.length === 0) return `messages[${i}].content array must be non-empty`;
-      // Element schema is intentionally not enforced — passed through to LLM as-is.
-    } else {
+    case 'TOOL_CALL_MALFORMED':
+      return `messages[${i}].tool_calls[${j}] is malformed (expected { id, type:'function', function:{ name, arguments } })`;
+    case 'TOOL_CONTENT_INVALID':
+      return `messages[${i}].content (tool) must be a string or an array`;
+    case 'TOOL_CALL_ID_MISSING':
+      return `messages[${i}].tool_call_id is required (tool messages must reference a prior tool_call)`;
+    case 'CONTENT_EMPTY_STRING':
+      return `messages[${i}].content must be a non-empty string`;
+    case 'CONTENT_EMPTY_ARRAY':
+      return `messages[${i}].content array must be non-empty`;
+    case 'CONTENT_INVALID_TYPE':
+    default:
       return `messages[${i}].content must be a non-empty string or a non-empty array`;
-    }
   }
-  return null;
 }
 
 /**

@@ -691,6 +691,11 @@ export function concatBytes(...chunks) {
 // Shared by amsg-server / amsg-instant / amsg-client so the same rules live
 // in exactly one place. All pure (no side effects).
 
+// OpenAI-style messages 数组形状校验（结构化错误码），instant 的
+// `validateMessagesArray` 与 server 的 `validateLlmMessagesArray` 共用。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js';
+
 /**
  * True when `value` parses as an absolute URL.
  * @param {unknown} value
