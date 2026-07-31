@@ -1,5 +1,65 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.10
+
+### Minor Changes
+
+- 73afa4f: 补发新鲜度守卫、循环任务不进终态、退避写租约、occurrence 级 push id、发送后 hook、update-message 认凭据字段
+
+  - **补发新鲜度守卫：错过触发时刻超过 60 分钟的任务不再照常补发。** 服务停摆几天恢复后，cron 捞到的旧任务按「错过了」处理，不把积压一口气倒给用户：
+    - 一次性任务：不发，行标 `failed`，原因记在 payload 的 `lastError`（`{ at, occurrence, reason: 'stale' }`）上，`GET /messages` 每条任务随之多返回一个 `lastError` 字段（没有记录 → `null`）。同时调用新增的可选 hook `ctx.onStaleSkip?.(task, { reason: 'stale', metadata })`（单用户 worker 从 config 的 `onStaleSkip` 透传），宿主用它写「这条错过了」的回执。`task` 是任务行原样（payload 是密文）；`metadata` 是解密 payload 里的 `metadata` 子字段（没有则为 `null`），宿主靠它对上是哪个角色的任务——解密 payload 里的 `apiKey` / `pushSubscription` 等凭据不会递给 hook。hook 抛错只记日志，不影响主流程。
+    - daily / weekly 任务：不发，`next_send_at` 快进到未来第一个名义时刻（保持钟点不变），`retry_count` 归零，行保持 `pending`。
+    - 正在重试链上的任务（`retry_count > 0`）不算过期：它的 `next_send_at` 一直是名义时刻，重试拖过一小时不等于用户错过了它。
+    - tick 返回值的 `details` 多一个 `staleTasks` 数组（`{ taskId, reason, action: 'expired' | 'fast_forwarded' }`）。
+  - **循环任务永不进终态：终审失败改为跳过本次 occurrence。** daily / weekly 任务重试用尽时不再标 `failed`（发送成功但发送后写库失败的场景也不再标 `sent`）——两种终态都会让循环任务从此退出捞取、每日消息无声消失。现在这两条路都改为：`next_send_at` 从名义时刻推进到下个周期、`retry_count` 归零、错误记在 payload 的 `lastError` 上（`GET /messages` 可见）。一次性任务维持既有终态行为。
+  - **重试退避改写在租约上，`next_send_at` 全程保持名义时刻。** 投递失败安排重试时，退避时刻写进 `lease_until`（捞取条件里的租约过滤到点自然放行），不再改写 `next_send_at`。循环任务的推进基准、hook 拿到的 `nextSendAt`、过期判定因此都始终对着用户设的触发时刻，不会每失败一次漂几分钟。没实现 `claimTask` 的自定义适配器没有租约列，维持老行为（退避写进 `next_send_at`）。
+  - **默认 messageId / sessionId 掺入名义触发时刻。** 有任务行的推送，默认 id 变为 `msg_task_<id>@<occurrenceMs>_<i>`（agentic 路径为 `..._hook_<i>`）与 `sess_task_<id>@<occurrenceMs>`，`occurrenceMs` 取 `Date.parse(task.next_send_at)`。循环任务跨天复用同一行，之前的 id 只含 task.id，离线设备一次性收到多天积压推送（push TTL 四周）时会在 service worker 端互相去重、收件箱按 messageId 覆盖，几天的消息只剩一条；掺入名义时刻后每个 occurrence 一套 id，同一 occurrence 的重试仍复用同一套（重投已送达的段照旧被去重）。调用方在 pushPayloads 里显式带了 `messageId` / `sessionId` 时仍以调用方为准；行上没有可解析的 `next_send_at` 时保持旧格式。
+  - **新增发送后 hook `ctx.onAfterSend?.({ task, sentCount, total, error })`。** agentic 路径的 pushPayloads 逐段发完（或中途发挂）后调用（单用户 worker / `createSingleUserServer` 从 config 的 `onAfterSend` 透传）。载荷带 `task`（任务行本身）：tick 内最多 8 个任务并发投递，宿主按任务写回执时靠它对号入座。全部成功时 `error` 为 `null`；第 k 段失败时 `sentCount = k`、`error` 带原始错误，且 hook 会在错误往上抛之前调用完。宿主用它把「真的发出去了几段」写回自己的存储——发送前的 hook（`onBeforeFire` / `onLLMOutput`）写的副作用，在推送全挂时会变成「云端记得说过、用户没收到」。hook 自身抛错只记日志，不影响主流程。
+  - **`PUT /update-message` 认 `apiUrl` / `apiKey` / `primaryModel` / `pushSubscription` 四个字段。** 消费方换了聊天 API 配置或重新订阅推送后，已挂任务里冻结的旧值可以刷新掉了（此前这四个字段不在合并白名单里，传了会被静默丢弃）。校验口径与 `schedule-message` 一致：前三个只要求 truthy，`pushSubscription` 带值时必须是对象（否则 400 `INVALID_UPDATE_DATA`）。四个字段都是 truthy 合并——传 `null` 不清空、只是忽略（清掉任何一个，任务到点就发不出去）。
+  - **`GET /capabilities` 的 features 追加** `tick-stale-guard` / `recurring-skip-occurrence` / `occurrence-scoped-push-ids` / `after-send-hook` / `update-message-credentials`，前端可以据此判断部署的 worker 认不认这些行为。
+
+### Patch Changes
+
+- 3dae842: LLM 调用器收敛到 shared：新模块 `shared/src/llm-call.js` 承载「构造请求体 + fetch + 超时 + 解析响应 + trim」的公共核心，从包根导出 `callLlm` / `buildLlmRequestBody` / `normalizeAiApiUrl`
+
+  此前 instant（`message-processor.js` 的 `callLlmRaw`）与 server（`lib/llm.js` 的 `callLlm`）各写一份 LLM HTTP 调用，已出现漂移（stream 字段、messages 模式探测、超时可配性、trim 位置）。现在单一来源在 shared，两侧差异走 options 参数化（`stream` / `forwardTools` / `timeoutMs` / `fetch` / `requireContent`），instant 与 server 的调用点改薄，各自的导出名（instant 的 `normalizeAiApiUrl`、server 的 `callLlm` / `buildAiRequestBody` / `normalizeAiApiUrl`）与错误码包装不变。`llm.js` 里「两包各自拷贝以避免架构依赖」的过期注释一并删除——两包都已依赖 shared，该理由不再成立。
+
+  行为变化（均为边缘修正）：
+
+  - instant：messages 模式探测统一为 `Array.isArray(payload.messages) && payload.messages.length > 0`（server 语义）。`messages: []` 从「把空数组原样发给上游 LLM」改为「回退 completePrompt 模式」——这是修正错误行为。经公开 handler 不可触达（校验层已拒绝空 messages），仅影响直接调用 `processInstantMessage` 的调用方。
+  - instant：`maxTokens` 非法时的错误文案统一为 server 措辞（`Invalid maxTokens: maxTokens must be a positive integer when provided.`）。handler 校验在前，正常路径不可触达。
+  - server：`normalizeAiApiUrl` 对非字符串输入统一为 instant 的宽松语义（先 `String()` 强转再解析；此前直接抛「apiUrl is required」）。字符串输入两侧行为本就一致，不受影响。
+  - server：`callLlm` 现接受额外 options（`fetch` / `stream` / `forwardTools`），默认值即原 server 语义，既有调用不受影响。
+
+- ef2f2d1: messages 数组形状校验统一到 amsg-shared，修复 amsg-server 误拒 agentic 会话的 bug。
+
+  - amsg-shared 新增 `validateLlmMessagesShape(messages)` 与 `LLM_MESSAGES_ERROR` 错误码常量（新模块 `src/llm-messages.js`）：返回结构化错误（稳定 code + 定位索引），支持 assistant 带 `tool_calls` 时 content 可空、`role:'tool'` 要求 `tool_call_id` 的 OpenAI 协议形状。
+  - amsg-instant 的 `validateMessagesArray` 改为调用 shared 实现的薄封装，导出名、错误文案与返回形状不变。
+  - amsg-server 的 `validateLlmMessagesArray` 同样改为调用 shared 实现。修复：此前该函数缺少 tool_calls / tool 消息分支，注释却声称与 amsg-instant lockstep，导致 agentic 会话（assistant tool_calls + tool 结果）回放到 `scheduleMessage` / `updateMessage` 会被 400 拒绝；现在与 amsg-instant 接受完全相同的形状。畸形 tool 消息新增对应英文错误文案（`tool_calls[j] is malformed` / `tool_call_id is required` 等）。
+
+- 6ead0c4: crypto / 编码 utils 收敛到 shared：新模块 `shared/src/webcrypto-utils.js` 承载全生态唯一一份 runtime-neutral 帮手（`toUint8` / `concatBytes` / `utf8` / `utf8Decode` / `bytesToBase64` / `bytesToBase64Url` / `base64UrlToBytes` / `jsonToBase64Url` / `bytesToHex` / `hexToBytes` / `hmacSha256` / `timingSafeEqualBytes` / `randomBytes` / `randomUUID`），index 聚合导出（`utf8Decode` / `bytesToBase64` / `bytesToHex` / `hexToBytes` / `timingSafeEqualBytes` / `randomUUID` 为 shared 新增导出）。instant 的 `src/utils.js` 与 server 的 `lib/webcrypto-utils.js` 改为纯 re-export（文件与导出名不变，包内引用不受影响）；server 的 tenant token 模块也换用 shared 的 base64url / 常量时间比较实现（编码逐字节一致，HMAC 因同步 API 约束仍走 node:crypto）。
+- b146fde: Web Push 加密栈上移 amsg-shared，instant / server 共用同一份实现
+
+  此前 amsg-instant 的 `src/webpush.js` 与 amsg-server 的 `lib/webpush-webcrypto.js` 是逐字相同的两份拷贝（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID，纯 WebCrypto）。现在实现只有一份，放在 amsg-shared 的独立模块 `src/webpush.js`，从包根导出：
+
+  - `sendWebPush` / `buildVapidJwt` / `verifyVapidJwt`
+  - 顺带上移它依赖的 runtime-neutral 帮手：`utf8`、`bytesToBase64Url`、`jsonToBase64Url`、`hmacSha256`、`randomBytes`
+
+  instant 与 server 的对应模块变薄，re-export shared 实现；两个包的公开导出面与 wire format 不变。server 独有的部分原样保留在自己包里：payload 大小护栏（`measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` 等，`sendWebPush` 超限仍抛 `PUSH_PAYLOAD_TOO_LARGE`）、scheduled 默认 4 周 TTL 与 `createWebCryptoWebPush`。
+
+- 9d1f89f: 补齐许可证文件：每个包根目录加入 MIT LICENSE 文本（此前 package.json 声明 MIT 但 tarball 里没有许可证文件）。仓库层面确立双许可——代码 MIT、`standards/` 规范文本 CC BY-NC-SA 4.0，根 README 的许可一节与 npm 元数据不再互相矛盾。
+- c064ecd: 修复发布产物里损坏的 .d.ts：四个包此前用 tsup `dts: true` 处理 .js 入口，发出去的 .d.ts 是 JS 源码原文，TS 消费者 import 即报错。现改用 shared 同款两步构建（tsup 出 JS + `tsc --allowJs --emitDeclarationOnly` 出真声明），subpath 导出（server `./cloudflare`、instant `./adapters/*` `./blob/*`）的声明文件一并对齐。
+
+  amsg-server 另含两处加固：pg / neon 适配器的动态 UPDATE 列名补上与 D1 一致的白名单校验（此前直接插值进 SQL）；清理死代码（未引用的 `REQUIRED_COLUMNS`、`timingSafeEqualBytes`、schedule-message 的死分支与重复注释）。amsg-sw 清理 `createNotificationFromPayload` 永不触发的两处假值守卫。
+
+- Updated dependencies [3dae842]
+- Updated dependencies [8ca959c]
+- Updated dependencies [ef2f2d1]
+- Updated dependencies [6ead0c4]
+- Updated dependencies [b146fde]
+- Updated dependencies [9d1f89f]
+  - @rei-standard/amsg-shared@0.4.0-next.2
+
 ## 2.6.0-next.9
 
 ### Minor Changes
