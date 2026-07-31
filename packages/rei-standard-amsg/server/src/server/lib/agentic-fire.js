@@ -15,6 +15,13 @@
  *                             client to execute — then append the
  *                             assistant turn + tool results, next round
  *
+ * 发送后回执：finish 的 pushPayloads 逐段发完（或中途发挂）后，可选的
+ * ctx.onAfterSend?.({ task, sentCount, total, error }) 会被调用（见
+ * notifyAfterSend），宿主用它把「真的发出去了几段」写回自己的存储——发送前
+ * 的 hook 写的副作用，在推送全挂时会变成「云端记得说过、用户没收到」。载荷
+ * 带 task（任务行本身）：tick 内多个任务并发投递时，hook 靠它区分回执属于
+ * 哪条任务。
+ *
  * The decision contract is shared with @rei-standard/amsg-instant
  * (assertValidDecision / buildSessionContext live in
  * @rei-standard/amsg-shared), so a classifier written for instant's
@@ -121,6 +128,24 @@ const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 const CREDENTIAL_PAYLOAD_KEYS = new Set(['apiKey', 'pushSubscription']);
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 默认 messageId / sessionId 里掺的名义触发时刻后缀（`@<epoch-ms>`）。
+ *
+ * 循环任务跨天复用同一条任务行，id 只用 task.id 的话，离线设备一次性收到
+ * 多天积压的推送（push TTL 有四周）时会在 service worker 端互相去重、在
+ * 收件箱按 messageId 覆盖，几天的消息只剩一条。掺入名义触发时刻后每个
+ * occurrence 一套 id；同一 occurrence 的重试仍是同一套——重投已送达的段
+ * 会被去重，这正是想要的。行上没有可解析的 next_send_at（比如直接喂进来
+ * 的内存任务对象）时返回 ''，等价于旧格式。
+ *
+ * @param {{ next_send_at?: string }} task
+ * @returns {string}
+ */
+export function occurrenceSuffix(task) {
+  const occurrenceMs = Date.parse(task && task.next_send_at);
+  return Number.isFinite(occurrenceMs) ? `@${occurrenceMs}` : '';
+}
 
 /**
  * Does this task need the LLM at fire time? Fixed text never does, so it
@@ -526,9 +551,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   );
   const deadline = nowFn() + totalTimeoutMs;
 
-  // Same sessionId scheme as the legacy path: pinned to the task id so a
-  // retried task reuses the same session and clients can group/dedupe.
-  const sessionId = task.id != null ? `sess_task_${task.id}` : `sess_${randomUUID()}`;
+  // Same sessionId scheme as the legacy path: pinned to (task id + 名义触发
+  // 时刻)，同一 occurrence 的重试复用同一个 session，不同 occurrence 各一个
+  // （见 occurrenceSuffix）。
+  const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
   let messages = normalized.messages.slice();
 
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
@@ -647,30 +673,59 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 }
 
 /**
+ * ctx.onAfterSend?.({ task, sentCount, total, error }) —— 推送发出（或发挂）
+ * 之后的可选 hook。发送前的 hook（onBeforeFire / onLLMOutput）只能在推送发出
+ * 前写副作用，LLM 成功但推送全挂时会「云端记得说过、用户没收到」；宿主要把
+ * 「真的发出去了几段」写回自己的存储，就挂这个。task 是任务行本身（tick 内
+ * 最多 8 个任务并发投递，回执要靠它对号入座）。全部成功时 error 为 null；
+ * 第 k 段失败时 sentCount = k、error 带原始错误，且 hook 会在错误往上抛之前
+ * 调用完。hook 自身抛错只 console.warn，不影响主流程。
+ */
+async function notifyAfterSend(ctx, info) {
+  if (typeof ctx.onAfterSend !== 'function') return;
+  try {
+    await ctx.onAfterSend(info);
+  } catch (hookError) {
+    console.warn('[amsg-server] onAfterSend hook 抛错（已忽略）:', hookError && hookError.message);
+  }
+}
+
+/**
  * Deliver the hook's pushPayloads sequentially. Mirrors instant's
  * sendPushesSequentially: force-overwrite messageIndex/totalMessages,
  * stamp missing ids, pace with the same 1500ms spacing. Ids are
- * deterministic per (task, index) so a retried task reuses the same ids
- * and clients can dedupe.
+ * deterministic per (task, occurrence, index) so a retried occurrence
+ * reuses the same ids and clients can dedupe (see occurrenceSuffix)。
+ * 调用方显式带了 messageId / sessionId 时以调用方为准，只有缺省值掺
+ * occurrence。
  */
 async function sendHookPushPayloads(pushPayloads, decryptedPayload, ctx, sessionId, task, sleep) {
-  if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-    throw new Error('VAPID configuration missing - push notifications cannot be sent');
-  }
-  const pushSubscription = decryptedPayload.pushSubscription;
   const total = pushPayloads.length;
-  const messageIdBase = task.id != null ? `msg_task_${task.id}` : `msg_${randomUUID()}`;
+  let sentCount = 0;
+  try {
+    if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
+      throw new Error('VAPID configuration missing - push notifications cannot be sent');
+    }
+    const pushSubscription = decryptedPayload.pushSubscription;
+    const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 
-  for (let i = 0; i < total; i++) {
-    const push = { ...pushPayloads[i] };
-    if (typeof push.messageId !== 'string' || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
-    if (typeof push.sessionId !== 'string' || !push.sessionId) push.sessionId = sessionId;
-    if (typeof push.timestamp !== 'string' || !push.timestamp) push.timestamp = new Date().toISOString();
-    push.messageIndex = i + 1;
-    push.totalMessages = total;
+    for (let i = 0; i < total; i++) {
+      const push = { ...pushPayloads[i] };
+      if (typeof push.messageId !== 'string' || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
+      if (typeof push.sessionId !== 'string' || !push.sessionId) push.sessionId = sessionId;
+      if (typeof push.timestamp !== 'string' || !push.timestamp) push.timestamp = new Date().toISOString();
+      push.messageIndex = i + 1;
+      push.totalMessages = total;
 
-    await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
-    if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
+      sentCount++;
+      if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+    }
+  } catch (error) {
+    // 部分失败也要让宿主知道已经发出去了几段——先通知，再把错误往上抛。
+    await notifyAfterSend(ctx, { task, sentCount, total, error });
+    throw error;
   }
+  await notifyAfterSend(ctx, { task, sentCount, total, error: null });
   return total;
 }

@@ -19,6 +19,11 @@ const EXPECTED_FEATURES = [
   'agentic-fire-tools',
   'agentic-schedule-task',
   'vapid-public-key',
+  'tick-stale-guard',
+  'recurring-skip-occurrence',
+  'occurrence-scoped-push-ids',
+  'after-send-hook',
+  'update-message-credentials',
 ];
 
 function makeWorker(extra = {}) {

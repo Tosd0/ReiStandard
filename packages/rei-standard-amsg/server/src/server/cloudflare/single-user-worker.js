@@ -173,6 +173,13 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         maxStateValueBytes: cfg.maxStateValueBytes,
         // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
         maxScheduledTasksPerFire: cfg.maxScheduledTasksPerFire,
+        // 一次性任务错过触发时刻太久（> 60 分钟）不再补发时的回执 hook：
+        // (task, { reason: 'stale', metadata })，metadata 取自解密 payload
+        //（凭据字段不透传；best-effort，见 lib/run-tick.js）。
+        onStaleSkip: cfg.onStaleSkip,
+        // 推送发出（或发挂）之后的 hook：{ task, sentCount, total, error }
+        //（best-effort，见 lib/agentic-fire.js）。
+        onAfterSend: cfg.onAfterSend,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs
       });

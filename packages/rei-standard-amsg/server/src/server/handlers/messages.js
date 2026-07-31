@@ -71,7 +71,11 @@ export function createMessagesHandler(ctx) {
         // metadata fields are surfaced — the rest of metadata may hold
         // host-private data and stays server-side. Absent → null.
         charId: decrypted.metadata?.charId ?? null,
-        clientTaskId: decrypted.metadata?.amsgClientTaskId ?? null
+        clientTaskId: decrypted.metadata?.amsgClientTaskId ?? null,
+        // 上一次没发出去的原因（run-tick 记进 payload 的 lastError）：
+        // { at, occurrence, reason }。reason 'stale' 表示错过触发时刻太久被
+        // 判定不再补发；其余是投递失败的错误信息。没有记录 → null。
+        lastError: decrypted.lastError ?? null
       };
     }));
 
