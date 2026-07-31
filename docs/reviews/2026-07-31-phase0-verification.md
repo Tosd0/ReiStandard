@@ -39,5 +39,5 @@
 
 ## 未落地、需要决策/后续阶段
 
-- **许可证**（A6）：MIT vs CC BY-NC-SA 是业务决策，需要仓库所有者拍板后补 LICENSE 文件并统一 package.json / README。
+- **许可证**（A6）：~~MIT vs CC BY-NC-SA 是业务决策，需要仓库所有者拍板后补 LICENSE 文件并统一 package.json / README~~ 已决策（2026-07-31）：双许可——代码 MIT（根 LICENSE + 各包 LICENSE），`standards/` 规范文本 CC BY-NC-SA 4.0（standards/LICENSE），README 许可一节已改。
 - Phase 1–4（重复收敛、结构重组、双轨对齐、防回归）见原报告计划。
