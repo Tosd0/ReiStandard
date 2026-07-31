@@ -1,5 +1,22 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.9.0-next.5
+
+### Patch Changes
+
+- 9d1f89f: 补齐许可证文件：每个包根目录加入 MIT LICENSE 文本（此前 package.json 声明 MIT 但 tarball 里没有许可证文件）。仓库层面确立双许可——代码 MIT、`standards/` 规范文本 CC BY-NC-SA 4.0，根 README 的许可一节与 npm 元数据不再互相矛盾。
+- c064ecd: 修复发布产物里损坏的 .d.ts：四个包此前用 tsup `dts: true` 处理 .js 入口，发出去的 .d.ts 是 JS 源码原文，TS 消费者 import 即报错。现改用 shared 同款两步构建（tsup 出 JS + `tsc --allowJs --emitDeclarationOnly` 出真声明），subpath 导出（server `./cloudflare`、instant `./adapters/*` `./blob/*`）的声明文件一并对齐。
+
+  amsg-server 另含两处加固：pg / neon 适配器的动态 UPDATE 列名补上与 D1 一致的白名单校验（此前直接插值进 SQL）；清理死代码（未引用的 `REQUIRED_COLUMNS`、`timingSafeEqualBytes`、schedule-message 的死分支与重复注释）。amsg-sw 清理 `createNotificationFromPayload` 永不触发的两处假值守卫。
+
+- Updated dependencies [3dae842]
+- Updated dependencies [8ca959c]
+- Updated dependencies [ef2f2d1]
+- Updated dependencies [6ead0c4]
+- Updated dependencies [b146fde]
+- Updated dependencies [9d1f89f]
+  - @rei-standard/amsg-shared@0.4.0-next.2
+
 ## 2.9.0-next.4
 
 ### Minor Changes

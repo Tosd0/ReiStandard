@@ -1,5 +1,39 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.4.0-next.1
+
+### Minor Changes
+
+- 12ba6fb: duplicate 分支的业务自愈：首投 `onBusinessPayload` 失败后，同 key 重复包会重跑一次
+
+  - dedupe 记录上带着 `businessError`（首投业务回调失败）时，同 key 的重复包（发送方重试 / 另一条 transport 的 backup）到达会重跑一次 `onBusinessPayload`：重跑成功 → 清掉记录上的 `businessError`，本次 ack 不带该字段，之后的重复包恢复纯去重；重跑仍失败 → 用新的失败信息更新记录，照旧在 ack 上报。此前修复通道只有通知这半边（首投没弹成、重复包会补弹一次），业务这半边没有：首投落库失败被持久化后，所有重复包只如实上报、永不重跑，结果是「横幅弹了、收件箱永远没写上」，任何重投都救不回。现在通知和业务走同一套 duplicate 自愈。
+  - 记录上没有 `businessError` 时（首投业务成功，或业务还在 in-flight——失败要等 settle 后才落到记录上），重复包行为与之前完全一致：不重跑业务、不双写。
+  - 注意：`onBusinessPayload` 现在可能对同一 key 被调用多次（仅发生在上一次调用失败之后）。按 key（如 `messageId`）幂等覆盖写的消费方天然安全；README「在 SW 内执行 tool_request 的安全边界」中的幂等建议，对「失败自动重试」场景从建议升级为前提。
+
+### Patch Changes
+
+- 8ca959c: 线协议常量收敛到 shared：新模块 `shared/src/protocol.js` 承载 multipart transport 与 SW ↔ 页面 postMessage 的全部线协议常量，从包根导出
+
+  此前 multipart 的 kind / encoding / 默认限额在 instant（`src/multipart.js`，导出）与 sw（`src/index.js`，本地重写、未导出）各写一份，`version: 1` 字面量也两侧各写；SW ↔ 页面 postMessage 常量只定义在 sw 包里，README 教页面侧硬编码字符串。现在单一来源在 shared：
+
+  - multipart：`MULTIPART_MESSAGE_KIND` / `MULTIPART_ENCODING` / `MULTIPART_VERSION`（新增，替代两侧的 `version: 1` 字面量）/ `DEFAULT_MULTIPART_TTL_MS` / `DEFAULT_MULTIPART_MAX_CHUNKS` / `DEFAULT_MULTIPART_MAX_TOTAL_BYTES`
+  - postMessage 信封：`REI_AMSG_POSTMESSAGE_TYPE` / `REI_SW_EVENT` / `REI_SW_MESSAGE_TYPE` / `REI_AMSG_DELIVER_MESSAGE_TYPE`
+
+  instant 的 `src/multipart.js` 与 sw 的 `src/index.js` 改为 import shared 并按原导出名 re-export，两个包的公开导出面与 wire format 不变（`DEFAULT_MULTIPART_CHUNK_BYTES` 是发送端独有的切片默认值，留在 instant）。页面侧代码现在可以从 `@rei-standard/amsg-shared` import 这些常量，不必硬编码字符串，也不必从 sw 包 import（那会执行 SW 模块的顶层状态）；client / sw 的 README 示例已相应更新。
+
+- 9d1f89f: 补齐许可证文件：每个包根目录加入 MIT LICENSE 文本（此前 package.json 声明 MIT 但 tarball 里没有许可证文件）。仓库层面确立双许可——代码 MIT、`standards/` 规范文本 CC BY-NC-SA 4.0，根 README 的许可一节与 npm 元数据不再互相矛盾。
+- c064ecd: 修复发布产物里损坏的 .d.ts：四个包此前用 tsup `dts: true` 处理 .js 入口，发出去的 .d.ts 是 JS 源码原文，TS 消费者 import 即报错。现改用 shared 同款两步构建（tsup 出 JS + `tsc --allowJs --emitDeclarationOnly` 出真声明），subpath 导出（server `./cloudflare`、instant `./adapters/*` `./blob/*`）的声明文件一并对齐。
+
+  amsg-server 另含两处加固：pg / neon 适配器的动态 UPDATE 列名补上与 D1 一致的白名单校验（此前直接插值进 SQL）；清理死代码（未引用的 `REQUIRED_COLUMNS`、`timingSafeEqualBytes`、schedule-message 的死分支与重复注释）。amsg-sw 清理 `createNotificationFromPayload` 永不触发的两处假值守卫。
+
+- Updated dependencies [3dae842]
+- Updated dependencies [8ca959c]
+- Updated dependencies [ef2f2d1]
+- Updated dependencies [6ead0c4]
+- Updated dependencies [b146fde]
+- Updated dependencies [9d1f89f]
+  - @rei-standard/amsg-shared@0.4.0-next.2
+
 ## 2.3.3-next.0
 
 ### Patch Changes
