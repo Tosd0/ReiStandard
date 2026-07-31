@@ -673,6 +673,16 @@ export {
 // 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
 export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js';
 
+// OpenAI-compatible LLM HTTP 调用核心（构造请求体 + fetch + 超时 + 解析
+// 响应 + trim），instant 的 callLlmRaw 与 server 的 callLlm 共用这一份，
+// 两侧差异（stream 字段 / tools 转发 / timeoutMs）走 options 参数化。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  callLlm,
+  buildLlmRequestBody,
+  normalizeAiApiUrl,
+} from './llm-call.js';
+
 // Web Push 加密栈（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID），
 // 纯 WebCrypto 实现，instant 与 server 的 webpush 模块共用这一份。
 // 它依赖的编码 / crypto 帮手在 webcrypto-utils.js（上方已聚合导出）。
