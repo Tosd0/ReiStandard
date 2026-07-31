@@ -256,13 +256,15 @@ cancel 路径用的是 `grace / 2`（abort 后只给一半时间等延迟送达�
 
 ### Service Worker 广播
 
-如果你的 SW 是 `@rei-standard/amsg-sw` 或类似实现，会在落库后 `postMessage` 一份 `{ type: 'REI_AMSG_PUSH', event, payload }`——`event` 是按 `messageKind` 区分的事件名（`'rei-amsg-content-received'`、`'rei-amsg-reasoning-received'` 等，见 amsg-sw 导出的 `REI_SW_EVENT`），**不是** `'DELIVER'`（`'REI_AMSG_DELIVER'` 是页面→SW 方向的 message type，方向相反）。按 `messageId` 匹配即可，不必按 `event` 过滤；要过滤就用 `REI_SW_EVENT` 里的值。把它包成 Promise：
+如果你的 SW 是 `@rei-standard/amsg-sw` 或类似实现，会在落库后 `postMessage` 一份 `{ type: 'REI_AMSG_PUSH', event, payload }`——`event` 是按 `messageKind` 区分的事件名（`'rei-amsg-content-received'`、`'rei-amsg-reasoning-received'` 等，见 `@rei-standard/amsg-shared` 导出的 `REI_SW_EVENT`），**不是** `'DELIVER'`（`'REI_AMSG_DELIVER'` 是页面→SW 方向的 message type，方向相反）。按 `messageId` 匹配即可，不必按 `event` 过滤；要过滤就用 `REI_SW_EVENT` 里的值。这些常量的单一来源是 `@rei-standard/amsg-shared`——页面侧从 shared import，而不要从 amsg-sw 包 import（那会执行 SW 模块的顶层状态）。把它包成 Promise：
 
 ```js
+import { REI_AMSG_POSTMESSAGE_TYPE } from '@rei-standard/amsg-shared';
+
 function waitForSwReceipt(messageId, signal) {
   return new Promise((resolve, reject) => {
     function handler(e) {
-      if (e.data?.type !== 'REI_AMSG_PUSH') return;
+      if (e.data?.type !== REI_AMSG_POSTMESSAGE_TYPE) return;
       const p = e.data.payload;
       if (p?.messageId === messageId) {
         navigator.serviceWorker.removeEventListener('message', handler);

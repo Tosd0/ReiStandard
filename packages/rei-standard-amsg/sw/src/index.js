@@ -51,7 +51,21 @@
  * @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush
  */
 
-import { MESSAGE_KIND, base64UrlToBytes, concatBytes } from '@rei-standard/amsg-shared';
+import {
+  MESSAGE_KIND,
+  MULTIPART_MESSAGE_KIND,
+  MULTIPART_ENCODING,
+  MULTIPART_VERSION,
+  DEFAULT_MULTIPART_TTL_MS,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  REI_AMSG_POSTMESSAGE_TYPE,
+  REI_SW_EVENT,
+  REI_SW_MESSAGE_TYPE,
+  REI_AMSG_DELIVER_MESSAGE_TYPE,
+  base64UrlToBytes,
+  concatBytes,
+} from '@rei-standard/amsg-shared';
 
 const REI_SW_DB_NAME = 'rei-sw';
 const REI_SW_DB_STORE = 'request-outbox';
@@ -65,13 +79,13 @@ const REI_AMSG_DEDUPE_STORE = 'delivery-dedupe';
 const DEFAULT_DEDUPE_TTL_MS = 10 * 60_000;
 const DEFAULT_DEDUPE_CLEANUP_INTERVAL_MS = 60_000;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
-const MULTIPART_MESSAGE_KIND = '_multipart';
-const MULTIPART_ENCODING = 'json-utf8-base64url';
+// multipart 的 kind / encoding / version 与限额默认值来自
+// @rei-standard/amsg-shared 的 protocol 模块（与 instant 发送端同一份）。
 const DEFAULT_MULTIPART_OPTIONS = Object.freeze({
   enabled: true,
-  ttlMs: 60_000,
-  maxTotalBytes: 256_000,
-  maxChunks: 128,
+  ttlMs: DEFAULT_MULTIPART_TTL_MS,
+  maxTotalBytes: DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  maxChunks: DEFAULT_MULTIPART_MAX_CHUNKS,
   cleanupIntervalMs: 15 * 60_000,
 });
 const memoryMultipartPending = new Map();
@@ -80,40 +94,17 @@ const memoryMultipartChunks = new Map();
 const multipartLocks = new Map();
 const dedupeDbCache = new Map();
 
-/**
- * Wire-level message type for SW → client postMessage envelopes.
- * Clients filter on `e.data.type === 'REI_AMSG_PUSH'` before reading
- * `e.data.event` (which is one of {@link REI_SW_EVENT}'s values).
- */
-export const REI_AMSG_POSTMESSAGE_TYPE = 'REI_AMSG_PUSH';
-
-/**
- * Per-kind event names dispatched to controlled clients. Each push the
- * SW receives is mirrored to every window via
- * `postMessage({ type: 'REI_AMSG_PUSH', event: <one of these>, payload })`.
- *
- * The mapping is keyed by `payload.messageKind`. Legacy payloads (and
- * blob envelopes) without a `messageKind` field dispatch as
- * {@link REI_SW_EVENT.UNKNOWN_RECEIVED} so apps can still handle 2.0.x
- * producers during migration.
- */
-export const REI_SW_EVENT = Object.freeze({
-  CONTENT_RECEIVED: 'rei-amsg-content-received',
-  REASONING_RECEIVED: 'rei-amsg-reasoning-received',
-  TOOL_REQUEST_RECEIVED: 'rei-amsg-tool-request-received',
-  ERROR_RECEIVED: 'rei-amsg-error-received',
-  MULTIPART_EXPIRED: 'rei-amsg-multipart-expired',
-  UNKNOWN_RECEIVED: 'rei-amsg-unknown-received'
-});
-
-export const REI_SW_MESSAGE_TYPE = Object.freeze({
-  ENQUEUE_REQUEST: 'REI_ENQUEUE_REQUEST',
-  DELIVER: 'REI_AMSG_DELIVER',
-  FLUSH_QUEUE: 'REI_FLUSH_QUEUE',
-  QUEUE_RESULT: 'REI_QUEUE_RESULT'
-});
-
-export const REI_AMSG_DELIVER_MESSAGE_TYPE = REI_SW_MESSAGE_TYPE.DELIVER;
+// SW ↔ 页面 postMessage 常量（REI_AMSG_POSTMESSAGE_TYPE / REI_SW_EVENT /
+// REI_SW_MESSAGE_TYPE / REI_AMSG_DELIVER_MESSAGE_TYPE）单一来源在
+// @rei-standard/amsg-shared 的 protocol 模块，这里 re-export 保持本包
+// 既有导出名不变。页面侧代码建议直接从 shared import 这些常量——从本包
+// import 会执行 SW 模块的顶层状态，在窗口环境里并不合适。
+export {
+  REI_AMSG_POSTMESSAGE_TYPE,
+  REI_SW_EVENT,
+  REI_SW_MESSAGE_TYPE,
+  REI_AMSG_DELIVER_MESSAGE_TYPE,
+} from '@rei-standard/amsg-shared';
 
 /**
  * @typedef {Object} ReiSWOptions
@@ -952,7 +943,7 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
 function normalizeMultipartChunk(payload, options) {
   const meta = payload.multipart;
   if (!meta || typeof meta !== 'object') return null;
-  if (meta.version !== 1 || meta.encoding !== MULTIPART_ENCODING) return null;
+  if (meta.version !== MULTIPART_VERSION || meta.encoding !== MULTIPART_ENCODING) return null;
   if (typeof meta.id !== 'string' || !meta.id) return null;
   if (!Number.isInteger(meta.index) || !Number.isInteger(meta.total)) return null;
   if (meta.total <= 0 || meta.total > options.maxChunks) return null;

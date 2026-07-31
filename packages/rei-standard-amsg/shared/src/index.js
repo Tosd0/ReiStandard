@@ -683,6 +683,23 @@ export {
   verifyVapidJwt,
 } from './webpush.js';
 
+// 线协议常量单一来源：multipart transport 的 kind / encoding / version 与
+// 默认限额（instant 发送端、sw 重组端共用），以及 SW ↔ 页面 postMessage
+// 信封常量（页面侧从这里 import，避免 import sw 包执行其模块顶层状态）。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  MULTIPART_MESSAGE_KIND,
+  MULTIPART_ENCODING,
+  MULTIPART_VERSION,
+  DEFAULT_MULTIPART_TTL_MS,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  REI_AMSG_POSTMESSAGE_TYPE,
+  REI_SW_EVENT,
+  REI_SW_MESSAGE_TYPE,
+  REI_AMSG_DELIVER_MESSAGE_TYPE,
+} from './protocol.js';
+
 /**
  * True when `value` parses as an absolute URL.
  * @param {unknown} value

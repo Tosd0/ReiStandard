@@ -1,12 +1,26 @@
+import {
+  MULTIPART_MESSAGE_KIND,
+  MULTIPART_ENCODING,
+  MULTIPART_VERSION,
+  DEFAULT_MULTIPART_TTL_MS,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+} from '@rei-standard/amsg-shared';
 import { bytesToBase64Url, randomUUID, utf8 } from './utils.js';
 
-export const MULTIPART_MESSAGE_KIND = '_multipart';
-export const MULTIPART_ENCODING = 'json-utf8-base64url';
+// 线协议常量（kind / encoding / version 与接收端限额默认值）单一来源在
+// @rei-standard/amsg-shared 的 protocol 模块 — sw 的重组端用同一份。
+// 这里 re-export 保持本包既有导出名不变。
+export {
+  MULTIPART_MESSAGE_KIND,
+  MULTIPART_ENCODING,
+  DEFAULT_MULTIPART_TTL_MS,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+} from '@rei-standard/amsg-shared';
 
+// 发送端独有的切片默认值（sw 接收端不感知），留在本包。
 export const DEFAULT_MULTIPART_CHUNK_BYTES = 1800;
-export const DEFAULT_MULTIPART_TTL_MS = 60_000;
-export const DEFAULT_MULTIPART_MAX_CHUNKS = 128;
-export const DEFAULT_MULTIPART_MAX_TOTAL_BYTES = 256_000;
 
 /**
  * Build generic multipart Web Push payloads for a JSON-safe business payload.
@@ -63,7 +77,7 @@ export function buildMultipartPushPayloads(payload, options = {}) {
     parts.push({
       messageKind: MULTIPART_MESSAGE_KIND,
       multipart: {
-        version: 1,
+        version: MULTIPART_VERSION,
         id,
         index: i + 1,
         total,
