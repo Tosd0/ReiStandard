@@ -203,15 +203,29 @@ async function handlePushPayload(sw, payload, ctx) {
     claim.duplicateNotification = duplicateNotification;
     await notifyDuplicate(payload, claim, ctx);
     const result = { ...claim, duplicateNotification };
-    // The first delivery claims this key and runs business at most once. If
-    // that business failed, the failure is persisted on the dedupe record —
-    // surface it so a retry/backup gets an honest ack, not a clean ok:true.
+    // The first delivery claims this key and runs business once. If that
+    // business failed, the failure is persisted on the dedupe record — and a
+    // duplicate (sender retry, or the other transport's backup) is the only
+    // later chance to repair the missed inbox write. Re-run the business
+    // callback here, mirroring the notification repair path above, and keep
+    // the ack honest when even the re-run fails.
     // Read the LATEST record, not the pre-await `claim.existing` snapshot:
     // while we awaited the repair path above, an in-flight first delivery may
     // have just persisted its businessError, which the stale snapshot misses.
+    // No businessError on the record means the first delivery's business
+    // either succeeded or is still in flight (a failure is only persisted
+    // after it settles) — in both cases the duplicate must NOT run business:
+    // a success would be double-written, and an in-flight first delivery
+    // would race its own retry.
     const businessError = await readDuplicateBusinessError(claim, ctx);
     if (businessError !== undefined) {
-      result.businessError = businessError;
+      const remainingError = await repairDuplicateBusiness(payload, claim, ctx, businessError);
+      // A successful re-run means the payload has now landed — do not carry
+      // the stale failure on the ack (callers read businessError as
+      // "dispatched but not persisted").
+      if (remainingError !== undefined) {
+        result.businessError = remainingError;
+      }
     }
     return result;
   }
@@ -666,15 +680,67 @@ async function readDuplicateBusinessError(claim, ctx) {
     // A TTL-renewed claim (fresh `firstSeenAt`) belongs to a different, newer
     // delivery, so reporting its businessError on this stale duplicate's ack
     // would misattribute an unrelated failure. Mirrors the write path.
-    if (latest
-        && latest.firstSeenAt === claim.existing.firstSeenAt
-        && latest.businessError !== undefined) {
+    if (latest && latest.firstSeenAt === claim.existing.firstSeenAt) {
+      // The matching live record is authoritative — including an ABSENT
+      // businessError, which means another duplicate's business re-run has
+      // already repaired the failure. Falling back to the snapshot here
+      // would resurrect the cleared error and trigger a needless re-run.
       return latest.businessError;
     }
   } catch (_readError) {
     // Fall back to the snapshot below.
   }
   return snapshot;
+}
+
+/**
+ * Business self-heal for duplicates. The first delivery ran the consumer's
+ * business callback and FAILED (e.g. a transient IndexedDB fault while
+ * writing the inbox); the failure was persisted on the dedupe record. A
+ * duplicate of that key is the natural retry vehicle, so re-run the business
+ * callback once per duplicate:
+ *  - success → clear `businessError` from the record (later duplicates go
+ *    back to pure dedupe) and return `undefined` so the ack reads clean;
+ *  - failure → persist the fresh error onto the record and return it so the
+ *    ack keeps reporting the still-unresolved failure.
+ * Only ever called when a businessError IS on the record — a first delivery
+ * whose business succeeded or is still in flight never reaches this path.
+ */
+async function repairDuplicateBusiness(payload, claim, ctx, previousError) {
+  if (typeof ctx.onBusinessPayload !== 'function') return previousError;
+
+  let retryError;
+  try {
+    // `await` absorbs sync throws, promises and generic thenables alike —
+    // the same callback surface dispatchBusinessPayload accepts on first
+    // delivery.
+    await ctx.onBusinessPayload(payload);
+  } catch (error) {
+    retryError = errorToMessage(error);
+    console.error('[rei-standard-amsg-sw] onBusinessPayload re-run on duplicate failed:', error);
+  }
+
+  try {
+    // Persist the outcome with the same ownership guard as the write path
+    // (updateDedupeBusinessState): merge onto the LATEST record, and only if
+    // it still belongs to the claim we duplicated — a TTL-renewed claim
+    // (fresh `firstSeenAt`) is a different delivery and must not be stamped
+    // with this stale duplicate's outcome.
+    const latest = await readDedupeRecord(ctx.dedupe, claim.key);
+    if (latest && claim.existing && latest.firstSeenAt === claim.existing.firstSeenAt) {
+      const next = { ...latest, key: claim.key };
+      if (retryError === undefined) {
+        delete next.businessError;
+      } else {
+        next.businessError = retryError;
+      }
+      await putDedupeRecord(ctx.dedupe, next);
+    }
+  } catch (error) {
+    console.error('[rei-standard-amsg-sw] dedupe business repair state update failed:', error);
+  }
+
+  return retryError;
 }
 
 async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {

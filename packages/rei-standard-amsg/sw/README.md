@@ -170,20 +170,20 @@ channel.port1.onmessage = (event) => {
 
 这样设计是为了向后兼容：`ok` 的含义保持不变，原本只看 `ok` 的调用方不受影响；需要严格区分「传输成功」和「业务落库成功」的调用方读 `businessError` 即可。webpush `push` 路径没有 ack，业务回调失败只会在 SW 内部 `console.error`，不会让投递 promise reject。
 
-`businessError` 会持久化到 dedupe 记录上：之后**同 key 的重复包**（发送方重试、或另一条 transport 的 backup）被去重后，ack 仍会带上首包的 `businessError`，不会回一个看着干净的 `{ ok:true, duplicate:true }` 把未解决的失败藏起来。但要注意——**去重不会让 `onBusinessPayload` 重跑**：这个字段只是把信号报准，不是补救机制。想让「失败的投递」能被重试真正修好，得消费方自己保证业务回调幂等（见下方「在 SW 内执行 tool_request 的安全边界」）。
+`businessError` 会持久化到 dedupe 记录上，并且是 duplicate 自愈的开关：记录上带着 `businessError` 时，之后**同 key 的重复包**（发送方重试、或另一条 transport 的 backup）到达会重跑一次 `onBusinessPayload`——重跑成功就清掉记录上的 `businessError`（本次 ack 不带该字段，之后的重复包恢复纯去重），重跑仍失败则用新的失败信息更新记录、照旧在 ack 上报。业务成功过的记录不受影响：重复包永不重跑业务，只按当前 `notification.show` 策略决定要不要补通知。
 
 #### 在 SW 内执行 tool_request 的安全边界
 
 `onBusinessPayload` 里直接执行 `tool_request`（在 SW 里跑工具、回结果）是支持的常见用法。这里要理解清楚去重提供的保证和它的边界：
 
-- **正常情况下不会重复执行**：dedupe 是「先占坑、再跑业务」，所以同一个 `messageId` 在 TTL 窗口内（默认 10 分钟）`onBusinessPayload` **最多被调用一次**。SSE + Web Push backup 双路送达、push 服务重投递，重复的那些都会在跑业务之前被挡掉。换句话说，**dedupe 本身就是你的「执行一次」闸门**，普通场景你不需要再自己记账本。
+- **正常情况下不会重复执行**：dedupe 是「先占坑、再跑业务」，所以同一个 `messageId` 在 TTL 窗口内（默认 10 分钟）只要 `onBusinessPayload` 成功过一次，就**不会再被调用**。SSE + Web Push backup 双路送达、push 服务重投递，重复的那些都会在跑业务之前被挡掉。换句话说，**dedupe 本身就是你的「执行一次」闸门**，普通场景你不需要再自己记账本。
 - **边界一：TTL**。这个「只执行一次」只保 TTL 那段时间。极少数超过 TTL 才发生的重投递会被当成新消息、重新执行。绝大多数重投递都在秒级~分钟级，10 分钟够用；要更死的保证就自己按 `id` 记一张永久「执行账本」。
-- **边界二：失败不回滚**。`onBusinessPayload` 失败时，dedupe 的坑**不会撤销**——同 key 重试会被去重、不会重跑业务（ack 会持续带上 `businessError` 提醒你「这条仍未解决」）。所以：
+- **边界二：首投失败会重跑**。`onBusinessPayload` 失败时，失败信息记在 dedupe 记录的 `businessError` 上——之后同 key 的重复包到达会**重跑一次**业务回调，成功即清除、之后恢复纯去重（详见上方 `businessError` 一节）。所以：
 
-  - 如果你的工具有**真实副作用**（发邮件、下单、转账、加未读数、播声音……），**不要**指望「重发同一条」来补救失败——那只会被去重吞掉。让 `onBusinessPayload` 失败时把 `businessError` 报上去，由应用层用**新的 id / 新的请求**去重试，或自备幂等「执行账本」（执行前查 `id` 是否已执行）后再考虑开启失败回滚。
-  - 如果你的业务回调是**纯幂等**（只按 `messageId` 覆盖写、工具可安全重跑），那重跑无害，怎么重试都行。
+  - 如果你的工具有**真实副作用**（发邮件、下单、转账、加未读数、播声音……），要按「失败后可能再跑一次」来写：工具执行成功、但回调在收尾处（落库之后）抛了错，重复包重跑就会让副作用发生第二次。给这类工具备一张幂等「执行账本」（执行前查 `id` 是否已执行），或保证回调里「副作用完成 = 回调成功」不留尾巴。
+  - 如果你的业务回调是**纯幂等**（只按 `messageId` 覆盖写、工具可安全重跑），那重跑无害，失败自愈白拿。
 
-> 一句话：**普通成功路径，在 SW 里执行 tool_request 是安全的，dedupe 已经保证不重复执行**；只有当你需要「失败的工具自动重试」时，幂等才成为你的责任。
+> 一句话：**在 SW 里执行 tool_request，业务成功过就不会重复执行**；首投失败时 duplicate 会重跑一次来自愈，所以有真实副作用的工具要按幂等来写。
 
 ### 生产推荐链路：SSE + Web Push backup + SW dedupe
 

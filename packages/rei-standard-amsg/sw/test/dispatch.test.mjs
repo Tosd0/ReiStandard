@@ -1181,23 +1181,25 @@ test('DELIVER ack surfaces businessError on a later duplicate of a failed busine
   }));
   assert.equal(first.value[0].businessError, 'inbox write failed');
 
-  // Retry the same key: deduped, business is NOT re-run, but the ack still
-  // honestly reports the unresolved business failure instead of a clean
-  // ok:true that would mislead a retry flow.
-  const second = await triggerMessage({
+  // Retry the same key: deduped (no double notification/broadcast), but the
+  // persisted failure makes the duplicate re-run the business callback as a
+  // self-heal. The re-run fails again here, so the ack still honestly
+  // reports the unresolved business failure instead of a clean ok:true that
+  // would mislead a retry flow.
+  const second = await captureConsoleError(() => triggerMessage({
     type: REI_AMSG_DELIVER_MESSAGE_TYPE,
     source: 'sse',
     requestId: 'req-dup-2',
     payload,
-  });
-  assert.deepEqual(second[0], {
+  }));
+  assert.deepEqual(second.value[0], {
     ok: true,
     duplicate: true,
     key: 'msg_dup_bizerr',
     requestId: 'req-dup-2',
     businessError: 'inbox write failed',
   });
-  assert.equal(calls, 1, 'business must not re-run on the duplicate');
+  assert.equal(calls, 2, 'the duplicate re-runs business once as a self-heal retry');
 });
 
 test('DELIVER duplicate ack has no businessError when the first delivery succeeded', async () => {
@@ -1278,7 +1280,9 @@ test('a failed first-delivery business callback must not clobber a notification 
   await captureConsoleError(() => Promise.all(ssePending));
 
   // A third copy of the same key must NOT trigger another notification.
-  await triggerPush(payload);
+  // (It DOES retry the failed business — the gate promise stays rejected, so
+  // the re-run fails again and logs; capture keeps the runner output clean.)
+  await captureConsoleError(() => triggerPush(payload));
   assert.equal(notifications.length, 1, 'no second notification after the failed business write');
 });
 
@@ -1392,17 +1396,19 @@ test('a concurrent duplicate notification repair must not erase a persisted busi
   rejectBusiness(new Error('inbox write failed'));
   await captureConsoleError(() => Promise.all(firstPending));
 
-  // Backup resumes and writes its repair record back.
+  // Backup resumes and writes its repair record back. (Its self-heal re-run
+  // awaits the same rejected business gate, fails again and logs — captured.)
   releaseShow();
-  await Promise.all(backupPending);
+  await captureConsoleError(() => Promise.all(backupPending));
 
-  // A later duplicate must still surface the businessError.
-  const replies = await triggerMessage({
+  // A later duplicate must still surface the businessError. (Its self-heal
+  // re-run awaits the same rejected gate, fails again and logs — captured.)
+  const { value: replies } = await captureConsoleError(() => triggerMessage({
     type: REI_AMSG_DELIVER_MESSAGE_TYPE,
     source: 'sse',
     requestId: 'req-e2',
     payload,
-  });
+  }));
   assert.equal(
     replies[0].businessError,
     'inbox write failed',
@@ -1464,9 +1470,10 @@ test('an in-flight duplicate DELIVER ack must reflect a businessError persisted 
   rejectBusiness(new Error('inbox write failed'));
   await captureConsoleError(() => Promise.all(firstPending));
 
-  // Duplicate resumes and acks.
+  // Duplicate resumes and acks. (Its self-heal re-run awaits the same
+  // rejected business gate, fails again and logs — captured.)
   releaseShow();
-  await Promise.all(backupPending);
+  await captureConsoleError(() => Promise.all(backupPending));
 
   assert.equal(backupReplies[0].duplicate, true);
   assert.equal(
@@ -1544,4 +1551,152 @@ test('an in-flight duplicate must not inherit a businessError from a TTL-renewed
     !('businessError' in bReplies[0]),
     'duplicate ack must not inherit a businessError from a TTL-renewed claim',
   );
+});
+
+// --- Duplicate business self-heal: a businessError persisted on the dedupe
+// --- record makes later duplicates re-run onBusinessPayload instead of only
+// --- reporting the failure forever.
+
+test('self-heal: duplicate re-runs onBusinessPayload after a failed first delivery and clears the record on success', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  let calls = 0;
+  installReiSW(sw, {
+    onBusinessPayload: () => {
+      calls += 1;
+      return calls === 1
+        ? Promise.reject(new Error('inbox write failed'))
+        : Promise.resolve();
+    },
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_heal_ok', messageKind: 'content', message: 'x' };
+
+  // First delivery: business fails; the failure lands on the dedupe record.
+  const first = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-heal-1',
+    payload,
+  }));
+  assert.equal(first.value[0].businessError, 'inbox write failed');
+
+  // Duplicate: re-runs the failed business callback. The re-run succeeds,
+  // so the ack must NOT carry the stale businessError — callers read that
+  // field as "dispatched but not persisted".
+  const second = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-heal-2',
+    payload,
+  });
+  assert.equal(calls, 2, 'the duplicate must re-run the failed business callback');
+  assert.deepEqual(second[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_heal_ok',
+    requestId: 'req-heal-2',
+  });
+
+  // The successful re-run cleared businessError from the record: a later
+  // duplicate is pure dedupe again — no third business run (no double
+  // write), clean ack.
+  const third = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-heal-3',
+    payload,
+  });
+  assert.equal(calls, 2, 'a repaired record must not trigger another business run');
+  assert.deepEqual(third[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_heal_ok',
+    requestId: 'req-heal-3',
+  });
+});
+
+test('self-heal: a successful first delivery never re-runs onBusinessPayload on duplicates', async () => {
+  const { sw, triggerMessage, triggerPush } = createSwMock();
+  let calls = 0;
+  installReiSW(sw, {
+    onBusinessPayload: () => {
+      calls += 1;
+      return Promise.resolve();
+    },
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_heal_noop', messageKind: 'content', message: 'x' };
+
+  await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-noheal-1',
+    payload,
+  });
+  assert.equal(calls, 1);
+
+  // Duplicates over both transports: no businessError on the record, so the
+  // business callback must NOT run again — that would double-write the inbox.
+  const dupAck = await triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-noheal-2',
+    payload,
+  });
+  await triggerPush(payload);
+
+  assert.equal(calls, 1, 'duplicates of a successful delivery must not re-run business');
+  assert.deepEqual(dupAck[0], {
+    ok: true,
+    duplicate: true,
+    key: 'msg_heal_noop',
+    requestId: 'req-noheal-2',
+  });
+});
+
+test('self-heal: a re-run that fails again keeps businessError persisted and reported', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  let calls = 0;
+  installReiSW(sw, {
+    onBusinessPayload: () => {
+      calls += 1;
+      return Promise.reject(new Error(`inbox write failed #${calls}`));
+    },
+  });
+
+  const payload = { ...COMMON, messageId: 'msg_heal_fail', messageKind: 'content', message: 'x' };
+
+  const first = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-refail-1',
+    payload,
+  }));
+  assert.equal(first.value[0].businessError, 'inbox write failed #1');
+
+  // Duplicate: the re-run fails too. The record's businessError is updated
+  // to the FRESH failure and the ack reports it — not the stale first one.
+  const second = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-refail-2',
+    payload,
+  }));
+  assert.equal(calls, 2);
+  assert.equal(
+    second.value[0].businessError,
+    'inbox write failed #2',
+    'the ack reports the updated (re-run) failure',
+  );
+
+  // The failure stayed on the record, so a further duplicate retries again —
+  // the self-heal channel stays open until a re-run finally lands.
+  const third = await captureConsoleError(() => triggerMessage({
+    type: REI_AMSG_DELIVER_MESSAGE_TYPE,
+    source: 'sse',
+    requestId: 'req-refail-3',
+    payload,
+  }));
+  assert.equal(calls, 3, 'a still-failing record keeps the retry channel open');
+  assert.equal(third.value[0].businessError, 'inbox write failed #3');
 });
