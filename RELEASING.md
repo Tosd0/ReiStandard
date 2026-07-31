@@ -22,7 +22,7 @@
 
 ## 内部依赖区间
 
-四个上层包对 `@rei-standard/amsg-shared` 用 `^0.2.0`。在 0.x 上脱字号只放行同一 minor 内的补丁（`0.2.x`），所以 shared 出补丁时消费者自动跟随、不必协调重发；shared 升 minor（如 `0.3.0`）不会被自动选中，要消费者在自己的 changeset 里显式升级区间。
+四个上层包对 `@rei-standard/amsg-shared` 用脱字号区间（以各包 `package.json` 里的实际区间为准）。在 0.x 上脱字号只放行同一 minor 内的补丁，所以 shared 出补丁时消费者自动跟随、不必协调重发；shared 升 minor 不会被自动选中，要消费者在自己的 changeset 里显式升级区间。
 
 ## 权限与密钥
 

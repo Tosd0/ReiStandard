@@ -69,21 +69,6 @@ export function jsonToBase64Url(value) {
   return bytesToBase64Url(utf8(JSON.stringify(value)));
 }
 
-/**
- * Constant-time byte comparison. Returns true iff `a` and `b` are equal-length
- * sequences with the same bytes. Length is intentionally NOT secret — early
- * length-check is fine and matches Node `timingSafeEqual`'s contract.
- */
-export function timingSafeEqualBytes(a, b) {
-  const x = toUint8(a);
-  const y = toUint8(b);
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) {
-    diff |= x[i] ^ y[i];
-  }
-  return diff === 0;
-}
 
 /** HMAC-SHA-256 over `data` with `keyBytes`. Returns 32-byte Uint8Array. */
 export async function hmacSha256(keyBytes, data) {

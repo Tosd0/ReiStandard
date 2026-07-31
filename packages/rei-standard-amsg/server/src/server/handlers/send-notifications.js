@@ -1,6 +1,5 @@
 /**
  * Handler: send-notifications
- * ReiStandard SDK v2.0.1
  *
  * @param {Object} ctx - Server context.
  * @returns {{ POST: function }}

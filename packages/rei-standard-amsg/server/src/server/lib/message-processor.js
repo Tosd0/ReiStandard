@@ -1,6 +1,5 @@
 /**
  * Message Processor (SDK version)
- * ReiStandard amsg-server v2.4.0
  *
  * Handles single message content generation and Web Push delivery for
  * scheduled tasks (`fixed` / `prompted` / `auto`) and the

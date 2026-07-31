@@ -1,6 +1,5 @@
 /**
  * Handler: schedule-message
- * ReiStandard SDK v2.0.1
  *
  * @param {Object} ctx - Server context.
  * @returns {{ POST: function }}
@@ -55,11 +54,6 @@ export function createScheduleMessageHandler(ctx) {
     } catch (error) {
       if (error instanceof SyntaxError) {
         return { status: 400, body: { success: false, error: { code: 'INVALID_PAYLOAD_FORMAT', message: '解密后的数据不是有效 JSON' } } };
-      }
-
-      const message = typeof error.message === 'string' ? error.message : '';
-      if (message.includes('auth') || message.includes('Unsupported state')) {
-        return { status: 400, body: { success: false, error: { code: 'DECRYPTION_FAILED', message: '请求体解密失败' } } };
       }
 
       return { status: 400, body: { success: false, error: { code: 'DECRYPTION_FAILED', message: '请求体解密失败' } } };
@@ -174,22 +168,7 @@ export function createScheduleMessageHandler(ctx) {
       return { status: 500, body: { success: false, error: { code: 'TASK_CREATE_FAILED', message: '创建任务失败' } } };
     }
 
-    /**
-     * In-server instant path. Delivers an instant message through this
-     * server's own task queue (create task → process by UUID → delete task).
-     * The task is written to the database before processing, so delivery is
-     * not tied to the request connection: even if the client disconnects, the
-     * row stays and the generation keeps running (and can be retried) for as
-     * long as it needs. Use this when you have a database and want long or
-     * guaranteed-complete generations with no dropped messages.
-     *
-     * The stateless alternative is `@rei-standard/amsg-instant`: it streams
-     * over SSE with a Web Push backup and needs no database, which makes it a
-     * good fit for edge runtimes (e.g. Cloudflare Workers). Its work rides the
-     * response connection, so after the client disconnects it only has the
-     * platform's brief grace window to finish (≈20-30s observed on Deno
-     * Deploy) — ideal for short instant messages that complete quickly.
-     */
+    // In-server instant path — rationale documented above the VAPID pre-check.
     // Instant type: send immediately
     if (payload.messageType === 'instant') {
       try {

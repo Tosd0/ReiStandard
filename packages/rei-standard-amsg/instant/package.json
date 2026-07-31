@@ -77,7 +77,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.json && node scripts/finalize-dts.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

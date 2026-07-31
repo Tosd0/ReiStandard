@@ -1,6 +1,5 @@
 /**
  * Validation utility library (SDK version)
- * ReiStandard SDK v2.0.1
  */
 
 import { validateAvatarUrl } from '@rei-standard/amsg-shared';

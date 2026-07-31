@@ -256,7 +256,7 @@ cancel 路径用的是 `grace / 2`（abort 后只给一半时间等延迟送达�
 
 ### Service Worker 广播
 
-如果你的 SW 是 `@rei-standard/amsg-sw` 或类似实现，会在落库后 `postMessage` 一份 `{ type: 'REI_AMSG_PUSH', event: 'DELIVER', payload }`。把它包成 Promise：
+如果你的 SW 是 `@rei-standard/amsg-sw` 或类似实现，会在落库后 `postMessage` 一份 `{ type: 'REI_AMSG_PUSH', event, payload }`——`event` 是按 `messageKind` 区分的事件名（`'rei-amsg-content-received'`、`'rei-amsg-reasoning-received'` 等，见 amsg-sw 导出的 `REI_SW_EVENT`），**不是** `'DELIVER'`（`'REI_AMSG_DELIVER'` 是页面→SW 方向的 message type，方向相反）。按 `messageId` 匹配即可，不必按 `event` 过滤；要过滤就用 `REI_SW_EVENT` 里的值。把它包成 Promise：
 
 ```js
 function waitForSwReceipt(messageId, signal) {

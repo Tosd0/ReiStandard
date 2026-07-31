@@ -1,6 +1,5 @@
 /**
  * Handler: cancel-message
- * ReiStandard SDK v2.0.1
  *
  * @param {Object} ctx - Server context.
  * @returns {{ DELETE: function }}

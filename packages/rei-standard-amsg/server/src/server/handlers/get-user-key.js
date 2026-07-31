@@ -1,6 +1,5 @@
 /**
  * Handler: get-user-key
- * ReiStandard SDK v2.0.1
  *
  * @param {Object} ctx - Server context.
  * @returns {{ GET: function }}

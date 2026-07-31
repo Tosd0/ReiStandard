@@ -302,22 +302,20 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
 
   if (notificationState.shouldRender) {
     const notification = createNotificationFromPayload(payload, defaults);
-    if (notification) {
-      // A rejected showNotification (permission revoked / quota / OS error)
-      // must NOT stop onNotificationSettled from running — that callback is
-      // the only thing that clears `notificationStatePending`, and leaving
-      // it stuck makes the backup transport's repair path swallow every
-      // duplicate as 'first-delivery-pending'.
-      notificationWork.push(
-        sw.registration.showNotification(notification.title, notification.options)
-          .then(
-            () => { notificationState.shown = true; },
-            (error) => {
-              console.error('[rei-standard-amsg-sw] showNotification rejected:', error);
-            }
-          )
-      );
-    }
+    // A rejected showNotification (permission revoked / quota / OS error)
+    // must NOT stop onNotificationSettled from running — that callback is
+    // the only thing that clears `notificationStatePending`, and leaving
+    // it stuck makes the backup transport's repair path swallow every
+    // duplicate as 'first-delivery-pending'.
+    notificationWork.push(
+      sw.registration.showNotification(notification.title, notification.options)
+        .then(
+          () => { notificationState.shown = true; },
+          (error) => {
+            console.error('[rei-standard-amsg-sw] showNotification rejected:', error);
+          }
+        )
+    );
   }
 
   // Kick the user's business callback off in parallel with notification
@@ -428,6 +426,8 @@ function shouldRenderNotification(payload, clientList) {
  * @param {ServiceWorkerGlobalScope} sw
  * @param {string}                   eventName
  * @param {Record<string, unknown>}  payload
+ * @param {Array<Client>|null} [preFetchedClientList] - reuse an already
+ *   fetched `clients.matchAll` result instead of fetching again.
  * @returns {Promise<void>}
  */
 async function dispatchPushToClients(sw, eventName, payload, preFetchedClientList = null) {
@@ -713,9 +713,6 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
   });
-  if (!notification) {
-    return { shown: false, reason: 'no-notification' };
-  }
 
   await sw.registration.showNotification(notification.title, notification.options);
 
