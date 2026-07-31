@@ -18,59 +18,18 @@
  * 主题拆文件，index 只负责聚合导出。
  */
 
-import { toUint8, concatBytes, base64UrlToBytes, normalizeVapidSubject } from './index.js';
-
-// ─── WebCrypto / encoding helpers ──────────────────────────────────────
-// 与 toUint8 / concatBytes / base64UrlToBytes（在 index.js）同一层的
-// runtime-neutral 帮手，只用 WHATWG 标准原语（`globalThis.crypto.subtle`、
-// `TextEncoder`、`Uint8Array`）。instant / server 的 utils 模块从这里
-// re-export，保证全生态只有一份定义。
-
-const TEXT_ENCODER = new TextEncoder();
-
-/** UTF-8 encode a string into a Uint8Array. */
-export function utf8(str) {
-  return TEXT_ENCODER.encode(String(str));
-}
-
-/** Encode bytes as base64url (no padding). */
-export function bytesToBase64Url(buf) {
-  const bytes = toUint8(buf);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]);
-  }
-  // btoa is available in all Web Crypto runtimes (browsers, Workers, Node 16+).
-  const b64 = (typeof btoa === 'function')
-    ? btoa(bin)
-    : Buffer.from(bin, 'binary').toString('base64');
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-/** Encode a JSON-serializable value as base64url (UTF-8 JSON). */
-export function jsonToBase64Url(value) {
-  return bytesToBase64Url(utf8(JSON.stringify(value)));
-}
-
-/** HMAC-SHA-256 over `data` with `keyBytes`. Returns 32-byte Uint8Array. */
-export async function hmacSha256(keyBytes, data) {
-  const key = await globalThis.crypto.subtle.importKey(
-    'raw',
-    toUint8(keyBytes),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const sig = await globalThis.crypto.subtle.sign('HMAC', key, toUint8(data));
-  return new Uint8Array(sig);
-}
-
-/** Cryptographically random bytes. */
-export function randomBytes(n) {
-  const out = new Uint8Array(n);
-  globalThis.crypto.getRandomValues(out);
-  return out;
-}
+import { normalizeVapidSubject } from './index.js';
+// runtime-neutral 编码 / crypto 帮手统一放 webcrypto-utils.js（全生态唯一
+// 一份定义），本模块只 import 不再自带实现。
+import {
+  toUint8,
+  concatBytes,
+  base64UrlToBytes,
+  utf8,
+  bytesToBase64Url,
+  jsonToBase64Url,
+  randomBytes,
+} from './webcrypto-utils.js';
 
 // RFC 8291 fixed labels (each followed by a NUL byte per HKDF "info" framing).
 const KEY_INFO_PREFIX = utf8('WebPush: info\0');

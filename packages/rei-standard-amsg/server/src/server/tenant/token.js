@@ -1,23 +1,18 @@
-import { createHmac, timingSafeEqual } from 'crypto';
-
-function base64UrlEncode(input) {
-  return Buffer.from(input)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function base64UrlDecode(input) {
-  const normalized = input
-    .replace(/-/g, '+')
-    .replace(/_/g, '/');
-  const padLength = (4 - (normalized.length % 4)) % 4;
-  return Buffer.from(normalized + '='.repeat(padLength), 'base64');
-}
+import { createHmac } from 'crypto';
+// base64url / UTF-8 / 常量时间比较统一用 shared 的实现（编码逐字节一致）。
+// HMAC 仍走 node:crypto 的 createHmac：shared 的 hmacSha256 基于
+// SubtleCrypto、必然 async，而 createTenantToken / verifyTenantToken
+// 是对外导出的同步 API，不能因此改成 Promise。
+import {
+  utf8,
+  utf8Decode,
+  bytesToBase64Url,
+  base64UrlToBytes,
+  timingSafeEqualBytes,
+} from '../lib/webcrypto-utils.js';
 
 function sign(input, secret) {
-  return base64UrlEncode(createHmac('sha256', secret).update(input).digest());
+  return bytesToBase64Url(createHmac('sha256', secret).update(input).digest());
 }
 
 function nowEpochSeconds() {
@@ -44,8 +39,8 @@ export function createTenantToken(params, secret) {
   };
 
   const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = base64UrlEncode(JSON.stringify(header));
-  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const encodedHeader = bytesToBase64Url(utf8(JSON.stringify(header)));
+  const encodedPayload = bytesToBase64Url(utf8(JSON.stringify(payload)));
   const signingInput = `${encodedHeader}.${encodedPayload}`;
   const signature = sign(signingInput, secret);
   return `${signingInput}.${signature}`;
@@ -73,24 +68,21 @@ export function verifyTenantToken(token, secret, options = {}) {
   // Compare raw HMAC bytes (decoded from base64url) rather than the
   // encoded character bytes — semantically clearer and avoids the
   // implicit-UTF-8 default of Buffer.from(string).
-  let receivedBuffer;
-  let expectedBuffer;
+  let receivedBytes;
+  let expectedBytes;
   try {
-    receivedBuffer = base64UrlDecode(receivedSignature);
-    expectedBuffer = base64UrlDecode(expectedSignature);
+    receivedBytes = base64UrlToBytes(receivedSignature);
+    expectedBytes = base64UrlToBytes(expectedSignature);
   } catch {
     throw new Error('INVALID_TENANT_AUTH');
   }
-  if (
-    receivedBuffer.length !== expectedBuffer.length ||
-    !timingSafeEqual(receivedBuffer, expectedBuffer)
-  ) {
+  if (!timingSafeEqualBytes(receivedBytes, expectedBytes)) {
     throw new Error('INVALID_TENANT_AUTH');
   }
 
   let payload;
   try {
-    payload = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8'));
+    payload = JSON.parse(utf8Decode(base64UrlToBytes(encodedPayload)));
   } catch {
     throw new Error('INVALID_TENANT_AUTH');
   }
