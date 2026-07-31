@@ -1,6 +1,5 @@
 /**
  * PostgreSQL (pg) Database Adapter
- * ReiStandard SDK v2.0.1
  *
  * Uses the standard 'pg' npm package.
  *
@@ -13,7 +12,8 @@ import {
   INDEXES,
   MIGRATIONS,
   VERIFY_TABLE_SQL,
-  COLUMNS_SQL
+  COLUMNS_SQL,
+  UPDATABLE_COLUMNS
 } from './schema.js';
 
 export class PgAdapter {
@@ -134,6 +134,9 @@ export class PgAdapter {
     let idx = 1;
 
     for (const [key, value] of Object.entries(updates)) {
+      if (!UPDATABLE_COLUMNS.has(key)) {
+        throw new Error(`[amsg-server pg] rejected unknown update column: ${key}`);
+      }
       sets.push(`${key} = $${idx}`);
       values.push(value);
       idx++;
@@ -156,6 +159,9 @@ export class PgAdapter {
 
     if (extraFields) {
       for (const [key, value] of Object.entries(extraFields)) {
+        if (!UPDATABLE_COLUMNS.has(key)) {
+          throw new Error(`[amsg-server pg] rejected unknown update column: ${key}`);
+        }
         sets.push(`${key} = $${idx}`);
         values.push(value);
         idx++;

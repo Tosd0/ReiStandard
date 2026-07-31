@@ -1,6 +1,5 @@
 /**
  * Neon Serverless Database Adapter
- * ReiStandard SDK v2.0.1
  *
  * @implements {import('./interface.js').DbAdapter}
  */
@@ -11,7 +10,8 @@ import {
   INDEXES,
   MIGRATIONS,
   VERIFY_TABLE_SQL,
-  COLUMNS_SQL
+  COLUMNS_SQL,
+  UPDATABLE_COLUMNS
 } from './schema.js';
 
 export class NeonAdapter {
@@ -132,6 +132,9 @@ export class NeonAdapter {
     let idx = 1;
 
     for (const [key, value] of Object.entries(updates)) {
+      if (!UPDATABLE_COLUMNS.has(key)) {
+        throw new Error(`[amsg-server neon] rejected unknown update column: ${key}`);
+      }
       sets.push(`${key} = $${idx}`);
       values.push(value);
       idx++;
@@ -155,6 +158,9 @@ export class NeonAdapter {
 
     if (extraFields) {
       for (const [key, value] of Object.entries(extraFields)) {
+        if (!UPDATABLE_COLUMNS.has(key)) {
+          throw new Error(`[amsg-server neon] rejected unknown update column: ${key}`);
+        }
         sets.push(`${key} = $${idx}`);
         values.push(value);
         idx++;

@@ -27,7 +27,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup && tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('dist/index.d.ts', 'dist/index.d.cts')\"",
+    "build": "tsup && tsc -p tsconfig.json && node -e \"const fs=require('fs');for(const f of fs.readdirSync('dist'))if(f.endsWith('.d.ts'))fs.copyFileSync('dist/'+f,'dist/'+f.slice(0,-5)+'.d.cts')\"",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

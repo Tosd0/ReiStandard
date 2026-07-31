@@ -643,53 +643,72 @@ export function chunkReasoningByUtf8Bytes(text, maxBytes) {
 
 // ─── Shared Utilities ───────────────────────────────────────────────────
 
-/**
- * Coerce ArrayBuffer | Uint8Array | view → Uint8Array (no copy when possible).
- */
-export function toUint8(buf) {
-  if (buf instanceof Uint8Array) return buf;
-  if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
-  if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-  throw new TypeError('Expected ArrayBuffer / Uint8Array');
-}
-
-/**
- * Decode base64url (with or without padding) → Uint8Array.
- * @param {string} input
- * @returns {Uint8Array}
- */
-export function base64UrlToBytes(input) {
-  const s = String(input).replace(/-/g, '+').replace(/_/g, '/');
-  const pad = (4 - (s.length % 4)) % 4;
-  const padded = s + '='.repeat(pad);
-  const bin = (typeof atob === 'function')
-    ? atob(padded)
-    : Buffer.from(padded, 'base64').toString('binary');
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-/**
- * Concatenate Uint8Arrays into a single Uint8Array.
- * @param {...(Uint8Array | ArrayBuffer | ArrayBufferView)} chunks
- * @returns {Uint8Array}
- */
-export function concatBytes(...chunks) {
-  let total = 0;
-  for (const c of chunks) total += c.byteLength;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c), offset);
-    offset += c.byteLength;
-  }
-  return out;
-}
+// Runtime-neutral 编码 / crypto 帮手（toUint8、base64url、hex、HMAC、
+// 常量时间比较等），instant 的 utils 与 server 的 webcrypto-utils 模块
+// 从这里 re-export 而不再各自拷贝。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  toUint8,
+  concatBytes,
+  utf8,
+  utf8Decode,
+  bytesToBase64,
+  bytesToBase64Url,
+  base64UrlToBytes,
+  jsonToBase64Url,
+  bytesToHex,
+  hexToBytes,
+  hmacSha256,
+  timingSafeEqualBytes,
+  randomBytes,
+  randomUUID,
+} from './webcrypto-utils.js';
 
 // ─── Validation & normalization helpers ─────────────────────────────────
 // Shared by amsg-server / amsg-instant / amsg-client so the same rules live
 // in exactly one place. All pure (no side effects).
+
+// OpenAI-style messages 数组形状校验（结构化错误码），instant 的
+// `validateMessagesArray` 与 server 的 `validateLlmMessagesArray` 共用。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js';
+
+// OpenAI-compatible LLM HTTP 调用核心（构造请求体 + fetch + 超时 + 解析
+// 响应 + trim），instant 的 callLlmRaw 与 server 的 callLlm 共用这一份，
+// 两侧差异（stream 字段 / tools 转发 / timeoutMs）走 options 参数化。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  callLlm,
+  buildLlmRequestBody,
+  normalizeAiApiUrl,
+} from './llm-call.js';
+
+// Web Push 加密栈（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID），
+// 纯 WebCrypto 实现，instant 与 server 的 webpush 模块共用这一份。
+// 它依赖的编码 / crypto 帮手在 webcrypto-utils.js（上方已聚合导出）。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  sendWebPush,
+  buildVapidJwt,
+  verifyVapidJwt,
+} from './webpush.js';
+
+// 线协议常量单一来源：multipart transport 的 kind / encoding / version 与
+// 默认限额（instant 发送端、sw 重组端共用），以及 SW ↔ 页面 postMessage
+// 信封常量（页面侧从这里 import，避免 import sw 包执行其模块顶层状态）。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  MULTIPART_MESSAGE_KIND,
+  MULTIPART_ENCODING,
+  MULTIPART_VERSION,
+  DEFAULT_MULTIPART_TTL_MS,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  REI_AMSG_POSTMESSAGE_TYPE,
+  REI_SW_EVENT,
+  REI_SW_MESSAGE_TYPE,
+  REI_AMSG_DELIVER_MESSAGE_TYPE,
+} from './protocol.js';
 
 /**
  * True when `value` parses as an absolute URL.

@@ -31,7 +31,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('dist/index.d.ts', 'dist/index.d.cts')\"",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

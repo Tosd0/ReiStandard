@@ -104,7 +104,10 @@ ReiStandard/
 
 ## 📄 许可
 
-CC BY-NC-SA 4.0（署名 - 非商业 - 相同方式共享）。
+双许可，按内容类型区分：
+
+- **代码**（`packages/`、`examples/`、`scripts/`、`tests/` 等全部代码与配套文件）：[MIT](./LICENSE)。与 npm 上各包 `package.json` 声明一致。
+- **标准文档**（`standards/` 下的规范文本）：[CC BY-NC-SA 4.0](./standards/LICENSE)（署名 - 非商业 - 相同方式共享）。
 
 ## 👥 致谢
 

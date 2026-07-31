@@ -25,16 +25,20 @@
 
 ### 客户端订阅示例
 
+页面侧请从 `@rei-standard/amsg-shared` import 这些常量（本包只是 re-export 同一份）：从本包 import 会执行 SW 模块的顶层状态，在窗口环境里并不合适。
+
 ```js
+import { REI_AMSG_POSTMESSAGE_TYPE, REI_SW_EVENT } from '@rei-standard/amsg-shared';
+
 navigator.serviceWorker.addEventListener('message', (e) => {
-  if (e.data?.type !== 'REI_AMSG_PUSH') return;
+  if (e.data?.type !== REI_AMSG_POSTMESSAGE_TYPE) return;
   switch (e.data.event) {
-    case 'rei-amsg-content-received':      /* 渲染 app 内消息 */ break;
-    case 'rei-amsg-reasoning-received':    /* 渲染思考中 UI */ break;
-    case 'rei-amsg-tool-request-received': /* 弹出工具执行确认 */ break;
-    case 'rei-amsg-error-received':        /* 显示错误 toast */ break;
-    case 'rei-amsg-multipart-expired':     /* 观测 transport 缺片 */ break;
-    case 'rei-amsg-unknown-received':      /* 2.0.x 老 payload 的兼容路径 */ break;
+    case REI_SW_EVENT.CONTENT_RECEIVED:      /* 渲染 app 内消息 */ break;
+    case REI_SW_EVENT.REASONING_RECEIVED:    /* 渲染思考中 UI */ break;
+    case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: /* 弹出工具执行确认 */ break;
+    case REI_SW_EVENT.ERROR_RECEIVED:        /* 显示错误 toast */ break;
+    case REI_SW_EVENT.MULTIPART_EXPIRED:     /* 观测 transport 缺片 */ break;
+    case REI_SW_EVENT.UNKNOWN_RECEIVED:      /* 2.0.x 老 payload 的兼容路径 */ break;
   }
 });
 ```
@@ -131,6 +135,8 @@ installReiSW(self, {
 SSE 默认先进页面主线程。若要让 SSE payload 和 Web Push backup 共用 SW 的 dedupe / notification / `onBusinessPayload` 管线，页面可以把 payload 转交给 SW：
 
 ```js
+import { REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-shared';
+
 const registration = await navigator.serviceWorker.ready;
 const channel = new MessageChannel();
 
@@ -140,7 +146,7 @@ channel.port1.onmessage = (event) => {
 };
 
 registration.active?.postMessage({
-  type: 'REI_AMSG_DELIVER',
+  type: REI_SW_MESSAGE_TYPE.DELIVER,
   source: 'sse',
   requestId: crypto.randomUUID(),
   payload,
@@ -321,7 +327,9 @@ self.addEventListener('notificationclick', (event) => {
 离线入队（可选）：
 
 ```js
-import { REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-sw';
+// 页面侧从 shared import（本包 re-export 的是同一份常量；
+// import 本包会执行 SW 模块顶层状态，窗口环境里不合适）
+import { REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-shared';
 
 export async function enqueueRequestToSW(requestPayload) {
   const registration = await navigator.serviceWorker.ready;
@@ -383,6 +391,8 @@ export async function enqueueRequestToSW(requestPayload) {
 - `REI_SW_EVENT` — 2.1.0 新增，按 kind 分发的客户端事件名
 - `REI_AMSG_POSTMESSAGE_TYPE` — 2.1.0 新增，SW → client 广播信封的 `type` 字段（恒为 `'REI_AMSG_PUSH'`）
 - `REI_SW_MESSAGE_TYPE`
+
+以上常量的单一来源是 `@rei-standard/amsg-shared`（本包 re-export 同一份）。页面侧代码请直接从 shared import，避免在窗口环境里执行本包 SW 模块的顶层状态。
 
 `REI_SW_EVENT` 包含（详见上文 v2.1.0 章节）：
 

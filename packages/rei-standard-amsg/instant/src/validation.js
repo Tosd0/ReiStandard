@@ -9,71 +9,41 @@
  * scheduled-only fields here.
  */
 
-import { validateAvatarUrl } from '@rei-standard/amsg-shared';
-
-const VALID_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
+import { validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
 
 // `validateAvatarUrl` 现统一在 @rei-standard/amsg-shared（server / instant /
 // client 共用一份规则）。此处重导出，保持 `createInstantHandler` 的公开导出不变。
 export { validateAvatarUrl };
 
+// messages 数组的形状规则统一在 @rei-standard/amsg-shared 的
+// `validateLlmMessagesShape`（amsg-server 的 `validateLlmMessagesArray`
+// 也走同一实现，两包接受的形状不可能再漂移）。此处只把结构化错误码
+// 映射成本包既有的中文错误文案，返回形状（string | null）不变。
 function validateMessagesArray(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return 'messages 必须是长度 ≥ 1 的数组';
-  }
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+  const err = validateLlmMessagesShape(messages);
+  if (!err) return null;
+  const { code, index: i, toolCallIndex: j } = err;
+  switch (code) {
+    case 'MESSAGES_NOT_ARRAY':
+      return 'messages 必须是长度 ≥ 1 的数组';
+    case 'MESSAGE_NOT_OBJECT':
       return `messages[${i}] 必须是对象`;
-    }
-    if (!VALID_MESSAGE_ROLES.has(m.role)) {
+    case 'INVALID_ROLE':
       return `messages[${i}].role 必须是 system / user / assistant / tool 之一`;
-    }
-
-    // OpenAI 协议:assistant 消息在带 tool_calls 时, content 可为 null / 空串 / 缺省.
-    // 跳过 content 校验, 但仍要求 tool_calls 是非空数组 (否则就是无意义的纯空 assistant).
-    const isAssistantToolCallCarrier =
-      m.role === 'assistant'
-      && Array.isArray(m.tool_calls)
-      && m.tool_calls.length > 0;
-    if (isAssistantToolCallCarrier) {
-      // tool_calls 形状轻量校验 — 不严, 上游 LLM API 会再校一遍.
-      for (let j = 0; j < m.tool_calls.length; j++) {
-        const tc = m.tool_calls[j];
-        if (!tc || typeof tc !== 'object' || typeof tc.id !== 'string' || !tc.function) {
-          return `messages[${i}].tool_calls[${j}] 形状非法 (需要 { id, type:'function', function:{ name, arguments } })`;
-        }
-      }
-      continue;
-    }
-
-    // tool 消息: content 允许空串 (工具返回空结果是合法的, 例如 search 无命中);
-    // tool_call_id 必填 — 这是 OpenAI 协议的硬约束 (用于关联到此前的 tool_call).
-    if (m.role === 'tool') {
-      if (typeof m.content !== 'string' && !Array.isArray(m.content)) {
-        return `messages[${i}].content (tool) 必须是字符串或数组`;
-      }
-      if (typeof m.tool_call_id !== 'string' || !m.tool_call_id) {
-        return `messages[${i}].tool_call_id 必填 (tool 消息必须关联到一次 tool_call)`;
-      }
-      continue;
-    }
-
-    // system / user / 不带 tool_calls 的 assistant: 老校验.
-    if (typeof m.content === 'string') {
-      if (!m.content) {
-        return `messages[${i}].content 不能是空字符串`;
-      }
-    } else if (Array.isArray(m.content)) {
-      if (m.content.length === 0) {
-        return `messages[${i}].content 数组不能为空`;
-      }
-      // Element schema is intentionally not validated — passed through to LLM as-is.
-    } else {
+    case 'TOOL_CALL_MALFORMED':
+      return `messages[${i}].tool_calls[${j}] 形状非法 (需要 { id, type:'function', function:{ name, arguments } })`;
+    case 'TOOL_CONTENT_INVALID':
+      return `messages[${i}].content (tool) 必须是字符串或数组`;
+    case 'TOOL_CALL_ID_MISSING':
+      return `messages[${i}].tool_call_id 必填 (tool 消息必须关联到一次 tool_call)`;
+    case 'CONTENT_EMPTY_STRING':
+      return `messages[${i}].content 不能是空字符串`;
+    case 'CONTENT_EMPTY_ARRAY':
+      return `messages[${i}].content 数组不能为空`;
+    case 'CONTENT_INVALID_TYPE':
+    default:
       return `messages[${i}].content 必须是非空字符串或长度 ≥ 1 的数组`;
-    }
   }
-  return null;
 }
 
 /**

@@ -1,6 +1,5 @@
 /**
  * Shared SQL schema constants
- * ReiStandard SDK v2.0.1
  */
 
 export const TABLE_SQL = `
@@ -85,7 +84,11 @@ export const COLUMNS_SQL = `
   ORDER BY ordinal_position
 `;
 
-export const REQUIRED_COLUMNS = [
-  'id', 'user_id', 'uuid', 'encrypted_payload',
-  'message_type', 'next_send_at', 'status', 'retry_count'
-];
+// Update methods build a dynamic SET clause from object keys. Callers pass only
+// hardcoded column names today, but enforcing a whitelist keeps a future caller
+// from ever turning a caller-supplied key into interpolated SQL.
+// (The D1 adapter enforces the same list with its own in-file copy.)
+export const UPDATABLE_COLUMNS = new Set([
+  'user_id', 'uuid', 'encrypted_payload', 'message_type',
+  'next_send_at', 'lease_until', 'status', 'retry_count', 'created_at', 'updated_at'
+]);
