@@ -4,9 +4,9 @@
 >
 > 版本日期：2026-05-19
 >
-> 对齐实现（稳定版）：`@rei-standard/amsg-shared` 0.2.0、`@rei-standard/amsg-server` 2.5.2、`@rei-standard/amsg-instant` 0.9.1、`@rei-standard/amsg-client` 2.7.0、`@rei-standard/amsg-sw` 2.3.1。
+> 对齐实现：`@rei-standard/amsg-shared` / `amsg-server` / `amsg-instant` / `amsg-client` / `amsg-sw` 五个 npm 包（各包当前版本以其 `package.json` / npm 为准）。
 >
-> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。上层包对 `@rei-standard/amsg-shared` 用脱字号区间（`^0.2.0`）：在 0.x 上只放行同一 minor 内的补丁，shared 出补丁时消费者自动跟随，shared 升 minor 则需消费者显式升级区间。
+> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。上层包对 `@rei-standard/amsg-shared` 用脱字号区间（具体区间以各包 `package.json` 为准）：在 0.x 上只放行同一 minor 内的补丁，shared 出补丁时消费者自动跟随，shared 升 minor 则需消费者显式升级区间。
 
 ## 1. 目标与范围
 

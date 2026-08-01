@@ -1,5 +1,13 @@
 # Migration guide — 0.8.0-next.3 → 0.8.0-next.4
 
+> **Historical document.** This guide describes `@rei-standard/amsg-instant`
+> as of `0.8.0-next.4` and is kept for readers migrating across that
+> pre-release boundary. Later releases superseded some details — e.g.
+> `messageId` auto-fill is now done once per transport payload by
+> `ensureStableMessageId()` inside `deliverPush()`, not the
+> `msg_<uuid>_chunk_<i>` scheme described below. For current behavior see
+> the [README](../README.md) and [CHANGELOG](../CHANGELOG.md).
+
 `0.8.0-next.*` is a pre-release line. next.4 is intentionally breaking because we're consolidating two overlapping mechanisms (lib-side `splitPattern` auto-split + hook-side singular `pushPayload`) into one: **the hook returns the exact N pushes it wants sent, and the lib does zero splitting.**
 
 This guide expands on the CHANGELOG. If you only want a one-pager, [`CHANGELOG.md`](../CHANGELOG.md) has the cheat sheet.

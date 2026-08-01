@@ -24,7 +24,7 @@
 - [发送即时消息（加密 vs 明文）](#发送即时消息加密-vs-明文)
 - [`messages` 多轮 / `splitPattern` 自定义分句](#messages-多轮--splitpattern-自定义分句)
 - [本地软清空与可选 `maxPayloadBytes`](#本地软清空与可选-maxpayloadbytes)
-- [其他工具：scheduleMessage / listMessages / subscribePush…](#其他工具)
+- [其他工具：scheduleMessage / listMessages / client-state / subscribePush…](#其他工具)
 - [模块格式与环境](#模块格式与环境)
 
 ---
@@ -501,6 +501,14 @@ try {
 - `cancelMessage(uuid)` —— 取消任务
 - `listMessages(opts)` —— 拉当前 user 的任务列表
 - `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装
+
+对接单用户 amsg-server worker 的配套方法：
+
+- `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
+- `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，amsg-server 2.7.0+ 单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
+- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，amsg-server 2.6.0+ 单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 2.7.0+ 的 worker 会自动分片存储（feature `client-state-chunking`，可用 `getCapabilities()` 探测）
+- `getClientState(namespace)` —— 读回一个 namespace 的全部条目（走加密响应信封，方法内解密后返回明文值）
+- `clearClientState()` —— 清空该用户所有 namespace 的云端状态（如「清除云端数据」设置项）
 
 以及从 `@rei-standard/amsg-shared` re-export 的运行时常量 / builder / type guard：
 

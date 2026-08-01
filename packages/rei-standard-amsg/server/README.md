@@ -2,14 +2,7 @@
 
 `@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK：Blob 租户配置、`tenantToken` / `cronToken` 鉴权、标准路由处理器。API 规范见 [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)。
 
-## v2.0.1 变更摘要
-
-- 初始化流程合并为 `POST /api/v1/init-tenant`
-- 移除旧端点：`init-database`、`init-master-key`
-- 业务端点统一使用 `Authorization: Bearer <tenantToken>`
-- `send-notifications` 支持 `cronToken`（Header 或 query token）
-
-2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)。其中 `splitPattern` 是 server 调度任务的持久化配置；`amsg-instant` 0.8.0 起改为 hook 内自定义 split 函数 + `pushPayloads`。
+历史变更见各版本 [CHANGELOG](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/CHANGELOG.md)。2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)。其中 `splitPattern` 是 server 调度任务的持久化配置；`amsg-instant` 0.8.0 起改为 hook 内自定义 split 函数 + `pushPayloads`。
 
 ## 安装
 
@@ -208,23 +201,25 @@ const result = await ctx.scheduleTask({
 
 ## 导出 API（Exports）
 
-- `createReiServer`
-- `createAdapter`
-- `createTenantToken`
-- `verifyTenantToken`
-- `deriveUserEncryptionKey`
-- `decryptPayload`
-- `encryptForStorage`
-- `decryptFromStorage`
-- `validateScheduleMessagePayload`
-- `measurePushPayload`
-- `MAX_PUSH_PAYLOAD_BYTES`
-- `WEB_PUSH_MAX_BODY_BYTES`
-- `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
-- `isValidISO8601`
-- `isValidUrl`
-- `isValidUUID`
-- `isValidUUIDv4`
+包根（`@rei-standard/amsg-server`）：
+
+- `createReiServer` — 多租户装配线（标准路由处理器全家）
+- `createSingleUserServer` — 单用户装配线：没有租户概念，不需要 Blob 租户配置和 tenantToken 体系
+- `createSingleUserCloudflareWorker` — 单用户 Cloudflare Worker 一键装配（`fetch` + `scheduled` 两个入口）
+- `createAdapter` / `createD1Adapter` — pg·neon / Cloudflare D1 数据库适配器
+- `runScheduledTick` — 手动触发一轮到期任务投递（自定义 cron 宿主、要调 `claimLeaseMs` 时用）
+- `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
+- `createTenantToken` / `verifyTenantToken`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
+- `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl`
+- `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `isValidISO8601` / `isValidUrl` / `isValidUUID` / `isValidUUIDv4`
+
+`@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
+
+- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick`
+- `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
 
 ## 运行环境与要求
 
@@ -267,7 +262,7 @@ PUBLIC_BASE_URL=https://your-domain.com
 VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 ```
 
-Vercel 部署配置可参考 [`examples/vercel.json.example`](https://github.com/Tosd0/ReiStandard/blob/main/examples/vercel.json.example)。
+函数超时、响应头这类 Vercel 配置的写法可参考 [`tests/vercel.json.example`](https://github.com/Tosd0/ReiStandard/blob/main/tests/vercel.json.example)（它是 `tests/` 健康检查端点的部署配置，不是本包的部署模板）；环境变量用 `vercel env add` 或控制台配置，不写进 `vercel.json`。
 
 ## 相关链接（绝对 URL）
 

@@ -35,7 +35,7 @@
 
 ```bash
 cd tests
-cp ../examples/.env.test.example .env.test
+cp .env.test.example .env.test
 # 编辑 .env.test 后执行
 ./run-test.sh
 ```

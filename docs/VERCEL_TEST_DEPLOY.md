@@ -1,4 +1,4 @@
-# 生产环境测试端点部署指南（v2.0.1）
+# 生产环境测试端点部署指南
 
 将 `tests/test-vercel-function.js` 部署为 Serverless 健康检查端点。
 
@@ -21,7 +21,7 @@
 ### 1. 添加测试端点
 
 ```bash
-cp tests/test-vercel-function.js /api/test-active-messaging.js
+cp tests/test-vercel-function.js api/test-active-messaging.js
 ```
 
 ### 2. 部署
@@ -57,25 +57,30 @@ active-messaging-test/
 
 ### 3. 示例 `vercel.json`
 
+环境变量不写进 `vercel.json`（旧的 `"env"` + `@secret` 引用语法已被 Vercel 下线），`vercel.json` 只留函数配置：
+
 ```json
 {
-  "version": 2,
-  "env": {
-    "TENANT_DATABASE_URL": "@rei-tenant-database-url"
+  "functions": {
+    "api/test-active-messaging.js": {
+      "maxDuration": 300
+    }
   }
 }
 ```
 
-### 4. 设置 Secret
+### 4. 设置环境变量
+
+用 CLI 添加（命令会交互式询问值），或在 Vercel 控制台 Project → Settings → Environment Variables 里配置：
 
 ```bash
-vercel secrets add rei-tenant-database-url "postgres://..."
+vercel env add TENANT_DATABASE_URL production
 ```
 
 如果服务端启用了初始化鉴权，再额外配置：
 
 ```bash
-vercel secrets add rei-init-secret "your_init_secret"
+vercel env add INIT_SECRET production
 ```
 
 ## CI/CD 集成（示例）

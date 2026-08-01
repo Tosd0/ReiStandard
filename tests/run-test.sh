@@ -25,7 +25,7 @@ if [ ! -f .env.test ]; then
     echo "❌ 错误: 找不到 .env.test 配置文件"
     echo ""
     echo "请执行以下步骤:"
-    echo "  1. 复制配置模板: cp ../examples/.env.test.example .env.test"
+    echo "  1. 复制配置模板: cp .env.test.example .env.test"
     echo "  2. 编辑配置文件: nano .env.test"
     echo "  3. 填写必需配置项:"
     echo "     - API_BASE_URL"

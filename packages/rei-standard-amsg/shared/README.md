@@ -96,11 +96,17 @@ fields above are validated by the builders when present.
 | `title`            | `string?`      |                                                             |
 | `contactName`      | `string?`      |                                                             |
 | `avatarUrl`        | `string \| null?` |                                                          |
+| `messageIndex`     | `number?`      | 1-based part index when a producer sentence-splits reasoning into a burst. Omit for singletons. |
+| `totalMessages`    | `number?`      | Total parts of that split. Omit for singletons.             |
+| `chunkIndex`       | `number?`      | Transport-only slice index when a single segment exceeds the Web Push payload limit (see `chunkReasoningByUtf8Bytes`). |
+| `totalChunks`      | `number?`      | Total transport slices. Omit when not sliced.               |
 
-**No `messageIndex` / `totalMessages`.** Reasoning is one push per
-LLM round, never a split-burst. Those fields are absent at the type
-level on purpose — making them optional would leave callers
-wondering when they're set.
+Both multi-part axes are **omitted from the wire when the part count
+is 1**, so single-shot reasoning stays byte-for-byte identical to
+older payloads. Current producers emit one `ReasoningPush` per LLM
+round and set neither — oversized reasoning rides the generic
+multipart transport instead. The two axes can coexist when a
+sentence-split segment is itself oversized.
 
 Emitted **before** the matching `ContentPush` burst when the LLM
 response carried a non-empty `reasoning_content`.
@@ -116,8 +122,11 @@ response carried a non-empty `reasoning_content`.
 | `message`     | `string?`        | Optional human-readable tag for the request.                |
 
 Emitted by an agentic-loop hook returning
-`{ decision: 'tool-request', pushPayload }`. The client is expected
-to execute the tool and resume via `/continue`.
+`{ decision: 'tool-request', pushPayloads }`. In the default
+(amsg-instant) flavor the client executes the tools and resumes via
+`/continue`; amsg-server's fire-time loop runs the tools in-process
+instead and may carry a `toolCalls` array directly — see
+`assertValidDecision` below.
 
 ### `ErrorPush` — producer-level error
 
@@ -221,7 +230,7 @@ const error = buildErrorPush({
 ### Type guards
 
 ```js
-import { isContentPush, isReasoningPush, isErrorPush } from '@rei-standard/amsg-shared';
+import { isContentPush, isReasoningPush, isToolRequestPush, isErrorPush } from '@rei-standard/amsg-shared';
 
 if (isContentPush(push)) {
   // push.message is `string`
@@ -251,6 +260,68 @@ PUSH_SOURCE.SCHEDULED;      // 'scheduled'
 
 ---
 
+## Shared building blocks
+
+Besides the push schema, this package is the single source of truth
+for helpers that `amsg-instant`, `amsg-server`, and `amsg-sw` used to
+each keep a copy of. All are exported from the package root; the
+one-liners below are just a map — see the JSDoc on each export for
+the full contract.
+
+### Bytes / encoding / crypto
+
+`toUint8` · `concatBytes` · `utf8` · `utf8Decode` · `bytesToBase64` ·
+`bytesToBase64Url` · `base64UrlToBytes` · `jsonToBase64Url` ·
+`bytesToHex` · `hexToBytes` · `randomBytes` · `hmacSha256` ·
+`timingSafeEqualBytes` — WebCrypto-friendly byte/encoding helpers for
+base64url, hex, HMAC, and constant-time comparison.
+
+### LLM call
+
+| Export | What it is |
+|---|---|
+| `callLlm(...)` | Call an OpenAI-compatible chat-completions endpoint with timeout / abort handling (default 300 000 ms, injectable `fetch`). |
+| `buildLlmRequestBody(...)` | Build the request body for prompt mode or `messages` mode. |
+| `normalizeAiApiUrl(apiUrl)` | Normalize a base URL to its chat-completions endpoint without doubling `/v1`; unrecognized paths pass through unchanged. |
+| `validateLlmMessagesShape(...)` | Validate a `messages` array, including assistant `tool_calls` and `role: 'tool'` entries. |
+| `LLM_MESSAGES_ERROR` | Stable error codes emitted by that validation. |
+
+### Web Push
+
+| Export | What it is |
+|---|---|
+| `sendWebPush(...)` | RFC 8291 payload encryption + RFC 8292 VAPID auth + POST to the push service (`err.code = 'PUSH_SEND_FAILED'` on failure). |
+| `buildVapidJwt(...)` / `verifyVapidJwt(...)` | Build / verify the ES256 VAPID JWT. |
+| `normalizeVapidSubject(...)` | Normalize the VAPID subject (e.g. add the `mailto:` prefix). |
+
+### Wire-protocol constants
+
+| Export | What it is |
+|---|---|
+| `MULTIPART_MESSAGE_KIND` / `MULTIPART_ENCODING` / `MULTIPART_VERSION` | The generic multipart chunk envelope (`'_multipart'`) produced by `amsg-instant` and reassembled by `amsg-sw`. |
+| `DEFAULT_MULTIPART_TTL_MS` / `DEFAULT_MULTIPART_MAX_CHUNKS` / `DEFAULT_MULTIPART_MAX_TOTAL_BYTES` | Multipart reassembly budget defaults. |
+| `REI_AMSG_POSTMESSAGE_TYPE` / `REI_SW_EVENT` / `REI_SW_MESSAGE_TYPE` / `REI_AMSG_DELIVER_MESSAGE_TYPE` | The window ⇄ Service Worker `postMessage` protocol strings — import these instead of hard-coding the literals. |
+
+### Agentic-loop contract
+
+| Export | What it is |
+|---|---|
+| `assertValidDecision(decision, options?)` | Runtime-validate an `onLLMOutput` hook decision (`finish` / `tool-request` / `continue` / `skip-push`); `{ inlineToolCalls: true }` enables the amsg-server flavor. |
+| `extractToolCallsFromDecision(...)` | Pull tool calls out of either decision flavor (inline `toolCalls` or tool-request `pushPayloads`). |
+| `buildSessionContext(...)` | Build the frozen, credential-free context object handed to agentic hooks. |
+| `extractAssistantMessage(...)` | Safely read `choices[0].message` off an LLM response (never throws). |
+| `readReasoningContent(...)` | Read `reasoning_content` off an assistant message; empty string means "none". |
+| `stripReasoningTags(...)` | Strip reasoning that leaked into `message.content` so it doesn't ship inside the `ContentPush` burst. |
+| `chunkReasoningByUtf8Bytes(text, maxBytes)` | Split reasoning text on safe UTF-8 edges for payload-limited transports. |
+
+### Validation misc
+
+`isValidUrl` · `validateAvatarUrl` · `AVATAR_URL_MAX_LENGTH` — the
+avatar-URL soft-strip rule shared by client / instant / server
+(standards §6.2).
+
+---
+
 ## Invariants
 
 1. **`messageKind` is a literal-type discriminator.** Producers must
@@ -260,8 +331,10 @@ PUSH_SOURCE.SCHEDULED;      // 'scheduled'
    `ReasoningPush` and the `ContentPush`(es) it precedes share the
    same `sessionId`. Agentic-loop multi-iteration runs reuse the
    same `sessionId` across iterations.
-3. **`ReasoningPush` carries no `messageIndex` / `totalMessages`.**
-   Those fields belong to the content N-split burst.
+3. **Multi-part fields are omitted for singletons.** On `ContentPush`
+   and `ReasoningPush` alike, `messageIndex` / `totalMessages` (and
+   reasoning's `chunkIndex` / `totalChunks`) only appear on genuine
+   multi-part bursts — never as a redundant `1 / 1`.
 4. **`metadata` is caller-owned.** Packages must add protocol-level
    data as top-level fields, never inside `metadata`.
 5. **`source` is the routing origin, not the dispatch type.**

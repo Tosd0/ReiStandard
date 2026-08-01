@@ -26,6 +26,8 @@
 npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
 ```
 
+仓库处于 Changesets pre（`next`）模式期间，新功能先以 `x.y.z-next.N` 版本发到 `next` dist-tag，`latest` 停在进入 pre 模式前的稳定线。要用最新功能请显式装 `next`（如 `npm install @rei-standard/amsg-client@next`）；是否处于 pre 模式以 `.changeset/pre.json` 为准，详见 [`RELEASING.md`](./RELEASING.md)。
+
 ## 推送 schema
 
 每条推送用三个互不影响的维度描述："用什么方式发出去"（dispatch）、"属于哪个业务"（business）、"载荷里装的是什么"（content）。三者拆开，给某一个维度加新值时，另外两个不用动。
@@ -88,6 +90,8 @@ ReiStandard/
 │   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）
 │   └── sw/                      # Service Worker（推送展示、离线队列）
 ├── examples/                    # 手动接入示例（不用 SDK 包时的备用路径）
+├── tests/                       # 手动 E2E 冒烟脚本（打真实部署验证，不接 CI）
+├── scripts/                     # 仓库自检脚本（ESM 语法 / 包管理器检查）
 └── docs/                        # 本地测试、生产监控
 ```
 
