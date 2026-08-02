@@ -33,6 +33,10 @@ const EXPECTED_FEATURES = [
   'recurring-stale-skip-hook',
   'task-timezone',
   'user-push-subscription',
+  'get-message-detail',
+  'update-message-contact-name',
+  'tick-serialize-by',
+  'fire-settled-hook',
 ];
 
 function makeWorker(extra = {}) {

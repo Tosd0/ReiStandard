@@ -28,6 +28,13 @@
  *   error 为 null；第 k 段失败时 sentCount = k、error 带原始错误，且在错误往
  *   上抛之前调用完。hook 自身抛错只记日志，不影响主流程（见
  *   lib/agentic-fire.js）。
+ * @param {function} [config.onFireSettled] - 一次 fire 收尾的可选 hook：
+ *   ({ task, status, skipReason, sentCount, total, iterations, error,
+ *   scratch, readState, writeState }) => void|Promise。onBeforeFire 被调用过
+ *   就一定会调一次，无论这次是发完（status 'sent'）、跳过（'skipped'）、抛错
+ *   （'failed'）还是交还给冻结 prompt 老链路（'not-handled'）。onAfterSend 只
+ *   走「有 push 要发」那条路，「开始时占点什么、结束时放掉」的写法挂这个才不
+ *   会漏（见 lib/agentic-fire.js）。
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
@@ -38,6 +45,7 @@ import { createScheduleMessageHandler } from './handlers/schedule-message.js';
 import { createUpdateMessageHandler } from './handlers/update-message.js';
 import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
+import { createGetMessageHandler } from './handlers/get-message.js';
 import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
 import { createClientStateHandler } from './handlers/client-state.js';
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
@@ -71,6 +79,9 @@ export function createSingleUserServer(config) {
     maxStateValueBytes: config.maxStateValueBytes,
     // 推送发出（或发挂）之后的 hook（见 lib/agentic-fire.js 的 notifyAfterSend）。
     onAfterSend: config.onAfterSend,
+    // 一次 fire 收尾的 hook，什么结局都会调一次（见 lib/agentic-fire.js 的
+    // notifyFireSettled）。
+    onFireSettled: config.onFireSettled,
     // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
     maxScheduledTasksPerFire: config.maxScheduledTasksPerFire
   };
@@ -84,6 +95,7 @@ export function createSingleUserServer(config) {
       updateMessage: createUpdateMessageHandler(ctx),
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx),
+      getMessage: createGetMessageHandler(ctx),
       vapidPublicKey: createVapidPublicKeyHandler(ctx),
       clientState: createClientStateHandler(ctx),
       pushSubscription: createPushSubscriptionHandler(ctx),

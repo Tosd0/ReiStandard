@@ -107,7 +107,7 @@ export class NeonAdapter {
   async getTaskByUuid(uuid, userId) {
     const sql = this._getSql();
     const rows = await sql.query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
        FROM scheduled_messages
        WHERE uuid = $1 AND user_id = $2 AND status = 'pending'
        LIMIT 1`,
@@ -202,6 +202,7 @@ export class NeonAdapter {
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= NOW()
          AND (lease_until IS NULL OR lease_until <= NOW())
+         AND (retry_after IS NULL OR retry_after <= NOW())
        ORDER BY next_send_at ASC
        LIMIT $1`,
       [limit]
@@ -228,22 +229,43 @@ export class NeonAdapter {
    * 比 next_send_at 时两边都截到毫秒：列是 timestamptz（微秒精度），驱动读
    * 出来是 JS Date（毫秒精度），原值送回去可能因为亚毫秒差对不上。
    *
+   * 带 serializeGroup 时多一道分组门：同一分组里已经有别的行拿着未到期的租
+   * 约，这条就领不走（同一分组同时只跑一条）。判定和写租约在同一条 UPDATE
+   * 里完成，「先查再占」的空档天然不存在。分组门只看租约，不看
+   * `retry_after`：等着重试的任务其实闲着，不该把同分组的其他任务一起堵住。
+   *
    * @param {number} taskId
    * @param {string|Date} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
    * @param {string|Date} leaseUntil - 租期末尾
-   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、排期被改过、或行已不是 pending
+   * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
+   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、同分组
+   *   有任务正在跑、排期被改过、或行已不是 pending
    */
-  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null) {
     const sql = this._getSql();
+    const grouped = typeof serializeGroup === 'string' && serializeGroup.length > 0;
+    const params = [leaseUntil, taskId, expectedNextSendAt];
+    let setClause = 'lease_until = $1, updated_at = NOW()';
+    let groupGuard = '';
+    if (grouped) {
+      params.push(serializeGroup); // $4
+      setClause = 'lease_until = $1, serialize_group = $4, updated_at = NOW()';
+      groupGuard = `
+          AND NOT EXISTS (
+            SELECT 1 FROM scheduled_messages busy
+             WHERE busy.serialize_group = $4 AND busy.id <> $2
+               AND busy.status = 'pending' AND busy.lease_until > NOW()
+          )`;
+    }
     const rows = await sql.query(
       `UPDATE scheduled_messages
-          SET lease_until = $1, updated_at = NOW()
+          SET ${setClause}
         WHERE id = $2 AND status = 'pending'
           AND date_trunc('milliseconds', next_send_at)
             = date_trunc('milliseconds', $3::timestamptz)
-          AND (lease_until IS NULL OR lease_until <= NOW())
+          AND (lease_until IS NULL OR lease_until <= NOW())${groupGuard}
        RETURNING id`,
-      [leaseUntil, taskId, expectedNextSendAt]
+      params
     );
     return rows.length > 0;
   }

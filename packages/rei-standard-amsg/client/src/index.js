@@ -1027,6 +1027,45 @@ export class ReiClient {
     };
   }
 
+  /**
+   * Read one task, with its **full** `metadata` (amsg-server 2.6.0+
+   * `GET /message`).
+   *
+   * `listMessages` 的每条任务只带 `charId` / `clientTaskId` 两个 metadata 子
+   * 字段——一页最多 100 条，整份 metadata 驮上去会把响应撑得很大。要改
+   * metadata 时得用这个：`updateMessage` 对 `metadata` 是**整体替换**，只改其
+   * 中一个键就必须先读回完整的那份改完再传，只传一部分会把宿主存在里面的其余
+   * 键一起冲掉。
+   *
+   * 只读得到还没发出去的任务；已完成 / 已失败的返回 409
+   * `TASK_ALREADY_COMPLETED`，不存在返回 404 `TASK_NOT_FOUND`（与
+   * `updateMessage` 同一口径）。老 worker 没有这个路由 → 404 `NOT_FOUND`，用
+   * `getCapabilities()` 的 `get-message-detail` 探测。
+   *
+   * @param {string} uuid - Task UUID.
+   * @returns {Promise<Object>} `{ success, encrypted, version, data: { task } }`
+   */
+  async getMessage(uuid) {
+    const res = await fetch(`${this._baseUrl}/message?id=${encodeURIComponent(uuid)}`, {
+      method: 'GET',
+      headers: this._withServerToken({
+        'X-User-Id': this._userId,
+        'X-Response-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      })
+    });
+
+    const json = await res.json();
+    if (!json?.success || json?.encrypted !== true) return json;
+
+    return {
+      success: true,
+      encrypted: true,
+      version: json.version || 1,
+      data: await this._decrypt(json.data)
+    };
+  }
+
   // ─── Client state (single-user cloud mirror) ────────────────────
 
   /**

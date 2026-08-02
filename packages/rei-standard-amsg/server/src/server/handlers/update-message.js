@@ -68,6 +68,17 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['nextSendAt'] } } } };
     }
 
+    // contactName：用户给角色改了名之后，已经排好的任务推送出来的通知标题
+    // （「来自 <contactName>」）还得跟着改。校验口径对齐 schedule-message 的
+    // 必填项——非空字符串。空串 / null 直接打回，不做「传了就忽略」：那会写出
+    // 一条标题是「来自 undefined」的任务，而调用方以为改成功了。
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'contactName') &&
+      (typeof updates.contactName !== 'string' || !updates.contactName.trim())
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'contactName 必须是非空字符串', details: { invalidFields: ['contactName'] } } } };
+    }
+
     if (updates.recurrenceType && !['none', 'daily', 'weekly'].includes(updates.recurrenceType)) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['recurrenceType'] } } } };
     }
@@ -170,9 +181,15 @@ export function createUpdateMessageHandler(ctx) {
     const updatedData = {
       ...existingData,
       ...promptUpdates,
+      ...(Object.prototype.hasOwnProperty.call(updates, 'contactName') && { contactName: updates.contactName }),
       ...(updates.userMessage && { userMessage: updates.userMessage }),
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'tzId') && { tzId: updates.tzId ?? null }),
+      // avatarUrl 走 truthy spread：显式传 null 只是「不改」，不是「清空」。
+      // 与 tzId / splitPattern 那几个 hasOwnProperty 的字段不一样，是因为
+      // §6.2 的软清空策略要求非法头像从 patch 里被摘掉、旧头像原样保留，而
+      // 「摘掉」和「传了个 null」在这一层看起来是同一件事。真要支持清空，得
+      // 先把这两件事区分开，不能只把判断换成 hasOwnProperty。
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
       ...(updates.metadata && { metadata: updates.metadata }),
       ...(updates.apiUrl && { apiUrl: updates.apiUrl }),

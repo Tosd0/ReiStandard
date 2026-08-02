@@ -49,6 +49,15 @@ test('fetch routes init + schedule + messages, unknown → 404', async () => {
   }), env);
   assert.equal(listRes.status, 200);
 
+  // 复数是列表、单数是单条。两条路由都用 endsWith 匹配，这里钉住它们不会互相
+  // 吃掉请求：/messages 拿到的是列表（上面那条 200），/message 缺 id 会被单条
+  // 处理器打回 400 —— 要是路由串了，这里会变成列表的 200。
+  const detailNoId = await worker.fetch(new Request('https://w.dev/message', {
+    method: 'GET', headers: { 'X-User-Id': USER }
+  }), env);
+  assert.equal(detailNoId.status, 400);
+  assert.equal((await detailNoId.json()).error.code, 'TASK_ID_REQUIRED');
+
   const notFound = await worker.fetch(new Request('https://w.dev/nope', { method: 'GET' }), env);
   assert.equal(notFound.status, 404);
 

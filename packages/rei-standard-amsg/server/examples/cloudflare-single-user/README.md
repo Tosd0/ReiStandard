@@ -27,8 +27,10 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/capabilities`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
+
+`GET /messages` 是列表，`GET /message?id=<uuid>` 是单条。单条比列表多给一个**完整的 `metadata`**：`PUT /update-message` 对 `metadata` 是整体替换，只改其中一个键就得先把完整那份读回来。列表不带整份 metadata——一页最多 100 条，每条都驮着它会把响应撑得很大。
 
 `GET /vapid-public-key` 返回本 Worker 的 `VAPID_PUBLIC_KEY`，供前端创建 Web Push 订阅时作 `applicationServerKey`；未配置 VAPID 时返回 503。跟其它端点一样受 CORS 和 `serverToken` 约束。
 
@@ -289,6 +291,60 @@ export default createSingleUserCloudflareWorker((env) => ({
 
 两个 hook 都自带 `readState` / `writeState`（当前用户的 `client_state`）。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。两个都是 best-effort，自身抛错只记日志。
 
+## 一次 fire 的收尾回执（onFireSettled）
+
+这是啥：**只要 `onBeforeFire` 被调用过**，这次 fire 无论是发完了、跳过了、还是半路抛错，都会调一次 `onFireSettled`。「开始时占点什么、结束时放掉」的写法挂这个。
+
+```js
+export default createSingleUserCloudflareWorker((env) => ({
+  // ...其余 config
+  async onFireSettled(info) {
+    // info: { task, status, skipReason, sentCount, total, iterations, error,
+    //         scratch, readState, writeState }
+    if (info.scratch.scheduledFollowUp) {
+      // fire 里用 ctx.scheduleTask 建出来的任务已经真的写进库了，不管这次有没
+      // 有发出去，账都得记上——不然它只活在数据库里：面板列不出、用户取消不
+      // 掉，却照样到点触发。
+      await info.writeState('tasks', [{ key: info.scratch.scheduledFollowUp.uuid, value: '…' }]);
+    }
+  },
+}));
+```
+
+`status` 四种：
+
+| status | 什么时候 |
+|---|---|
+| `sent` | pushPayloads 全部发完（`sentCount === total`） |
+| `skipped` | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`） |
+| `failed` | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数 |
+| `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管 |
+
+跟 `onAfterSend` 的分工：`onAfterSend` 只走「有 push 要发」这条路，`onFireSettled` 什么结局都到。正常发完时两个都会调，`onAfterSend` 在前。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。同样是 best-effort，自身抛错只记日志。
+
+## 同一个角色的任务不要撞在一起（serializeBy）
+
+这是啥：同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互不知情的消息；宿主在 hook 里维护的「我刚才说过什么」台账是读进内存 → 改 → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条。
+
+config 顶层挂一个 `serializeBy`，返回这条任务属于哪一组，同一组同时只跑一条：
+
+```js
+export default createSingleUserCloudflareWorker((env) => ({
+  // ...其余 config
+  serializeBy: (task) => task.metadata?.charId ?? null,
+}));
+```
+
+- 参数是与 `onBeforeFire` 的 `ctx.task` 同一份的只读任务视图（凭据已剔除）。
+- 返回 `null` / 空串，或者根本不配这个函数 → 这条任务不参与串行，行为与以前完全一致。
+- **跨跳也算**：上一跳的 fire 还在跑（还拿着租约）时，下一跳捞到同组的另一条任务照样不放行。一次 fire 常常跑十几秒到几分钟，只挡同一跳是不够的。
+- 同一跳内同组也只放行一条，放行的是**到点更早**的那条；本跳跑完之后不补跑同组剩下的，留给下一跳（cron 一分钟就再来）。
+- 被拦下的任务是**推迟不是丢弃**：`next_send_at` / `status` / `retry_count` 一个字段都不会被动，下一跳原样再捞一次。跳过的条数记在 tick 返回值的 `details.serializeSkippedTasks`（同一跳内拦下的）和 `details.claimSkippedTasks`（跨跳拦下的）里。
+- 函数自身抛错时这条任务这一跳不跑：分不清它属于哪一组，就不该冒着破坏台账的风险跑下去。
+- 正在等重试的任务不算「这一组忙着」——退避时刻记在 `retry_after` 上，租约当场就放掉了。
+
+分组 key 不会明文落库：库拿它和该用户的存储密钥做一次 HMAC，`serialize_group` 列里存的是那个派生值。
+
 ## 推送里带什么
 
 每条从任务发出去的 push 顶层带 `taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs`，客户端据此认领这条任务、判断它还会不会再来——角色在 fire 里给自己排的任务客户端从没见过，靠这四个字段就能把它记进面板、让用户取消得掉。hook 自己在 `pushPayloads` 里写了这几个字段会被库覆盖：它们描述的是任务行的事实，不是内容。
@@ -301,9 +357,11 @@ cron 一分钟一跳，跳与跳之间互不相让；带工具的任务跑过一
 
 租约写在自己的列上，`next_send_at` 全程不动。`ctx.task.nextSendAt` 拿到的就是这条任务原本的触发时刻，拿它当时间锚点（窗口判断、缓存键）对得上；循环任务也按它推进到下一次。投递收尾时租约就放掉。
 
+投递失败的退避记在另一列 `retry_after` 上，租约同时放掉。两件事分开记：租约的意思只有「这条正在跑」，而正在等重试的任务其实闲着——挤在一列的话，`serializeBy` 会把它当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。
+
 Worker 中途被回收就没人来放租约，这条任务会等到租约到期才被后面的 tick 接手。所以租期要比最慢的一次投递长一点，但也别设太长——它同时也是「崩了之后多久能重来」的等待时间。
 
-`lease_until` 是这次新加的列。部署后 `POST /init-tenant` 会自动给已有的表补上；手工建表的看 `schema.sql`。
+任务表用到三列 `lease_until` / `retry_after` / `serialize_group`。部署后 `POST /init-tenant` 会自动给已有的表补上（跑几次都没事）；手工建表的看 `schema.sql`。
 
 ## 导入入口
 

@@ -79,6 +79,8 @@ const REI_AMSG_DEDUPE_STORE = 'delivery-dedupe';
 const DEFAULT_DEDUPE_TTL_MS = 10 * 60_000;
 const DEFAULT_DEDUPE_CLEANUP_INTERVAL_MS = 60_000;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
+// 通知正文的兜底文案（opts.defaultBody 可覆盖），见 resolveNotificationBody。
+const DEFAULT_NOTIFICATION_BODY = 'New message';
 // multipart 的 kind / encoding / version 与限额默认值来自
 // @rei-standard/amsg-shared 的 protocol 模块（与 instant 发送端同一份）。
 const DEFAULT_MULTIPART_OPTIONS = Object.freeze({
@@ -110,6 +112,8 @@ export {
  * @typedef {Object} ReiSWOptions
  * @property {string} [defaultIcon]  - Fallback notification icon URL.
  * @property {string} [defaultBadge] - Fallback notification badge URL.
+ * @property {string} [defaultBody]  - Fallback notification body, used when the
+ *   payload's body/message is empty or blank (default `'New message'`).
  * @property {Object} [multipart]
  * @property {boolean} [multipart.enabled=true]
  * @property {number} [multipart.ttlMs=60000]
@@ -135,6 +139,8 @@ export {
 export function installReiSW(sw, opts = {}) {
   const defaultIcon = opts.defaultIcon || '/icon-192x192.png';
   const defaultBadge = opts.defaultBadge || '/badge-72x72.png';
+  // 正文空白时顶上的那一句，见 resolveNotificationBody。
+  const defaultBody = opts.defaultBody || DEFAULT_NOTIFICATION_BODY;
   const multipart = normalizeMultipartOptions(opts.multipart);
   const dedupe = normalizeDedupeOptions(opts.dedupe);
   let lastMultipartCleanupAt = 0;
@@ -142,6 +148,7 @@ export function installReiSW(sw, opts = {}) {
   const makeDeliveryContext = (source) => ({
     defaultBadge,
     defaultIcon,
+    defaultBody,
     dedupe,
     multipart,
     onDuplicate: opts.onDuplicate,
@@ -233,6 +240,7 @@ async function handlePushPayload(sw, payload, ctx) {
   const dispatchResult = await dispatchBusinessPayload(sw, payload, {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
+    defaultBody: ctx.defaultBody,
     onBusinessPayload: ctx.onBusinessPayload,
   }, async (intermediateResult) => {
     // Settle the dedupe pending flag as soon as the notification policy
@@ -473,12 +481,32 @@ function readPushPayload(event) {
   }
 }
 
+/**
+ * 通知正文的兜底：正文取下来是空的（发送方漏了、或者内容被上游截没了）时用
+ * 这一句顶上，而不是弹一条只有标题、正文空白的横幅——用户在锁屏上看到一条什
+ * 么都没有的消息、未读 +1、点进去也是空的。
+ *
+ * 兜底只能是「弹一条有内容的」，不能是「干脆不弹」：订阅是按
+ * `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，不弹会被
+ * Firefox 按配额退订、iOS 可能撤掉推送权限（见 README 的通知策略一节）。
+ *
+ * @param {unknown} value - 从 payload 上取到的正文
+ * @param {{ defaultBody: string }} defaults
+ * @returns {string}
+ */
+function resolveNotificationBody(value, defaults) {
+  const body = typeof value === 'string' ? value : '';
+  if (body.trim()) return body;
+  const fallback = defaults && defaults.defaultBody;
+  return typeof fallback === 'string' && fallback.trim() ? fallback : DEFAULT_NOTIFICATION_BODY;
+}
+
 function createNotificationFromPayload(payload, defaults) {
   if (!payload || typeof payload !== 'object') {
     return {
       title: 'New notification',
       options: {
-        body: String(payload || ''),
+        body: resolveNotificationBody(payload == null ? '' : String(payload), defaults),
         icon: defaults.defaultIcon,
         badge: defaults.defaultBadge
       }
@@ -494,7 +522,10 @@ function createNotificationFromPayload(payload, defaults) {
     payload.title ||
     (payload.contactName && `来自 ${payload.contactName}`) ||
     'New notification';
-  const body = pushNotification.body || payload.body || payload.message || '';
+  const body = resolveNotificationBody(
+    pushNotification.body || payload.body || payload.message || '',
+    defaults
+  );
   const data = pushNotification.data && typeof pushNotification.data === 'object'
     ? { ...pushNotification.data }
     : (payload.data && typeof payload.data === 'object' ? { ...payload.data } : {});
@@ -769,6 +800,7 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
   const notification = createNotificationFromPayload(payload, {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
+    defaultBody: ctx.defaultBody,
   });
 
   await sw.registration.showNotification(notification.title, notification.options);

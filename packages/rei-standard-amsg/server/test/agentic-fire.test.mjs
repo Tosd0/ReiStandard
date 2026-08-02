@@ -1560,6 +1560,167 @@ describe('onAfterSend（推送发出之后的 hook）', () => {
   });
 });
 
+// onAfterSend 只在「有 push 要发」这条路上走。hook 判断这次不用说话、或者
+// 链路中途抛错时，宿主此前收不到任何收尾信号——「开始时占点什么、结束时放
+// 掉」的写法必然漏（fire 里已经真建出来的任务没人记账、拿到的锁没处释放）。
+// 下面每条都是那种漏法的钉子：onBeforeFire 被调用过，就必须有一次回执。
+describe('onFireSettled（一次 fire 收尾，什么结局都调）', () => {
+  const finishTwo = {
+    onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+    onLLMOutput: async () => ({
+      decision: 'finish',
+      pushPayloads: [{ messageKind: 'content', message: 'A' }, { messageKind: 'content', message: 'B' }],
+    }),
+  };
+
+  async function runWithSettled(hooks, extraCtx = {}) {
+    const { task } = await makeTask();
+    const calls = [];
+    const llm = stubLlm([finishRound]);
+    let result;
+    try {
+      result = await processSingleMessage(task, {
+        ...makeCtx({ hooks }),
+        ...extraCtx,
+        onFireSettled: async (info) => { calls.push(info); },
+      });
+    } finally {
+      llm.restore();
+    }
+    return { task, calls, result };
+  }
+
+  test('正常发完：status sent，带 sentCount / total / iterations', async () => {
+    const { task, calls, result } = await runWithSettled(finishTwo);
+    assert.equal(result.success, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].task, task);
+    assert.equal(calls[0].status, 'sent');
+    assert.equal(calls[0].skipReason, null);
+    assert.equal(calls[0].sentCount, 2);
+    assert.equal(calls[0].total, 2);
+    assert.equal(calls[0].iterations, 1);
+    assert.equal(calls[0].error, null);
+    // 状态读写口跟着回执一起来（与 onAfterSend 同一套）。
+    assert.equal(typeof calls[0].readState, 'function');
+    assert.equal(typeof calls[0].writeState, 'function');
+  });
+
+  test('onBeforeFire 直接 skip：status skipped / skipReason before-fire', async () => {
+    const { calls, result } = await runWithSettled({
+      onBeforeFire: async () => ({ skip: true }),
+      onLLMOutput: async () => { throw new Error('不该走到这里'); },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.messagesSent, 0);
+    assert.equal(calls.length, 1, 'skip 也要有收尾回执');
+    assert.equal(calls[0].status, 'skipped');
+    assert.equal(calls[0].skipReason, 'before-fire');
+    assert.equal(calls[0].sentCount, 0);
+    assert.equal(calls[0].total, 0);
+    assert.equal(calls[0].iterations, 0);
+    assert.equal(calls[0].error, null);
+  });
+
+  test('模型跑完判定不发（skip-push）：status skipped / skipReason skip-push', async () => {
+    const { calls, result } = await runWithSettled({
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'skip-push' }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(calls.length, 1, '没有可发的 push 也要有收尾回执');
+    assert.equal(calls[0].status, 'skipped');
+    assert.equal(calls[0].skipReason, 'skip-push');
+    assert.equal(calls[0].iterations, 1);
+  });
+
+  test('链路抛错：status failed，带原始错误', async () => {
+    const { calls, result } = await runWithSettled({
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => { throw new Error('classifier exploded'); },
+    });
+    assert.equal(result.success, false);
+    assert.equal(calls.length, 1, '抛错也要有收尾回执');
+    assert.equal(calls[0].status, 'failed');
+    assert.ok(calls[0].error instanceof Error);
+    assert.match(calls[0].error.message, /classifier exploded/);
+  });
+
+  test('发到一半挂掉：status failed，sentCount / total 说清发出去了几段', async () => {
+    let sends = 0;
+    const { calls, result } = await runWithSettled(finishTwo, {
+      webpush: {
+        async sendNotification() {
+          sends++;
+          if (sends === 2) throw new Error('push endpoint gone');
+        },
+      },
+    });
+    assert.equal(result.success, false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].status, 'failed');
+    assert.equal(calls[0].sentCount, 1);
+    assert.equal(calls[0].total, 2);
+    assert.match(calls[0].error.message, /push endpoint gone/);
+  });
+
+  test('onBeforeFire 交还老链路（返回 null）：status not-handled', async () => {
+    const { calls } = await runWithSettled({
+      onBeforeFire: async () => null,
+      onLLMOutput: async () => { throw new Error('不该走到这里'); },
+    });
+    assert.equal(calls.length, 1, 'onBeforeFire 被调用过就得有回执');
+    assert.equal(calls[0].status, 'not-handled');
+    assert.equal(calls[0].sentCount, 0);
+  });
+
+  test('正常发完时 onAfterSend 与 onFireSettled 都调，且共享同一个 scratch', async () => {
+    const { task } = await makeTask();
+    const order = [];
+    let afterSend = null;
+    let settled = null;
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, {
+        ...makeCtx({
+          hooks: {
+            onBeforeFire: async (fireCtx) => { fireCtx.scratch.note = 'hi'; return [{ role: 'user', content: 'U' }]; },
+            onLLMOutput: finishTwo.onLLMOutput,
+          },
+        }),
+        onAfterSend: async (info) => { order.push('after-send'); afterSend = info; },
+        onFireSettled: async (info) => { order.push('settled'); settled = info; },
+      });
+    } finally {
+      llm.restore();
+    }
+    assert.deepEqual(order, ['after-send', 'settled'], 'onAfterSend 先、收尾回执后');
+    assert.equal(settled.scratch, afterSend.scratch);
+    assert.equal(settled.scratch.note, 'hi');
+  });
+
+  test('hook 自己抛错只 console.warn，不影响投递结果', async () => {
+    const { task } = await makeTask();
+    const origWarn = console.warn;
+    let warned = 0;
+    console.warn = () => { warned++; };
+    const llm = stubLlm([finishRound]);
+    let result;
+    try {
+      result = await processSingleMessage(task, {
+        ...makeCtx({ hooks: finishTwo }),
+        onFireSettled: async () => { throw new Error('hook boom'); },
+      });
+    } finally {
+      llm.restore();
+      console.warn = origWarn;
+    }
+    assert.equal(result.success, true);
+    assert.equal(result.messagesSent, 2);
+    assert.ok(warned >= 1);
+  });
+});
+
 describe('任务身份：hook ctx 与 push 都直接带着', () => {
   const OCCURRENCE = '2020-01-01T00:00:00.000Z';
   const OCCURRENCE_MS = Date.parse(OCCURRENCE);

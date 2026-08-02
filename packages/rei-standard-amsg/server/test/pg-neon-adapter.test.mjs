@@ -81,6 +81,38 @@ for (const backend of BACKENDS) {
     assert.match(where, /status = 'pending'/i);
   });
 
+  // 分组串行：判定和占位必须在同一条语句里。拆成「先查这组忙不忙、再占位」的
+  // 话，两个 tick 的查询都会在对方占位之前返回「不忙」，双双进同一个分组。
+  test(`${backend.name}: 带 serializeGroup 时，分组判定和占位是同一条 UPDATE`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 1 }]);
+    const lease = '2026-01-01T00:10:00.000Z';
+
+    assert.equal(await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', lease, 'grp-abc'), true);
+
+    assert.equal(calls.length, 1, '只发一条语句，不能先查一次再占一次');
+    const { text, params } = calls.at(-1);
+    // 子查询自带 WHERE，这里就不切段了，直接对整条语句断言。
+    const sql = flat(text);
+    // 同一分组里有别的行拿着未到期的租约就领不走。
+    assert.match(sql, /NOT EXISTS/i);
+    assert.match(sql, /busy\.serialize_group = \$4/i);
+    assert.match(sql, /busy\.lease_until > NOW\(\)/i);
+    // 退避中的任务闲着，不算「这个分组忙着」。
+    assert.doesNotMatch(sql, /busy\.retry_after/i);
+    // 领到的同时把分组写在行上，下一跳靠它判断这组忙不忙。
+    assert.match(setClauseOf(text), /serialize_group\s*=\s*\$4/);
+    assert.deepEqual(params, [lease, 7, '2026-01-01T00:00:00.000Z', 'grp-abc']);
+  });
+
+  test(`${backend.name}: 不传 serializeGroup 时语句里没有分组门`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 1 }]);
+    await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z');
+
+    const text = flat(calls.at(-1).text);
+    assert.doesNotMatch(text, /NOT EXISTS/i);
+    assert.doesNotMatch(text, /serialize_group/i);
+  });
+
   test(`${backend.name}: 改到 0 行就是没领到`, async () => {
     const { adapter } = backend.make(() => []);
     assert.equal(
@@ -89,12 +121,13 @@ for (const backend of BACKENDS) {
     );
   });
 
-  test(`${backend.name}: getPendingTasks 跳过租约还没到期的行`, async () => {
+  test(`${backend.name}: getPendingTasks 跳过租约没到期、退避没到点的行`, async () => {
     const { adapter, calls } = backend.make(() => []);
     await adapter.getPendingTasks(50);
 
     const text = flat(calls.at(-1).text);
     assert.match(text, /lease_until IS NULL OR lease_until <= NOW\(\)/i);
+    assert.match(text, /retry_after IS NULL OR retry_after <= NOW\(\)/i);
     assert.match(text, /next_send_at <= NOW\(\)/i);
   });
 
@@ -105,7 +138,11 @@ for (const backend of BACKENDS) {
     );
     await adapter.initSchema();
 
-    const altered = calls.some((c) => /ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS lease_until/i.test(flat(c.text)));
-    assert.ok(altered, 'initSchema 应该给已有的表补 lease_until 列');
+    for (const column of ['lease_until', 'retry_after', 'serialize_group']) {
+      const altered = calls.some((c) =>
+        new RegExp(`ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS ${column}`, 'i').test(flat(c.text))
+      );
+      assert.ok(altered, `initSchema 应该给已有的表补 ${column} 列`);
+    }
   });
 }

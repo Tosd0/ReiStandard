@@ -21,7 +21,8 @@ import {
 // from ever turning a caller-supplied key into interpolated SQL.
 const UPDATABLE_COLUMNS = new Set([
   'user_id', 'uuid', 'encrypted_payload', 'message_type',
-  'next_send_at', 'lease_until', 'status', 'retry_count', 'created_at', 'updated_at'
+  'next_send_at', 'lease_until', 'retry_after', 'serialize_group',
+  'status', 'retry_count', 'created_at', 'updated_at'
 ]);
 
 // LIKE 前缀转义：用户 key 里的 % _ \ 不能变成通配符/转义符。
@@ -86,7 +87,7 @@ export class D1Adapter {
     }
 
     return {
-      columnsCreated: 11,
+      columnsCreated: 13,
       indexesCreated: indexResults.filter((r) => r.status === 'success').length,
       indexesFailed: indexResults.filter((r) => r.status === 'failed').length,
       columns: [],
@@ -117,7 +118,7 @@ export class D1Adapter {
 
   async getTaskByUuid(uuid, userId) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
        FROM scheduled_messages
        WHERE uuid = ? AND user_id = ? AND status = 'pending'
        LIMIT 1`
@@ -200,9 +201,10 @@ export class D1Adapter {
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= ?
          AND (lease_until IS NULL OR lease_until <= ?)
+         AND (retry_after IS NULL OR retry_after <= ?)
        ORDER BY next_send_at ASC
        LIMIT ?`
-    ).bind(now, now, limit).all();
+    ).bind(now, now, now, limit).all();
     return res.results || [];
   }
 
@@ -227,21 +229,53 @@ export class D1Adapter {
    * 着非归一化写法的行（如 +08:00 结尾），归一化后反而对不上，那条任务会永
    * 远领不到。
    *
+   * 带 serializeGroup 时多一道分组门：同一分组里已经有别的行拿着未到期的租
+   * 约，这条就领不走（同一分组同时只跑一条）。判定和写租约在同一条 UPDATE
+   * 里完成，「先查再占」的空档天然不存在——两个 tick 同时来，只有一个改得动
+   * 行。分组门只看租约，不看 `retry_after`：等着重试的任务其实闲着，不该把
+   * 同分组的其他任务一起堵住。
+   *
    * @param {number} taskId
    * @param {string} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
    * @param {string|Date} leaseUntil - 租期末尾
-   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、排期被改过、或行已不是 pending
+   * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
+   * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、同分组
+   *   有任务正在跑、排期被改过、或行已不是 pending
    */
-  async claimTask(taskId, expectedNextSendAt, leaseUntil) {
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null) {
     const expected = typeof expectedNextSendAt === 'string'
       ? expectedNextSendAt
       : this._iso(expectedNextSendAt);
+    const grouped = typeof serializeGroup === 'string' && serializeGroup.length > 0;
+    const now = this._now();
+
+    const sets = ['lease_until = ?'];
+    const values = [this._iso(leaseUntil)];
+    if (grouped) {
+      sets.push('serialize_group = ?');
+      values.push(serializeGroup);
+    }
+    sets.push('updated_at = ?');
+    values.push(now);
+
+    let where =
+      `id = ? AND status = 'pending' AND next_send_at = ?
+          AND (lease_until IS NULL OR lease_until <= ?)`;
+    values.push(taskId, expected, now);
+    if (grouped) {
+      where +=
+        `
+          AND NOT EXISTS (
+            SELECT 1 FROM scheduled_messages busy
+             WHERE busy.serialize_group = ? AND busy.id <> ?
+               AND busy.status = 'pending' AND busy.lease_until > ?
+          )`;
+      values.push(serializeGroup, taskId, now);
+    }
+
     const res = await this._db.prepare(
-      `UPDATE scheduled_messages
-          SET lease_until = ?, updated_at = ?
-        WHERE id = ? AND status = 'pending' AND next_send_at = ?
-          AND (lease_until IS NULL OR lease_until <= ?)`
-    ).bind(this._iso(leaseUntil), this._now(), taskId, expected, this._now()).run();
+      `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE ${where}`
+    ).bind(...values).run();
     return (res.meta.changes || 0) > 0;
   }
 

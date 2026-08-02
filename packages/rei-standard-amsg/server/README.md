@@ -43,6 +43,7 @@ const rei = await createReiServer({
 // PUT  /api/v1/update-message       -> rei.handlers.updateMessage.PUT
 // DELETE /api/v1/cancel-message     -> rei.handlers.cancelMessage.DELETE
 // GET  /api/v1/messages             -> rei.handlers.messages.GET
+// GET  /api/v1/message?id={uuid}    -> rei.handlers.getMessage.GET
 // PUT  /api/v1/push-subscription    -> rei.handlers.pushSubscription.PUT
 // GET  /api/v1/push-subscription    -> rei.handlers.pushSubscription.GET
 // DELETE /api/v1/push-subscription  -> rei.handlers.pushSubscription.DELETE
@@ -159,6 +160,27 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 装不下的内容（长文、附件详情）建议走旁路：正文存进 `client_state`，push 里只带一个引用键，客户端上线后用 `GET /client-state` 取回。单用户 Worker 的 fire-time hook 用 `ctx.writeState()` 写，见 [`examples/cloudflare-single-user/README.md`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/examples/cloudflare-single-user/README.md)。
 
+## 读一条任务：列表 vs 单条
+
+| 端点 | 给什么 |
+|---|---|
+| `GET /messages` | 任务列表。每条只带 `charId` / `clientTaskId` 两个 `metadata` 子字段 |
+| `GET /message?id=<uuid>` | 单条任务。同样的形状，外加**完整的 `metadata`** |
+
+什么时候需要单条：`PUT /update-message` 对 `metadata` 是**整体替换**（不深合并），所以「只改 metadata 里的一个键」必须先把完整的那份读回来，改完再整份传上去；只传一部分会把宿主存在里面的其余键（任务指令、锚点时间戳、过期策略之类）一起冲掉。列表不带整份 metadata，是因为一页最多 100 条，每条都驮着它会把响应撑得很大，而列表要的只是「有哪些任务」。
+
+`GET /message` 只读得到还没发出去的任务；已完成 / 已失败的返回 `409 TASK_ALREADY_COMPLETED`，不存在返回 `404 TASK_NOT_FOUND`（与 `PUT /update-message` 同一口径）。响应和列表一样是加密的，客户端侧对应 `client.getMessage(uuid)`。
+
+## 更新任务时能改哪些字段
+
+`PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `maxTokens` / `temperature` / `splitPattern`，以及凭据三件套 `apiUrl` / `apiKey` / `primaryModel`。
+
+- `contactName` 必须是非空字符串（口径与排程时一致），空串 / `null` / 非字符串一律 `400`。用户给角色改了名之后，之前排的任务推送出来的通知标题（「来自 <contactName>」）靠它跟着改。
+- `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。
+- `avatarUrl` 显式传 `null` 是「不改」而不是「清空」（§6.2 的软清空策略要求非法头像被摘掉时保留旧头像，「摘掉」和「传了个 null」在这一层是同一件事）。
+- 凭据三件套传 `null` 同样只是忽略：清掉任何一个，任务到点就发不出去。
+- `pushSubscription` 不收（`400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`），它是用户级的一份，走 `PUT /push-subscription`。
+
 ## 推送自带任务身份
 
 每条从任务行发出去的 push（冻结 prompt 路径和 fire-time hook 路径都算）顶层带这四个字段：
@@ -203,11 +225,23 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 | hook | 什么时候调 | 载荷 |
 |---|---|---|
 | `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, total, error, scratch, readState, writeState }` |
+| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, total, iterations, error, scratch, readState, writeState }` |
 | `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState }` |
 
-两个 hook 都自带 `readState` / `writeState`，作用于当前用户的 `client_state`，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
+三个 hook 都自带 `readState` / `writeState`，作用于当前用户的 `client_state`，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
 
 `onAfterSend` 的 `scratch` 与本次 fire 的 `onBeforeFire` / `onLLMOutput` 是同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读，不用自建按任务分格的登记表。全部成功时 `error` 为 `null`；第 k 段失败时 `sentCount = k`、`error` 带原始错误，且在错误往上抛之前调用完。
+
+`onFireSettled` 是「这次 fire 结束了」这一个信号，`status` 说明结局：
+
+| status | 什么时候 |
+|---|---|
+| `sent` | pushPayloads 全部发完（`sentCount === total`） |
+| `skipped` | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`） |
+| `failed` | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数 |
+| `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管，它后面发没发出去不体现在这里 |
+
+跟 `onAfterSend` 的分工：`onAfterSend` 只走「有 push 要发」这条路，所以 hook 判断这次不用说话、或者链路中途抛错时它不会被调到——「开始时占点什么、结束时放掉」的写法要挂 `onFireSettled`（fire 里已经用 `ctx.scheduleTask` 建出来的任务，不记账就成了只活在数据库里的幽灵任务；fire 开头拿的锁，没有可靠释放点就只能等 TTL）。正常发完时两个都会调，`onAfterSend` 在前。`scratch` 是同一个引用。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。
 
 `onStaleSkip` 的 `action` 分两种：
 
@@ -275,7 +309,7 @@ const result = await ctx.scheduleTask({
 
 ## 端点鉴权
 
-- `get-user-key`、`schedule-message`、`update-message`、`cancel-message`、`messages`
+- `get-user-key`、`schedule-message`、`update-message`、`cancel-message`、`messages`、`message`
   - `Authorization: Bearer <tenantToken>`
 - `send-notifications`
   - `Authorization: Bearer <cronToken>` 或 `?token=<cronToken>`
@@ -315,7 +349,38 @@ await client.scheduleMessage({
 
 内置适配器都实现了占位。自定义适配器可以不实现 `claimTask`，跑得动，只是回到不占位的行为。
 
-`lease_until` 是这次新加的列。走 `POST /init-tenant`（或任何一次 `initSchema`）会自动给已有的表补上；手工建表的看 `examples/cloudflare-single-user/schema.sql`。
+投递失败的退避记在 `retry_after` 上，租约同时放掉。两件事分两列记：`lease_until` 只表示「这条正在跑」，`retry_after` 表示「这条没在跑，在等重试」。挤在一列的话，下面的分组串行会把一条正在退避、其实闲着的任务当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。
+
+## 同一分组的任务不并发（`serializeBy`）
+
+同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互不知情的消息；宿主在 hook 里维护的「我刚才说过什么」台账通常是读进内存 → 改 → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条。
+
+`runScheduledTick`（以及单用户 Worker 的 config）收一个可选的 `serializeBy`：
+
+```js
+await runScheduledTick({
+  // ...其余 ctx
+  serializeBy: (task) => task.metadata?.charId ?? null,
+});
+```
+
+- 参数是与 `onBeforeFire` 的 `ctx.task` 同一份的只读任务视图（凭据已剔除）。
+- 返回 `null` / 空串、或者不配这个函数 → 这条任务不参与串行，行为与以前完全一致。
+- 同一分组同时只放行一条，**跨跳也算**：上一跳的 fire 还拿着租约时，下一跳捞到同组的另一条也不放行。一次 fire 常常跑十几秒到几分钟，只挡同一跳是不够的。
+- 同一跳内同组放行的是**到点更早**的那条；跑完之后不补跑同组剩下的，留给下一跳。
+- 被拦下的任务是**推迟不是丢弃**：`next_send_at` / `status` / `retry_count` 一个字段都不会被动，下一跳原样再捞一次。条数记在 `details.serializeSkippedTasks`（同一跳内拦下的）和 `details.claimSkippedTasks`（跨跳拦下的）里。
+- `serializeBy` 自身抛错时这条任务这一跳不跑：分不清它属于哪一组，就不该冒着破坏台账的风险跑下去。
+- 正在等重试的任务不算「这一组忙着」（退避记在 `retry_after` 上，租约已经放掉）。
+
+判定和占位是同一条 `UPDATE`：先查「这一组忙不忙」再占位的话，两个 tick 的查询会双双在对方占位之前返回「不忙」。分组 key 不明文落库——库拿它和该用户的存储密钥做一次 HMAC，`serialize_group` 列存的是那个派生值。
+
+自定义适配器实现了 `claimTask` 但忽略第四个参数的，分组串行退化成只在同一跳内生效；完全没实现 `claimTask` 的同理。
+
+`createReiServer` 内置的 `/send-notifications` 处理器不透传 `serializeBy`（和 `claimLeaseMs` 一样），多租户部署要用就自己调 `runScheduledTick`。单用户 Worker 直接在 config 里写。
+
+## 任务表用到的三列
+
+`lease_until` / `retry_after` / `serialize_group`（都可空）。走 `POST /init-tenant`（或任何一次 `initSchema`）会自动给已有的表补上，跑几次都没事；手工维护表结构的看 `examples/cloudflare-single-user/schema.sql`，Postgres 侧对应三句 `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS …`。分组串行还多一个索引 `idx_serialize_group_lease`，`initSchema` 一并建。
 
 ## 导出 API（Exports）
 

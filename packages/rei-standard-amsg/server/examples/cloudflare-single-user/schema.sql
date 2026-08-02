@@ -9,16 +9,23 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
   encrypted_payload TEXT NOT NULL,
   message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
   next_send_at TEXT NOT NULL,
+  -- lease_until：这条正在跑（某个 tick 占位时写，投递收尾放掉）
+  -- retry_after：这条没在跑，上次没发成，在等重试
+  -- serialize_group：这条属于哪个串行分组（serializeBy 算出来的派生值）
   lease_until TEXT,
+  retry_after TEXT,
+  serialize_group TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
   retry_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
--- 2.5.x 建的表没有 lease_until。这句给老库补列，新库会报「列已存在」，
--- 忽略即可；走 POST /init-tenant 的话服务端会自动处理。
+-- 老库缺哪列就补哪列（新库会报「列已存在」，忽略即可）。走
+-- POST /init-tenant 的话服务端会自动处理，这几句只给手工维护表结构的人用。
 -- ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT;
+-- ALTER TABLE scheduled_messages ADD COLUMN retry_after TEXT;
+-- ALTER TABLE scheduled_messages ADD COLUMN serialize_group TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pending_tasks_optimized
   ON scheduled_messages (status, next_send_at, id, retry_count)
@@ -34,6 +41,10 @@ CREATE INDEX IF NOT EXISTS idx_user_id
 CREATE UNIQUE INDEX IF NOT EXISTS uidx_uuid
   ON scheduled_messages (uuid)
   WHERE uuid IS NOT NULL;
+-- 分组串行的判定索引（占位时查「这一组有没有任务正拿着租约」）。
+CREATE INDEX IF NOT EXISTS idx_serialize_group_lease
+  ON scheduled_messages (serialize_group, lease_until)
+  WHERE serialize_group IS NOT NULL AND status = 'pending';
 
 -- 客户端状态的云端镜像（/client-state 端点用）。
 -- value 是密文；updated_at 是客户端给的 epoch 毫秒整数，用于 last-write-wins。

@@ -10,6 +10,7 @@
  *   GET  /get-user-key      → derive user key
  *   POST /schedule-message  → create task
  *   GET  /messages          → list
+ *   GET  /message?id=<uuid> → 单条任务（比列表多一个完整的 metadata）
  *   PUT  /update-message    → patch
  *   DELETE /cancel-message  → delete
  *   GET  /vapid-public-key  → this worker's VAPID public key (for the frontend's
@@ -36,6 +37,10 @@
  * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
  * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。租期默认 10 分钟，可以
  * 用 config 里的 `claimLeaseMs` 调整。
+ *
+ * 同一个角色（或宿主定义的任何一组）的多条任务不想同时跑，就配一个
+ * `serializeBy`；一次 fire 无论什么结局都想收到回执，就配 `onFireSettled`。
+ * 两个都不配时行为与以前完全一致。
  */
 
 import { createSingleUserServer } from '../single-user.js';
@@ -127,6 +132,10 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.scheduleMessage.POST(headers, await request.text());
       } else if (method === 'GET' && pathname.endsWith('/messages')) {
         result = await server.handlers.messages.GET(url, headers);
+      } else if (method === 'GET' && pathname.endsWith('/message')) {
+        // 复数是列表、单数是单条。'/messages' 不以 '/message' 结尾（末尾是
+        // 's'），两条 endsWith 判断互不吃对方的请求。
+        result = await server.handlers.getMessage.GET(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/update-message')) {
         result = await server.handlers.updateMessage.PUT(url, headers, await request.text());
       } else if (method === 'DELETE' && pathname.endsWith('/cancel-message')) {
@@ -191,6 +200,14 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         // 推送发出（或发挂）之后的 hook：{ task, sentCount, total, error,
         // scratch, readState, writeState }（best-effort，见 lib/agentic-fire.js）。
         onAfterSend: cfg.onAfterSend,
+        // 一次 fire 收尾的 hook：{ task, status, skipReason, sentCount, total,
+        // iterations, error, scratch, readState, writeState }。发完 / 跳过 /
+        // 抛错都会调，宿主用它做「开始时占点什么、结束时放掉」那类收尾
+        //（best-effort，见 lib/agentic-fire.js）。
+        onFireSettled: cfg.onFireSettled,
+        // 分组串行：(task) => 分组标识 | null。同一分组的任务同时只跑一条，
+        // 跨跳也算（见 lib/run-tick.js）。不配 = 全并发，与以前一致。
+        serializeBy: cfg.serializeBy,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs
       });

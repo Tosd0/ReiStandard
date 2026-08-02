@@ -21,8 +21,8 @@ test('SQLITE_TABLE_SQL uses SQLite dialect', () => {
   assert.doesNotMatch(SQLITE_TABLE_SQL, /TIMESTAMP WITH TIME ZONE/);
 });
 
-test('SQLITE_INDEXES defines the 5 indexes incl. the critical unique guard', () => {
-  assert.equal(SQLITE_INDEXES.length, 5);
+test('SQLITE_INDEXES defines the 6 indexes incl. the critical unique guard', () => {
+  assert.equal(SQLITE_INDEXES.length, 6);
   const uidx = SQLITE_INDEXES.find((i) => i.name === 'uidx_uuid');
   assert.ok(uidx && uidx.critical === true);
   // Every entry mirrors the Postgres INDEXES shape so both adapters'

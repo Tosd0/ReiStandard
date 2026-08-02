@@ -235,10 +235,11 @@ test('投递中途断掉后，接手的 tick 仍按原始触发时刻推进排�
   assert.equal((await adapter.getTaskByUuidOnly('abandoned')).next_send_at, plusMs(dueAt, DAY));
 });
 
-// 重试的退避写在租约上（lease_until = 现在 + 退避），next_send_at 保持名义
-// 时刻不动。这样退避既不会被默认 10 分钟的租期压住（2 分钟一到，捞取条件里
-// 的 lease 过滤自然放行），也不会污染循环任务的推进基准。
-test('投递失败后的重试退避不会被租约压住', async () => {
+// 重试的退避写在 retry_after 上，next_send_at 保持名义时刻不动，租约当场放
+// 掉。这样退避既不会被默认 10 分钟的租期压住（2 分钟一到，捞取条件里的
+// retry_after 过滤自然放行），也不会污染循环任务的推进基准；租约放掉是因为
+// 它只表示「这条正在跑」，等重试的任务并没有在跑。
+test('投递失败后的重试退避写在 retry_after 上，租约当场放掉', async () => {
   const d1 = createTestD1();
   const adapter = createD1Adapter(d1);
   await adapter.initSchema();
@@ -252,10 +253,12 @@ test('投递失败后的重试退避不会被租约压住', async () => {
 
   const row = await d1.prepare('SELECT * FROM scheduled_messages WHERE uuid = ?').bind('retry').first();
   assert.equal(row.retry_count, 1);
-  // 租约末尾是 2 分钟的退避，不是 600 秒的占位租期。
-  const leaseMs = Date.parse(row.lease_until) - before;
-  assert.ok(leaseMs > 0, '退避期间租约还没到期');
-  assert.ok(leaseMs <= 2 * MINUTE + 30_000, `退避该是 2 分钟上下，实际 ${leaseMs}ms`);
+  // 退避时刻在 retry_after 上，且是 2 分钟上下，不是 600 秒的占位租期。
+  const backoffMs = Date.parse(row.retry_after) - before;
+  assert.ok(backoffMs > 0, '退避还没到点');
+  assert.ok(backoffMs <= 2 * MINUTE + 30_000, `退避该是 2 分钟上下，实际 ${backoffMs}ms`);
+  // 租约不能继续占着：占着的话分组串行会把同组别的任务一起堵住一轮退避。
+  assert.equal(row.lease_until, null);
   // 退避期间这条任务不该被捞出来。
   assert.equal((await adapter.getPendingTasks(50)).length, 0);
 });
@@ -324,6 +327,224 @@ test('hook 拿到的 nextSendAt 是原始触发时刻，不是占位后的租期
 
   assert.equal(res.successCount, 1);
   assert.equal(seenNextSendAt, dueAt);
+});
+
+// ─── 分组串行（serializeBy）─────────────────────────────────────────────
+// 同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互
+// 不知情的消息，而宿主在 hook 里维护的「我刚才说过什么」台账是读进内存 → 改
+// → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条——有一句说过的话没
+// 记上账，下次角色会换个说法再讲一遍。
+
+const byCharId = (task) => (task.metadata && task.metadata.charId) || null;
+
+test('同一分组的两条任务：一跳只放行一条，另一条行原样留到下一跳', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const firstDue = new Date(Date.now() - 60_000).toISOString();
+  const secondDue = new Date(Date.now() - 30_000).toISOString();
+  await seed(adapter, { uuid: 'c1-a', recurrenceType: 'none', nextSendAt: firstDue, payload: { metadata: { charId: 'char-1' } } });
+  await seed(adapter, { uuid: 'c1-b', recurrenceType: 'none', nextSendAt: secondDue, payload: { metadata: { charId: 'char-1' } } });
+
+  const webpush = fakeWebpush();
+  const first = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+
+  assert.equal(first.successCount, 1, '同一分组一跳只发一条');
+  assert.equal(first.details.serializeSkippedTasks, 1);
+
+  // 被拦下的那条是推迟不是丢弃：一个字段都没被动过（连租约都没写过）。
+  const held = await d1.prepare('SELECT * FROM scheduled_messages WHERE uuid = ?').bind('c1-b').first();
+  assert.equal(held.status, 'pending');
+  assert.equal(held.next_send_at, secondDue);
+  assert.equal(held.retry_count, 0);
+  assert.equal(held.lease_until, null);
+  assert.equal(held.retry_after, null);
+
+  // 下一跳照常把它发出去。
+  const second = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+  assert.equal(second.successCount, 1);
+  assert.equal((await adapter.getPendingTasks(50)).length, 0);
+});
+
+// 同组放行哪一条不能看运气：分组串行要的就是「同一个角色的消息按时间顺序一
+// 条一条来」，晚的那条抢在早的前面发出去，正是它要避免的事。这条把「先到点的
+// 先跑」钉住——建表顺序故意和到点顺序相反。
+test('同一分组里放行的是到点更早的那条', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const later = new Date(Date.now() - 30_000).toISOString();
+  const earlier = new Date(Date.now() - 90_000).toISOString();
+  await seed(adapter, { uuid: 'later', recurrenceType: 'none', nextSendAt: later, payload: { metadata: { charId: 'char-5' }, userMessage: 'second' } });
+  await seed(adapter, { uuid: 'earlier', recurrenceType: 'none', nextSendAt: earlier, payload: { metadata: { charId: 'char-5' }, userMessage: 'first' } });
+
+  const webpush = fakeWebpush();
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+
+  assert.equal(webpush.sent.length, 1);
+  assert.match(webpush.sent[0], /first/, '先发到点更早的那条');
+  assert.ok(await adapter.getTaskByUuidOnly('later'), '晚的那条留到下一跳');
+});
+
+// 一次 fire 常常要跑十几秒到几分钟（组 prompt → 调 LLM → 跑工具 → 分段推
+// 送），所以危险窗口不止「同一跳」：上一跳的 fire 还在跑时，下一跳捞到同角色
+// 的另一条任务，照样读到的是那份还没写回的旧台账。
+test('上一跳的同分组任务还在跑时，下一跳的另一条也不放行', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'x-a', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 60_000).toISOString(), payload: { metadata: { charId: 'char-9' } } });
+  await seed(adapter, { uuid: 'x-b', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 30_000).toISOString(), payload: { metadata: { charId: 'char-9' } } });
+
+  let sends = 0;
+  let markPushing;
+  const pushing = new Promise((resolve) => { markPushing = resolve; });
+  let releasePush;
+  const held = new Promise((resolve) => { releasePush = resolve; });
+  const webpush = {
+    async sendNotification() {
+      sends++;
+      if (sends === 1) { markPushing(); await held; }
+    }
+  };
+
+  const firstTick = runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+  await pushing; // 第一跳卡在推送里，x-a 的租约还拿着
+
+  const second = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+  // 第二跳捞到的是 x-b（x-a 正被租约挡着），但同分组正忙，占位不给过。
+  assert.equal(second.successCount, 0, '同分组还有任务在跑，这一跳一条都不该发');
+  assert.equal(second.details.claimSkippedTasks, 1);
+  assert.equal(sends, 1);
+
+  releasePush();
+  assert.equal((await firstTick).successCount, 1);
+
+  const stillPending = await adapter.getTaskByUuidOnly('x-b');
+  assert.equal(stillPending.status, 'pending');
+  assert.equal(stillPending.retry_count, 0);
+});
+
+// 退避中的任务其实闲着。退避要是和「正在跑」共用 lease_until 那一列，同分组
+// 别的任务就得白等一轮退避（最长 6 分钟）才动得了。
+test('同分组里有任务在退避重试，不挡住这一组的其他任务', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'r-a', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 60_000).toISOString(), payload: { metadata: { charId: 'char-3' } } });
+
+  // 第一跳：r-a 投递失败 → 进退避。
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, serializeBy: byCharId,
+    webpush: { async sendNotification() { throw new Error('push failed'); } }
+  });
+  assert.equal((await adapter.getPendingTasks(50)).length, 0, '退避期间 r-a 捞不出来');
+
+  // 同一个角色的另一条任务到点了。
+  await seed(adapter, { uuid: 'r-b', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 30_000).toISOString(), payload: { metadata: { charId: 'char-3' } } });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+  assert.equal(res.successCount, 1, '退避中的任务不该把同分组的其他任务一起堵住');
+  assert.ok(webpush.sent.length >= 1);
+});
+
+test('serializeBy 返回 null 的任务不参与串行，照常并发', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'free-a', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 60_000).toISOString() });
+  await seed(adapter, { uuid: 'free-b', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 30_000).toISOString() });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, serializeBy: byCharId
+  });
+  assert.equal(res.successCount, 2);
+  assert.equal(res.details.serializeSkippedTasks, 0);
+});
+
+test('不配 serializeBy 时同角色的多条任务照旧一起跑', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'p-a', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 60_000).toISOString(), payload: { metadata: { charId: 'char-1' } } });
+  await seed(adapter, { uuid: 'p-b', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 30_000).toISOString(), payload: { metadata: { charId: 'char-1' } } });
+
+  const webpush = fakeWebpush();
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+  assert.equal(res.successCount, 2);
+  assert.equal(res.details.serializeSkippedTasks, 0);
+});
+
+test('serializeBy 抛错时这条任务这一跳不跑，行也不动', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, { uuid: 'boom', recurrenceType: 'daily', nextSendAt: dueAt });
+
+  const origWarn = console.warn;
+  let warned = 0;
+  console.warn = () => { warned++; };
+  const webpush = fakeWebpush();
+  let res;
+  try {
+    res = await runScheduledTick({
+      db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush,
+      serializeBy: () => { throw new Error('分组算不出来'); }
+    });
+  } finally {
+    console.warn = origWarn;
+  }
+
+  assert.equal(webpush.sent.length, 0, '分不清属于哪一组就不该冒险跑');
+  assert.equal(res.details.serializeSkippedTasks, 1);
+  assert.ok(warned >= 1);
+
+  const row = await adapter.getTaskByUuidOnly('boom');
+  assert.equal(row.status, 'pending');
+  assert.equal(row.next_send_at, dueAt);
+  assert.equal(row.retry_count, 0);
+});
+
+test('serializeBy 拿到的是剔掉凭据的任务视图（与 onBeforeFire 的 ctx.task 同款）', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, {
+    uuid: 'view', recurrenceType: 'daily', nextSendAt: dueAt,
+    payload: {
+      metadata: { charId: 'char-42' },
+      messageType: 'prompted', completePrompt: 'p',
+      apiUrl: 'https://x', apiKey: 'sk-super-secret', primaryModel: 'm'
+    }
+  });
+
+  const seen = [];
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(),
+    hooks: {
+      async onBeforeFire() { return { skip: true }; },
+      async onLLMOutput() { throw new Error('不该走到这里'); }
+    },
+    serializeBy: (task) => { seen.push(task); return byCharId(task); }
+  });
+
+  assert.equal(seen.length, 1);
+  const view = seen[0];
+  assert.deepEqual(view.metadata, { charId: 'char-42' });
+  assert.equal(view.uuid, 'view');
+  assert.equal(view.nextSendAt, dueAt, 'nextSendAt 是名义触发时刻，不是占位租期');
+  // 防泄漏钉子：凭据不能出现在分组函数拿到的视图里。
+  assert.ok(!('apiKey' in view) && !('pushSubscription' in view));
+  assert.ok(!JSON.stringify(view).includes('sk-super-secret'));
 });
 
 // ─── 补发新鲜度守卫（stale guard）───────────────────────────────────────
@@ -567,14 +788,14 @@ test('失败重试后成功，循环推进的基准仍是名义时刻（不带�
   const dueAt = recentDue();
   await seed(adapter, { uuid: 'no-drift', recurrenceType: 'daily', nextSendAt: dueAt });
 
-  // 第一跳失败 → 退避写在租约上。
+  // 第一跳失败 → 退避写在 retry_after 上。
   await runScheduledTick({
     db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
     webpush: { async sendNotification() { throw new Error('push failed'); } }
   });
-  // 手动把退避租约调成已过期，等价于「退避时间到了」。
+  // 手动把退避时刻调成已过去，等价于「退避时间到了」。
   const [pending] = (await adapter.listTasks(USER, { status: 'all' })).tasks;
-  await adapter.updateTaskById(pending.id, { lease_until: new Date(Date.now() - 1000).toISOString() });
+  await adapter.updateTaskById(pending.id, { retry_after: new Date(Date.now() - 1000).toISOString() });
 
   // 第二跳成功 → 推进到名义时刻 + 24h，而不是（名义 + 退避）+ 24h。
   const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
