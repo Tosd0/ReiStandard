@@ -87,15 +87,27 @@ export const PUSH_SOURCE = Object.freeze({
  * are forbidden from writing their own fields into `metadata` — any
  * protocol-level data goes on top-level fields.
  *
+ * Scheduling identity (`taskId` / `taskUuid` / `recurrenceType` /
+ * `occurrenceMs`) is stamped by `@rei-standard/amsg-server` on every push
+ * that came out of a scheduled task row. It tells the client which task
+ * this is, whether the task will come back, and which nominal fire time
+ * produced this burst — so a task the client never created (one the
+ * character scheduled for itself at fire time) still arrives fully
+ * identified. Pushes with no task behind them (amsg-instant) omit all four.
+ *
  * @typedef {Object} AmsgPushCommon
  * @property {MessageType} messageType   - How the push was produced.
  * @property {PushSource}  source        - Which sub-package routed it.
  * @property {string}      messageId     - Unique per push. Format owned by the producer.
- * @property {string}      sessionId     - Shared across all pushes from one LLM round (reasoning + content) and across iterations of a single agentic-loop request.
+ * @property {string}      sessionId     - Shared across all pushes from one LLM round (reasoning + content) and across iterations of a single agentic-loop request. Opaque id — do not parse it for task identity, read the fields below.
  * @property {string}      timestamp     - ISO 8601 timestamp at producer.
  * @property {string}      [messageSubtype] - Caller-defined business namespace. Defaults to 'chat' at producers.
  * @property {Object}      [metadata]    - Caller passthrough. Packages MUST NOT write here.
  * @property {NotificationDirective} [notification] - SW notification strategy.
+ * @property {number | string | null} [taskId] - Scheduled task row id.
+ * @property {string | null} [taskUuid] - Scheduled task uuid (the id the scheduling side chose).
+ * @property {'none' | 'daily' | 'weekly'} [recurrenceType] - Whether that task fires again.
+ * @property {number | null} [occurrenceMs] - Nominal fire time of this occurrence (epoch ms).
  */
 
 // ─── Per-kind interfaces ────────────────────────────────────────────────
@@ -144,7 +156,6 @@ export const PUSH_SOURCE = Object.freeze({
  *   avatarUrl?:    string | null,
  *   messageIndex?: number,
  *   totalMessages?: number,
- *   taskId?:       string | null,
  * }} ContentPush
  */
 

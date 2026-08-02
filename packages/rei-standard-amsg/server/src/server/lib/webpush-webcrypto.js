@@ -33,28 +33,64 @@ export const WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES = 16 + 4 + 1 + 65 + 1 + 16;
 /** 一条 push 的明文（JSON 字符串）上限，UTF-8 字节数。 */
 export const MAX_PUSH_PAYLOAD_BYTES = WEB_PUSH_MAX_BODY_BYTES - WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES;
 
+// ─── 信封预留 ──────────────────────────────────────────────────────────
+//
+// fire-time hook 把 pushPayloads 交还给库之后，库还会往每条 push 上补一批
+// 「这是谁、第几条、什么时候」的字段（见 lib/agentic-fire.js 的
+// sendHookPushPayloads）：
+//
+//   messageId / sessionId / timestamp / messageIndex / totalMessages
+//   taskId / taskUuid / recurrenceType / occurrenceMs
+//
+// 也就是说 hook 手里量到的从来不是最终 payload。要判断「这条内容装不装得
+// 下」，得先把这批字段的额度留出来，否则卡在边界上的消息会「量出来装得下、
+// 补完字段就超了」——既没走旁路存储也发不出去。
+//
+// 下面这个数是上面九个字段（含 JSON 的引号、冒号、逗号）在最坏取值下的上界，
+// 由 webpush-webcrypto.test.mjs 钉住。其中 uuid 按 64 字符算：`scheduleTask`
+// 允许宿主传任意字符串当 uuid，用更长的 uuid 就要自己再多留一点。
+
+/**
+ * 库在 hook 交还 payload 之后还要补的那批字段占的字节数上界。
+ * 组 payload 时按 `MAX_PUSH_PAYLOAD_BYTES - PUSH_ENVELOPE_RESERVED_BYTES`
+ * 预算，或者直接用 `measurePushPayload(s, { reserveEnvelope: true })`。
+ */
+export const PUSH_ENVELOPE_RESERVED_BYTES = 384;
+
 const payloadEncoder = new TextEncoder();
 
 /**
  * 组 payload 前做预算用：先量骨架有多大，剩下多少字节才是能塞附加数据的额度。
  *
  * @example
- * const { remainingBytes } = measurePushPayload(JSON.stringify(basePush));
+ * // hook 里组 push：把库要补的信封字段先扣掉
+ * const { remainingBytes } = measurePushPayload(
+ *   JSON.stringify({ ...basePush, message: '' }),
+ *   { reserveEnvelope: true }
+ * );
  * const excerpt = remainingBytes > 0 ? text.slice(0, remainingBytes) : '';
  *
  * @param {string} payload - 待发送的 payload 字符串（通常是 JSON.stringify 的结果）。
- * @returns {{ bytes: number, maxBytes: number, remainingBytes: number, withinLimit: boolean }}
- *   `bytes` 是 payload 的 UTF-8 字节数；`remainingBytes` 是还能加多少字节
- *   （已超限时为负）；`withinLimit` 为 false 时 sendWebPush 会抛
- *   `PUSH_PAYLOAD_TOO_LARGE`。
+ * @param {{ reserveEnvelope?: boolean }} [options]
+ *   `reserveEnvelope: true` → 额度里扣掉 {@link PUSH_ENVELOPE_RESERVED_BYTES}，
+ *   也就是「库补完字段之后还装得下」的口径。fire-time hook 组 payload 时用这个。
+ *   默认 false = 量这个字符串本身对上限的占用。
+ * @returns {{ bytes: number, maxBytes: number, remainingBytes: number, withinLimit: boolean, envelopeReservedBytes: number }}
+ *   `bytes` 是 payload 的 UTF-8 字节数；`maxBytes` 是本次口径下的上限；
+ *   `remainingBytes` 是还能加多少字节（已超限时为负）；`withinLimit` 为 false
+ *   时（不留信封的口径下）sendWebPush 会抛 `PUSH_PAYLOAD_TOO_LARGE`。
  */
-export function measurePushPayload(payload) {
+export function measurePushPayload(payload, options) {
+  const reserveEnvelope = !!(options && options.reserveEnvelope);
   const bytes = payloadEncoder.encode(typeof payload === 'string' ? payload : String(payload)).length;
+  const envelopeReservedBytes = reserveEnvelope ? PUSH_ENVELOPE_RESERVED_BYTES : 0;
+  const maxBytes = MAX_PUSH_PAYLOAD_BYTES - envelopeReservedBytes;
   return {
     bytes,
-    maxBytes: MAX_PUSH_PAYLOAD_BYTES,
-    remainingBytes: MAX_PUSH_PAYLOAD_BYTES - bytes,
-    withinLimit: bytes <= MAX_PUSH_PAYLOAD_BYTES,
+    maxBytes,
+    remainingBytes: maxBytes - bytes,
+    withinLimit: bytes <= maxBytes,
+    envelopeReservedBytes,
   };
 }
 

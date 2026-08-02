@@ -41,10 +41,24 @@ origin** (`'instant'` for `amsg-instant`, `'scheduled'` for any
 | `messageType`    | `MessageType`     | Dispatch axis.                                                              |
 | `source`         | `'instant' \| 'scheduled'` | Routing origin.                                                    |
 | `messageId`      | `string`          | Unique per push. Format owned by the producer.                              |
-| `sessionId`      | `string`          | **Shared across all pushes from the same LLM round** (reasoning + content), and across all iterations of a single agentic-loop request. |
+| `sessionId`      | `string`          | **Shared across all pushes from the same LLM round** (reasoning + content), and across all iterations of a single agentic-loop request. Opaque — do not parse it for task identity, read the scheduling fields below. |
 | `timestamp`      | `string` (ISO 8601) | Producer-side wall clock.                                                 |
 | `messageSubtype` | `string?`         | Caller's business namespace. Defaults to `'chat'` at producers.             |
 | `metadata`       | `object?`         | **Caller passthrough.** Packages MUST NOT write here.                       |
+| `taskId`         | `number \| string \| null?` | Scheduled task row id.                                          |
+| `taskUuid`       | `string \| null?` | Scheduled task uuid (the id the scheduling side chose).                    |
+| `recurrenceType` | `'none' \| 'daily' \| 'weekly'?` | Whether that task fires again.                            |
+| `occurrenceMs`   | `number \| null?` | Nominal fire time of this occurrence (epoch ms).                           |
+
+### Scheduling identity
+
+`taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs` are stamped by
+`@rei-standard/amsg-server` on every push that came out of a scheduled task
+row. They tell the client which task this is, whether the task will come
+back, and which nominal fire time produced this burst — so a task the client
+never created (one the character scheduled for itself at fire time) still
+arrives fully identified. Pushes with no task behind them (`amsg-instant`)
+omit all four.
 
 ---
 
@@ -85,7 +99,6 @@ fields above are validated by the builders when present.
 | `title`          | `string?`   | Notification title.                                            |
 | `contactName`    | `string?`   | Sender display name.                                           |
 | `avatarUrl`      | `string \| null?` | Sender avatar URL (`https:` only — `data:` is rejected upstream). |
-| `taskId`         | `string \| null?` | Scheduled task ID (server only).                          |
 
 ### `ReasoningPush` — LLM meta-thinking
 

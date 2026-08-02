@@ -5,6 +5,7 @@ import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createWebCryptoWebPush } from '../src/server/lib/webpush-webcrypto.js';
 import { deriveUserEncryptionKey, encryptPayload, encryptForStorage } from '../src/server/lib/encryption.js';
+import { seedPushSubscription } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -27,11 +28,13 @@ test('fetch routes init + schedule + messages, unknown → 404', async () => {
   const initRes = await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
   assert.equal(initRes.status, 200);
 
+  // 排程要求这个用户已经登记过推送订阅（任务行不携带订阅了）。
+  await seedPushSubscription(createD1Adapter(d1), USER, MASTER_KEY);
+
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const body = JSON.stringify(await encryptPayload({
     contactName: 'Rei', messageType: 'fixed', userMessage: 'hi',
-    firstSendTime: '2999-01-01T00:00:00.000Z', recurrenceType: 'none',
-    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+    firstSendTime: '2999-01-01T00:00:00.000Z', recurrenceType: 'none'
   }, userKey));
 
   const schedRes = await worker.fetch(new Request('https://w.dev/schedule-message', {
@@ -60,9 +63,9 @@ test('scheduled() runs the tick over env.DB', async () => {
   await adapter.initSchema();
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const enc = await encryptForStorage(JSON.stringify({
-    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
-    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none'
   }), userKey);
+  await seedPushSubscription(adapter, USER, MASTER_KEY);
   await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
 
   let sent = 0;
@@ -256,9 +259,9 @@ test('the exposed VAPID public key is the same key push signing actually uses', 
   await adapter.initSchema();
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const enc = await encryptForStorage(JSON.stringify({
-    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
-    pushSubscription: sub
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none'
   }), userKey);
+  await seedPushSubscription(adapter, USER, MASTER_KEY, sub);
   await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
 
   const worker = createSingleUserCloudflareWorker(() => ({
@@ -372,9 +375,9 @@ test('scheduled() 过期跳过后，GET /messages 透出 lastError', async () =>
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const missedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 两小时前
   const enc = await encryptForStorage(JSON.stringify({
-    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none',
-    pushSubscription: { endpoint: 'https://e.com/x', keys: { p256dh: 'k', auth: 'a' } }
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none'
   }), userKey);
+  await seedPushSubscription(adapter, USER, MASTER_KEY);
   await adapter.createTask({ user_id: USER, uuid: 'missed', encrypted_payload: enc, next_send_at: missedAt, message_type: 'fixed' });
 
   let sent = 0;

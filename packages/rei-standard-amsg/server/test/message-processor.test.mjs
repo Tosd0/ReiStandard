@@ -4,9 +4,12 @@ import { processSingleMessage, normalizeAiApiUrl } from '../src/server/lib/messa
 import { buildAiRequestBody } from '../src/server/lib/llm.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../src/server/lib/validation.js';
+import { encryptTestSubscription, withPushSubscriptionStore } from './helpers/push-subscription.mjs';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
+// 用户级订阅：投递时从这里现读（任务行不携带订阅）。
+const ENCRYPTED_PUSH_SUB = await encryptTestSubscription(TEST_USER_ID, TEST_MASTER_KEY);
 
 async function createEncryptedTask(payload) {
   const userKey = await deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);
@@ -31,7 +34,7 @@ function createContext(sendNotificationSpy = async () => {}) {
       publicKey: 'public',
       privateKey: 'private'
     },
-    db: {}
+    db: withPushSubscriptionStore({}, ENCRYPTED_PUSH_SUB)
   };
 }
 
@@ -287,7 +290,6 @@ describe('messages array support', () => {
       apiUrl: 'https://api.example.com/v1/chat/completions',
       apiKey: 'secret',
       primaryModel: 'model-x',
-      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
       ...overrides,
     };
   }
@@ -522,7 +524,6 @@ describe('splitPattern support', () => {
       apiUrl: 'https://api.example.com/v1/chat/completions',
       apiKey: 'secret',
       primaryModel: 'model-x',
-      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
       ...overrides,
     };
   }
@@ -915,7 +916,6 @@ describe('avatarUrl validation', () => {
       apiUrl: 'https://api.example.com/v1/chat/completions',
       apiKey: 'secret',
       primaryModel: 'model-x',
-      pushSubscription: { endpoint: 'https://push.example.com/sub', keys: { p256dh: 'p', auth: 'a' } },
       ...overrides,
     };
   }
@@ -1058,5 +1058,73 @@ describe('messageId/sessionId 掺名义触发时刻（occurrence）', () => {
     const day1Again = await fireFixedAt('2020-01-01T00:00:00.000Z');
     assert.equal(day1[0].messageId, day1Again[0].messageId);
     assert.equal(day1[0].sessionId, day1Again[0].sessionId);
+  });
+});
+
+describe('冻结 prompt 路径的 push 也带任务的调度身份', () => {
+  // 客户端认领任务、判断「它还会不会再来」靠的是这四个字段。宿主往 metadata
+  // 里抄一遍是抄漏的温床，所以由库统一补。
+  it('ContentPush / ReasoningPush 都带 taskId / taskUuid / recurrenceType / occurrenceMs', async () => {
+    const task = await createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'prompted',
+      completePrompt: 'say hi',
+      recurrenceType: 'daily',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'secret',
+      primaryModel: 'model-x',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' }
+    });
+    task.uuid = 'task-uuid-1';
+    task.next_send_at = '2020-01-01T00:00:00.000Z';
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return { choices: [{ message: { content: '第一句。第二句。', reasoning_content: '想了想' } }] };
+      }
+    });
+
+    const pushes = [];
+    try {
+      const result = await processSingleMessage(
+        task,
+        createContext(async (_sub, payload) => { pushes.push(JSON.parse(payload)); })
+      );
+      assert.equal(result.success, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(pushes.length >= 2);
+    assert.ok(pushes.some((p) => p.messageKind === 'reasoning'));
+    for (const push of pushes) {
+      assert.equal(push.taskId, 1, `${push.messageKind} 应带 taskId`);
+      assert.equal(push.taskUuid, 'task-uuid-1');
+      assert.equal(push.recurrenceType, 'daily');
+      assert.equal(push.occurrenceMs, Date.parse('2020-01-01T00:00:00.000Z'));
+    }
+  });
+
+  it('没有任务行的 instant 路径：身份字段给 null，recurrenceType 归 none', async () => {
+    const task = await createEncryptedTask({
+      contactName: 'Rei',
+      messageType: 'instant',
+      userMessage: '你好',
+      pushSubscription: { endpoint: 'https://push.example.com/sub' }
+    });
+    delete task.id;
+
+    const pushes = [];
+    const result = await processSingleMessage(
+      task,
+      createContext(async (_sub, payload) => { pushes.push(JSON.parse(payload)); })
+    );
+    assert.equal(result.success, true);
+    assert.equal(pushes[0].taskId, null);
+    assert.equal(pushes[0].taskUuid, null);
+    assert.equal(pushes[0].recurrenceType, 'none');
+    assert.equal(pushes[0].occurrenceMs, null);
   });
 });

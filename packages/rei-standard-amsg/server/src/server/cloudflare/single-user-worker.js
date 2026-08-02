@@ -18,6 +18,9 @@
  *   PUT  /client-state      → batch upsert client state (last-write-wins on updatedAt)
  *   GET  /client-state      → read one namespace's entries (?namespace=<ns>)
  *   DELETE /client-state    → wipe this user's client state
+ *   PUT    /push-subscription → 登记 / 覆盖这个用户的 Web Push 订阅
+ *   GET    /push-subscription → { exists, updatedAt, endpoint }
+ *   DELETE /push-subscription → 删掉这个用户的订阅
  *
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
@@ -138,6 +141,12 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.clientState.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.DELETE(url, headers);
+      } else if (method === 'PUT' && pathname.endsWith('/push-subscription')) {
+        result = await server.handlers.pushSubscription.PUT(headers, await request.text());
+      } else if (method === 'GET' && pathname.endsWith('/push-subscription')) {
+        result = await server.handlers.pushSubscription.GET(url, headers);
+      } else if (method === 'DELETE' && pathname.endsWith('/push-subscription')) {
+        result = await server.handlers.pushSubscription.DELETE(url, headers);
       } else {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }
@@ -173,12 +182,14 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         maxStateValueBytes: cfg.maxStateValueBytes,
         // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
         maxScheduledTasksPerFire: cfg.maxScheduledTasksPerFire,
-        // 一次性任务错过触发时刻太久（> 60 分钟）不再补发时的回执 hook：
-        // (task, { reason: 'stale', metadata })，metadata 取自解密 payload
-        //（凭据字段不透传；best-effort，见 lib/run-tick.js）。
+        // 任务错过触发时刻太久（> 60 分钟）不再补发时的回执 hook：
+        // (task, { reason, action, metadata, skippedCount, …, readState,
+        // writeState })。一次性任务（action 'expired'）和循环任务快进
+        //（action 'fast_forwarded'）都会调（凭据字段不透传；best-effort，
+        // 见 lib/run-tick.js）。
         onStaleSkip: cfg.onStaleSkip,
-        // 推送发出（或发挂）之后的 hook：{ task, sentCount, total, error }
-        //（best-effort，见 lib/agentic-fire.js）。
+        // 推送发出（或发挂）之后的 hook：{ task, sentCount, total, error,
+        // scratch, readState, writeState }（best-effort，见 lib/agentic-fire.js）。
         onAfterSend: cfg.onAfterSend,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs

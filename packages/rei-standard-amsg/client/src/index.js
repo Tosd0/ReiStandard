@@ -1143,6 +1143,9 @@ export class ReiClient {
   /**
    * Subscribe to Web Push notifications.
    *
+   * 拿到订阅之后要用 {@link ReiClient#putPushSubscription} 把它登记到服务端，
+   * 定时任务到点才知道往哪推。
+   *
    * @param {string} vapidPublicKey - The server's VAPID public key.
    * @param {ServiceWorkerRegistration} registration - An active SW registration.
    * @returns {Promise<PushSubscription>}
@@ -1153,6 +1156,86 @@ export class ReiClient {
       applicationServerKey: base64UrlToBytes(vapidPublicKey)
     });
     return subscription;
+  }
+
+  /**
+   * 登记（或覆盖）这个用户的 Web Push 订阅。
+   *
+   * 服务端一个用户存一份订阅，所有定时任务到点投递时都读它——包括角色在
+   * fire 里给自己排的、客户端根本不知道存在的那些任务。用户清了站点数据、
+   * 重装了 PWA、或者推送服务轮换了 endpoint 之后，调一次这个就全好了。
+   *
+   * 什么时候调：`subscribePush()` 拿到订阅之后调一次；之后每次应用启动确认
+   * 订阅仍然有效时再调一次（幂等覆盖，重复调没有副作用）。
+   *
+   * 载荷像其它接口一样加密（需要先 `init()`），服务端落库时再用 per-user
+   * key 加密一次。
+   *
+   * @param {PushSubscription|Object} subscription - `pushManager.subscribe()` 的结果
+   *   （或它的 `toJSON()`）。至少要有非空的 `endpoint`。
+   * @param {{ updatedAt?: number }} [opts] - `updatedAt` 为 epoch 毫秒，默认由服务端取当前时刻。
+   * @returns {Promise<Object>} `{ success, data?: { updatedAt }, error? }`
+   */
+  async putPushSubscription(subscription, opts = {}) {
+    const plain = subscription && typeof subscription.toJSON === 'function'
+      ? subscription.toJSON()
+      : subscription;
+    if (!plain || typeof plain !== 'object' || typeof plain.endpoint !== 'string' || !plain.endpoint) {
+      throw new TypeError('[rei-standard-amsg-client] subscription must be an object with a non-empty endpoint');
+    }
+    const body = { subscription: plain };
+    if (opts.updatedAt !== undefined) body.updatedAt = opts.updatedAt;
+
+    const json = JSON.stringify(body);
+    this._assertPayloadSize(json, 'putPushSubscription');
+    const encrypted = await this._encrypt(json);
+
+    const res = await fetch(`${this._baseUrl}/push-subscription`, {
+      method: 'PUT',
+      headers: this._withServerToken({
+        'Content-Type': 'application/json',
+        'X-User-Id': this._userId,
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      }),
+      body: JSON.stringify(encrypted)
+    });
+
+    return res.json();
+  }
+
+  /**
+   * 服务端登记的订阅现状。
+   *
+   * 返回的是「有没有、什么时候登记的、endpoint 是哪个」，不含订阅的密钥部分
+   * ——设置页显示状态、或者拿 `endpoint` 跟本地订阅对一下是不是同一个，这些
+   * 就够了。
+   *
+   * @returns {Promise<Object>} `{ success, data?: { exists, updatedAt, endpoint }, error? }`
+   */
+  async getPushSubscription() {
+    const res = await fetch(`${this._baseUrl}/push-subscription`, {
+      method: 'GET',
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
+    });
+
+    return res.json();
+  }
+
+  /**
+   * 删掉服务端登记的订阅（设置页的「停止接收推送」）。
+   *
+   * 删掉之后已有的定时任务到点会投递失败并记下原因，不会静默消失。
+   *
+   * @returns {Promise<Object>} `{ success, data?: { deleted }, error? }`
+   */
+  async deletePushSubscription() {
+    const res = await fetch(`${this._baseUrl}/push-subscription`, {
+      method: 'DELETE',
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
+    });
+
+    return res.json();
   }
 
   // ─── Local preflight (no network) ────────────────────────────────

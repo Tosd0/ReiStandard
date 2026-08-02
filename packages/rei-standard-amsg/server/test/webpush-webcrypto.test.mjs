@@ -5,6 +5,7 @@ import {
   verifyVapidJwt,
   measurePushPayload,
   MAX_PUSH_PAYLOAD_BYTES,
+  PUSH_ENVELOPE_RESERVED_BYTES,
   WEB_PUSH_MAX_BODY_BYTES,
   WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
 } from '../src/server/lib/webpush-webcrypto.js';
@@ -146,5 +147,101 @@ describe('payload 大小护栏', () => {
     const filled = JSON.stringify({ messageKind: 'content', message: 'y'.repeat(remainingBytes) });
     assert.equal(measurePushPayload(filled).withinLimit, true);
     assert.equal(measurePushPayload(filled).remainingBytes, 0);
+  });
+});
+
+describe('信封预留字节（PUSH_ENVELOPE_RESERVED_BYTES）', () => {
+  // hook 把 payload 交还给库之后，库还会补一批「这是谁、第几条、什么时候」的
+  // 字段。hook 手里量到的从来不是最终 payload——不留出这批字节的话，卡在边界
+  // 上的消息会「量出来装得下、补完字段就超了」，既没走旁路存储也发不出去。
+  const STAMPED_KEYS = [
+    'messageId', 'sessionId', 'timestamp', 'messageIndex', 'totalMessages',
+    'taskId', 'taskUuid', 'recurrenceType', 'occurrenceMs',
+  ];
+
+  /** 库补完之后最坏情况下多出来的字节数。 */
+  function worstCaseEnvelopeBytes() {
+    const base = { messageKind: 'content', message: '' };
+    const stamped = {
+      ...base,
+      // 任务行 id 取 32 位整数上限，occurrence 取 13 位 epoch 毫秒
+      messageId: `msg_task_2147483647@9999999999999_hook_999`,
+      sessionId: `sess_task_2147483647@9999999999999`,
+      timestamp: '2026-08-02T12:34:56.789Z',
+      messageIndex: 999,
+      totalMessages: 999,
+      taskId: 2147483647,
+      taskUuid: 'u'.repeat(64), // scheduleTask 允许宿主传任意字符串当 uuid
+      recurrenceType: 'weekly',
+      occurrenceMs: 9999999999999,
+    };
+    for (const key of STAMPED_KEYS) {
+      assert.ok(key in stamped, `信封字段清单漏了 ${key}`);
+    }
+    return measurePushPayload(JSON.stringify(stamped)).bytes
+      - measurePushPayload(JSON.stringify(base)).bytes;
+  }
+
+  test('预留字节能盖住库真正会补上的那批字段', () => {
+    const needed = worstCaseEnvelopeBytes();
+    assert.ok(
+      needed <= PUSH_ENVELOPE_RESERVED_BYTES,
+      `信封实际要 ${needed} 字节，PUSH_ENVELOPE_RESERVED_BYTES 只留了 ${PUSH_ENVELOPE_RESERVED_BYTES}`
+    );
+    // 也别留得离谱——留太多等于白白少发正文。
+    assert.ok(PUSH_ENVELOPE_RESERVED_BYTES - needed < 200, '预留得太宽松了，正文额度被白白吃掉');
+  });
+
+  test('按预留额度组的 payload，补完信封字段之后仍在上限内', () => {
+    const skeleton = JSON.stringify({ messageKind: 'content', message: '' });
+    const { remainingBytes } = measurePushPayload(skeleton, { reserveEnvelope: true });
+    const push = { messageKind: 'content', message: 'x'.repeat(remainingBytes) };
+    assert.equal(measurePushPayload(JSON.stringify(push), { reserveEnvelope: true }).remainingBytes, 0);
+
+    const stamped = JSON.stringify({
+      ...push,
+      messageId: 'msg_task_2147483647@9999999999999_hook_999',
+      sessionId: 'sess_task_2147483647@9999999999999',
+      timestamp: '2026-08-02T12:34:56.789Z',
+      messageIndex: 999,
+      totalMessages: 999,
+      taskId: 2147483647,
+      taskUuid: 'u'.repeat(64),
+      recurrenceType: 'weekly',
+      occurrenceMs: 9999999999999,
+    });
+    assert.equal(measurePushPayload(stamped).withinLimit, true, '补完信封之后就该还装得下');
+  });
+
+  test('不留信封的老口径正好会溢出（这就是要留的理由）', () => {
+    const skeleton = JSON.stringify({ messageKind: 'content', message: '' });
+    const { remainingBytes } = measurePushPayload(skeleton); // 没留信封
+    const push = { messageKind: 'content', message: 'x'.repeat(remainingBytes) };
+    assert.equal(measurePushPayload(JSON.stringify(push)).withinLimit, true);
+
+    const stamped = JSON.stringify({
+      ...push,
+      messageId: 'msg_task_7@1577836800000_hook_0',
+      sessionId: 'sess_task_7@1577836800000',
+      timestamp: '2026-08-02T12:34:56.789Z',
+      messageIndex: 1,
+      totalMessages: 1,
+      taskId: 7,
+      taskUuid: '550e8400-e29b-41d4-a716-446655440000',
+      recurrenceType: 'daily',
+      occurrenceMs: 1577836800000,
+    });
+    assert.equal(measurePushPayload(stamped).withinLimit, false);
+  });
+
+  test('reserveEnvelope 只影响额度口径，bytes 还是这段字符串本身', () => {
+    const payload = 'x'.repeat(100);
+    const plain = measurePushPayload(payload);
+    const reserved = measurePushPayload(payload, { reserveEnvelope: true });
+    assert.equal(plain.bytes, reserved.bytes);
+    assert.equal(plain.envelopeReservedBytes, 0);
+    assert.equal(reserved.envelopeReservedBytes, PUSH_ENVELOPE_RESERVED_BYTES);
+    assert.equal(reserved.maxBytes, MAX_PUSH_PAYLOAD_BYTES - PUSH_ENVELOPE_RESERVED_BYTES);
+    assert.equal(plain.remainingBytes - reserved.remainingBytes, PUSH_ENVELOPE_RESERVED_BYTES);
   });
 });

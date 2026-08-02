@@ -24,6 +24,15 @@ const EXPECTED_FEATURES = [
   'occurrence-scoped-push-ids',
   'after-send-hook',
   'update-message-credentials',
+  'hook-state-accessors',
+  'after-send-scratch',
+  'fire-task-identity',
+  'push-task-identity',
+  'push-envelope-reserved-bytes',
+  'schedule-task-duplicate-row',
+  'recurring-stale-skip-hook',
+  'task-timezone',
+  'user-push-subscription',
 ];
 
 function makeWorker(extra = {}) {

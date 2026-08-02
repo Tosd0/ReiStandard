@@ -34,6 +34,7 @@ function createInMemoryBlobStore() {
 function createFakeAdapter() {
   let idCounter = 1;
   const tasks = [];
+  const pushSubscriptions = new Map();
 
   return {
     async initSchema() {
@@ -148,6 +149,20 @@ function createFakeAdapter() {
     async getTaskStatus(uuid, userId) {
       const target = tasks.find(task => task.uuid === uuid && task.user_id === userId);
       return target ? target.status : null;
+    },
+
+    // 用户级推送订阅：任务行不携带订阅，到点投递时读这里。
+    async getPushSubscription(userId) {
+      return pushSubscriptions.get(userId) || null;
+    },
+
+    async upsertPushSubscription(userId, subscription, updatedAt) {
+      pushSubscriptions.set(userId, { subscription, updated_at: updatedAt });
+      return true;
+    },
+
+    async deletePushSubscription(userId) {
+      return pushSubscriptions.delete(userId);
     }
   };
 }
@@ -170,6 +185,26 @@ function buildServer() {
       adapterFactory: async () => fakeAdapter
     }
   });
+}
+
+/**
+ * 登记这个用户的 Web Push 订阅。订阅是用户级的一份，任务行不携带它——排程
+ * 之前必须先有这一份，否则 `POST /schedule-message` 会 409。
+ */
+async function registerPushSubscription(server, tenantToken, userKey) {
+  const body = await encryptPayload(
+    { subscription: { endpoint: 'https://push.example.com' } },
+    userKey
+  );
+  return server.handlers.pushSubscription.PUT(
+    {
+      authorization: `Bearer ${tenantToken}`,
+      'x-user-id': TEST_USER_ID,
+      'x-payload-encrypted': 'true',
+      'x-encryption-version': '1'
+    },
+    body
+  );
 }
 
 // ─── Encryption tests ──────────────────────────────────────────
@@ -229,7 +264,6 @@ describe('validation utilities', () => {
       contactName: 'Alice',
       messageType: 'fixed',
       firstSendTime: new Date(Date.now() + 60000).toISOString(),
-      pushSubscription: { endpoint: 'https://push.example.com' },
       userMessage: 'Hello!'
     });
     assert.equal(result.valid, true);
@@ -240,7 +274,6 @@ describe('validation utilities', () => {
       contactName: 'Alice',
       messageType: 'prompted',
       firstSendTime: new Date(Date.now() + 60000).toISOString(),
-      pushSubscription: { endpoint: 'https://push.example.com' },
       completePrompt: 'Say hello',
       apiUrl: 'https://api.example.com/v1/chat/completions',
       apiKey: 'secret',
@@ -255,7 +288,6 @@ describe('validation utilities', () => {
       contactName: 'Alice',
       messageType: 'prompted',
       firstSendTime: new Date(Date.now() + 60000).toISOString(),
-      pushSubscription: { endpoint: 'https://push.example.com' },
       completePrompt: 'Say hello',
       apiUrl: 'https://api.example.com/v1/chat/completions',
       apiKey: 'secret',
@@ -393,12 +425,14 @@ describe('createReiServer v2.0.1 flow', () => {
       'x-user-id': TEST_USER_ID
     });
 
+    // 排程之前要有一份用户级订阅（任务行不携带订阅了）。
+    await registerPushSubscription(server, tenantToken, keyResult.body.data.userKey);
+
     const encryptedBody = await encryptPayload(
       {
         contactName: 'Alice',
         messageType: 'fixed',
         firstSendTime: new Date(Date.now() + 60000).toISOString(),
-        pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hello'
       },
       keyResult.body.data.userKey
@@ -505,7 +539,10 @@ describe('update-message splitPattern round-trip', () => {
       authorization: `Bearer ${tenantToken}`,
       'x-user-id': TEST_USER_ID
     });
-    return { tenantToken, userKey: keyResult.body.data.userKey };
+    const userKey = keyResult.body.data.userKey;
+    // 排程之前要有一份用户级订阅，否则 POST /schedule-message 会 409。
+    await registerPushSubscription(server, tenantToken, userKey);
+    return { tenantToken, userKey };
   }
 
   it('PUT splitPattern persists; PUT null resets; omitting preserves', async () => {
@@ -523,7 +560,6 @@ describe('update-message splitPattern round-trip', () => {
         contactName: 'Alice',
         messageType: 'fixed',
         firstSendTime,
-        pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hello',
         splitPattern: '([\\n]+)'
       },
@@ -632,7 +668,6 @@ describe('update-message splitPattern round-trip', () => {
         contactName: 'Bob',
         messageType: 'fixed',
         firstSendTime: new Date(Date.now() + 60_000).toISOString(),
-        pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hi'
       },
       userKey
@@ -676,7 +711,6 @@ describe('update-message splitPattern round-trip', () => {
         contactName: 'Carol',
         messageType: 'fixed',
         firstSendTime: new Date(Date.now() + 60_000).toISOString(),
-        pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hi',
         avatarUrl: 'https://example.com/original.png'
       },
@@ -716,12 +750,11 @@ describe('update-message splitPattern round-trip', () => {
     assert.equal(afterData.userMessage, 'updated', 'sibling field still applied');
   });
 
-  // ─── 凭据 / 推送订阅刷新（2.6.0-next.10）────────────────────────────
+  // ─── 凭据刷新 ──────────────────────────────────────────────────────
   //
-  // 白名单不认这四个字段时它们会被静默丢弃：消费方换了聊天 API 配置或重新
-  // 订阅推送，已挂任务里冻结的旧值刷不掉。回归守卫：旧行为下三个 assert
-  // （apiUrl/apiKey/primaryModel/pushSubscription 更新后落库）会挂。
-  it('PUT 可刷新 apiUrl / apiKey / primaryModel / pushSubscription；null 不清空', async () => {
+  // 白名单不认这三个字段时它们会被静默丢弃：消费方换了聊天 API 配置，已挂
+  // 任务里冻结的旧值刷不掉。
+  it('PUT 可刷新 apiUrl / apiKey / primaryModel；null 不清空', async () => {
     globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
     const { server, adapter } = await buildServerAndAdapter();
     const { tenantToken, userKey } = await bootstrapTenant(server);
@@ -733,7 +766,6 @@ describe('update-message splitPattern round-trip', () => {
         contactName: 'Dana',
         messageType: 'prompted',
         firstSendTime: new Date(Date.now() + 60_000).toISOString(),
-        pushSubscription: { endpoint: 'https://push.example.com/old' },
         completePrompt: 'say hi',
         apiUrl: 'https://old.example.com/v1/chat/completions',
         apiKey: 'sk-old',
@@ -750,14 +782,12 @@ describe('update-message splitPattern round-trip', () => {
     const scheduled = await server.handlers.scheduleMessage.POST(headers, scheduleBody);
     assert.equal(scheduled.status, 201);
 
-    // 一次性刷新四个字段。
-    const newSub = { endpoint: 'https://push.example.com/new', keys: { p256dh: 'k', auth: 'a' } };
+    // 一次性刷新三个字段。
     const patchBody = await encryptPayload(
       {
         apiUrl: 'https://new.example.com/v1/chat/completions',
         apiKey: 'sk-new',
-        primaryModel: 'model-new',
-        pushSubscription: newSub
+        primaryModel: 'model-new'
       },
       userKey
     );
@@ -771,13 +801,12 @@ describe('update-message splitPattern round-trip', () => {
     assert.equal(data.apiUrl, 'https://new.example.com/v1/chat/completions');
     assert.equal(data.apiKey, 'sk-new');
     assert.equal(data.primaryModel, 'model-new');
-    assert.deepEqual(data.pushSubscription, newSub);
     assert.equal(data.completePrompt, 'say hi', '未提及的字段保持不变');
 
     // truthy spread 语义钉住：显式 null 不清空、只是忽略——这些字段清掉
     // 任务就发不出去，「清空」没有合法用途。
     const nullBody = await encryptPayload(
-      { apiUrl: null, apiKey: null, primaryModel: null, pushSubscription: null },
+      { apiUrl: null, apiKey: null, primaryModel: null },
       userKey
     );
     const nulled = await server.handlers.updateMessage.PUT(
@@ -787,10 +816,11 @@ describe('update-message splitPattern round-trip', () => {
     const rowAfterNull = await adapter.getTaskByUuid(taskUuid, TEST_USER_ID);
     const dataAfterNull = JSON.parse(await decryptFromStorage(rowAfterNull.encrypted_payload, userKey));
     assert.equal(dataAfterNull.apiKey, 'sk-new', 'null 不清空凭据');
-    assert.deepEqual(dataAfterNull.pushSubscription, newSub, 'null 不清空订阅');
   });
 
-  it('PUT pushSubscription 非对象 → 400 INVALID_UPDATE_DATA（口径同 schedule-message）', async () => {
+  // 订阅是用户级的一份（PUT /push-subscription）。任务更新里还带着它多半是
+  // 照着老写法搬的，明确拒掉比静默丢弃好。
+  it('PUT 带 pushSubscription → 400 PUSH_SUBSCRIPTION_NOT_ACCEPTED', async () => {
     globalThis.__REI_BLOB_STORE__ = createInMemoryBlobStore();
     const { server } = await buildServerAndAdapter();
     const { tenantToken, userKey } = await bootstrapTenant(server);
@@ -808,19 +838,20 @@ describe('update-message splitPattern round-trip', () => {
         contactName: 'Eve',
         messageType: 'fixed',
         firstSendTime: new Date(Date.now() + 60_000).toISOString(),
-        pushSubscription: { endpoint: 'https://push.example.com' },
         userMessage: 'hi'
       },
       userKey
     );
     await server.handlers.scheduleMessage.POST(headers, scheduleBody);
 
-    const badBody = await encryptPayload({ pushSubscription: 'not-an-object' }, userKey);
+    const badBody = await encryptPayload(
+      { pushSubscription: { endpoint: 'https://push.example.com/new' } }, userKey
+    );
     const result = await server.handlers.updateMessage.PUT(
       `/api/v1/update-message?id=${taskUuid}`, headers, badBody
     );
     assert.equal(result.status, 400);
-    assert.equal(result.body.error.code, 'INVALID_UPDATE_DATA');
+    assert.equal(result.body.error.code, 'PUSH_SUBSCRIPTION_NOT_ACCEPTED');
     assert.deepEqual(result.body.error.details.invalidFields, ['pushSubscription']);
   });
 });

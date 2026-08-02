@@ -8,7 +8,13 @@
  * equals chronological ordering (mixed offsets like +08:00 vs Z are unified).
  */
 
-import { SQLITE_TABLE_SQL, SQLITE_INDEXES, SQLITE_MIGRATIONS, CLIENT_STATE_TABLE_SQL } from './schema.sqlite.js';
+import {
+  SQLITE_TABLE_SQL,
+  SQLITE_INDEXES,
+  SQLITE_MIGRATIONS,
+  CLIENT_STATE_TABLE_SQL,
+  PUSH_SUBSCRIPTION_TABLE_SQL
+} from './schema.sqlite.js';
 
 // Update methods build a dynamic SET clause from object keys. Callers pass only
 // hardcoded column names today, but enforcing a whitelist keeps a future caller
@@ -47,6 +53,7 @@ export class D1Adapter {
   async initSchema() {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
     await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
+    await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
 
     // SQLite 的 ALTER TABLE 没有 ADD COLUMN IF NOT EXISTS，列已经在了就会
     // 报 duplicate column name。那正是「这一步不用做」的意思，跳过即可；
@@ -90,6 +97,7 @@ export class D1Adapter {
   async dropSchema() {
     await this._db.prepare('DROP TABLE IF EXISTS scheduled_messages').run();
     await this._db.prepare('DROP TABLE IF EXISTS client_state').run();
+    await this._db.prepare('DROP TABLE IF EXISTS push_subscriptions').run();
   }
 
   async createTask(params) {
@@ -381,6 +389,51 @@ export class D1Adapter {
   async clearClientState(userId) {
     const res = await this._db.prepare('DELETE FROM client_state WHERE user_id = ?').bind(userId).run();
     return res.meta.changes || 0;
+  }
+
+  // ── push_subscriptions (user-level Web Push subscription) ──────────────
+
+  /**
+   * 这个用户当前登记的推送订阅（密文原样返回，解密在上层）。
+   *
+   * @param {string} userId
+   * @returns {Promise<{ subscription: string, updated_at: number }|null>}
+   */
+  async getPushSubscription(userId) {
+    return this._db.prepare(
+      'SELECT subscription, updated_at FROM push_subscriptions WHERE user_id = ? LIMIT 1'
+    ).bind(userId).first();
+  }
+
+  /**
+   * 覆盖写这个用户的订阅。一个用户一行，没有 last-write-wins 之类的比较——
+   * 客户端拿到的新订阅永远比旧的有效，旧的那份只会 410。
+   *
+   * @param {string} userId
+   * @param {string} encryptedSubscription
+   * @param {number} updatedAt - epoch 毫秒
+   * @returns {Promise<boolean>}
+   */
+  async upsertPushSubscription(userId, encryptedSubscription, updatedAt) {
+    const res = await this._db.prepare(
+      `INSERT INTO push_subscriptions (user_id, subscription, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT (user_id) DO UPDATE SET
+         subscription = excluded.subscription,
+         updated_at = excluded.updated_at`
+    ).bind(userId, encryptedSubscription, updatedAt).run();
+    return (res.meta.changes || 0) > 0;
+  }
+
+  /**
+   * 删掉这个用户的订阅（设置页「停止接收推送」）。
+   *
+   * @param {string} userId
+   * @returns {Promise<boolean>} true = 确实删掉了一行
+   */
+  async deletePushSubscription(userId) {
+    const res = await this._db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId).run();
+    return (res.meta.changes || 0) > 0;
   }
 }
 

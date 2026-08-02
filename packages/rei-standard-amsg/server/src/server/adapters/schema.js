@@ -69,6 +69,19 @@ export const INDEXES = [
   }
 ];
 
+// push_subscriptions: 一个用户一份 Web Push 订阅，任务行不再各自携带。
+// 用户清站点数据 / 重装 PWA / 推送服务轮换 endpoint 之后，客户端覆盖这一行
+// 就够了，不用把每条任务翻出来逐行刷（角色自排的任务客户端根本不知道存在，
+// 逐行刷本来也刷不到它）。`subscription` 是 encryptForStorage 密文，
+// `updated_at` 是 epoch 毫秒（BIGINT，与 SQLite 侧同口径）。
+export const PUSH_SUBSCRIPTION_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    user_id VARCHAR(255) PRIMARY KEY,
+    subscription TEXT NOT NULL,
+    updated_at BIGINT NOT NULL
+  )
+`;
+
 export const VERIFY_TABLE_SQL = `
   SELECT table_name
   FROM information_schema.tables

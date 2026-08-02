@@ -21,10 +21,13 @@
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
  * @param {number} [config.maxScheduledTasksPerFire] - 一次 fire 里 hook 用 ctx.scheduleTask() 最多能建几条后续任务（默认 2，0 表示不许自排）。
  * @param {function} [config.onAfterSend] - 推送发出（或发挂）之后的可选 hook：
- *   ({ task, sentCount, total, error }) => void|Promise。task 是任务行本身
- *   （并发投递时靠它区分回执属于哪条任务）。全部成功 error 为 null；第
- *   k 段失败时 sentCount = k、error 带原始错误，且在错误往上抛之前调用完。
- *   hook 自身抛错只记日志，不影响主流程（见 lib/agentic-fire.js）。
+ *   ({ task, sentCount, total, error, scratch, readState, writeState }) =>
+ *   void|Promise。task 是任务行本身（并发投递时靠它区分回执属于哪条任务）；
+ *   scratch 是本次 fire 的便签对象，与 onBeforeFire / onLLMOutput 拿到的是同
+ *   一个引用；readState / writeState 是 client_state 的读写口。全部成功
+ *   error 为 null；第 k 段失败时 sentCount = k、error 带原始错误，且在错误往
+ *   上抛之前调用完。hook 自身抛错只记日志，不影响主流程（见
+ *   lib/agentic-fire.js）。
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
@@ -37,6 +40,7 @@ import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
 import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
 import { createClientStateHandler } from './handlers/client-state.js';
+import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createCapabilitiesHandler } from './handlers/capabilities.js';
 
 export function createSingleUserServer(config) {
@@ -82,6 +86,7 @@ export function createSingleUserServer(config) {
       messages: createMessagesHandler(ctx),
       vapidPublicKey: createVapidPublicKeyHandler(ctx),
       clientState: createClientStateHandler(ctx),
+      pushSubscription: createPushSubscriptionHandler(ctx),
       capabilities: createCapabilitiesHandler(ctx)
     }
   };

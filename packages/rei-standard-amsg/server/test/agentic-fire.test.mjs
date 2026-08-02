@@ -6,9 +6,12 @@ import { decryptFromStorage, deriveUserEncryptionKey, encryptForStorage } from '
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
+import { encryptTestSubscription, seedPushSubscription, withPushSubscriptionStore } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
+// 用户级订阅：投递时从这里现读（任务行不携带订阅）。
+const ENCRYPTED_PUSH_SUB = await encryptTestSubscription(USER, MASTER_KEY);
 
 async function makeTask(payloadOverrides = {}) {
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
@@ -39,7 +42,7 @@ function makeCtx({ hooks, maxToolIterations, totalTimeoutMs, db, pushSpy, now, m
     masterKey: MASTER_KEY,
     webpush: { async sendNotification(sub, payload) { if (pushSpy) pushSpy(sub, payload); } },
     vapid: { email: 'v@example.com', publicKey: 'pub', privateKey: 'priv' },
-    db: db || {},
+    db: withPushSubscriptionStore(db || {}, ENCRYPTED_PUSH_SUB),
     hooks: hooks || null,
     maxToolIterations,
     totalTimeoutMs,
@@ -393,7 +396,8 @@ describe('agentic fire loop', () => {
       const allowedSessionKeys = new Set([
         'sessionId', 'charId', 'messages', 'llmResponse', 'llmOutputText',
         'iteration', 'metadata', 'contactName', 'avatarUrl', 'scratch',
-        // server 侧在共享 SessionContext 之上加的状态访问器与建任务口
+        // server 侧在共享 SessionContext 之上加的任务身份、状态访问器与建任务口
+        'taskId', 'taskUuid', 'occurrenceMs',
         'readState', 'writeState', 'scheduleTask',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
@@ -650,6 +654,8 @@ describe('agentic fire via the single-user worker (scheduled e2e)', () => {
       { namespace: 'notes', key: 'latest', value: await encryptForStorage('state-derived context', userKey), updatedAt: 1 },
     ]);
     const seeded = await seedDueTask(adapter);
+    // 用户级订阅：投递时现读这一份。
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
 
     const pushes = [];
     const worker = createSingleUserCloudflareWorker(() => ({
@@ -927,6 +933,7 @@ describe('writeState', () => {
       next_send_at: new Date(Date.now() - 30_000).toISOString(),
       message_type: 'auto',
     });
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
 
     const llm = stubLlm([finishRound]);
     try {
@@ -1072,9 +1079,9 @@ describe('scheduleTask（fire 里给自己排后续任务）', () => {
 
     // 落库的 payload 里凭据齐全，新任务到点能自己发出去
     const { row, payload } = await readStoredPayload(adapter, outcome.uuid);
-    assert.deepEqual(payload.pushSubscription, {
-      endpoint: 'https://push.example.com/sub', keys: { p256dh: 'k', auth: 'a' },
-    });
+    // 推送订阅是用户级的一份，任务不携带它——新任务到点读的就是当时最新的
+    // 那份，用户中途换了设备也不用回头把这条任务翻出来刷。
+    assert.equal('pushSubscription' in payload, false);
     assert.equal(payload.apiKey, 'sk-secret');
     assert.equal(payload.apiUrl, 'https://api.example.com/v1/chat/completions');
     assert.equal(payload.primaryModel, 'model-x');
@@ -1255,8 +1262,26 @@ describe('scheduleTask（fire 里给自己排后续任务）', () => {
       onFire: async (ctx) => { retry = await ctx.scheduleTask({ firstSendTime: IN_90MIN, uuid }); },
     });
     assert.equal(result.success, true);
-    assert.deepEqual(retry, { created: false, reason: 'duplicate', uuid });
+    assert.equal(retry.created, false);
+    assert.equal(retry.reason, 'duplicate');
+    assert.equal(retry.uuid, uuid);
     assert.equal(await countTasks(d1), 1);
+
+    // 撞车时把已经存在的那一行投影回来：重跑那轮宿主才记得下这条任务，
+    // 否则它只活在数据库里——面板列不出、用户取消不了、还会照常到点触发。
+    assert.equal(retry.task.uuid, uuid);
+    assert.equal(retry.task.id, first.id);
+    assert.equal(retry.task.nextSendAt, first.nextSendAt);
+    assert.equal(retry.task.status, 'pending');
+    assert.equal(retry.task.contactName, 'Rei');
+    assert.equal(retry.task.recurrenceType, 'none');
+    // 脱敏形状：凭据一个都不能出现在这份投影里。
+    const serialized = JSON.stringify(retry.task);
+    assert.ok(!serialized.includes('sk-secret'));
+    assert.ok(!serialized.includes('push.example.com'));
+    for (const k of ['apiKey', 'apiUrl', 'pushSubscription', 'completePrompt', 'messages']) {
+      assert.equal(k in retry.task, false, `duplicate 投影不该带 ${k}`);
+    }
   });
 
   // 要不要接着说，往往是看完这轮 LLM 输出才定的——那时 onBeforeFire 早已返回。
@@ -1446,8 +1471,14 @@ describe('onAfterSend（推送发出之后的 hook）', () => {
       llm.restore();
     }
     // 载荷带任务身份：宿主按任务写回自述日志时靠 task 对号入座。
-    assert.deepEqual(calls, [{ task, sentCount: 2, total: 2, error: null }]);
+    assert.equal(calls.length, 1);
     assert.equal(calls[0].task, task);
+    assert.equal(calls[0].sentCount, 2);
+    assert.equal(calls[0].total, 2);
+    assert.equal(calls[0].error, null);
+    // client_state 的读写口跟着回执一起来：宿主不用再去别处翻一个能用的写口。
+    assert.equal(typeof calls[0].readState, 'function');
+    assert.equal(typeof calls[0].writeState, 'function');
   });
 
   test('tick 内多任务并发：每次回执的 task 各是各的，能区分开', async () => {
@@ -1526,5 +1557,200 @@ describe('onAfterSend（推送发出之后的 hook）', () => {
     assert.equal(result.success, true);
     assert.equal(result.messagesSent, 2);
     assert.ok(warned >= 1);
+  });
+});
+
+describe('任务身份：hook ctx 与 push 都直接带着', () => {
+  const OCCURRENCE = '2020-01-01T00:00:00.000Z';
+  const OCCURRENCE_MS = Date.parse(OCCURRENCE);
+
+  // 以前只能从 sessionId（`sess_task_<id>@<occurrenceMs>`）里切字符串，切不出
+  // 来是静默的：送达归属失效之后客户端会误判「这次没送达过」。
+  test('onLLMOutput / executeToolCalls 的 ctx 上直接有 taskId / taskUuid / occurrenceMs', async () => {
+    const { task } = await makeTask();
+    const seen = [];
+    let round = 0;
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async (ctx) => {
+        seen.push({ from: 'onLLMOutput', taskId: ctx.taskId, taskUuid: ctx.taskUuid, occurrenceMs: ctx.occurrenceMs });
+        return round++ === 0
+          ? { decision: 'tool-request', toolCalls: [TOOL_CALL] }
+          : { decision: 'skip-push' };
+      },
+      executeToolCalls: async (_calls, ctx) => {
+        seen.push({ from: 'executeToolCalls', taskId: ctx.taskId, taskUuid: ctx.taskUuid, occurrenceMs: ctx.occurrenceMs });
+        return [{ tool_call_id: 'call_1', role: 'tool', content: '{}' }];
+      },
+    };
+    const llm = stubLlm([toolRound, finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks }));
+    } finally {
+      llm.restore();
+    }
+    assert.equal(seen.length, 3);
+    for (const entry of seen) {
+      assert.equal(entry.taskId, 7, `${entry.from} 应拿到 taskId`);
+      assert.equal(entry.taskUuid, 'u7', `${entry.from} 应拿到 taskUuid`);
+      assert.equal(entry.occurrenceMs, OCCURRENCE_MS, `${entry.from} 应拿到 occurrenceMs`);
+    }
+  });
+
+  // 客户端要知道「这条推送属于哪条任务、它还会不会再来」。角色在 fire 里给
+  // 自己排的任务客户端从没见过，靠宿主往 metadata 里抄字段总有抄漏的一天。
+  test('hook 路径的每条 push 都带 taskId / taskUuid / recurrenceType / occurrenceMs', async () => {
+    const { task } = await makeTask({ recurrenceType: 'daily' });
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'A' },
+          { messageKind: 'content', message: 'B' },
+        ],
+      }),
+    };
+    const pushes = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, pushSpy: (_s, p) => pushes.push(JSON.parse(p)) }));
+    } finally {
+      llm.restore();
+    }
+    assert.equal(pushes.length, 2);
+    for (const push of pushes) {
+      assert.equal(push.taskId, 7);
+      assert.equal(push.taskUuid, 'u7');
+      assert.equal(push.recurrenceType, 'daily');
+      assert.equal(push.occurrenceMs, OCCURRENCE_MS);
+    }
+  });
+
+  test('调度身份以库为准：hook 自己写的值会被覆盖', async () => {
+    const { task } = await makeTask({ recurrenceType: 'weekly' });
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({
+        decision: 'finish',
+        pushPayloads: [{ messageKind: 'content', message: 'A', taskUuid: '瞎写的', recurrenceType: 'none' }],
+      }),
+    };
+    const pushes = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, pushSpy: (_s, p) => pushes.push(JSON.parse(p)) }));
+    } finally {
+      llm.restore();
+    }
+    assert.equal(pushes[0].taskUuid, 'u7');
+    assert.equal(pushes[0].recurrenceType, 'weekly');
+  });
+
+  test('一次性任务的 recurrenceType 是 none（payload 里没写也一样）', async () => {
+    const { task } = await makeTask({ recurrenceType: undefined });
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'A' }] }),
+    };
+    const pushes = [];
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, makeCtx({ hooks, pushSpy: (_s, p) => pushes.push(JSON.parse(p)) }));
+    } finally {
+      llm.restore();
+    }
+    assert.equal(pushes[0].recurrenceType, 'none');
+  });
+});
+
+describe('scratch 贯穿到 onAfterSend', () => {
+  // 宿主要把「这次 fire 生成了哪几段正文」从 onLLMOutput 传到 onAfterSend，
+  // 以前只能自建模块级 Map 按任务行 id 分格，还得配 TTL 清扫和并发隔离——
+  // 那张登记表上长了一堆「早退就把状态丢了」的洞。
+  test('onBeforeFire / onLLMOutput / onAfterSend 拿到同一个 scratch 引用', async () => {
+    const { task } = await makeTask();
+    const seen = [];
+    const hooks = {
+      onBeforeFire: async (ctx) => {
+        ctx.scratch.segments = [];
+        seen.push(ctx.scratch);
+        return [{ role: 'user', content: 'U' }];
+      },
+      onLLMOutput: async (ctx) => {
+        ctx.scratch.segments.push('A', 'B');
+        seen.push(ctx.scratch);
+        return {
+          decision: 'finish',
+          pushPayloads: [
+            { messageKind: 'content', message: 'A' },
+            { messageKind: 'content', message: 'B' },
+          ],
+        };
+      },
+    };
+    let afterSend = null;
+    const llm = stubLlm([finishRound]);
+    try {
+      await processSingleMessage(task, {
+        ...makeCtx({ hooks }),
+        onAfterSend: async (info) => { afterSend = info; },
+      });
+    } finally {
+      llm.restore();
+    }
+    assert.ok(afterSend, 'onAfterSend 必须被调到');
+    assert.deepEqual(afterSend.scratch.segments, ['A', 'B']);
+    assert.equal(afterSend.scratch, seen[0], 'onAfterSend 的 scratch 必须是 onBeforeFire 那一个');
+    assert.equal(afterSend.scratch, seen[1]);
+  });
+
+  test('推送中途挂掉时，onAfterSend 照样拿得到 scratch', async () => {
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async (ctx) => { ctx.scratch.segments = ['A', 'B']; return [{ role: 'user', content: 'U' }]; },
+      onLLMOutput: async () => ({
+        decision: 'finish',
+        pushPayloads: [
+          { messageKind: 'content', message: 'A' },
+          { messageKind: 'content', message: 'B' },
+        ],
+      }),
+    };
+    let sends = 0;
+    let afterSend = null;
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, {
+        ...makeCtx({ hooks }),
+        webpush: { async sendNotification() { if (++sends === 2) throw new Error('push endpoint gone'); } },
+        onAfterSend: async (info) => { afterSend = info; },
+      });
+      assert.equal(result.success, false);
+    } finally {
+      llm.restore();
+    }
+    assert.equal(afterSend.sentCount, 1);
+    assert.deepEqual(afterSend.scratch.segments, ['A', 'B']);
+  });
+
+  // 每次 fire 一份新的：重试产生的新 fire 不该看见上一轮留下的东西。
+  test('两次 fire 各自一份 scratch', async () => {
+    const { task } = await makeTask();
+    const scratches = [];
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'A' }] }),
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      const ctx = { ...makeCtx({ hooks }), onAfterSend: async (info) => { scratches.push(info.scratch); } };
+      await processSingleMessage(task, ctx);
+      await processSingleMessage(task, ctx);
+    } finally {
+      llm.restore();
+    }
+    assert.equal(scratches.length, 2);
+    assert.notEqual(scratches[0], scratches[1]);
   });
 });
