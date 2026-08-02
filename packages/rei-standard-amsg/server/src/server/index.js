@@ -28,6 +28,7 @@ import { createSendNotificationsHandler } from './handlers/send-notifications.js
 import { createUpdateMessageHandler } from './handlers/update-message.js';
 import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
+import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createTenantBlobStore } from './tenant/blob-store.js';
 import { createTenantContextManager } from './tenant/context.js';
 import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
@@ -65,6 +66,7 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @property {{ PUT: function }} updateMessage
  * @property {{ DELETE: function }} cancelMessage
  * @property {{ GET: function }} messages
+ * @property {{ PUT: function, GET: function, DELETE: function }} pushSubscription
  */
 
 /**
@@ -138,7 +140,8 @@ export async function createReiServer(config) {
       sendNotifications: createSendNotificationsHandler(ctx),
       updateMessage: createUpdateMessageHandler(ctx),
       cancelMessage: createCancelMessageHandler(ctx),
-      messages: createMessagesHandler(ctx)
+      messages: createMessagesHandler(ctx),
+      pushSubscription: createPushSubscriptionHandler(ctx)
     }
   };
 }
@@ -152,10 +155,12 @@ export {
   createWebCryptoWebPush,
   measurePushPayload,
   MAX_PUSH_PAYLOAD_BYTES,
+  PUSH_ENVELOPE_RESERVED_BYTES,
   WEB_PUSH_MAX_BODY_BYTES,
   WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
 } from './lib/webpush-webcrypto.js';
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
-export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4 } from './lib/validation.js';
+export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
+export { advanceOccurrence, nextFutureOccurrence, planNextOccurrence } from './lib/recurrence.js';
 export { createTenantToken, verifyTenantToken } from './tenant/token.js';

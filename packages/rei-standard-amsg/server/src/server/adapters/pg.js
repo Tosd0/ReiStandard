@@ -11,6 +11,7 @@ import {
   TABLE_SQL,
   INDEXES,
   MIGRATIONS,
+  PUSH_SUBSCRIPTION_TABLE_SQL,
   VERIFY_TABLE_SQL,
   COLUMNS_SQL,
   UPDATABLE_COLUMNS
@@ -42,6 +43,7 @@ export class PgAdapter {
 
   async initSchema() {
     await this._query(TABLE_SQL);
+    await this._query(PUSH_SUBSCRIPTION_TABLE_SQL);
     for (const migration of MIGRATIONS) {
       await this._query(migration.sql);
     }
@@ -93,6 +95,7 @@ export class PgAdapter {
 
   async dropSchema() {
     await this._query('DROP TABLE IF EXISTS scheduled_messages CASCADE');
+    await this._query('DROP TABLE IF EXISTS push_subscriptions CASCADE');
   }
 
   async createTask(params) {
@@ -294,5 +297,59 @@ export class PgAdapter {
       [uuid, userId]
     );
     return rows.length > 0 ? rows[0].status : null;
+  }
+
+  // ── push_subscriptions (user-level Web Push subscription) ──────────────
+
+  /**
+   * 这个用户当前登记的推送订阅（密文原样返回，解密在上层）。
+   *
+   * @param {string} userId
+   * @returns {Promise<{ subscription: string, updated_at: number }|null>}
+   */
+  async getPushSubscription(userId) {
+    const rows = await this._query(
+      'SELECT subscription, updated_at FROM push_subscriptions WHERE user_id = $1 LIMIT 1',
+      [userId]
+    );
+    if (rows.length === 0) return null;
+    // BIGINT 在 pg 驱动里读出来是字符串，统一成 number 再往上给。
+    return { subscription: rows[0].subscription, updated_at: Number(rows[0].updated_at) };
+  }
+
+  /**
+   * 覆盖写这个用户的订阅。一个用户一行，没有 last-write-wins 之类的比较——
+   * 客户端拿到的新订阅永远比旧的有效，旧的那份只会 410。
+   *
+   * @param {string} userId
+   * @param {string} encryptedSubscription
+   * @param {number} updatedAt - epoch 毫秒
+   * @returns {Promise<boolean>}
+   */
+  async upsertPushSubscription(userId, encryptedSubscription, updatedAt) {
+    const rows = await this._query(
+      `INSERT INTO push_subscriptions (user_id, subscription, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) DO UPDATE SET
+         subscription = EXCLUDED.subscription,
+         updated_at = EXCLUDED.updated_at
+       RETURNING user_id`,
+      [userId, encryptedSubscription, updatedAt]
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * 删掉这个用户的订阅（设置页「停止接收推送」）。
+   *
+   * @param {string} userId
+   * @returns {Promise<boolean>} true = 确实删掉了一行
+   */
+  async deletePushSubscription(userId) {
+    const rows = await this._query(
+      'DELETE FROM push_subscriptions WHERE user_id = $1 RETURNING user_id',
+      [userId]
+    );
+    return rows.length > 0;
   }
 }

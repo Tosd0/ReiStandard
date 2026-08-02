@@ -45,3 +45,11 @@ CREATE TABLE IF NOT EXISTS client_state (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, namespace, key)
 );
+
+-- Web Push 订阅（/push-subscription 端点用）。一个用户一份，任务行不携带
+-- 订阅，到点投递时读这里。subscription 是密文；updated_at 是 epoch 毫秒。
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  user_id TEXT PRIMARY KEY,
+  subscription TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);

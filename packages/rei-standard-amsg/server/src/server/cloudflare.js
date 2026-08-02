@@ -23,10 +23,12 @@ export {
   createWebCryptoWebPush,
   measurePushPayload,
   MAX_PUSH_PAYLOAD_BYTES,
+  PUSH_ENVELOPE_RESERVED_BYTES,
   WEB_PUSH_MAX_BODY_BYTES,
   WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
 } from './lib/webpush-webcrypto.js';
 export { runScheduledTick } from './lib/run-tick.js';
+export { isValidTimeZoneId, advanceOccurrence, nextFutureOccurrence, planNextOccurrence } from './lib/recurrence.js';
 export {
   deriveUserEncryptionKey,
   decryptPayload,

@@ -53,13 +53,18 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 - `"auto"` 或不传：保持默认行为。
 - `"always"`：强制弹系统通知，无视 `messageKind`。
-- `"when-hidden"`：仅当没有 `visibilityState === "visible"` 的客户端时才弹系统通知。如果应用在前台，则静默。
-- `false`：强制不弹通知，即使是 `content`。适合完全交给应用自行接管或自绘弹窗的场景。
+- `"when-hidden"`：仅当没有 `visibilityState === "visible"` 的客户端时才弹系统通知。应用在前台时静默——这一档是安全的，规范允许 user agent 在有可见窗口时免掉「必须展示通知」的约束，界面里自己提示即可。
+- `false`：强制不弹通知，即使是 `content`，也不看应用在不在前台。事件照常派发给页面和 `onBusinessPayload`，但用户可能什么反馈都收不到。用之前先读下面这段。
 
 当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `renotify`, `requireInteraction`, `silent`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
 
-> **APNs / iOS Web Push 提醒**
-> 如果业务大量发送后台 push 却长期不展示可见通知，iOS Web Push 的送达可能被系统策略影响。生产环境建议对后台消息使用 `notification.show = "always"` 或 `"when-hidden"`，再配合 `tag` 折叠与 `silent: true` 降低打扰。
+> **收到 push 却不展示通知，是要付代价的**
+>
+> 订阅是按 `userVisibleOnly: true` 建的——那是跟浏览器约好「每条 push 都会给用户可见反馈」。应用在后台时违约，各家处理不同：Chrome 会替你弹一条通用的「此网站在后台更新了内容」；Firefox 对不展示通知的 push 有配额，超了直接把这个订阅退掉，得等用户再访问站点才恢复；iOS Web Push 会影响送达，反复不展示可能撤销推送权限。掉订阅这件事是静默发生的，事后很难查。
+>
+> 所以后台消息用 `"always"` 或 `"when-hidden"`，再配合 `tag` 折叠与 `silent: true` 降低打扰。`false` 留给「确知页面在前台、这条 push 只是给它送数据」的场景，而那种场景通常 `"when-hidden"` 就够了。
+>
+> 想让后台产生的副作用到达客户端，比起发一条不弹的 push，让客户端上线时主动拉一次更靠得住：push 本来就是通知通道，订阅失效、离线、平台限流都会让它丢，不适合当唯一的数据同步手段。
 
 #### 场景示例
 
@@ -79,18 +84,20 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 }
 ```
 
-**2. Content 消息完全由前端接管**
-应用层想在页面前台做非常定制的 Toast，不想弹系统级别通知：
+**2. Content 消息在前台由页面自绘**
+应用层想在页面前台做定制 Toast，不弹系统通知；页面不在前台时仍然要让用户看到：
 
 ```json
 {
   "messageKind": "content",
   "message": "...",
   "notification": {
-    "show": false
+    "show": "when-hidden"
   }
 }
 ```
+
+前台由 `postMessage` 事件驱动自绘，后台交给系统通知，两边都不落空。要连后台都不弹才用 `false`，代价见上一节。
 
 > **注意：对于 multipart 传输**
 > 当 payload 通过 `_multipart` 分片时，未收齐前不仅不派发业务事件，也**绝不**弹系统通知。收齐并还原为原始 payload 后，再按原始 payload 的 `notification.show` 策略执行判定。

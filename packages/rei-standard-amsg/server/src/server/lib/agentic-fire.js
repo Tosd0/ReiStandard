@@ -16,11 +16,13 @@
  *                             assistant turn + tool results, next round
  *
  * 发送后回执：finish 的 pushPayloads 逐段发完（或中途发挂）后，可选的
- * ctx.onAfterSend?.({ task, sentCount, total, error }) 会被调用（见
- * notifyAfterSend），宿主用它把「真的发出去了几段」写回自己的存储——发送前
- * 的 hook 写的副作用，在推送全挂时会变成「云端记得说过、用户没收到」。载荷
- * 带 task（任务行本身）：tick 内多个任务并发投递时，hook 靠它区分回执属于
- * 哪条任务。
+ * ctx.onAfterSend?.({ task, sentCount, total, error, scratch, readState,
+ * writeState }) 会被调用（见 notifyAfterSend），宿主用它把「真的发出去了几
+ * 段」写回自己的存储——发送前的 hook 写的副作用，在推送全挂时会变成「云端
+ * 记得说过、用户没收到」。载荷带 task（任务行本身）：tick 内多个任务并发
+ * 投递时，hook 靠它区分回执属于哪条任务；带 scratch（与本次 fire 的
+ * onBeforeFire / onLLMOutput 同一个引用），前面几个 hook 记下的东西这里直
+ * 接读；带 readState / writeState，回执要落进 client_state 时不用另想办法。
  *
  * The decision contract is shared with @rei-standard/amsg-instant
  * (assertValidDecision / buildSessionContext live in
@@ -28,19 +30,25 @@
  * onLLMOutput drops in unchanged: 'tool-request' may carry `toolCalls`
  * directly, or tool_request pushPayloads that embed them — both work.
  *
- * Credential hiding: hook ctx objects never contain apiKey /
- * pushSubscription / vapid / masterKey (same rationale as instant's
- * SessionContext — a console.log(ctx) in a hook must not leak keys).
+ * Credential hiding: hook ctx objects never contain apiKey / vapid /
+ * masterKey (same rationale as instant's SessionContext — a
+ * console.log(ctx) in a hook must not leak keys). 推送订阅根本不在任务
+ * payload 里（它是用户级的一份，见 lib/push-subscription-store.js），投递
+ * 时才现读，也不会经过 hook。
  *
  * client_state 读写：fireCtx 和每轮的 sessionCtx 上都挂着 readState /
  * writeState，读到和写出的都是客户端 `GET/PUT /client-state` 那套数据。写口
  * 在 sessionCtx 上也给，是因为「这条内容太大、塞不进 push」往往到工具跑完、
  * 组 pushPayloads 时才知道，那时 onBeforeFire 早已返回。
  *
- * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx 与同一次
- * fire 每轮的 sessionCtx 都持有同一个引用，hook 之间借它传工具上下文，
- * 不用再自己维护 Map<sessionId, state>。fire 结束（finish / skip-push /
- * 抛错 / 轮数超限）后随调用栈丢弃；库不读不写、不落库、不打日志。
+ * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx、同一次 fire
+ * 每轮的 sessionCtx、以及发送后的 onAfterSend 都持有同一个引用，hook 之间借
+ * 它传上下文，不用再自己维护 Map<sessionId, state>。fire 结束（finish /
+ * skip-push / 抛错 / 轮数超限）后随调用栈丢弃；库不读不写、不落库、不打日志。
+ *
+ * 任务身份：sessionCtx 上直接带 taskId（任务行 id）、taskUuid、occurrenceMs
+ * （本次触发的名义时刻，epoch 毫秒）。sessionId 是给日志和去重用的不透明
+ * 字符串，别去拆它拿这些值。
  *
  * 工具声明：onBeforeFire 的返回值里可以带 `tools`（OpenAI 的 tools 数组，
  * 另有可选的 `toolChoice`），本次 fire 的每一轮 LLM 请求都原样带上它们——
@@ -50,9 +58,10 @@
  * 自排后续任务：fireCtx 和每轮的 sessionCtx 上都挂着 scheduleTask，宿主用它
  * 在这次 fire 里给同一个用户再建一条定时任务（「这条发完，一个半小时后我再
  * 接着说一句」）。写口在 sessionCtx 上也给，是因为要不要接着说往往是看完
- * LLM 输出才定的，那时 onBeforeFire 早已返回。凭据（pushSubscription /
- * apiKey）和投递配置从当前任务继承、宿主全程看不到（与 buildHookTask 屏蔽
- * 凭据同一个原则），宿主只提供「什么时候、说什么方向」。
+ * LLM 输出才定的，那时 onBeforeFire 早已返回。凭据（apiKey）和投递配置从当前
+ * 任务继承、宿主全程看不到（与 buildHookTask 屏蔽凭据同一个原则），宿主只提供
+ * 「什么时候、说什么方向」。推送订阅不用继承——它是用户级的一份，新任务到点
+ * 投递时读的就是当时最新的那份。
  *
  * 新任务不继承 completePrompt / messages，两者都置 null：fire-time hook 每次
  * 现场重组 prompt，把排程时冻结的旧 prompt 带过去，会在新任务万一走回老链路
@@ -93,19 +102,10 @@ import { randomUUID } from './webcrypto-utils.js';
 import { decryptFromStorage, encryptForStorage } from './encryption.js';
 import { isUniqueViolation } from './db-errors.js';
 import { callLlm } from './llm.js';
-import {
-  DEFAULT_MAX_STATE_VALUE_BYTES,
-  INTERNAL_STATE_CHAR_RE,
-  chunkNamespaceFor,
-  resolveClientStateEntries,
-} from './state-chunks.js';
-import {
-  MAX_STATE_ENTRIES_PER_BATCH,
-  MAX_NAMESPACE_CHARS,
-  MAX_KEY_CHARS,
-  stateValueBytes,
-  writeClientStateEntries,
-} from './client-state-store.js';
+import { createStateAccessors } from './state-accessors.js';
+import { projectTask } from './task-projection.js';
+import { isValidTimeZoneId } from './recurrence.js';
+import { resolvePushSubscription } from './push-subscription-store.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -143,8 +143,20 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @returns {string}
  */
 export function occurrenceSuffix(task) {
+  const occurrenceMs = occurrenceMsOf(task);
+  return occurrenceMs == null ? '' : `@${occurrenceMs}`;
+}
+
+/**
+ * 本次触发的名义时刻（epoch 毫秒）。行上没有可解析的 next_send_at（比如直接
+ * 喂进来的内存任务对象）时返回 null。
+ *
+ * @param {{ next_send_at?: string }} task
+ * @returns {number|null}
+ */
+export function occurrenceMsOf(task) {
   const occurrenceMs = Date.parse(task && task.next_send_at);
-  return Number.isFinite(occurrenceMs) ? `@${occurrenceMs}` : '';
+  return Number.isFinite(occurrenceMs) ? occurrenceMs : null;
 }
 
 /**
@@ -246,104 +258,15 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const nowFn = typeof ctx._agenticNow === 'function' ? ctx._agenticNow : Date.now;
   const sleep = typeof ctx._agenticSleep === 'function' ? ctx._agenticSleep : defaultSleep;
 
-  const readState = async (namespace) => {
-    if (typeof namespace !== 'string' || !namespace.trim()) {
-      throw new TypeError('readState(namespace) requires a non-empty string');
-    }
-    if (!ctx.db || typeof ctx.db.getClientState !== 'function') return [];
-    const rows = await ctx.db.getClientState(task.user_id, namespace);
-    // 分块存储的值在这里拼回原文（见 state-chunks.js）；块不齐全的 key 视为
-    // 不存在 —— hook 作者拿到的与客户端写入的一致，永远不会是半截数据。
-    return resolveClientStateEntries(
-      rows,
-      () => ctx.db.getClientState(task.user_id, chunkNamespaceFor(namespace)),
-      (value) => decryptFromStorage(value, userKey)
-    );
-  };
-
-  const maxStateValueBytes = Number.isInteger(ctx.maxStateValueBytes) && ctx.maxStateValueBytes > 0
-    ? ctx.maxStateValueBytes
-    : DEFAULT_MAX_STATE_VALUE_BYTES;
-
-  /**
-   * writeState(namespace, entries) —— readState 的写入口，落库走的是
-   * `PUT /client-state` 那条路径的同一份实现（加密、大值分块、切片清理，见
-   * lib/client-state-store.js），所以 hook 写下的东西客户端 `GET /client-state`
-   * 能原样读回，反过来也一样。
-   *
-   * 典型用法是「大内容旁路」：一条 Web Push 的正文只有 4KB 出头（见
-   * lib/webpush-webcrypto.js 的 MAX_PUSH_PAYLOAD_BYTES），塞不下的内容先写进
-   * client_state，push 里只带一个引用键，客户端上线后按键取回。
-   *
-   * @param {string} namespace
-   * @param {Array<{ key: string, value: string|null, updatedAt?: number }>} entries
-   *   `value` 是字符串 → 整条覆盖写（不是追加，宿主自己负责序列化）；
-   *   `value` 为 `null` → 删掉这个 key（含它的切片行）。
-   *   `updatedAt` 默认取当前时刻，语义与客户端同步一致：比库里已有值旧的写入
-   *   （或删除）不生效，客户端后写的数据不会被这次 fire 盖回去。
-   * @returns {Promise<{ upserted: number, skipped: number, deleted: number }>}
-   *
-   * 谁清、什么时候清：库不做 TTL 也不自动回收，写进去的东西一直在，直到有人
-   * 覆盖或删除它。旁路内容建议放在固定的少量 key 上（例如每个角色一个），下次
-   * 写同一个 key 直接覆盖，存量天然有上限；一次性的大内容在确认客户端取走后，
-   * 用 `{ key, value: null }` 删掉。`DELETE /client-state` 仍然是清空这个用户
-   * 全部状态的兜底。
-   */
-  const writeState = async (namespace, entries) => {
-    if (typeof namespace !== 'string' || !namespace.trim()) {
-      throw new TypeError('writeState(namespace, entries) requires a non-empty string namespace');
-    }
-    if (namespace.length > MAX_NAMESPACE_CHARS || INTERNAL_STATE_CHAR_RE.test(namespace)) {
-      throw new TypeError(
-        `writeState: namespace 必须是 1-${MAX_NAMESPACE_CHARS} 字符且不含控制字符（\\u0000-\\u001f 为库内部保留）`
-      );
-    }
-    if (!Array.isArray(entries)) {
-      throw new TypeError('writeState(namespace, entries) requires an array of { key, value }');
-    }
-    if (entries.length === 0) return { upserted: 0, skipped: 0, deleted: 0 };
-    if (entries.length > MAX_STATE_ENTRIES_PER_BATCH) {
-      throw new RangeError(`writeState: 单次最多 ${MAX_STATE_ENTRIES_PER_BATCH} 条，收到 ${entries.length} 条`);
-    }
-    // readState 在适配器不支持时返回空数组（读不到状态，hook 走自己的兜底）。
-    // 写不一样：静默成功会让 push 带上一个指向不存在数据的引用键，所以这里报错。
-    if (!ctx.db || typeof ctx.db.upsertClientState !== 'function') {
-      throw new Error('AGENTIC_STATE_WRITE_UNSUPPORTED: 当前数据库适配器不支持 client_state 写入');
-    }
-
-    const now = nowFn();
-    const normalized = entries.map((entry, index) => {
-      if (!entry || typeof entry !== 'object') {
-        throw new TypeError(`writeState: entries[${index}] 必须是对象`);
-      }
-      if (typeof entry.key !== 'string' || !entry.key.trim() || entry.key.length > MAX_KEY_CHARS) {
-        throw new TypeError(`writeState: entries[${index}].key 必须是 1-${MAX_KEY_CHARS} 字符的字符串`);
-      }
-      if (INTERNAL_STATE_CHAR_RE.test(entry.key)) {
-        throw new TypeError(`writeState: entries[${index}].key 不能包含控制字符（\\u0000-\\u001f 为库内部保留）`);
-      }
-      if (entry.value !== null && typeof entry.value !== 'string') {
-        throw new TypeError(`writeState: entries[${index}].value 必须是字符串（宿主自行序列化），或 null 表示删除`);
-      }
-      if (typeof entry.value === 'string') {
-        const bytes = stateValueBytes(entry.value);
-        if (bytes > maxStateValueBytes) {
-          throw new RangeError(`writeState: entries[${index}].value 为 ${bytes} 字节，超过单条上限 ${maxStateValueBytes} 字节`);
-        }
-      }
-      if (entry.updatedAt !== undefined && (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0)) {
-        throw new TypeError(`writeState: entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
-      }
-      return {
-        namespace,
-        key: entry.key,
-        value: entry.value,
-        updatedAt: entry.updatedAt ?? now,
-      };
-    });
-
-    return writeClientStateEntries({ db: ctx.db, userId: task.user_id, userKey, entries: normalized });
-  };
+  // client_state 的读写口。实现与 `GET/PUT /client-state` 共用一份（见
+  // lib/state-accessors.js），fire 级和 config 级 hook 拿到的是同一套语义。
+  const { readState, writeState } = createStateAccessors({
+    db: ctx.db,
+    userId: task.user_id,
+    userKey,
+    maxStateValueBytes: ctx.maxStateValueBytes,
+    now: nowFn,
+  });
 
   const maxScheduledTasksPerFire =
     Number.isInteger(ctx.maxScheduledTasksPerFire) && ctx.maxScheduledTasksPerFire >= 0
@@ -354,21 +277,40 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   let scheduledTaskCount = 0;
 
   /**
+   * 按 uuid 把一条已存在的任务读回来，投影成 `GET /messages` 那份形状。
+   * 读不到（行已不是 pending、适配器没有 getTaskByUuid、解密失败）→ null：
+   * 这只是给宿主的一份补充信息，不该把整条 fire 拖挂。
+   */
+  async function readExistingTask(uuid) {
+    if (!ctx.db || typeof ctx.db.getTaskByUuid !== 'function') return null;
+    try {
+      const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
+      if (!row) return null;
+      const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+      return projectTask(row, payload);
+    } catch (error) {
+      console.warn('[amsg-server] scheduleTask: 读取撞车任务失败（已忽略）:', error && error.message);
+      return null;
+    }
+  }
+
+  /**
    * scheduleTask(options) —— 在这次 fire 里给**同一个用户**再建一条定时任务。
    *
    * 典型用法：角色发完这条，想过一个半小时再接着说一句。以前只能写进
    * client_state 等客户端上线重放，用户一直不上线这条链就断了；建成任务行之后，
    * 到点由 cron 直接触发，跟别的定时消息一样。
    *
-   * 凭据与投递配置（pushSubscription / apiUrl / apiKey / primaryModel /
-   * maxTokens / temperature / splitPattern）以及 contactName / avatarUrl /
-   * messageSubtype / userMessage 从当前任务继承，宿主只说「什么时候、说什么
-   * 方向」——hook 全程看不到凭据。completePrompt / messages 不继承（都置 null），
-   * 见文件头。
+   * 凭据与投递配置（apiUrl / apiKey / primaryModel / maxTokens / temperature /
+   * splitPattern）以及 contactName / avatarUrl / messageSubtype / userMessage /
+   * tzId 从当前任务继承，宿主只说「什么时候、说什么方向」——hook 全程看不到
+   * 凭据。推送订阅是用户级的一份，任务不携带，到点投递时现读。
+   * completePrompt / messages 不继承（都置 null），见文件头。
    *
    * @param {Object} options
    * @param {string} options.firstSendTime      - 必填，ISO 8601；至少比现在晚 60 秒
    * @param {'none'|'daily'|'weekly'} [options.recurrenceType='none']
+   * @param {string|null} [options.tzId]        - IANA 时区 id，循环推进按这个时区的墙钟走；默认继承当前任务
    * @param {'auto'|'prompted'|'fixed'} [options.messageType]  - 默认继承当前任务
    * @param {Object} [options.metadata]         - 整体替换（不是深合并）当前任务的 metadata
    * @param {string} [options.contactName]      - 默认继承
@@ -377,7 +319,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    * @param {string|null} [options.userMessage] - 默认继承；messageType 'fixed' 时必须有
    * @param {string} [options.uuid]             - 默认 randomUUID()；传确定性 uuid 可做重试幂等
    * @returns {Promise<{ created: true, id: number|null, uuid: string, nextSendAt: string }
-   *   | { created: false, reason: 'duplicate', uuid: string }>}
+   *   | { created: false, reason: 'duplicate', uuid: string, task: import('./task-projection.js').TaskProjection|null }>}
+   *   撞 uuid 时 `task` 是那条已经存在的任务行的投影（与 `GET /messages` 同款
+   *   形状，不含任何凭据），宿主据此把它记进自己的任务账本、随 push 带回客户端
+   *   认领。行读不回来（已经不是 pending，或适配器没有 getTaskByUuid）→ `null`。
    */
   const scheduleTask = async (options) => {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -422,6 +367,15 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     if (!SCHEDULABLE_RECURRENCE_TYPES.has(recurrenceType)) {
       throw new TypeError(
         `scheduleTask: recurrenceType 只能是 none / daily / weekly，收到 ${JSON.stringify(recurrenceType)}`
+      );
+    }
+
+    // 循环推进跟着哪个时区的墙钟走。不传就继承当前任务，显式传 null 表示
+    // 「按 UTC 推进」。
+    const tzId = options.tzId === undefined ? (decryptedPayload.tzId ?? null) : (options.tzId || null);
+    if (tzId !== null && !isValidTimeZoneId(tzId)) {
+      throw new TypeError(
+        `scheduleTask: tzId 必须是可用的 IANA 时区 id（如 Asia/Tokyo），收到 ${JSON.stringify(tzId)}`
       );
     }
 
@@ -471,6 +425,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       userMessage: userMessage || null,
       firstSendTime: nextSendAt,
       recurrenceType,
+      tzId,
       apiUrl: decryptedPayload.apiUrl || null,
       apiKey: decryptedPayload.apiKey || null,
       primaryModel: decryptedPayload.primaryModel || null,
@@ -481,7 +436,6 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       maxTokens: decryptedPayload.maxTokens ?? null,
       temperature: decryptedPayload.temperature ?? null,
       splitPattern: decryptedPayload.splitPattern ?? null,
-      pushSubscription: decryptedPayload.pushSubscription,
       metadata,
     };
 
@@ -498,8 +452,17 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       });
     } catch (error) {
       // 撞 uuid 不算错：fire 失败会整条重跑，宿主用确定性 uuid（任务 id + 触发
-      // 时刻推出来的那种）就天然幂等，重试不会多排一条。
-      if (isUniqueViolation(error)) return { created: false, reason: 'duplicate', uuid };
+      // 时刻推出来的那种）就天然幂等，重试不会多排一条。重跑那轮要能拿到已经
+      // 存在的那条任务，否则这条任务只活在数据库里——宿主的面板列不出、用户
+      // 取消不了，却照样到点触发。
+      if (isUniqueViolation(error)) {
+        return {
+          created: false,
+          reason: 'duplicate',
+          uuid,
+          task: await readExistingTask(uuid),
+        };
+      }
       throw error;
     }
     if (!created) {
@@ -553,8 +516,11 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 
   // Same sessionId scheme as the legacy path: pinned to (task id + 名义触发
   // 时刻)，同一 occurrence 的重试复用同一个 session，不同 occurrence 各一个
-  // （见 occurrenceSuffix）。
+  // （见 occurrenceSuffix）。这个字符串是给日志和去重用的**不透明 id**，
+  // 想知道是哪条任务、哪一次触发，读 sessionCtx 上的 taskId / taskUuid /
+  // occurrenceMs，别去拆它。
   const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
+  const occurrenceMs = occurrenceMsOf(task);
   let messages = normalized.messages.slice();
 
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
@@ -578,10 +544,14 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     const assistantMessage = extractAssistantMessage(llmResponse);
     messages = [...messages, assistantMessage];
 
-    // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂两个状态访问器
-    // 和 scheduleTask：大内容要不要旁路存、要不要给自己排条后续，往往到工具跑完、
-    // 组 push 时才知道，而那正是 onLLMOutput / executeToolCalls 的位置，
-    // onBeforeFire 早就返回了。
+    // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂任务身份、
+    // 两个状态访问器和 scheduleTask：
+    //   - taskId / taskUuid / occurrenceMs 直接给，是因为「这轮输出属于哪条
+    //     任务的哪一次触发」是宿主写回执、对账时的必备信息，不该靠拆
+    //     sessionId 的字符串拿；
+    //   - 大内容要不要旁路存、要不要给自己排条后续，往往到工具跑完、组 push
+    //     时才知道，而那正是 onLLMOutput / executeToolCalls 的位置，
+    //     onBeforeFire 早就返回了。
     const sessionCtx = Object.freeze({
       ...buildSessionContext({
         sessionId,
@@ -594,6 +564,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
         metadata: decryptedPayload.metadata,
         scratch,
       }),
+      taskId: task.id ?? null,
+      taskUuid: task.uuid ?? null,
+      occurrenceMs,
       readState,
       writeState,
       scheduleTask,
@@ -612,7 +585,19 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     }
 
     if (decision.decision === 'finish') {
-      const messagesSent = await sendHookPushPayloads(decision.pushPayloads, decryptedPayload, ctx, sessionId, task, sleep);
+      const messagesSent = await sendHookPushPayloads({
+        pushPayloads: decision.pushPayloads,
+        decryptedPayload,
+        ctx,
+        sessionId,
+        occurrenceMs,
+        task,
+        userKey,
+        sleep,
+        scratch,
+        readState,
+        writeState,
+      });
       return { handled: true, result: { success: true, messagesSent, status: 'finished', iterations: iteration + 1 } };
     }
 
@@ -673,13 +658,22 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 }
 
 /**
- * ctx.onAfterSend?.({ task, sentCount, total, error }) —— 推送发出（或发挂）
- * 之后的可选 hook。发送前的 hook（onBeforeFire / onLLMOutput）只能在推送发出
- * 前写副作用，LLM 成功但推送全挂时会「云端记得说过、用户没收到」；宿主要把
- * 「真的发出去了几段」写回自己的存储，就挂这个。task 是任务行本身（tick 内
- * 最多 8 个任务并发投递，回执要靠它对号入座）。全部成功时 error 为 null；
- * 第 k 段失败时 sentCount = k、error 带原始错误，且 hook 会在错误往上抛之前
- * 调用完。hook 自身抛错只 console.warn，不影响主流程。
+ * ctx.onAfterSend?.({ task, sentCount, total, error, scratch, readState,
+ * writeState }) —— 推送发出（或发挂）之后的可选 hook。发送前的 hook
+ * （onBeforeFire / onLLMOutput）只能在推送发出前写副作用，LLM 成功但推送全挂
+ * 时会「云端记得说过、用户没收到」；宿主要把「真的发出去了几段」写回自己的
+ * 存储，就挂这个。
+ *
+ * 载荷各字段：
+ *   - task：任务行本身（tick 内最多 8 个任务并发投递，回执要靠它对号入座）
+ *   - sentCount / total：发出去几段、一共几段
+ *   - error：全部成功为 null；第 k 段失败时 sentCount = k、error 带原始错误，
+ *     且 hook 会在错误往上抛之前调用完
+ *   - scratch：本次 fire 的便签对象，与 onBeforeFire / onLLMOutput 拿到的是
+ *     同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读
+ *   - readState / writeState：与 fire 级 hook 同一套 client_state 读写口
+ *
+ * hook 自身抛错只 console.warn，不影响主流程。
  */
 async function notifyAfterSend(ctx, info) {
   if (typeof ctx.onAfterSend !== 'function') return;
@@ -691,22 +685,69 @@ async function notifyAfterSend(ctx, info) {
 }
 
 /**
+ * 把任务的调度身份投影进一条 push。
+ *
+ * 客户端收到推送时要知道「这是哪条任务、哪一次触发、它还会不会再来」——不然
+ * 角色在 fire 里自排的任务客户端从没见过，只能靠猜。这三个字段由库统一补，
+ * 宿主不用再往 metadata 里抄一遍（抄漏一个就够坏事了）。
+ *
+ * 放在 push 顶层，和 messageId / sessionId / timestamp / messageIndex /
+ * totalMessages 一样，不塞进 metadata：metadata 是宿主自己的地盘，库往里写
+ * 会和宿主的键打架。
+ *
+ * @param {Object} push - 待发送的 push（原地补字段）
+ * @param {Object} task - 数据库任务行
+ * @param {Object} decryptedPayload
+ * @param {number|null} occurrenceMs
+ */
+function stampTaskIdentity(push, task, decryptedPayload, occurrenceMs) {
+  push.taskId = task.id ?? null;
+  push.taskUuid = task.uuid ?? null;
+  push.recurrenceType = decryptedPayload.recurrenceType || 'none';
+  push.occurrenceMs = occurrenceMs;
+}
+
+/**
  * Deliver the hook's pushPayloads sequentially. Mirrors instant's
  * sendPushesSequentially: force-overwrite messageIndex/totalMessages,
  * stamp missing ids, pace with the same 1500ms spacing. Ids are
  * deterministic per (task, occurrence, index) so a retried occurrence
  * reuses the same ids and clients can dedupe (see occurrenceSuffix)。
  * 调用方显式带了 messageId / sessionId 时以调用方为准，只有缺省值掺
- * occurrence。
+ * occurrence。任务的调度身份（taskId / taskUuid / recurrenceType /
+ * occurrenceMs）由库覆盖写，调用方带了也以库为准——它描述的是任务行的事实，
+ * 不是内容。
+ *
+ * 这批字段加起来占的字节由 PUSH_ENVELOPE_RESERVED_BYTES 兜住（见
+ * lib/webpush-webcrypto.js）：hook 组 payload 时要按那个额度预算，不然会
+ * 「量的时候装得下、补完字段就超了」。
  */
-async function sendHookPushPayloads(pushPayloads, decryptedPayload, ctx, sessionId, task, sleep) {
+async function sendHookPushPayloads({
+  pushPayloads,
+  decryptedPayload,
+  ctx,
+  sessionId,
+  occurrenceMs,
+  task,
+  userKey,
+  sleep,
+  scratch,
+  readState,
+  writeState,
+}) {
   const total = pushPayloads.length;
   let sentCount = 0;
+  const afterSendBase = { task, total, scratch, readState, writeState };
   try {
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
     }
-    const pushSubscription = decryptedPayload.pushSubscription;
+    // 用户级订阅，投递时现读（任务行不携带它）。
+    const pushSubscription = await resolvePushSubscription({
+      db: ctx.db,
+      userId: task.user_id,
+      userKey,
+    });
     const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 
     for (let i = 0; i < total; i++) {
@@ -716,6 +757,7 @@ async function sendHookPushPayloads(pushPayloads, decryptedPayload, ctx, session
       if (typeof push.timestamp !== 'string' || !push.timestamp) push.timestamp = new Date().toISOString();
       push.messageIndex = i + 1;
       push.totalMessages = total;
+      stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
 
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
       sentCount++;
@@ -723,9 +765,11 @@ async function sendHookPushPayloads(pushPayloads, decryptedPayload, ctx, session
     }
   } catch (error) {
     // 部分失败也要让宿主知道已经发出去了几段——先通知，再把错误往上抛。
-    await notifyAfterSend(ctx, { task, sentCount, total, error });
+    await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });
     throw error;
   }
-  await notifyAfterSend(ctx, { task, sentCount, total, error: null });
+  await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error: null });
   return total;
 }
+
+export { stampTaskIdentity };

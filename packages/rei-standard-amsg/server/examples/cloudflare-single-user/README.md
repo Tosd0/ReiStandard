@@ -27,7 +27,7 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/capabilities`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /vapid-public-key` 返回本 Worker 的 `VAPID_PUBLIC_KEY`，供前端创建 Web Push 订阅时作 `applicationServerKey`；未配置 VAPID 时返回 503。跟其它端点一样受 CORS 和 `serverToken` 约束。
@@ -35,6 +35,34 @@
 `GET /capabilities` 返回 `{ serverVersion, features }`，给前端做特性探测：worker 部署版本落后时新功能只是探测不到，前端（`client.getCapabilities()`，打到老 worker 时返回 `null`）可以据此在设置页提示重新部署。feature 名如 `client-state` / `client-state-chunking` / `agentic-hooks`，随版本追加。
 
 VAPID 和 webpush 都要配齐：定时投递（cron）和 `instant` 类型消息都靠它推送，缺了就发不出去。
+
+## 推送订阅（/push-subscription）
+
+这是啥：一份用户级的 Web Push 订阅。任务行不携带订阅，到点投递时读这一份。
+
+为什么这么放：用户清了站点数据、重装了 PWA、或者推送服务轮换了 endpoint 之后，覆盖这一份就全好了。订阅冻结在每条任务里的话，得把任务一条条翻出来刷——而角色在 fire 里给自己排的任务客户端根本不知道存在，刷不到它，于是那条任务就永远推不出去了。
+
+| 端点 | 语义 |
+|------|------|
+| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription` 至少要有非空 `endpoint` |
+| `GET /push-subscription` | `{ exists, updatedAt, endpoint }`（不含订阅的密钥部分） |
+| `DELETE /push-subscription` | 删掉，设置页做「停止接收推送」按钮用 |
+
+客户端侧：
+
+```js
+const sub = await client.subscribePush(vapidPublicKey, registration);
+await client.putPushSubscription(sub);
+```
+
+`subscribePush()` 拿到订阅之后调一次；之后每次应用启动确认订阅仍然有效时再调一次（幂等覆盖）。
+
+配套约束：
+
+- 这个用户还没登记订阅时，`POST /schedule-message` 返回 `409 PUSH_SUBSCRIPTION_MISSING`——建了也永远发不出去。
+- `POST /schedule-message` / `PUT /update-message` 都不收 `pushSubscription` 字段（带了 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）。
+- 投递时读不到订阅 → 任务按投递失败处理，原因记进 `lastError`，`GET /messages` 上看得见。
+- 表是 `push_subscriptions`（`user_id` 主键，`subscription` 密文，`updated_at` epoch 毫秒）。`POST /init-tenant` 会建，手工建表的看 `schema.sql`。
 
 ## 客户端状态同步（/client-state）
 
@@ -84,7 +112,8 @@ export default createSingleUserCloudflareWorker((env) => ({
     // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
     // ctx: { task, userId, readState(ns), writeState(ns, entries),
     //        scheduleTask(options), now, scratch }
-    //   task 是解密后的任务字段（不含 apiKey / pushSubscription）；
+    //   task 是解密后的任务字段（不含 apiKey；推送订阅是用户级的一份，
+    //   根本不在任务 payload 里）；
     //   自定义字段排程时放 metadata 里，这里原样读回。
     //   scratch 是本次 fire 的便签对象：在这里塞的东西，同一次 fire 的
     //   onLLMOutput / executeToolCalls 从 ctx.scratch 拿到同一个引用；
@@ -110,7 +139,8 @@ export default createSingleUserCloudflareWorker((env) => ({
     // iteration / metadata / contactName / avatarUrl），instant 的
     // classifier 可以直接拿来用；另外这里还多两个状态访问器
     // readState / writeState 和一个 scheduleTask，都跟 onBeforeFire 拿到的
-    // 是同一份。四种 decision：
+    // 是同一份，以及本次触发的任务身份 taskId / taskUuid / occurrenceMs
+    //（sessionId 是不透明字符串，别拆它拿这些值）。四种 decision：
     //   { decision: 'finish', pushPayloads }        → 推送这些 payload，结束
     //   { decision: 'tool-request', toolCalls }     → 交给 executeToolCalls 执行
     //     （也接受 instant 形状：pushPayloads 里带 tool_request push）
@@ -163,15 +193,19 @@ async onLLMOutput(ctx) {
     recurrenceType: 'none',         // 可选，默认 none
     metadata: { beat: 'followup' }, // 可选，整体替换当前任务的 metadata（不是深合并）
     // contactName / avatarUrl / messageSubtype / userMessage 也都能覆盖，不传就继承
-    uuid: `fire-${ctx.sessionId}`,  // 可选，默认随机；传确定性 uuid 可做重试幂等
+    tzId: 'Asia/Tokyo',             // 可选，默认继承；循环推进按这个时区的墙钟走
+    uuid: `fire-${ctx.taskId}-${ctx.occurrenceMs}`, // 可选，默认随机；传确定性 uuid 可做重试幂等
   });
   // result: { created: true, id, uuid, nextSendAt }
-  //      或 { created: false, reason: 'duplicate', uuid }
+  //      或 { created: false, reason: 'duplicate', uuid, task }
+  //        task = 已经存在的那条任务行的投影（同 GET /messages 的形状，不含凭据）
   return { decision: 'finish', pushPayloads: [...] };
 }
 ```
 
-凭据和投递配置（`pushSubscription` / `apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern`）从当前任务继承，宿主只说「什么时候、说什么方向」——和 ctx 里看不到 apiKey 是同一个原则。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回老链路就会静默发出一条谁也没打算发的文案。
+凭据和投递配置（`apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern` / `tzId`）从当前任务继承，宿主只说「什么时候、说什么方向」——和 ctx 里看不到 apiKey 是同一个原则。推送订阅是用户级的一份，任务不携带、也不用继承。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回老链路就会静默发出一条谁也没打算发的文案。
+
+撞 uuid 时返回值里的 `task` 是那条已经存在的任务行的投影。用确定性 uuid 做重试幂等时，重跑那轮靠它把这条任务记进自己的账本、随 push 带回客户端认领——否则这条任务只活在数据库里，面板列不出、用户取消不了，却照样到点触发。
 
 护栏，以及它们各自在防什么：
 
@@ -181,7 +215,8 @@ async onLLMOutput(ctx) {
 | `messageType` | 只收 `auto` / `prompted` / `fixed` | `TypeError` | `instant` 的语义是「建行的那一刻就投递」，那条路径归 `POST /schedule-message` 管；从 fire 里造这么一行，投递时机反而说不清 |
 | `messageType: 'fixed'` | 必须有 `userMessage`（自己传或继承到） | `TypeError` | 固定文本任务没有正文，就是一条永远发空的任务 |
 | 单次 fire 的建任务条数 | 默认 **2 条**，config 里的 `maxScheduledTasksPerFire` 可调（`0` = 不许自排） | `RangeError` | 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键 |
-| `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid }` | fire 失败会整条重跑（见「慢任务与 cron 占位」），宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等，重试不会多排一条 |
+| `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid, task }` | fire 失败会整条重跑（见「慢任务与 cron 占位」），宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等，重试不会多排一条 |
+| `tzId` | 可用的 IANA 时区 id，或 `null` | `TypeError` | 认不出来的时区会让循环推进悄悄退回 UTC，用户设的钟点从此对不上 |
 | 数据库适配器没有 `createTask` | — | 抛 `AGENTIC_SCHEDULE_UNSUPPORTED` | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。新任务的触发靠 cron，所以自排的时间点也受 cron 精度约束——排在 `x:xx:30` 会等到下一跳才发出去。
@@ -194,13 +229,69 @@ async onLLMOutput(ctx) {
 import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from '@rei-standard/amsg-server/cloudflare';
 
 // 组 payload 前先量骨架，剩下的额度才是能塞正文的
-const { remainingBytes } = measurePushPayload(JSON.stringify({ ...basePush, message: '' }));
+const { remainingBytes } = measurePushPayload(
+  JSON.stringify({ ...basePush, message: '' }),
+  { reserveEnvelope: true }
+);
 const message = body.length <= remainingBytes ? body : body.slice(0, remainingBytes);
 ```
 
-`measurePushPayload(payload)` 返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`。超限的 payload 不会被发出去等 413：`sendWebPush` 当场抛错，`err.code === 'PUSH_PAYLOAD_TOO_LARGE'`，消息里带实际字节数和上限。
+`measurePushPayload(payload, options)` 返回 `{ bytes, maxBytes, remainingBytes, withinLimit, envelopeReservedBytes }`。超限的 payload 不会被发出去等 413：`sendWebPush` 当场抛错，`err.code === 'PUSH_PAYLOAD_TOO_LARGE'`，消息里带实际字节数和上限。
+
+`reserveEnvelope: true` 是给 hook 用的口径。hook 把 `pushPayloads` 交还给库之后，库还会补一批「这是谁、第几条、什么时候」的字段（`messageId` / `sessionId` / `timestamp` / `messageIndex` / `totalMessages` / `taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs`），加起来由导出的 `PUSH_ENVELOPE_RESERVED_BYTES`（384 字节，按 uuid ≤ 64 字符算）兜住。不留这一截的话，卡在边界上的消息会「量出来装得下、补完字段就超了」——既没走旁路存储也发不出去。
 
 内容天生装不下（长文、笔记详情、图片描述）就走旁路：正文用 `ctx.writeState()` 存进 `/client-state`，push 里只带一个引用键，客户端收到后用 `GET /client-state?namespace=...` 取回全文。
+
+## 循环任务的时区（tzId）
+
+这是啥：`daily` / `weekly` 任务可以带一个 IANA 时区 id，循环推进按**那个时区的墙钟**走——日期 +1 天 / +7 天，钟点原样保留。
+
+为什么需要：不带时区就是固定 +24h / +7×24h。有夏令时的地方（`America/New_York`、`Europe/London`）跨过切换点之后，用户设的「每天早八点」会永久变成早九点，而且再也回不去。
+
+```js
+await client.scheduleMessage({
+  contactName: 'Rei',
+  messageType: 'auto',
+  firstSendTime: '2026-03-07T13:00:00.000Z', // 纽约当地 08:00
+  recurrenceType: 'daily',
+  tzId: 'America/New_York',
+  // …
+});
+```
+
+`PUT /update-message` 也认这个字段：传时区 id 换一个，传 `null` 改回按 UTC 推进。`GET /messages` 每条任务多返回一个 `tzId`（没设 → `null`）。fire 里 `ctx.scheduleTask({ tzId })` 同理，不传就继承当前任务。
+
+两个边界情况：春令时被跳过的墙钟（纽约 2:30 不存在）落到切换之后的等价时刻（当地 3:30）；秋令时重复出现的墙钟（当地 1:30 出现两次）取其中一个，不触发两次。
+
+## 过期跳过的回执（onStaleSkip）
+
+这是啥：任务错过触发时刻超过 60 分钟，这一次（或这几次）就不补发了。config 顶层挂一个 `onStaleSkip`，宿主用它写「这条没响」的痕迹——用户问「说好的消息呢」时界面才给得出解释。
+
+```js
+export default createSingleUserCloudflareWorker((env) => ({
+  // ...其余 config
+  async onStaleSkip(task, info) {
+    // info: { reason: 'stale', action, metadata, recurrenceType, occurrenceMs,
+    //         skippedCount, skippedOccurrences, skippedTruncated, nextSendAt,
+    //         readState, writeState }
+    await info.writeState('missed', [
+      { key: info.metadata?.charId ?? 'unknown', value: JSON.stringify(info.skippedOccurrences) },
+    ]);
+  },
+  async onAfterSend(info) {
+    // info: { task, sentCount, total, error, scratch, readState, writeState }
+    // scratch 与本次 fire 的 onBeforeFire / onLLMOutput 是同一个引用
+  },
+}));
+```
+
+`action` 分两种：`expired`（一次性任务，这一次永远不会补发了，行已标 `failed`）、`fast_forwarded`（循环任务，攒下的这几次都跳过，排期已快进到 `nextSendAt`，下一次照常触发）。`skippedCount` 含名义那一次；`skippedOccurrences` 超过 32 次时只给首末两个并把 `skippedTruncated` 置 `true`。两种情况都会把原因写进 payload 的 `lastError`。
+
+两个 hook 都自带 `readState` / `writeState`（当前用户的 `client_state`）。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。两个都是 best-effort，自身抛错只记日志。
+
+## 推送里带什么
+
+每条从任务发出去的 push 顶层带 `taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs`，客户端据此认领这条任务、判断它还会不会再来——角色在 fire 里给自己排的任务客户端从没见过，靠这四个字段就能把它记进面板、让用户取消得掉。hook 自己在 `pushPayloads` 里写了这几个字段会被库覆盖：它们描述的是任务行的事实，不是内容。
 
 ## 慢任务与 cron 占位
 

@@ -10,6 +10,7 @@ import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../l
 import { isUniqueViolation } from '../lib/db-errors.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
 import { validateScheduleMessagePayload, isValidUUIDv4 } from '../lib/validation.js';
+import { loadPushSubscription, supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
 
 export function createScheduleMessageHandler(ctx) {
@@ -69,6 +70,30 @@ export function createScheduleMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: validationResult.errorCode, message: validationResult.errorMessage, details: validationResult.details } } };
     }
 
+    // 到点要往哪推：用户级订阅必须已经登记过。没登记就建任务的话，这条任务
+    // 到点只会失败一次又一次——早点说清楚比让它安静地烂在库里强。
+    if (!supportsPushSubscriptionStore(db)) {
+      return { status: 501, body: { success: false, error: { code: 'PUSH_SUBSCRIPTION_NOT_SUPPORTED', message: '当前数据库适配器不支持用户级推送订阅存储' } } };
+    }
+    let storedSubscription = null;
+    try {
+      storedSubscription = await loadPushSubscription({ db, userId, userKey });
+    } catch (_error) {
+      storedSubscription = null;
+    }
+    if (!storedSubscription) {
+      return {
+        status: 409,
+        body: {
+          success: false,
+          error: {
+            code: 'PUSH_SUBSCRIPTION_MISSING',
+            message: '该用户还没有登记推送订阅，请先调用 PUT /push-subscription'
+          }
+        }
+      };
+    }
+
     const taskUuid = payload.uuid || randomUUID();
 
     const fullTaskData = {
@@ -79,6 +104,9 @@ export function createScheduleMessageHandler(ctx) {
       userMessage: payload.userMessage || null,
       firstSendTime: payload.firstSendTime,
       recurrenceType: payload.recurrenceType || 'none',
+      // daily / weekly 按这个时区的墙钟推进（同一钟点，日期 +1 天 / +7 天）。
+      // 不传 → null → 按 UTC 推进。
+      tzId: payload.tzId || null,
       apiUrl: payload.apiUrl || null,
       apiKey: payload.apiKey || null,
       primaryModel: payload.primaryModel || null,
@@ -93,7 +121,6 @@ export function createScheduleMessageHandler(ctx) {
       // the message processor to chunk LLM output into individual pushes.
       // null → processor falls back to the default /([。！？!?]+)/ regex.
       splitPattern: payload.splitPattern ?? null,
-      pushSubscription: payload.pushSubscription,
       metadata: payload.metadata || {}
     };
 

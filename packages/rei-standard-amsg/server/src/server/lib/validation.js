@@ -3,6 +3,9 @@
  */
 
 import { validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
+import { isValidTimeZoneId } from './recurrence.js';
+
+export { isValidTimeZoneId };
 
 /**
  * Validate ISO 8601 date string.
@@ -155,12 +158,25 @@ export function validateScheduleMessagePayload(payload) {
     return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间必须在未来', details: { field: 'firstSendTime', reason: 'must be in the future' } };
   }
 
-  if (!payload.pushSubscription || typeof payload.pushSubscription !== 'object') {
-    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { missingFields: ['pushSubscription'] } };
+  // 推送订阅是用户级的一份（`PUT /push-subscription`），任务不携带它，到点
+  // 投递时现读。排程请求里还带着它多半是照着老写法搬过来的，明确拒掉比静默
+  // 丢弃好——静默丢弃会让人以为「这条任务用的是我传的这个订阅」。
+  if (payload.pushSubscription !== undefined) {
+    return {
+      valid: false,
+      errorCode: 'PUSH_SUBSCRIPTION_NOT_ACCEPTED',
+      errorMessage: 'pushSubscription 不再随任务提交，改用 PUT /push-subscription 登记一份用户级订阅',
+      details: { invalidFields: ['pushSubscription'] }
+    };
   }
 
   if (payload.recurrenceType && !['none', 'daily', 'weekly'].includes(payload.recurrenceType)) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['recurrenceType'] } };
+  }
+
+  // 循环任务按哪个时区的墙钟推进。不传（或 null）= 按 UTC 推进。
+  if (payload.tzId !== undefined && payload.tzId !== null && !isValidTimeZoneId(payload.tzId)) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'tzId 必须是可用的 IANA 时区 id（如 Asia/Tokyo）', details: { invalidFields: ['tzId'] } };
   }
 
   if (

@@ -7,7 +7,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidISO8601, isValidUUIDv4, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
+import { isValidISO8601, isValidUUIDv4, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -72,6 +72,16 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['recurrenceType'] } } } };
     }
 
+    // tzId：显式传 null 表示改回「按 UTC 推进」，所以走 hasOwnProperty 而不是
+    // truthy 判断——用户从「按东京墙钟」改回不设时区，这个改动不能被吞掉。
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'tzId') &&
+      updates.tzId !== null &&
+      !isValidTimeZoneId(updates.tzId)
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'tzId 必须是可用的 IANA 时区 id（如 Asia/Tokyo），或 null 表示按 UTC 推进', details: { invalidFields: ['tzId'] } } } };
+    }
+
     if (
       Object.prototype.hasOwnProperty.call(updates, 'maxTokens') &&
       updates.maxTokens !== null &&
@@ -120,18 +130,16 @@ export function createUpdateMessageHandler(ctx) {
       }
     }
 
-    // 凭据 / 推送订阅刷新：消费方换了聊天 API 配置或重新订阅推送后，用这
-    // 几个字段刷新任务里冻结的旧值。校验口径对齐 schedule-message：
-    // apiUrl / apiKey / primaryModel 那边只要求 truthy、不做格式校验，这里
-    // 同样不加；pushSubscription 那边要求是对象，这里带值时同样检查。四个
-    // 字段都走 truthy spread——传 null 不清空、只是忽略（清掉任何一个，任
-    // 务到点就发不出去，「清空」没有合法用途）。
-    if (
-      updates.pushSubscription !== undefined &&
-      updates.pushSubscription !== null &&
-      typeof updates.pushSubscription !== 'object'
-    ) {
-      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['pushSubscription'] } } } };
+    // 凭据刷新：消费方换了聊天 API 配置之后，用 apiUrl / apiKey /
+    // primaryModel 刷新任务里冻结的旧值。校验口径对齐 schedule-message：
+    // 只要求 truthy、不做格式校验。三个字段都走 truthy spread——传 null 不
+    // 清空、只是忽略（清掉任何一个，任务到点就发不出去，「清空」没有合法用途）。
+    //
+    // 推送订阅不在这里改：它是用户级的一份，`PUT /push-subscription` 覆盖那
+    // 一份就够了，所有任务（包括角色在 fire 里给自己排的、客户端根本不知道
+    // 存在的那些）下次触发时读到的都是新订阅。
+    if (updates.pushSubscription !== undefined) {
+      return { status: 400, body: { success: false, error: { code: 'PUSH_SUBSCRIPTION_NOT_ACCEPTED', message: 'pushSubscription 不再随任务更新，改用 PUT /push-subscription 覆盖用户级订阅', details: { invalidFields: ['pushSubscription'] } } } };
     }
 
     // Fetch existing task
@@ -164,12 +172,12 @@ export function createUpdateMessageHandler(ctx) {
       ...promptUpdates,
       ...(updates.userMessage && { userMessage: updates.userMessage }),
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
+      ...(Object.prototype.hasOwnProperty.call(updates, 'tzId') && { tzId: updates.tzId ?? null }),
       ...(updates.avatarUrl && { avatarUrl: updates.avatarUrl }),
       ...(updates.metadata && { metadata: updates.metadata }),
       ...(updates.apiUrl && { apiUrl: updates.apiUrl }),
       ...(updates.apiKey && { apiKey: updates.apiKey }),
       ...(updates.primaryModel && { primaryModel: updates.primaryModel }),
-      ...(updates.pushSubscription && { pushSubscription: updates.pushSubscription }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null }),
       // splitPattern: hasOwnProperty so that explicit `null` (= revert to

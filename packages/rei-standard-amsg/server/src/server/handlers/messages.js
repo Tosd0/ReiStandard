@@ -8,6 +8,7 @@
 import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../lib/encryption.js';
 import { getHeader } from '../lib/request.js';
 import { isValidUUIDv4 } from '../lib/validation.js';
+import { projectTask } from '../lib/task-projection.js';
 
 export function createMessagesHandler(ctx) {
   async function GET(url, headers) {
@@ -51,32 +52,11 @@ export function createMessagesHandler(ctx) {
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
 
+    // 投影形状住在 lib/task-projection.js —— fire-time hook 的
+    // ctx.scheduleTask() 撞 uuid 时回给宿主的那条任务用的是同一份，两边不会漂。
     const decryptedTasks = await Promise.all(tasks.map(async task => {
       const decrypted = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
-      return {
-        id: task.id,
-        uuid: task.uuid,
-        contactName: decrypted.contactName,
-        messageType: task.message_type,
-        messageSubtype: decrypted.messageSubtype,
-        nextSendAt: task.next_send_at,
-        recurrenceType: decrypted.recurrenceType,
-        status: task.status,
-        retryCount: task.retry_count,
-        createdAt: task.created_at,
-        updatedAt: task.updated_at,
-        // Character ownership / client-side task identity, pulled from the
-        // scheduling host's metadata so it can filter tasks by character
-        // (contactName can collide across characters). Only these two
-        // metadata fields are surfaced — the rest of metadata may hold
-        // host-private data and stays server-side. Absent → null.
-        charId: decrypted.metadata?.charId ?? null,
-        clientTaskId: decrypted.metadata?.amsgClientTaskId ?? null,
-        // 上一次没发出去的原因（run-tick 记进 payload 的 lastError）：
-        // { at, occurrence, reason }。reason 'stale' 表示错过触发时刻太久被
-        // 判定不再补发；其余是投递失败的错误信息。没有记录 → null。
-        lastError: decrypted.lastError ?? null
-      };
+      return projectTask(task, decrypted);
     }));
 
     const responsePayload = {

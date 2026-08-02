@@ -2,14 +2,7 @@
 
 `@rei-standard/amsg-server` 是 ReiStandard 主动消息标准的服务端 SDK：Blob 租户配置、`tenantToken` / `cronToken` 鉴权、标准路由处理器。API 规范见 [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)。
 
-## v2.0.1 变更摘要
-
-- 初始化流程合并为 `POST /api/v1/init-tenant`
-- 移除旧端点：`init-database`、`init-master-key`
-- 业务端点统一使用 `Authorization: Bearer <tenantToken>`
-- `send-notifications` 支持 `cronToken`（Header 或 query token）
-
-2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)。其中 `splitPattern` 是 server 调度任务的持久化配置；`amsg-instant` 0.8.0 起改为 hook 内自定义 split 函数 + `pushPayloads`。
+历史变更见各版本 [CHANGELOG](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/CHANGELOG.md)。2.2+ 的字段增量（`messages` 数组、`splitPattern`、`avatarUrl` 软清空策略）在规范的 [§6.1](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#61-ai-消息字段约束) / [§6.2](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md#62-avatarurl-软清空策略)。其中 `splitPattern` 是 server 调度任务的持久化配置；`amsg-instant` 0.8.0 起改为 hook 内自定义 split 函数 + `pushPayloads`。
 
 ## 安装
 
@@ -50,6 +43,9 @@ const rei = await createReiServer({
 // PUT  /api/v1/update-message       -> rei.handlers.updateMessage.PUT
 // DELETE /api/v1/cancel-message     -> rei.handlers.cancelMessage.DELETE
 // GET  /api/v1/messages             -> rei.handlers.messages.GET
+// PUT  /api/v1/push-subscription    -> rei.handlers.pushSubscription.PUT
+// GET  /api/v1/push-subscription    -> rei.handlers.pushSubscription.GET
+// DELETE /api/v1/push-subscription  -> rei.handlers.pushSubscription.DELETE
 ```
 
 ## 关于 `messageType: 'instant'`
@@ -119,7 +115,64 @@ const { bytes, remainingBytes, withinLimit } = measurePushPayload(JSON.stringify
 // remainingBytes = 还能再塞多少字节（已超限时为负）
 ```
 
+### 信封预留：fire-time hook 组 payload 时要多留一截
+
+hook 把 `pushPayloads` 交还给库之后，库还会往每条 push 上补一批「这是谁、第几条、什么时候」的字段：
+
+```
+messageId / sessionId / timestamp / messageIndex / totalMessages
+taskId / taskUuid / recurrenceType / occurrenceMs
+```
+
+也就是说 hook 手里量到的不是最终 payload。这批字段占的字节由导出的 `PUSH_ENVELOPE_RESERVED_BYTES`（384 字节，含 JSON 的引号逗号，按 uuid ≤ 64 字符算）兜住；`measurePushPayload` 传 `{ reserveEnvelope: true }` 就是「库补完字段之后还装得下」的口径：
+
+```js
+import { measurePushPayload, PUSH_ENVELOPE_RESERVED_BYTES } from '@rei-standard/amsg-server';
+
+const { remainingBytes } = measurePushPayload(
+  JSON.stringify({ ...basePush, message: '' }),
+  { reserveEnvelope: true }
+);
+const message = body.length <= remainingBytes ? body : body.slice(0, remainingBytes);
+```
+
+用比 64 字符更长的 uuid（`scheduleTask` 允许传任意字符串）就自己再多留一点。
+
+## 推送订阅（用户级）
+
+推送订阅一个用户存一份，任务行不携带它，到点投递时现读。用户清了站点数据、重装了 PWA、或者推送服务轮换了 endpoint 之后，覆盖这一份就够了——所有已排的任务，包括角色在 fire 里给自己排的、客户端根本不知道存在的那些，下次触发读到的都是新订阅。
+
+| 端点 | 语义 |
+|---|---|
+| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription` 至少要有非空 `endpoint` |
+| `GET /push-subscription` | `{ exists, updatedAt, endpoint }`。不含订阅的密钥部分——判断「登记过没有、是不是我手里这一个」用 `endpoint` 就够 |
+| `DELETE /push-subscription` | 删掉（设置页的「停止接收推送」） |
+
+客户端侧对应 `client.putPushSubscription(subscription)` / `getPushSubscription()` / `deletePushSubscription()`。什么时候调 PUT：`subscribePush()` 拿到订阅之后一次，之后每次应用启动确认订阅仍然有效时再一次（幂等覆盖）。
+
+配套的约束：
+
+- `POST /schedule-message` 在这个用户还没登记订阅时返回 `409 PUSH_SUBSCRIPTION_MISSING`——建了也永远发不出去，早点说清楚比让它烂在库里强。
+- `POST /schedule-message` 和 `PUT /update-message` 都不收 `pushSubscription` 字段（带了返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）：静默丢弃会让人以为「这条任务用的是我传的这个订阅」。
+- 投递时读不到订阅（没登记 / 被删了）→ 任务按投递失败处理，原因记进 payload 的 `lastError`，`GET /messages` 上看得见。
+- 数据库侧是 `push_subscriptions` 表（`user_id` 主键，`subscription` 密文，`updated_at` epoch 毫秒）。内置的 D1 / pg / neon 适配器都实现了，`initSchema()` 会建表。自定义适配器要补 `getPushSubscription` / `upsertPushSubscription` / `deletePushSubscription` 三个方法，缺任何一个这几个端点返回 501。
+
 装不下的内容（长文、附件详情）建议走旁路：正文存进 `client_state`，push 里只带一个引用键，客户端上线后用 `GET /client-state` 取回。单用户 Worker 的 fire-time hook 用 `ctx.writeState()` 写，见 [`examples/cloudflare-single-user/README.md`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/examples/cloudflare-single-user/README.md)。
+
+## 推送自带任务身份
+
+每条从任务行发出去的 push（冻结 prompt 路径和 fire-time hook 路径都算）顶层带这四个字段：
+
+| 字段 | 是什么 |
+|---|---|
+| `taskId` | 任务行 id；没有行的 in-server instant 路径为 `null` |
+| `taskUuid` | 任务 uuid（排程方选的那个） |
+| `recurrenceType` | `none` / `daily` / `weekly` —— 这条任务还会不会再来 |
+| `occurrenceMs` | 本次触发的名义时刻，epoch 毫秒 |
+
+客户端据此认领任务：角色在 fire 里给自己排的任务，客户端从没见过它，靠这四个字段就能把它记进面板、让用户取消得掉。放在顶层而不是 `metadata` 里——`metadata` 是调用方自己的地盘，库不往里写。
+
+hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：它们描述的是任务行的事实，不是内容。
 
 ## Fire 时刻 hooks
 
@@ -131,7 +184,39 @@ const { bytes, remainingBytes, withinLimit } = measurePushPayload(JSON.stringify
 |---|---|
 | `readState(ns)` / `writeState(ns, entries)` | 读写 `client_state`，和客户端 `GET/PUT /client-state` 是同一份数据 |
 | `scheduleTask(options)` | 给同一个用户再建一条定时任务 |
-| `scratch` | 本次 fire 的便签对象，三个 hook 共享同一个引用，fire 结束即丢弃 |
+| `scratch` | 本次 fire 的便签对象，三个 hook 加上发送后的 `onAfterSend` 共享同一个引用，fire 结束即丢弃 |
+
+`onLLMOutput` / `executeToolCalls` 的 ctx 上另外带着任务身份：
+
+| 字段 | 是什么 |
+|---|---|
+| `taskId` | 任务行 id |
+| `taskUuid` | 任务 uuid（排程方选的那个） |
+| `occurrenceMs` | 本次触发的名义时刻，epoch 毫秒 |
+
+`sessionId` 是给日志和去重用的不透明字符串，格式随版本变，别拆它拿上面这些值。
+
+### config 级 hook
+
+这两个挂在 worker 工厂 config 的顶层（不在 `hooks` 里）：
+
+| hook | 什么时候调 | 载荷 |
+|---|---|---|
+| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, total, error, scratch, readState, writeState }` |
+| `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState }` |
+
+两个 hook 都自带 `readState` / `writeState`，作用于当前用户的 `client_state`，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
+
+`onAfterSend` 的 `scratch` 与本次 fire 的 `onBeforeFire` / `onLLMOutput` 是同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读，不用自建按任务分格的登记表。全部成功时 `error` 为 `null`；第 k 段失败时 `sentCount = k`、`error` 带原始错误，且在错误往上抛之前调用完。
+
+`onStaleSkip` 的 `action` 分两种：
+
+- `expired` —— 一次性任务，这一次永远不会补发了，行已标 `failed`。
+- `fast_forwarded` —— 循环任务，攒下的这几次都跳过，排期已快进到 `nextSendAt`，行仍是 `pending`，下一次照常触发。
+
+`skippedCount` 是一共跳过几次（含名义那一次），`skippedOccurrences` 是被跳过的名义时刻列表（epoch 毫秒）；超过 32 次时只给首末两个并把 `skippedTruncated` 置 `true`。两种 action 都会把原因写进 payload 的 `lastError`，`GET /messages` 上看得见。
+
+两个 hook 都是 best-effort：自身抛错只记日志，不影响主流程。
 
 ### `ctx.scheduleTask(options)`
 
@@ -142,14 +227,17 @@ const result = await ctx.scheduleTask({
   firstSendTime: new Date(Date.now() + 90 * 60_000).toISOString(), // 必填，ISO 字符串
   messageType: 'auto',            // 可选，默认继承当前任务
   recurrenceType: 'none',         // 可选，默认 none
+  tzId: 'Asia/Tokyo',             // 可选，默认继承当前任务；循环推进按这个时区的墙钟走
   metadata: { beat: 'followup' }, // 可选，整体替换当前任务的 metadata（不深合并）
-  uuid: `fire-${ctx.task.id}-${ctx.task.nextSendAt}`, // 可选，默认随机
+  uuid: `fire-${ctx.taskId}-${ctx.occurrenceMs}`, // 可选，默认随机
 });
 // → { created: true, id, uuid, nextSendAt }
-//   或 { created: false, reason: 'duplicate', uuid }
+//   或 { created: false, reason: 'duplicate', uuid, task }
 ```
 
-凭据和投递配置（`pushSubscription` / `apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern`）以及 `contactName` / `avatarUrl` / `messageSubtype` / `userMessage` 从当前任务继承，宿主只说「什么时候、说什么方向」——hook 全程看不到凭据。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回冻结 prompt 老链路就会静默发出一条谁也没打算发的文案。
+撞 uuid 时 `task` 是那条**已经存在的任务行**的投影，形状与 `GET /messages` 列出来的一样（`{ id, uuid, contactName, messageType, messageSubtype, nextSendAt, recurrenceType, tzId, status, retryCount, createdAt, updatedAt, charId, clientTaskId, lastError }`，不含任何凭据）。用确定性 uuid 做重试幂等时，重跑那轮靠它把这条任务记进自己的账本、随 push 带回客户端认领——否则这条任务只活在数据库里，面板列不出、用户取消不了，却照样到点触发。行读不回来（已经不是 pending）→ `task` 为 `null`。
+
+凭据和投递配置（`apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern`）以及 `contactName` / `avatarUrl` / `messageSubtype` / `userMessage` / `tzId` 从当前任务继承，宿主只说「什么时候、说什么方向」——hook 全程看不到凭据。推送订阅是用户级的一份，任务不携带、也不用继承。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回冻结 prompt 老链路就会静默发出一条谁也没打算发的文案。
 
 护栏：
 
@@ -159,7 +247,8 @@ const result = await ctx.scheduleTask({
 | `messageType` | 只收 `auto` / `prompted` / `fixed` | `TypeError` | `instant` 的语义是「建行的那一刻就投递」，那条路径归 `POST /schedule-message` 管；从 fire 里造这么一行，投递时机反而说不清 |
 | `messageType: 'fixed'` | 必须有 `userMessage`（自己传或继承到） | `TypeError` | 固定文本任务没有正文，就是一条永远发空的任务 |
 | 单次 fire 的建任务条数 | 默认 **2 条**，factory 配置 `maxScheduledTasksPerFire` 可调（`0` = 不许自排） | `RangeError` | 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键 |
-| `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid }` | fire 失败会整条重跑，宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等 |
+| `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid, task }` | fire 失败会整条重跑，宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等 |
+| `tzId` | 可用的 IANA 时区 id，或 `null` | `TypeError` | 认不出来的时区会让循环推进悄悄退回 UTC，用户设的钟点从此对不上 |
 | 数据库适配器没有 `createTask` | — | 抛 `AGENTIC_SCHEDULE_UNSUPPORTED` | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。
@@ -171,10 +260,11 @@ const result = await ctx.scheduleTask({
 - `validateLlmMessagesArray(messages)` — 同步预校验 messages 数组，返回 `string | null`（错误信息 / 通过）。形状规则统一在 `@rei-standard/amsg-shared` 的 `validateLlmMessagesShape`，和 `@rei-standard/amsg-instant` 共用同一实现（含 agentic 会话：assistant 带 `tool_calls` 时 content 可空、`role:'tool'` 要求 `tool_call_id`）。
 - `validateSplitPattern(value)` — 同步预校验 splitPattern（string / string[] / null），返回 `string | null`。
 - `MAX_PUSH_PAYLOAD_BYTES` — 一条 push 的明文上限，3993 字节。
+- `PUSH_ENVELOPE_RESERVED_BYTES` — 库在 hook 交还 payload 之后还要补的那批字段占的字节上界，384。
 - `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES` — 推送服务的密文 body 上限（4096）与 aes128gcm 固定开销（103），上面那个数就是两者相减。
 - `measurePushPayload(payload)` — 量一段 payload 的字节数与剩余额度，返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`。
 
-以上四个在包根和 `@rei-standard/amsg-server/cloudflare` 两个入口都有。
+以上几个在包根和 `@rei-standard/amsg-server/cloudflare` 两个入口都有。
 
 ## 一体化初始化流程
 
@@ -189,6 +279,27 @@ const result = await ctx.scheduleTask({
   - `Authorization: Bearer <tenantToken>`
 - `send-notifications`
   - `Authorization: Bearer <cronToken>` 或 `?token=<cronToken>`
+
+## 循环任务的时区（`tzId`）
+
+`daily` / `weekly` 任务可以带一个 IANA 时区 id：
+
+```js
+await client.scheduleMessage({
+  contactName: 'Rei',
+  messageType: 'auto',
+  firstSendTime: '2026-03-07T13:00:00.000Z', // 纽约当地 08:00
+  recurrenceType: 'daily',
+  tzId: 'America/New_York',
+  // …
+});
+```
+
+带了 `tzId` 的任务按**那个时区的墙钟**推进：日期 +1 天 / +7 天，钟点原样保留。用户设的「每天早八点」在夏令时切换前后都还是早八点。不带 `tzId` 的任务按 UTC 推进（等价于固定 +24h / +7×24h）。
+
+`PUT /update-message` 也认这个字段：传时区 id 换一个，传 `null` 改回按 UTC 推进（`hasOwnProperty` 判断，不会被吞掉）。`GET /messages` 每条任务多返回一个 `tzId`（没设 → `null`）。
+
+两个边界情况的收敛规则：春令时被跳过的墙钟（例如纽约 2:30 不存在）落到切换之后的等价时刻（当地 3:30）；秋令时重复出现的墙钟（当地 1:30 出现两次）取其中一个，不触发两次。时区换算全部走 `Intl`，不手搓偏移加减。
 
 ## 触发任务时的占位
 
@@ -208,23 +319,26 @@ const result = await ctx.scheduleTask({
 
 ## 导出 API（Exports）
 
-- `createReiServer`
-- `createAdapter`
-- `createTenantToken`
-- `verifyTenantToken`
-- `deriveUserEncryptionKey`
-- `decryptPayload`
-- `encryptForStorage`
-- `decryptFromStorage`
-- `validateScheduleMessagePayload`
-- `measurePushPayload`
-- `MAX_PUSH_PAYLOAD_BYTES`
-- `WEB_PUSH_MAX_BODY_BYTES`
-- `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
-- `isValidISO8601`
-- `isValidUrl`
-- `isValidUUID`
-- `isValidUUIDv4`
+包根（`@rei-standard/amsg-server`）：
+
+- `createReiServer` — 多租户装配线（标准路由处理器全家）
+- `createSingleUserServer` — 单用户装配线：没有租户概念，不需要 Blob 租户配置和 tenantToken 体系
+- `createSingleUserCloudflareWorker` — 单用户 Cloudflare Worker 一键装配（`fetch` + `scheduled` 两个入口）
+- `createAdapter` / `createD1Adapter` — pg·neon / Cloudflare D1 数据库适配器
+- `runScheduledTick` — 手动触发一轮到期任务投递（自定义 cron 宿主、要调 `claimLeaseMs` 时用）
+- `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
+- `createTenantToken` / `verifyTenantToken`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
+- `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl`
+- `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `isValidISO8601` / `isValidUrl` / `isValidUUID` / `isValidUUIDv4` / `isValidTimeZoneId`
+- `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence` — 循环任务的时区感知推进（宿主想自己算「下次什么时候」时用同一份实现）
+
+`@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
+
+- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick`
+- `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
 
 ## 运行环境与要求
 
@@ -267,7 +381,7 @@ PUBLIC_BASE_URL=https://your-domain.com
 VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 ```
 
-Vercel 部署配置可参考 [`examples/vercel.json.example`](https://github.com/Tosd0/ReiStandard/blob/main/examples/vercel.json.example)。
+函数超时、响应头这类 Vercel 配置的写法可参考 [`tests/vercel.json.example`](https://github.com/Tosd0/ReiStandard/blob/main/tests/vercel.json.example)（它是 `tests/` 健康检查端点的部署配置，不是本包的部署模板）；环境变量用 `vercel env add` 或控制台配置，不写进 `vercel.json`。
 
 ## 相关链接（绝对 URL）
 

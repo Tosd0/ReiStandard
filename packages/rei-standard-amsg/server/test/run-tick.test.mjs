@@ -4,6 +4,7 @@ import { runScheduledTick } from '../src/server/lib/run-tick.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptForStorage, decryptFromStorage } from '../src/server/lib/encryption.js';
+import { seedPushSubscription } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -34,13 +35,14 @@ async function decryptPayloadOf(row) {
 }
 
 async function seed(adapter, { uuid, recurrenceType, nextSendAt, payload = {} }) {
+  // 用户级订阅：投递时现读这一份，任务行不携带订阅。
+  await seedPushSubscription(adapter, USER, MASTER_KEY);
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
   const enc = await encryptForStorage(JSON.stringify({
     contactName: 'Rei',
     messageType: 'fixed',
     userMessage: 'hi',
     recurrenceType,
-    pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } },
     ...payload
   }), userKey);
   await adapter.createTask({
@@ -353,7 +355,20 @@ test('过期的一次性任务不补发：标 failed、payload 记 lastError、o
   assert.equal(payload.lastError.occurrence, missedAt);
 
   // 消费方靠这个 hook 写「错过了」回执；payload 里没有 metadata 时给 null。
-  assert.deepEqual(staleCalls, [{ uuid: 'stale-once', info: { reason: 'stale', metadata: null } }]);
+  assert.equal(staleCalls.length, 1);
+  assert.equal(staleCalls[0].uuid, 'stale-once');
+  const info = staleCalls[0].info;
+  assert.equal(info.reason, 'stale');
+  assert.equal(info.action, 'expired');
+  assert.equal(info.metadata, null);
+  assert.equal(info.recurrenceType, 'none');
+  assert.equal(info.skippedCount, 1);
+  assert.equal(info.nextSendAt, null);
+  assert.deepEqual(info.skippedOccurrences, [Date.parse(missedAt)]);
+  // 状态读写口跟着回执一起来：服务停摆恢复后的第一跳可能一次 fire 都没跑过，
+  // 宿主此时也得写得下这条痕迹。
+  assert.equal(typeof info.readState, 'function');
+  assert.equal(typeof info.writeState, 'function');
 });
 
 test('onStaleSkip 透传解密 payload 的 metadata，凭据字段不外漏', async () => {
@@ -380,7 +395,7 @@ test('onStaleSkip 透传解密 payload 的 metadata，凭据字段不外漏', as
 
   // metadata 原样透传：task 是 D1 行原样（payload 是密文），hook 靠 info.metadata
   // 才知道这是哪个角色的任务。
-  assert.deepEqual(info, { reason: 'stale', metadata: { charId: 'char-42' } });
+  assert.deepEqual(info.metadata, { charId: 'char-42' });
 
   // 防泄漏钉子：解密 payload 里的凭据绝不能递给 hook——只准透传 metadata
   // 这一个子字段，别把整个 decryptedPayload 递出去。
@@ -567,4 +582,133 @@ test('失败重试后成功，循环推进的基准仍是名义时刻（不带�
   const row = await adapter.getTaskByUuidOnly('no-drift');
   assert.equal(row.next_send_at, plusMs(dueAt, DAY));
   assert.equal(row.retry_count, 0);
+});
+
+// ─── 循环任务按角色时区的墙钟推进 ─────────────────────────────────────────
+
+// 固定 +86400000ms 的推进跨过夏令时切换点之后，用户设的「每天早八点」会永久
+// 变成早九点。这条钉住「任务行上的 tzId 真的被读到、并且一路传到写库」。
+test('daily 任务带 tzId：快进之后纽约的墙钟时刻不变', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+
+  // 2026-03-08 是美国春令时切换日。3 月 7 日 08:00 EST = 13:00Z。
+  const missedAt = '2026-03-07T13:00:00.000Z';
+  await seed(adapter, {
+    uuid: 'tz-daily', recurrenceType: 'daily', nextSendAt: missedAt,
+    payload: { tzId: 'America/New_York' }
+  });
+
+  await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+
+  const row = await adapter.getTaskByUuidOnly('tz-daily');
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', hourCycle: 'h23',
+    hour: '2-digit', minute: '2-digit'
+  }).format(new Date(row.next_send_at));
+  assert.equal(wall, '08:00', `墙钟应保持早八点，实际 ${wall}（${row.next_send_at}）`);
+});
+
+test('不带 tzId 的 daily 任务维持固定周期推进', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, { uuid: 'tz-absent', recurrenceType: 'daily', nextSendAt: dueAt });
+
+  await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+
+  assert.equal((await adapter.getTaskByUuidOnly('tz-absent')).next_send_at, plusMs(dueAt, DAY));
+});
+
+// ─── 循环任务的过期跳过也有回执 ───────────────────────────────────────────
+
+test('循环任务快进也调 onStaleSkip：带 action / 跳过次数 / 被跳过的名义时刻', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const missedMs = Date.now() - 3 * DAY - 5 * MINUTE;
+  const missedAt = new Date(missedMs).toISOString();
+  await seed(adapter, {
+    uuid: 'stale-daily-hook', recurrenceType: 'daily', nextSendAt: missedAt,
+    payload: { metadata: { charId: 'char-7' } }
+  });
+
+  const calls = [];
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(),
+    onStaleSkip: async (task, info) => { calls.push({ task, info }); }
+  });
+
+  assert.deepEqual(res.details.staleTasks.map((t) => t.action), ['fast_forwarded']);
+  assert.equal(res.details.staleTasks[0].skippedCount, 4);
+
+  assert.equal(calls.length, 1, '循环任务的快进以前一声不吭，现在必须有回执');
+  const { info } = calls[0];
+  assert.equal(info.reason, 'stale');
+  assert.equal(info.action, 'fast_forwarded');
+  assert.equal(info.recurrenceType, 'daily');
+  assert.deepEqual(info.metadata, { charId: 'char-7' });
+  // 名义那次 + 之后三次 = 4 次没响。
+  assert.equal(info.skippedCount, 4);
+  assert.deepEqual(info.skippedOccurrences, [
+    missedMs, missedMs + DAY, missedMs + 2 * DAY, missedMs + 3 * DAY
+  ]);
+  assert.equal(info.skippedTruncated, false);
+  assert.equal(info.nextSendAt, new Date(missedMs + 4 * DAY).toISOString());
+  assert.equal(typeof info.readState, 'function');
+  assert.equal(typeof info.writeState, 'function');
+
+  // 行还活着、排期已快进，同时 payload 上留下了「上次为什么没响」。
+  const row = await adapter.getTaskByUuidOnly('stale-daily-hook');
+  assert.equal(row.status, 'pending');
+  assert.equal(row.next_send_at, new Date(missedMs + 4 * DAY).toISOString());
+  const payload = await decryptPayloadOf(row);
+  assert.equal(payload.lastError.reason, 'stale');
+  assert.equal(payload.lastError.occurrence, missedAt);
+  assert.equal(payload.lastError.skippedCount, 4);
+});
+
+// 服务停摆恢复后的第一跳里，这个 tick 可能一次 fire 都没跑过。回执 hook 必须
+// 自带一个能用的写口，否则「过期跳过」这件事一条痕迹都留不下——而那正是这个
+// hook 存在的意义。
+test('onStaleSkip 自带的 writeState 能直接落库（本跳没有任何 fire 跑过）', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'stale-write', recurrenceType: 'none',
+    nextSendAt: new Date(Date.now() - 2 * 60 * MINUTE).toISOString()
+  });
+
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(),
+    onStaleSkip: async (_task, info) => {
+      await info.writeState('missed', [{ key: 'char-7', value: JSON.stringify({ at: info.occurrenceMs }) }]);
+    }
+  });
+
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const rows = await adapter.getClientState(USER, 'missed');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].key, 'char-7');
+  assert.ok(JSON.parse(await decryptFromStorage(rows[0].value, userKey)).at > 0);
+});
+
+test('onStaleSkip 自带的 readState 读得到客户端同步上来的状态', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  await adapter.upsertClientState(USER, [
+    { namespace: 'notes', key: 'k', value: await encryptForStorage('hello', userKey), updatedAt: 42 }
+  ]);
+  await seed(adapter, {
+    uuid: 'stale-read', recurrenceType: 'none',
+    nextSendAt: new Date(Date.now() - 2 * 60 * MINUTE).toISOString()
+  });
+
+  let seen = null;
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(),
+    onStaleSkip: async (_task, info) => { seen = await info.readState('notes'); }
+  });
+
+  assert.deepEqual(seen, [{ namespace: 'notes', key: 'k', value: 'hello', updatedAt: 42 }]);
 });

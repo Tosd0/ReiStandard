@@ -20,6 +20,14 @@
 
 4. **合并「Version Packages」PR 即发版**：合并后，同一个 workflow 跑 `changeset publish`，把版本号领先于 npm 的包逐个发布（带 npm provenance），并推对应的 git tag。
 
+## pre（`next`）模式
+
+仓库可以进入 Changesets 的 pre 模式，把一段时间内的发布都打成预发布版：版本号带 `-next.N` 后缀、npm dist-tag 用 `next`，`latest` 停在进入 pre 模式前的稳定线上不动。`.changeset/pre.json` 存在且 `mode` 为 `pre` 就表示当前处于该模式（`tag` 字段是发布用的 dist-tag）。
+
+- **进入**：在 `main` 上跑 `npx changeset pre enter next`，提交生成的 `.changeset/pre.json`。
+- **pre 模式下发版**：流程与上文完全一样（写 changeset → 合并 → 「Version Packages」PR → 合并即发），区别只有版本号形如 `2.6.0-next.3`、发到 `next` dist-tag。用户装预发布版要显式指定：`npm install @rei-standard/amsg-client@next`。
+- **退出（切回稳定版）**：跑 `npx changeset pre exit`，提交 `pre.json` 的变化，然后正常走一轮「Version Packages」PR——这一轮会把 pre 期间累计的所有变更收敛成一次稳定版发布（去掉 `-next.N` 后缀），发到 `latest`。
+
 ## 内部依赖区间
 
 四个上层包对 `@rei-standard/amsg-shared` 用脱字号区间（以各包 `package.json` 里的实际区间为准）。在 0.x 上脱字号只放行同一 minor 内的补丁，所以 shared 出补丁时消费者自动跟随、不必协调重发；shared 升 minor 不会被自动选中，要消费者在自己的 changeset 里显式升级区间。

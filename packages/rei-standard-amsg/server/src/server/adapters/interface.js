@@ -88,6 +88,18 @@
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
+ * @property {(userId: string) => Promise<{ subscription: string, updated_at: number }|null>} [getPushSubscription]
+ *   这个用户当前登记的 Web Push 订阅（`subscription` 是密文，解密在上层）。没有登记过 → null。
+ *   一个用户一份：任务行不携带订阅，到点投递时读这里。
+ * @property {(userId: string, encryptedSubscription: string, updatedAt: number) => Promise<boolean>} [upsertPushSubscription]
+ *   覆盖写这个用户的订阅（`updatedAt` 是 epoch 毫秒）。没有 last-write-wins 比较——
+ *   客户端拿到的新订阅永远比旧的有效，旧的那份只会 410。
+ * @property {(userId: string) => Promise<boolean>} [deletePushSubscription]
+ *   删掉这个用户的订阅；返回是否真的删掉了一行。
+ *
+ *   上面三个方法要么都实现、要么都不实现：缺任何一个，`PUT/GET/DELETE
+ *   /push-subscription` 返回 501，`POST /schedule-message` 也会拒绝建任务
+ *   （建了也永远发不出去）。内置的 D1 / pg / neon 适配器都实现了。
  */
 
 export {};

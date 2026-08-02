@@ -31,6 +31,24 @@ export const SERVER_FEATURES = Object.freeze([
   'occurrence-scoped-push-ids',
   'after-send-hook',
   'update-message-credentials',
+  // config 级 hook（onAfterSend / onStaleSkip）的载荷带 readState / writeState。
+  'hook-state-accessors',
+  // onAfterSend 的载荷带本次 fire 的 scratch（与 onBeforeFire / onLLMOutput 同一个引用）。
+  'after-send-scratch',
+  // onLLMOutput / executeToolCalls 的 ctx 带 taskId / taskUuid / occurrenceMs。
+  'fire-task-identity',
+  // 每条 push 顶层带 taskId / taskUuid / recurrenceType / occurrenceMs。
+  'push-task-identity',
+  // 导出 PUSH_ENVELOPE_RESERVED_BYTES：库补完信封字段之后的额度。
+  'push-envelope-reserved-bytes',
+  // scheduleTask 撞 uuid 时回已存在任务行的投影（{ created:false, …, task }）。
+  'schedule-task-duplicate-row',
+  // 循环任务过期快进也调 onStaleSkip、也写 lastError。
+  'recurring-stale-skip-hook',
+  // 任务行支持 tzId：daily / weekly 按该时区的墙钟推进。
+  'task-timezone',
+  // 推送订阅是用户级的一份（PUT/GET/DELETE /push-subscription），任务不携带。
+  'user-push-subscription',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

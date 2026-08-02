@@ -35,7 +35,7 @@ npm install @rei-standard/amsg-instant
 | `cors.allowOrigin`  | string    | ❌   | `Access-Control-Allow-Origin` 的值，默认 `*`。配成具体来源（如 `https://app.example.com`）会自动加 `Vary: Origin`。0.4.0 起 handler 在入口处短路 `OPTIONS` 预检请求并对所有响应（200/4xx/5xx 都包括）叠 CORS headers。 |
 | `webpush`           | object    | ❌   | **0.3.0 起废弃**。保留参数兼容旧代码但被忽略；测试改用 `fetch` 拦截 push endpoint 的 POST。 |
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
-| `onEvent`           | function  | ❌   | 事件钩子：`request` / `llm_done` / `push_sent` / `error`（明文模式下 `request` 事件不再带 userId —— 如果需要按用户分流日志，从 `payload.contactName` 或 `payload.metadata` 自取） |
+| `onEvent`           | function  | ❌   | 事件钩子，收 `{ type, ...上下文 }` 形状的运行事件（`llm_done` / `push_sent` / `sse_*` / `multipart_*` 等 30+ 种，完整清单见 [`onEvent` 事件一览](#onevent-事件一览)）。明文模式下 `request` 事件不带 userId —— 需要按用户分流日志时，从 `payload.contactName` 或 `payload.metadata` 自取 |
 | `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
 | `onBeforeLoop`      | function  | ❌   | **0.9.0+**：主 LLM loop 启动前调用，约定同步启动副任务并返回 handle 对象。返回值透传给 `onAfterLoop` 的 `pending`。SSE / 纯 Push 两种传输模式都生效。见 [生命周期 hooks](#生命周期-hooks-onbeforeloop--onafterloop090) |
 | `onAfterLoop`       | function  | ❌   | **0.9.0+**：主 loop 结束后、流关闭前调用，从 `pending` 拿到 `onBeforeLoop` 返回的副任务 handle，await 完用 `deliver(payload)` 追加 push |
@@ -74,9 +74,27 @@ createInstantHandler({
 |-------------------------------------|------------------------------------------|
 | `Access-Control-Allow-Origin`       | `*`（默认）或 `cors.allowOrigin`         |
 | `Access-Control-Allow-Methods`      | `POST, OPTIONS`                          |
-| `Access-Control-Allow-Headers`      | `Content-Type, Authorization, X-Client-Token` |
+| `Access-Control-Allow-Headers`      | `Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding` |
 | `Access-Control-Max-Age`            | `86400`                                  |
 | `Vary`                              | `Origin`（仅当 `allowOrigin !== '*'`）   |
+
+### `onEvent` 事件一览
+
+`onEvent` 收到的事件对象形如 `{ type, ...上下文字段 }`：多数事件带 `sessionId`，失败类事件带 `cause`（原始错误）。当前会发出的 `type` 按家族分组：
+
+| 家族 | 事件 |
+|---|---|
+| 请求入口 | `request` |
+| LLM 调用 | `llm_start` / `llm_done` / `llm_call_failed` |
+| 推送主链路 | `reasoning_pushed` / `reasoning_push_failed` / `push_sent` / `final_pushed` / `payload_too_large` / `fallback_push_sent` / `fallback_push_failed` / `diagnostic_push_failed` |
+| agentic loop | `continue_received` / `tool_request_pushed` / `loop_exceeded` / `hook_threw` |
+| SSE 传输 | `sse_payload_enqueued` / `sse_payload_enqueue_failed` / `sse_stream_aborted` / `sse_stream_canceled` / `sse_error_fallback_failed` / `backup_push_scheduled` / `backup_push_sent` / `backup_push_failed` |
+| 通用 multipart | `multipart_built` / `multipart_sent` / `multipart_too_large` / `multipart_too_many_chunks` |
+| Blob 旁路 | `blob_written` / `blob_put_failed` / `blob_orphaned` |
+| waitUntil | `wait_until_failed` / `wait_until_rejected` |
+| 通用失败 | `error`（主流程失败时的兜底事件） |
+
+事件集会随版本增长：处理时对不认识的 `type` 直接忽略即可，不要做穷举断言。
 
 ## API
 

@@ -28,7 +28,8 @@ import {
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
-import { runAgenticFire, taskNeedsLlm, occurrenceSuffix } from './agentic-fire.js';
+import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
+import { resolvePushSubscription } from './push-subscription-store.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
@@ -168,7 +169,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
     }
 
-    const pushSubscription = decryptedPayload.pushSubscription;
+    // 订阅是用户级的一份，投递时现读（任务行不携带它）。取不到就抛，走既有
+    // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。
+    const pushSubscription = await resolvePushSubscription({ db: ctx.db, userId: task.user_id, userKey });
     // sessionId is shared across the optional ReasoningPush and every
     // ContentPush from this LLM round. Pin it to (task id + 名义触发时刻)
     // when available (scheduled tasks) so retries of the same occurrence
@@ -190,6 +193,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     const messageIdBase = task.id != null
       ? `msg_task_${task.id}${occurrenceSuffix(task)}`
       : `msg_${randomUUID()}_instant`;
+    // 任务的调度身份（taskId / taskUuid / recurrenceType / occurrenceMs）由库
+    // 统一补进每条 push，客户端据此认领这条任务、判断它还会不会再来。
+    const occurrenceMs = occurrenceMsOf(task);
 
     // ReasoningPush — auto-emitted before the content burst when the
     // LLM response carried non-empty reasoning_content. `fixed` and
@@ -209,6 +215,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
         messageSubtype,
         metadata,
       });
+      stampTaskIdentity(reasoningPush, task, decryptedPayload, occurrenceMs);
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
       await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
     }
@@ -227,9 +234,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
         messageSubtype,
         messageIndex: i + 1,
         totalMessages: messages.length,
-        taskId: task.id || null,
         metadata,
       });
+      stampTaskIdentity(contentPush, task, decryptedPayload, occurrenceMs);
 
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
 

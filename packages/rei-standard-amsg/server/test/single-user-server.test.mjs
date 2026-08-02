@@ -4,6 +4,7 @@ import { createSingleUserServer } from '../src/server/single-user.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptPayload, encryptForStorage, decryptFromStorage, decryptPayload } from '../src/server/lib/encryption.js';
+import { seedPushSubscription } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -11,6 +12,8 @@ const MASTER_KEY = 'a'.repeat(64);
 async function makeServer() {
   const db = createD1Adapter(createTestD1());
   await db.initSchema();
+  // 排程要求这个用户已经登记过推送订阅（任务行不携带订阅了）。
+  await seedPushSubscription(db, USER, MASTER_KEY);
   const server = createSingleUserServer({ db, masterKey: MASTER_KEY });
   return server;
 }
@@ -41,8 +44,7 @@ test('schedule → list → cancel round-trips through single-user server over D
     messageType: 'fixed',
     userMessage: 'hi',
     firstSendTime: '2999-01-01T00:00:00.000Z',
-    recurrenceType: 'none',
-    pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } }
+    recurrenceType: 'none'
   };
   const created = await server.handlers.scheduleMessage.POST(headers, await encBody(payload));
   assert.equal(created.status, 201);
@@ -71,7 +73,6 @@ function basePayload(overrides = {}) {
     userMessage: 'hi',
     firstSendTime: '2999-01-01T00:00:00.000Z',
     recurrenceType: 'none',
-    pushSubscription: { endpoint: 'https://example.com/x', keys: { p256dh: 'k', auth: 'a' } },
     ...overrides,
   };
 }

@@ -1,4 +1,6 @@
-ref
+# 本地参考资料（不入库）
+ref/
+
 .DS_Store
 
 # 测试配置文件
@@ -15,7 +17,6 @@ node_modules/
 .claude/
 
 # Build output
-packages/*/dist/
 packages/*/*/dist/
 
 # Worktrees
