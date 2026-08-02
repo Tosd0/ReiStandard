@@ -1,5 +1,70 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.12
+
+### Minor Changes
+
+- 17741db: 新增 `onFireSettled`：一次 fire 无论什么结局都给一次收尾回执
+
+  `onAfterSend` 只走「有 push 要发」那条路。hook 判断这次不用说话（`onBeforeFire` 返回 `{ skip: true }`、或模型跑完后 `skip-push`）、以及链路中途抛错时，宿主收不到任何收尾信号——凡是「开始时占点什么、结束时放掉」的写法都会漏。两种典型漏法：角色在这次 fire 里用 `ctx.scheduleTask` 排了一条后续任务（任务行已经真的写进库了），但记账的代码挂在发送后，这次生成最终是空的就没人记，那条任务从此只活在数据库里——面板列不出、用户取消不掉，却照样到点触发；以及 fire 开头拿的锁没有可靠的释放点，一次 skip 就把资源占满整个 TTL。
+
+  config 顶层（与 `onAfterSend` / `onStaleSkip` 并列）挂 `onFireSettled`，**只要 `onBeforeFire` 被调用过就一定会被调用一次**：
+
+  ```js
+  async onFireSettled(info) {
+    // { task, status, skipReason, sentCount, total, iterations, error,
+    //   scratch, readState, writeState }
+  }
+  ```
+
+  `status` 四种：
+
+  | status        | 什么时候                                                                                                                      |
+  | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+  | `sent`        | pushPayloads 全部发完（`sentCount === total`）                                                                                |
+  | `skipped`     | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`）  |
+  | `failed`      | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数                              |
+  | `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管，它后面发没发出去不体现在这里 |
+
+  `onAfterSend` 的调用点和载荷都不变，两者分工是「发送回执」与「fire 结束信号」：正常发完时两个都会调，`onAfterSend` 在前，`scratch` 是同一个引用。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。`onFireSettled` 同样是 best-effort，自身抛错只记日志。
+
+  `GET /capabilities` 的 features 追加 `fire-settled-hook`。
+
+- 17741db: 定时触发支持「同一分组的任务不并发」，投递失败的退避搬到自己的列上
+
+  同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互不知情的消息；宿主在 fire hook 里维护的「我刚才说过什么」台账通常是读进内存 → 改 → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条——有一句说过的话没记上账，下次角色会换个说法再讲一遍。宿主自己做的「每角色任务数上限」这类判定也一样，并发时各算各的，拦不住。
+
+  `runScheduledTick`（以及单用户 Worker 的 config）新增可选的 `serializeBy`：
+
+  ```js
+  serializeBy: (task) => task.metadata?.charId ?? null;
+  ```
+
+  - 参数是与 `onBeforeFire` 的 `ctx.task` 同一份的只读任务视图（凭据已剔除）。返回什么算一组由宿主定义。
+  - 返回 `null` / 空串、或者不配这个函数 → 这条任务不参与串行，行为与不带该配置时完全一致。
+  - 同一分组同时只放行一条，**跨跳也算**：上一跳的 fire 还拿着租约时，下一跳捞到同组的另一条也不放行。一次 fire（组 prompt → 调 LLM → 跑工具 → 分段推送）常常跑十几秒到几分钟，只挡同一跳是不够的。
+  - 同一跳内同组放行的是**到点更早**的那条，跑完之后不补跑同组剩下的，留给下一跳（cron 一分钟就再来）。
+  - 被拦下的任务是**推迟不是丢弃**：`next_send_at` / `status` / `retry_count` 一个字段都不会被动，下一跳原样再捞一次。条数记在 tick 返回值的 `details.serializeSkippedTasks`（同一跳内拦下的）和 `details.claimSkippedTasks`（跨跳拦下的）里。
+  - `serializeBy` 自身抛错时这条任务这一跳不跑：分不清它属于哪一组，就不该冒着破坏宿主台账的风险跑下去。
+
+  分组判定和占位是同一条 `UPDATE`——先查「这一组忙不忙」再占位的话，两个 tick 的查询会双双在对方占位之前返回「不忙」。分组 key 不明文落库：库拿它和该用户的存储密钥做一次 HMAC，列里存的是那个派生值。
+
+  **退避与租约分两列**：`lease_until` 只表示「这条正在跑」，投递失败的退避时刻记在新的 `retry_after` 上，失败时租约当场放掉。挤在一列的话，一条正在退避、其实闲着的任务会被分组串行当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。捞取待发任务时两列都要看：租约没到期、或退避没到点，都不算待发。
+
+  **表结构**：`scheduled_messages` 新增两列 `retry_after`（SQLite `TEXT` / Postgres `timestamptz`）、`serialize_group`（SQLite `TEXT` / Postgres `VARCHAR(64)`），都可空；另加一个索引 `idx_serialize_group_lease`。`initSchema()`（包括 `POST /init-tenant`）会给已有的表补上，跑几次都没事。手工维护表结构的话，D1 执行 `ALTER TABLE scheduled_messages ADD COLUMN retry_after TEXT` 与 `ALTER TABLE scheduled_messages ADD COLUMN serialize_group TEXT`，Postgres 用对应的 `ADD COLUMN IF NOT EXISTS`；索引语句见 `examples/cloudflare-single-user/schema.sql`。**先升 worker 再让 cron 跑**：列不在时捞取语句会直接报错，整跳发不出去。
+
+  适配器接口的 `claimTask` 多一个可选的第四参数 `serializeGroup`，D1 / pg / neon 三个内置适配器都已实现；实现了它的适配器，`updateTaskById` 还要认 `retry_after`（含写 null）。自定义适配器忽略第四个参数的话，分组串行退化成只在同一跳内生效；完全不实现 `claimTask` 的同理。
+
+  `GET /capabilities` 的 features 追加 `tick-serialize-by`。
+
+- 17741db: 新增 `GET /message` 单条任务查询；`update-message` 认 `contactName`
+
+  - **`GET /message?id=<uuid>`（客户端 `client.getMessage(uuid)`）** 返回单条任务，形状与 `GET /messages` 列出来的一样，外加**完整的 `metadata`**。`PUT /update-message` 对 `metadata` 是整体替换（不深合并），而列表的投影只给 `charId` / `clientTaskId` 两个子字段——两件事凑在一起，「只改 metadata 里的一个键」是做不到的：拿不回完整的那份就没法读-改-写，盲传一部分会把宿主存在里面的其余键（任务指令、锚点时间戳、过期策略之类）一起冲掉，下次触发直接失败。列表维持不带整份 metadata：一页最多 100 条，每条都驮着它会把响应撑得很大，而列表要的只是「有哪些任务」。单条查询只读得到还没发出去的任务，已完成 / 已失败返回 `409 TASK_ALREADY_COMPLETED`、不存在返回 `404 TASK_NOT_FOUND`，与 `PUT /update-message` 同一口径。
+
+  - **`PUT /update-message` 的可写字段加上 `contactName`**（非空字符串，口径与排程时一致；空串 / `null` / 非字符串返回 `400 INVALID_UPDATE_DATA`）。用户给角色改了名之后，之前排好的任务推送出来的通知标题（「来自 `<contactName>`」）靠它跟着改。`contactName` 不是 key——宿主按角色过滤用的是 `metadata.charId`，它会跨角色重名——数据库里也只活在加密 payload 中，没有独立列或索引引用它。
+
+  `GET /capabilities` 的 features 追加 `get-message-detail` / `update-message-contact-name`。
+
 ## 2.6.0-next.11
 
 ### Minor Changes
