@@ -26,7 +26,7 @@ test('initSchema creates table and indexes', async () => {
   const { adapter } = await freshAdapter();
   const res = await adapter.initSchema(); // idempotent (IF NOT EXISTS)
   assert.equal(res.indexesFailed, 0);
-  assert.equal(res.indexesCreated, 5);
+  assert.equal(res.indexesCreated, 6);
 });
 
 test('createTask returns id/uuid/status/created_at and normalizes next_send_at', async () => {
@@ -115,6 +115,56 @@ test('getPendingTasks 跳过租约还没到期的行', async () => {
 
   const uuids = (await adapter.getPendingTasks(50)).map((t) => t.uuid);
   assert.deepEqual(uuids, ['free']);
+});
+
+// 退避没到点的行同样不该出现在待发列表里。退避和租约分开两列：租约=「有人正
+// 在跑」，退避=「上次没发成，等着重试」。
+test('getPendingTasks 跳过退避还没到点的行', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'backoff', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  await adapter.createTask(baseTask({ uuid: 'ready', next_send_at: '2020-01-01T00:00:00.000Z' }));
+
+  await adapter.updateTaskById(row.id, { retry_after: new Date(Date.now() + 120_000).toISOString() });
+
+  assert.deepEqual((await adapter.getPendingTasks(50)).map((t) => t.uuid), ['ready']);
+});
+
+// 分组串行：同一个角色的两条任务撞在一起时，只放行一条。
+test('claimTask 带分组：同组有任务正拿着租约时领不走，租约一放就能领', async () => {
+  const { adapter } = await freshAdapter();
+  const due = '2020-01-01T00:00:00.000Z';
+  const a = await adapter.createTask(baseTask({ uuid: 'g-a', next_send_at: due }));
+  const b = await adapter.createTask(baseTask({ uuid: 'g-b', next_send_at: due }));
+  const lease = new Date(Date.now() + 600_000).toISOString();
+
+  assert.equal(await adapter.claimTask(a.id, due, lease, 'grp'), true);
+  assert.equal(await adapter.claimTask(b.id, due, lease, 'grp'), false, '同一分组同时只跑一条');
+  // 别的分组不受影响。
+  assert.equal(await adapter.claimTask(b.id, due, lease, 'other'), true);
+
+  // a 的租约放掉之后，同组又可以放行了。
+  await adapter.updateTaskById(a.id, { lease_until: null });
+  await adapter.updateTaskById(b.id, { lease_until: null });
+  assert.equal(await adapter.claimTask(b.id, due, lease, 'grp'), true);
+});
+
+// 退避中的任务其实闲着，不该把同分组的其他任务一起堵住。
+test('claimTask 带分组：同组有任务在退避，不影响这一组的其他任务', async () => {
+  const { adapter } = await freshAdapter();
+  const due = '2020-01-01T00:00:00.000Z';
+  const a = await adapter.createTask(baseTask({ uuid: 'gr-a', next_send_at: due }));
+  const b = await adapter.createTask(baseTask({ uuid: 'gr-b', next_send_at: due }));
+
+  await adapter.updateTaskById(a.id, {
+    serialize_group: 'grp',
+    retry_after: new Date(Date.now() + 120_000).toISOString(),
+    lease_until: null
+  });
+
+  assert.equal(
+    await adapter.claimTask(b.id, due, new Date(Date.now() + 600_000).toISOString(), 'grp'),
+    true
+  );
 });
 
 // 2.5.x 建的表没有 lease_until，initSchema 要把它补上，老数据原样保留。

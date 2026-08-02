@@ -28,6 +28,7 @@ import { createSendNotificationsHandler } from './handlers/send-notifications.js
 import { createUpdateMessageHandler } from './handlers/update-message.js';
 import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
+import { createGetMessageHandler } from './handlers/get-message.js';
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createTenantBlobStore } from './tenant/blob-store.js';
 import { createTenantContextManager } from './tenant/context.js';
@@ -66,6 +67,7 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @property {{ PUT: function }} updateMessage
  * @property {{ DELETE: function }} cancelMessage
  * @property {{ GET: function }} messages
+ * @property {{ GET: function }} getMessage
  * @property {{ PUT: function, GET: function, DELETE: function }} pushSubscription
  */
 
@@ -141,6 +143,7 @@ export async function createReiServer(config) {
       updateMessage: createUpdateMessageHandler(ctx),
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx),
+      getMessage: createGetMessageHandler(ctx),
       pushSubscription: createPushSubscriptionHandler(ctx)
     }
   };

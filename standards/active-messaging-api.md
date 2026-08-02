@@ -150,8 +150,11 @@ export const config = {
 | `PUT` | `/api/v1/update-message?id={uuid}` | 更新任务 | `tenantToken` |
 | `DELETE` | `/api/v1/cancel-message?id={uuid}` | 取消任务 | `tenantToken` |
 | `GET` | `/api/v1/messages` | 查询任务列表 | `tenantToken` |
+| `GET` | `/api/v1/message?id={uuid}` | 查询单条任务（比列表多给完整 `metadata`） | `tenantToken` |
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
+
+`/messages` 是列表、`/message` 是单条：列表的每条任务只投影 `metadata` 里的 `charId` / `clientTaskId`，单条则给出完整的 `metadata`。`update-message` 对 `metadata` 是整体替换，所以「只改其中一个子字段」要先用单条查询把完整的那份读回来。单条查询只返回还没发出去的任务（`pending`），已结束的返回 `409 TASK_ALREADY_COMPLETED`，与 `update-message` 同一口径。
 
 上表是 `@rei-standard/amsg-server` 的端点。`@rei-standard/amsg-instant` 是另一套无状态 worker，自带 `/instant`（一次性即时推送）与 `/continue`（agentic-loop 工具回执续跑，仅当 handler 配了 `onLLMOutput` 时可用）两个端点，鉴权用可选的 client token，详见 [`amsg-instant` README](../packages/rei-standard-amsg/instant/README.md)。本规范正文提到 `/continue` 时即指这里。
 

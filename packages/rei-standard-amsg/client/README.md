@@ -503,7 +503,8 @@ try {
 - `scheduleMessage(payload)` —— 排定 fixed / prompted / auto / instant 任务，加密走 amsg-server
 - `updateMessage(uuid, updates)` —— 改任务字段
 - `cancelMessage(uuid)` —— 取消任务
-- `listMessages(opts)` —— 拉当前 user 的任务列表
+- `listMessages(opts)` —— 拉当前 user 的任务列表。每条任务只带 `charId` / `clientTaskId` 两个 `metadata` 子字段
+- `getMessage(uuid)` —— 单条任务（`GET /message`，amsg-server 2.6.0+ 单用户线），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
 - `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装
 
 对接单用户 amsg-server worker 的配套方法：

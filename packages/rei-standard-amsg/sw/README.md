@@ -58,6 +58,8 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `renotify`, `requireInteraction`, `silent`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
 
+正文一路取下来是空的（或只有空白字符）时，SW 用兜底文案顶上，默认 `New message`，`installReiSW(self, { defaultBody })` 可以换成自己的。这里不能改成「干脆不弹」：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，代价见下面那段。弹一条只有标题、正文空白的横幅同样不行——用户在锁屏上看到一条什么都没有的消息、未读 +1，点进去也是空的。
+
 > **收到 push 却不展示通知，是要付代价的**
 >
 > 订阅是按 `userVisibleOnly: true` 建的——那是跟浏览器约好「每条 push 都会给用户可见反馈」。应用在后台时违约，各家处理不同：Chrome 会替你弹一条通用的「此网站在后台更新了内容」；Firefox 对不展示通知的 push 有配额，超了直接把这个订阅退掉，得等用户再访问站点才恢复；iOS Web Push 会影响送达，反复不展示可能撤销推送权限。掉订阅这件事是静默发生的，事后很难查。
@@ -250,6 +252,7 @@ SW 收到 `_multipart` 后会先写 IndexedDB，支持乱序、重复分片和 S
 installReiSW(self, {
   defaultIcon: '/icon-192x192.png',
   defaultBadge: '/badge-72x72.png',
+  defaultBody: 'New message',   // payload 正文为空时顶上的文案
   multipart: {
     enabled: true,
     ttlMs: 60_000,

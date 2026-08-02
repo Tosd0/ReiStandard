@@ -24,6 +24,12 @@
  * onBeforeFire / onLLMOutput 同一个引用），前面几个 hook 记下的东西这里直
  * 接读；带 readState / writeState，回执要落进 client_state 时不用另想办法。
  *
+ * 收尾回执：onAfterSend 只走「有 push 要发」这条路。**只要 onBeforeFire 被
+ * 调用过**，无论结局是发完、跳过（skip / skip-push）还是抛错，可选的
+ * ctx.onFireSettled?.({ task, status, skipReason, sentCount, total,
+ * iterations, error, scratch, readState, writeState }) 都会被调用一次（见
+ * notifyFireSettled）。「开始时占点什么、结束时放掉」的写法挂这个才不会漏。
+ *
  * The decision contract is shared with @rei-standard/amsg-instant
  * (assertValidDecision / buildSessionContext live in
  * @rei-standard/amsg-shared), so a classifier written for instant's
@@ -181,8 +187,12 @@ export function taskNeedsLlm(decryptedPayload) {
  * nextSendAt 是这条任务原本的触发时刻。run-tick 领取任务时写的是 lease_until，
  * next_send_at 那一列不动，所以这里给出去的和库里的是同一个值——宿主拿它当
  * 时间锚点（窗口判断、缓存键）时对得上。
+ *
+ * 导出给 run-tick 用：`serializeBy` 要从任务内容里取分组 key，拿到的就该是
+ * 这一份（凭据剔掉、和 onBeforeFire 的 ctx.task 同一个形状），宿主不用为了
+ * 分组再学第二套字段。
  */
-function buildHookTask(task, decryptedPayload) {
+export function buildHookTask(task, decryptedPayload) {
   const safe = {};
   for (const [key, value] of Object.entries(decryptedPayload)) {
     if (!CREDENTIAL_PAYLOAD_KEYS.has(key)) safe[key] = value;
@@ -247,6 +257,9 @@ function firstPositiveNumber(values, fallback) {
  *   success handling as the post-LLM skip-push path.
  *   Failures (timeout / loop exceeded / config errors) throw — the caller's
  *   existing error handling turns them into task retry/failure.
+ *
+ *   收尾回执：onBeforeFire 一旦被调用，上面每一种结局（含抛错）都会调一次
+ *   `ctx.onFireSettled`，见 notifyFireSettled。
  */
 export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
@@ -492,6 +505,53 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     scratch,
   });
 
+  // 本次 fire 的进度。收尾回执（onFireSettled）要照实说「发出去几段、跑了几
+  // 轮、为什么没发」，而这些数字在半路抛错时是拿不到返回值的，只能一路记在
+  // 这里。
+  const progress = { sentCount: 0, total: 0, iterations: 0, skipReason: null };
+
+  // 结局默认按 failed 记：下面只要有任何一步抛出去，finally 里发出的就是这个。
+  let settledStatus = 'failed';
+  let settledError = null;
+  try {
+    const outcome = await runFireChain({
+      task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
+      readState, writeState, scratch, scheduleTask, fireCtx, progress,
+    });
+    settledStatus = !outcome.handled
+      ? 'not-handled'
+      : (outcome.result.status === 'skipped' ? 'skipped' : 'sent');
+    return outcome;
+  } catch (error) {
+    settledError = error;
+    throw error;
+  } finally {
+    await notifyFireSettled(ctx, {
+      task,
+      status: settledStatus,
+      skipReason: settledStatus === 'skipped' ? progress.skipReason : null,
+      sentCount: progress.sentCount,
+      total: progress.total,
+      iterations: progress.iterations,
+      error: settledError,
+      scratch,
+      readState,
+      writeState,
+    });
+  }
+}
+
+/**
+ * 一次 fire 的主链：onBeforeFire → LLM 轮次 → finish / skip-push / 工具循环。
+ * 拆出来只是为了让 runAgenticFire 能在外面用一个 try/finally 兜住所有结局，
+ * 保证 onFireSettled 一次不漏。
+ *
+ * @returns {Promise<{ handled: false } | { handled: true, result: Object }>}
+ */
+async function runFireChain({
+  task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
+  readState, writeState, scratch, scheduleTask, fireCtx, progress,
+}) {
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
 
@@ -500,6 +560,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   // the post-LLM 'skipped' result, so run-tick's success handling (delete
   // once-off / advance recurrence) applies unchanged — and zero tokens spent.
   if (typeof before === 'object' && before.skip === true) {
+    progress.skipReason = 'before-fire';
     return { handled: true, result: { success: true, messagesSent: 0, status: 'skipped', iterations: 0 } };
   }
 
@@ -527,6 +588,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     if (nowFn() >= deadline) {
       throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
     }
+    progress.iterations = iteration + 1;
 
     // Shrink each round's fetch timeout to the remaining wall-time budget
     // (capped at the legacy 300s single-call ceiling) — a hung LLM request
@@ -581,6 +643,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     }
 
     if (decision.decision === 'skip-push') {
+      progress.skipReason = 'skip-push';
       return { handled: true, result: { success: true, messagesSent: 0, status: 'skipped', iterations: iteration + 1 } };
     }
 
@@ -597,6 +660,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
         scratch,
         readState,
         writeState,
+        progress,
       });
       return { handled: true, result: { success: true, messagesSent, status: 'finished', iterations: iteration + 1 } };
     }
@@ -685,6 +749,46 @@ async function notifyAfterSend(ctx, info) {
 }
 
 /**
+ * ctx.onFireSettled?.({ task, status, skipReason, sentCount, total,
+ * iterations, error, scratch, readState, writeState }) —— 一次 fire 收尾的
+ * 可选 hook。**onBeforeFire 被调用过，这个就一定会被调用一次**，无论这次
+ * 是发完了、跳过了、还是半路抛错。
+ *
+ * 有了 onAfterSend 为什么还要它：onAfterSend 只在「有 push 要发」这条路上
+ * 走。hook 判断这次不用说话（`{ skip: true }` / `skip-push`）、或者链路中途
+ * 抛错时，宿主收不到任何收尾信号——于是「开始时占点什么、结束时放掉」的写法
+ * 必然漏。典型两种：fire 里用 ctx.scheduleTask 建出来的任务已经真的写进库
+ * 了，但记账的代码挂在发送后，这次没发成就没人记，那条任务从此只活在数据库
+ * 里；以及 fire 开头拿的锁没有可靠的释放点，一次 skip 就把资源占满整个 TTL。
+ *
+ * status 四种：
+ *   - `sent`        —— pushPayloads 全部发完（sentCount === total）
+ *   - `skipped`     —— 这次不发。skipReason 区分是 onBeforeFire 直接
+ *                      `{ skip: true }`（`'before-fire'`），还是模型跑完之后
+ *                      判定不发（`'skip-push'`）
+ *   - `failed`      —— 链路抛错，error 带原始错误。部分失败也是这个：发到第
+ *                      k 段挂了 → sentCount = k、total 是原本要发的段数
+ *   - `not-handled` —— onBeforeFire 返回 null，这条任务交还给排程时冻结的
+ *                      prompt 老链路。那条链路不归 fire hook 管，所以它后面
+ *                      发没发出去不体现在这里
+ *
+ * 与 onAfterSend 的关系：正常发完时两个都会调，onAfterSend 在前。
+ * 没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个
+ * hook 都不会调。
+ *
+ * hook 自身抛错只 console.warn，不影响主流程（收尾回执挂掉不该把一次成功的
+ * 投递变成失败）。
+ */
+async function notifyFireSettled(ctx, info) {
+  if (typeof ctx.onFireSettled !== 'function') return;
+  try {
+    await ctx.onFireSettled(info);
+  } catch (hookError) {
+    console.warn('[amsg-server] onFireSettled hook 抛错（已忽略）:', hookError && hookError.message);
+  }
+}
+
+/**
  * 把任务的调度身份投影进一条 push。
  *
  * 客户端收到推送时要知道「这是哪条任务、哪一次触发、它还会不会再来」——不然
@@ -734,9 +838,11 @@ async function sendHookPushPayloads({
   scratch,
   readState,
   writeState,
+  progress,
 }) {
   const total = pushPayloads.length;
   let sentCount = 0;
+  progress.total = total;
   const afterSendBase = { task, total, scratch, readState, writeState };
   try {
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
@@ -761,6 +867,7 @@ async function sendHookPushPayloads({
 
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
       sentCount++;
+      progress.sentCount = sentCount;
       if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   } catch (error) {

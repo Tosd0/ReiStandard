@@ -553,6 +553,48 @@ test('content push triggers showNotification AND postMessage with CONTENT_RECEIV
   });
 });
 
+// 正文空白的 content push 以前会老老实实弹一条只有标题、正文全空的横幅：用户
+// 在锁屏上看到一条什么都没有的消息、未读 +1，点进去也是空的。
+// 兜底只能是「弹一条有内容的」——订阅是按 userVisibleOnly: true 建的，不弹会
+// 被 Firefox 按配额退订、iOS 可能撤掉推送权限。
+test('正文为空的 content push 弹兜底文案，而不是一条空白横幅', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({ ...COMMON, messageKind: 'content', message: '', title: 'Rei' });
+
+  assert.equal(notifications.length, 1, '照弹不误：不弹会违反 userVisibleOnly 的约定');
+  assert.equal(notifications[0].title, 'Rei');
+  assert.equal(notifications[0].options.body, 'New message');
+});
+
+test('正文只有空白字符也走兜底', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({ ...COMMON, messageKind: 'content', message: '   \n ', title: 'Rei' });
+
+  assert.equal(notifications[0].options.body, 'New message');
+});
+
+test('defaultBody 可以自定义兜底文案', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw, { defaultBody: '收到一条新消息' });
+
+  await triggerPush({ ...COMMON, messageKind: 'content', message: '', title: 'Rei' });
+
+  assert.equal(notifications[0].options.body, '收到一条新消息');
+});
+
+test('有正文时兜底不插手', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  installReiSW(sw, { defaultBody: '收到一条新消息' });
+
+  await triggerPush({ ...COMMON, messageKind: 'content', message: '  有内容  ', title: 'Rei' });
+
+  assert.equal(notifications[0].options.body, '  有内容  ', '原样保留，连空格都不动');
+});
+
 test('onBusinessPayload waits for thenables returned by another promise implementation', async () => {
   const { sw, triggerPush } = createSwMock();
   let hookSettled = false;

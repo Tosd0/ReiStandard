@@ -49,6 +49,14 @@ export const SERVER_FEATURES = Object.freeze([
   'task-timezone',
   // 推送订阅是用户级的一份（PUT/GET/DELETE /push-subscription），任务不携带。
   'user-push-subscription',
+  // GET /message?id=<uuid>：单条任务，带完整 metadata（列表只给两个子字段）。
+  'get-message-detail',
+  // PUT /update-message 认 contactName（改了角色名之后旧任务的通知标题跟着改）。
+  'update-message-contact-name',
+  // runScheduledTick 认 serializeBy：同一分组的任务同时只跑一条，跨跳也算。
+  'tick-serialize-by',
+  // 一次 fire 无论什么结局都调 onFireSettled（发完 / 跳过 / 抛错）。
+  'fire-settled-hook',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

@@ -1,6 +1,9 @@
 /**
  * SQLite (Cloudflare D1) dialect schema for scheduled_messages.
  *
+ * 定时触发用的 `lease_until` / `retry_after` / `serialize_group` 三列分别是什么
+ * 意思，写在 Postgres 那份 schema 的文件头（adapters/schema.js）。
+ *
  * Differences from the Postgres schema (adapters/schema.js):
  *   - id: INTEGER PRIMARY KEY AUTOINCREMENT (vs SERIAL)
  *   - timestamps stored as TEXT ISO8601 UTC (vs TIMESTAMP WITH TIME ZONE)
@@ -21,6 +24,8 @@ export const SQLITE_TABLE_SQL = `
     message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TEXT NOT NULL,
     lease_until TEXT,
+    retry_after TEXT,
+    serialize_group TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -37,6 +42,16 @@ export const SQLITE_MIGRATIONS = [
     name: 'add_lease_until',
     sql: 'ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT',
     description: 'Task claim lease (2.6.0)'
+  },
+  {
+    name: 'add_retry_after',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN retry_after TEXT',
+    description: 'Retry backoff, held apart from the claim lease (2.6.0)'
+  },
+  {
+    name: 'add_serialize_group',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN serialize_group TEXT',
+    description: 'Serialization group for runScheduledTick serializeBy (2.6.0)'
   }
 ];
 
@@ -79,6 +94,14 @@ export const SQLITE_INDEXES = [
           WHERE uuid IS NOT NULL`,
     description: 'UUID uniqueness guard',
     critical: true
+  },
+  {
+    name: 'idx_serialize_group_lease',
+    sql: `CREATE INDEX IF NOT EXISTS idx_serialize_group_lease
+          ON scheduled_messages (serialize_group, lease_until)
+          WHERE serialize_group IS NOT NULL AND status = 'pending'`,
+    description: 'Serialization group busy-check index (claimTask)',
+    critical: false
   }
 ];
 

@@ -1,5 +1,16 @@
 /**
  * Shared SQL schema constants
+ *
+ * 定时触发用的三列各管一件事，别把它们混着读（见 lib/run-tick.js）：
+ *   - `lease_until`：**这条正在跑**。某个 tick 占位时写「归我管到什么时候」，
+ *     投递收尾时放掉。捞取待发任务时跳过租约未到期的行。
+ *   - `retry_after`：**这条没在跑，等着重试**。投递失败的退避时刻，到点之前
+ *     捞不到这行。跟租约分开写，是因为「正在跑」会挡住同分组的其他任务，而
+ *     一条正在等重试的任务其实闲着，不该连累别人。
+ *   - `serialize_group`：这条属于哪个串行分组（`runScheduledTick` 的
+ *     `serializeBy` 算出来的，占位时一起写）。同一分组同时只放行一条。存的是
+ *     派生值而不是宿主给的原始 key —— 原始 key 往往是角色 id 之类的宿主数据，
+ *     任务内容都是密文落库的，这一列不该成为它的明文出口。
  */
 
 export const TABLE_SQL = `
@@ -11,6 +22,8 @@ export const TABLE_SQL = `
     message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TIMESTAMP WITH TIME ZONE NOT NULL,
     lease_until TIMESTAMP WITH TIME ZONE,
+    retry_after TIMESTAMP WITH TIME ZONE,
+    serialize_group VARCHAR(64),
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -28,6 +41,16 @@ export const MIGRATIONS = [
     name: 'add_lease_until',
     sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS lease_until TIMESTAMP WITH TIME ZONE',
     description: 'Task claim lease (2.6.0)'
+  },
+  {
+    name: 'add_retry_after',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS retry_after TIMESTAMP WITH TIME ZONE',
+    description: 'Retry backoff, held apart from the claim lease (2.6.0)'
+  },
+  {
+    name: 'add_serialize_group',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS serialize_group VARCHAR(64)',
+    description: 'Serialization group for runScheduledTick serializeBy (2.6.0)'
   }
 ];
 
@@ -66,6 +89,13 @@ export const INDEXES = [
           WHERE uuid IS NOT NULL`,
     description: 'UUID uniqueness guard',
     critical: true
+  },
+  {
+    name: 'idx_serialize_group_lease',
+    sql: `CREATE INDEX IF NOT EXISTS idx_serialize_group_lease
+          ON scheduled_messages (serialize_group, lease_until)
+          WHERE serialize_group IS NOT NULL AND status = 'pending'`,
+    description: 'Serialization group busy-check index (claimTask)'
   }
 ];
 
@@ -103,5 +133,6 @@ export const COLUMNS_SQL = `
 // (The D1 adapter enforces the same list with its own in-file copy.)
 export const UPDATABLE_COLUMNS = new Set([
   'user_id', 'uuid', 'encrypted_payload', 'message_type',
-  'next_send_at', 'lease_until', 'status', 'retry_count', 'created_at', 'updated_at'
+  'next_send_at', 'lease_until', 'retry_after', 'serialize_group',
+  'status', 'retry_count', 'created_at', 'updated_at'
 ]);
