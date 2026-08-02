@@ -1,5 +1,40 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.11
+
+### Minor Changes
+
+- d6bea67: hook 契约补齐任务身份与状态读写口；push 自带任务的调度身份
+
+  - **config 级 hook 拿到状态读写口。** `onAfterSend` / `onStaleSkip` 的载荷里现在有 `readState(ns)` / `writeState(ns, entries)`，语义与 fire 级那套一致（单用户模式下作用于当前用户的命名空间）。此前只有 fire 级 ctx 上有，宿主要在这两个 hook 里写 `client_state` 只能自己缓存一份写口：isolate 冷启动后、本次 tick 里还没有任何 fire 跑过时缓存是空的（服务停摆恢复后那一波过期跳过一条痕迹都留不下，而那正是 `onStaleSkip` 存在的意义），缓存下来的闭包还握着上一次 invocation 的数据库绑定。
+  - **`onAfterSend` 收到本次 fire 的 `scratch`。** 与 `onBeforeFire` / `onLLMOutput` 是同一个对象引用，所以「这次生成了哪几段正文」这类上下文直接从 `info.scratch` 读，不用再按任务行 id 自建登记表（连带 TTL 清扫和并发隔离）。完整载荷：`{ task, sentCount, total, error, scratch, readState, writeState }`。
+  - **`onLLMOutput` / `executeToolCalls` 的 ctx 直接带任务身份**：`taskId`（任务行 id）、`taskUuid`、`occurrenceMs`（本次触发的名义时刻，epoch 毫秒）。`sessionId` 是给日志和去重用的不透明字符串（当前格式 `sess_task_<id>@<occurrenceMs>`），拿它切字符串取任务身份是切不稳的。
+  - **每条 push 顶层带 `taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs`**（冻结 prompt 路径和 fire-time hook 路径都算）。客户端据此认领任务、判断它还会不会再来——角色在 fire 里给自己排的任务客户端从没见过，此前只能靠宿主往 `metadata` 里逐个抄。调用方在 `pushPayloads` 里自己写了这几个字段会被库覆盖：它们描述的是任务行的事实，不是内容。`@rei-standard/amsg-shared` 的 `AmsgPushCommon` 类型随之收录这四个字段（`taskId` 从 `ContentPush` 上移到公共层）。
+  - **新增导出 `PUSH_ENVELOPE_RESERVED_BYTES`（384 字节）**，以及 `measurePushPayload(payload, { reserveEnvelope: true })` 这个口径。hook 把 payload 交还给库之后，库还会补 `messageId` / `sessionId` / `timestamp` / `messageIndex` / `totalMessages` / `taskId` / `taskUuid` / `recurrenceType` / `occurrenceMs`，hook 手里量到的从来不是最终 payload；不留这一截的话，卡在边界上的消息会「量出来装得下、补完字段就超了」，既没走旁路存储也发不出去。返回值多一个 `envelopeReservedBytes`。
+  - **`GET /capabilities` 的 features 追加** `hook-state-accessors` / `after-send-scratch` / `fire-task-identity` / `push-task-identity` / `push-envelope-reserved-bytes`。
+
+- d6bea67: 任务生命周期：撞车回已存在的任务、循环过期也有回执、循环推进认时区
+
+  - **`ctx.scheduleTask()` 撞 uuid 时回已存在那一行的投影**：`{ created: false, reason: 'duplicate', uuid, task }`。`task` 与 `GET /messages` 列出来的形状一样（`id` / `uuid` / `contactName` / `messageType` / `messageSubtype` / `nextSendAt` / `recurrenceType` / `tzId` / `status` / `retryCount` / `createdAt` / `updatedAt` / `charId` / `clientTaskId` / `lastError`），不含任何凭据。用确定性 uuid 做重试幂等时，重跑那轮此前什么信息都拿不到，那条任务只活在数据库里——宿主的面板列不出、用户取消不了，却照样到点触发烧 LLM。行读不回来（已经不是 pending）→ `task` 为 `null`。投影实现与 `GET /messages` 共用一份，两边不会漂。
+  - **循环任务的过期快进也走 `onStaleSkip`、也写 `lastError`。** 此前一次性任务错过太久会标 `failed`、写 `lastError`、调 hook，而循环任务直接把 `next_send_at` 快进到下一次，不回调、不记录、零痕迹——宿主完全无从知道「昨天那次没响」。两种情况现在共用一个 hook，靠 `info.action` 区分：`expired`（一次性，行已标 `failed`）/ `fast_forwarded`（循环，排期已快进，行仍是 `pending`）。载荷补齐 `recurrenceType` / `occurrenceMs` / `skippedCount`（跳过几次，含名义那一次）/ `skippedOccurrences`（被跳过的名义时刻，超过 32 次时只给首末两个并置 `skippedTruncated`）/ `nextSendAt`。tick 返回值的 `staleTasks` 每项也多一个 `skippedCount`。
+  - **任务行支持 `tzId`（IANA 时区 id），`daily` / `weekly` 按该时区的墙钟推进**：同一钟点，日期 +1 天 / +7 天。此前是固定 +24h / +7×24h，跨过夏令时切换点之后墙钟永久漂一小时——用户设的「每天早八点」从此变成早九点。`POST /schedule-message`、`PUT /update-message`（传 `null` 改回按 UTC 推进）、`ctx.scheduleTask({ tzId })`（默认继承当前任务）三个入口都认这个字段，`GET /messages` 每条任务多返回一个 `tzId`（没设 → `null`）。不带 `tzId` 的任务按 UTC 推进。时区换算全部走 `Intl`，不做偏移加减：春令时被跳过的墙钟落到切换之后的等价时刻，秋令时重复出现的墙钟取其中一个、不触发两次。
+  - **新增导出** `isValidTimeZoneId` / `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence`，宿主想自己算「下次什么时候」时用的是同一份实现。
+  - **`GET /capabilities` 的 features 追加** `schedule-task-duplicate-row` / `recurring-stale-skip-hook` / `task-timezone`。
+
+- d6bea67: 推送订阅改成用户级的一份，任务不再携带它
+
+  - **新增 `push_subscriptions` 表与 `PUT` / `GET` / `DELETE /push-subscription` 三个端点。** 一个用户一份订阅，落库前用 per-user key 加密；`GET` 返回 `{ exists, updatedAt, endpoint }`，不含订阅的密钥部分。内置的 D1 / pg / neon 适配器都实现了对应的 `getPushSubscription` / `upsertPushSubscription` / `deletePushSubscription`，`initSchema()` 会建表；自定义适配器缺任何一个，这三个端点返回 501。
+  - **任务不再携带订阅，到点投递时现读那一份。** 订阅冻结在每条任务里的话，用户清站点数据 / 重装 PWA / 推送服务轮换 endpoint 之后，每条老任务都拿着一个已死的订阅，而「刷新订阅」只能按客户端本地已知的任务清单逐行 PUT——它不知道的任务（角色在 fire 里给自己排的那些）就永远刷不到，成了死循环：推不出去 → 状态记不下来 → 客户端不知道这条任务存在 → 更刷不到它。现在覆盖用户级那一份就全好了，已排的任务一条都不用碰。
+  - **`POST /schedule-message` 与 `PUT /update-message` 都不收 `pushSubscription` 字段**（带了返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）：静默丢弃会让人以为「这条任务用的是我传的这个订阅」。排程时这个用户还没登记订阅 → `409 PUSH_SUBSCRIPTION_MISSING`，建了也永远发不出去。投递时读不到订阅 → 任务按投递失败处理，原因记进 payload 的 `lastError`，`GET /messages` 上看得见。
+  - **`ctx.scheduleTask()` 建的任务同样不携带订阅**，也不需要继承——到点读的就是当时最新的那份。
+  - **客户端 SDK 新增** `putPushSubscription(subscription, opts?)` / `getPushSubscription()` / `deletePushSubscription()`。`putPushSubscription` 直接收 `pushManager.subscribe()` 的结果（内部取 `toJSON()`），什么时候调：拿到订阅之后一次，之后每次应用启动确认订阅仍然有效时再一次（幂等覆盖）。
+  - **`GET /capabilities` 的 features 追加** `user-push-subscription`。
+
+### Patch Changes
+
+- Updated dependencies [d6bea67]
+  - @rei-standard/amsg-shared@0.4.0-next.3
+
 ## 2.6.0-next.10
 
 ### Minor Changes
