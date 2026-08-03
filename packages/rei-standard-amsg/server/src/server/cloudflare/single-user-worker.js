@@ -26,6 +26,10 @@
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
  * Access-Control-* on responses. With no `cors` the Worker stays same-origin.
+ * Error responses carry the same headers as the success path — a header-less
+ * 500 is invisible to a cross-origin caller (the browser drops it and `fetch`
+ * rejects as a network error), so a server-side exception would otherwise be
+ * indistinguishable from the worker being unreachable.
  *
  * Fire-time hooks are opt-in too: pass `hooks: { onBeforeFire, onLLMOutput,
  * executeToolCalls }` (+ optional `maxToolIterations` / `totalTimeoutMs` /
@@ -92,6 +96,31 @@ function corsHeadersFor(cors, requestOrigin) {
   return headers;
 }
 
+/**
+ * CORS headers for the degraded path: buildConfig itself threw, so the
+ * deployment's configured policy is unknowable — yet the error response still
+ * needs headers, or a cross-origin caller cannot see it at all (the browser
+ * drops a header-less response and `fetch` rejects as a network error, which
+ * reads exactly like the worker being down).
+ *
+ * The fallback echoes the caller's Origin — never '*' — and is used ONLY on this
+ * path. What it exposes is a fixed error envelope with no data and no
+ * credentials, so a stranger's page learns nothing beyond "this worker is
+ * failing"; the moment the config builds again, every response goes back to
+ * cfg.cors, so a CORS-less (same-origin) deployment does not become an open one.
+ * maxAge 0 keeps a preflight answered during the outage out of the browser cache.
+ *
+ * @param {string} requestOrigin - the request's Origin header ('' → null, i.e.
+ *   a same-origin caller needs no headers, same as everywhere else)
+ */
+function degradedCorsHeaders(requestOrigin) {
+  return corsHeadersFor({ origin: requestOrigin, maxAge: 0 }, requestOrigin);
+}
+
+function internalErrorResponse(cors) {
+  return jsonResponse(500, { success: false, error: { code: 'INTERNAL_ERROR', message: '服务器内部错误' } }, cors);
+}
+
 export function createSingleUserCloudflareWorker(buildConfig) {
   async function resolveConfig(env) {
     const cfg = await buildConfig(env);
@@ -100,14 +129,33 @@ export function createSingleUserCloudflareWorker(buildConfig) {
   }
 
   async function fetch(request, env /* , ctx */) {
-    // Error boundary: a handler (or config build) may throw — e.g.
-    // schedule-message re-throws a non-unique DB error. Keep the client-facing
-    // contract consistent (a JSON envelope, not the runtime's HTML error page).
-    try {
-      const cfg = await resolveConfig(env);
-      const cors = corsHeadersFor(cfg.cors, request.headers.get('origin') || '');
-      const method = request.method.toUpperCase();
+    const requestOrigin = request.headers.get('origin') || '';
+    const method = request.method.toUpperCase();
 
+    // The config is built on its own so that a build failure (a missing binding,
+    // a lost env var) still answers with CORS headers — otherwise every request,
+    // preflights included, comes back header-less and the whole deployment looks
+    // offline to the frontend instead of broken.
+    let cfg;
+    try {
+      cfg = await resolveConfig(env);
+    } catch (error) {
+      console.error('[amsg single-user] fetch() config build failed:', error && error.message);
+      const degraded = degradedCorsHeaders(requestOrigin);
+      // A preflight must be 2xx or the browser never sends the real request —
+      // and then the readable 500 below never reaches the caller.
+      if (method === 'OPTIONS' && degraded) return new Response(null, { status: 204, headers: degraded });
+      return internalErrorResponse(degraded);
+    }
+
+    const cors = corsHeadersFor(cfg.cors, requestOrigin);
+
+    // Error boundary: a handler may throw — e.g. schedule-message re-throws a
+    // non-unique DB error. Keep the client-facing contract consistent (a JSON
+    // envelope, not the runtime's HTML error page) and carry the same CORS
+    // headers as the success path, so the caller reads the error instead of a
+    // browser-level network failure.
+    try {
       // CORS preflight: answer OPTIONS directly when CORS is configured.
       if (method === 'OPTIONS') {
         return cors
@@ -163,7 +211,7 @@ export function createSingleUserCloudflareWorker(buildConfig) {
       return jsonResponse(result.status, result.body, cors);
     } catch (error) {
       console.error('[amsg single-user] fetch() unhandled error:', error && error.message);
-      return jsonResponse(500, { success: false, error: { code: 'INTERNAL_ERROR', message: '服务器内部错误' } });
+      return internalErrorResponse(cors);
     }
   }
 

@@ -176,6 +176,70 @@ test('CORS opt-in: OPTIONS preflight answered, real response echoes the allowed 
   assert.equal(listed.headers.get('Vary'), 'Origin');
 });
 
+// 回归守卫：抛异常那条 500 也必须带 CORS 头。少了 Access-Control-Allow-Origin，
+// 浏览器会把整条响应吞掉、前端的 fetch 直接 reject 成网络错误（Safari 显示
+// "Load failed"）—— 服务端异常在前端长得和断网一模一样，真因谁也查不出来。
+test('CORS: a throwing handler still returns a 500 the browser can read', async () => {
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: { async listTasks() { throw new Error('db boom'); } },
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() {} },
+    cors: { origin: 'https://app.example.com' }
+  }));
+  const origErr = console.error;
+  console.error = () => {};
+  let res;
+  try {
+    res = await worker.fetch(new Request('https://w.dev/messages?status=all', {
+      method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' }
+    }), {});
+  } finally {
+    console.error = origErr;
+  }
+  assert.equal(res.status, 500);
+  assert.equal((await res.json()).error.code, 'INTERNAL_ERROR');
+  assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+});
+
+// 同一个洞的配置级版本：buildConfig 自己炸了（少个 binding、环境变量丢了）时
+// 连预检都会掉进错误分支。预检不是 2xx 浏览器就不会发真正那条请求，前端拿到的
+// 还是「网络失败」，整个站挂掉且零报错信息。
+test('CORS: a config build failure answers the preflight and returns a readable 500', async () => {
+  const worker = createSingleUserCloudflareWorker(() => { throw new Error('config boom'); });
+  const origErr = console.error;
+  console.error = () => {};
+  let preflight, res, sameOrigin;
+  try {
+    preflight = await worker.fetch(
+      new Request('https://w.dev/messages', { method: 'OPTIONS', headers: { Origin: 'https://app.example.com' } }),
+      {}
+    );
+    res = await worker.fetch(
+      new Request('https://w.dev/messages?status=all', {
+        method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://app.example.com' }
+      }),
+      {}
+    );
+    sameOrigin = await worker.fetch(new Request('https://w.dev/messages?status=all', { method: 'GET' }), {});
+  } finally {
+    console.error = origErr;
+  }
+
+  assert.ok(preflight.status >= 200 && preflight.status < 300, '预检必须是 2xx，否则真正那条请求根本发不出去');
+  assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers'), /X-User-Id/);
+  assert.match(preflight.headers.get('Access-Control-Allow-Methods'), /GET/);
+
+  assert.equal(res.status, 500);
+  assert.equal((await res.json()).error.code, 'INTERNAL_ERROR');
+  assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
+
+  // 兜底只回显来访的 Origin，不退化成 '*'：没配 CORS 的部署不该因为配置炸了就变成全开。
+  assert.equal(sameOrigin.status, 500);
+  assert.equal(sameOrigin.headers.get('Access-Control-Allow-Origin'), null);
+});
+
 // Regression guard (design spec §7): with serverToken set, EVERY exposed HTTP
 // endpoint must require X-Client-Token. Today all handlers funnel through the
 // same resolveTenant, but this pins it down so a future handler that forgets
