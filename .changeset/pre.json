@@ -33,6 +33,7 @@
     "amsg-server-tick-claim",
     "amsg-server-tick-serialize-by",
     "amsg-server-webcrypto-encryption",
+    "amsg-server-worker-error-cors",
     "amsg-shared-agentic-contract",
     "amsg-shared-llm-messages",
     "amsg-sw-duplicate-business-retry",
