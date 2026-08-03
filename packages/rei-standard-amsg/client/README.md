@@ -81,6 +81,20 @@ await client.scheduleMessage({
 
 订阅登记之后随时可以覆盖：用户清了站点数据、重装了 PWA、或者推送服务轮换了 endpoint，再调一次 `putPushSubscription()` 就全好了——已排的任务一条都不用碰。任务不再携带 `pushSubscription` 字段，`scheduleMessage` / `updateMessage` 里带了会被服务端 400 拒掉。
 
+`subscribePush()` 返回的订阅 endpoint 保证是活的，可以直接往服务端登记。刚 `unsubscribe()` 过又马上重订时，Chromium 会给一个 `https://permanently-removed.invalid/...` 的占位订阅——结构齐全但推什么都到不了；这种订阅会被识别出来，退掉重订，最多试三次。三次都是占位订阅时抛 `err.code === 'PUSH_ENDPOINT_ZOMBIE'`，给用户看什么话由你决定：
+
+```js
+try {
+  const subscription = await client.subscribePush(vapidPublicKey, registration);
+  await client.putPushSubscription(subscription);
+} catch (err) {
+  if (err.code === 'PUSH_ENDPOINT_ZOMBIE') {
+    // 浏览器一直给不出可用的推送地址，提示用户换个浏览器 / 稍后再开。
+  }
+  throw err;
+}
+```
+
 ---
 
 ## `deliver()` 标准用法
@@ -505,7 +519,7 @@ try {
 - `cancelMessage(uuid)` —— 取消任务
 - `listMessages(opts)` —— 拉当前 user 的任务列表。每条任务只带 `charId` / `clientTaskId` 两个 `metadata` 子字段
 - `getMessage(uuid)` —— 单条任务（`GET /message`，amsg-server 2.6.0+ 单用户线），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
-- `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装
+- `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装，返回的 endpoint 保证是活的（认出 Chromium 的 `permanently-removed.invalid` 占位订阅就退掉重订，最多三次；仍然拿不到就抛 `PUSH_ENDPOINT_ZOMBIE`）
 
 对接单用户 amsg-server worker 的配套方法：
 

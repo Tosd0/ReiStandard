@@ -334,6 +334,29 @@ async function maybeCompressRequestBody(body, compressRequest) {
   }
 }
 
+/**
+ * Host of the placeholder endpoint Chromium hands back when it subscribes
+ * while a previous subscription is still flagged for removal. `.invalid` is
+ * an RFC 2606 reserved TLD — it never resolves, so such a subscription can
+ * never receive a push even though it looks structurally complete
+ * (endpoint + keys, and `getSubscription()` returns it).
+ */
+const ZOMBIE_PUSH_ENDPOINT_HOST = 'permanently-removed.invalid';
+
+/**
+ * Base wait before re-subscribing after a zombie endpoint, in ms. Grows
+ * linearly per attempt (800ms, then 1600ms). Desktop Chrome usually clears
+ * the pending-removal flag within ~300ms; mobile and iOS PWAs need more.
+ */
+const PUSH_SUBSCRIBE_SETTLE_MS = 800;
+
+/** Total `pushManager.subscribe()` attempts, first try included. */
+const PUSH_SUBSCRIBE_ATTEMPTS_MAX = 3;
+
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class ReiClient {
   /**
    * @param {ReiClientConfig} config
@@ -1182,19 +1205,62 @@ export class ReiClient {
   /**
    * Subscribe to Web Push notifications.
    *
+   * 返回的订阅保证 endpoint 是活的。Chromium 在 `unsubscribe()` 之后要过一小
+   * 会儿才把旧订阅的待删除标记清干净，这段窗口期里 `subscribe()` 不会去推送
+   * 服务要新地址，而是给一个 `https://permanently-removed.invalid/...` 的占位
+   * 订阅——它有 endpoint、有密钥、`getSubscription()` 也认，唯独推什么都到不
+   * 了。这个方法认出这种订阅后会退掉它、等一会儿重新订，最多试
+   * 三次（间隔 800ms、1600ms）。
+   *
    * 拿到订阅之后要用 {@link ReiClient#putPushSubscription} 把它登记到服务端，
    * 定时任务到点才知道往哪推。
    *
    * @param {string} vapidPublicKey - The server's VAPID public key.
    * @param {ServiceWorkerRegistration} registration - An active SW registration.
-   * @returns {Promise<PushSubscription>}
+   * @returns {Promise<PushSubscription>} A subscription with a reachable endpoint.
+   * @throws {Error} `pushManager.subscribe()` 自己抛的错原样往外抛（用户拒了通知
+   *   权限、运行环境没有 Push API、VAPID 公钥不合法……重试也不会变好）。三次都
+   *   拿到占位订阅时抛一条 `err.code === 'PUSH_ENDPOINT_ZOMBIE'` 的错误，
+   *   `err.details` 为 `{ attempts, endpoint }`——面向用户的提示文案由调用方自己
+   *   决定，这里只给可判定的标识。
    */
   async subscribePush(vapidPublicKey, registration) {
-    const subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: base64UrlToBytes(vapidPublicKey)
-    });
-    return subscription;
+    // Injectable seam for tests only (no real 800/1600ms pacing in the suite).
+    const sleep = typeof this._pushSubscribeSleep === 'function'
+      ? this._pushSubscribeSleep
+      : defaultSleep;
+    const applicationServerKey = base64UrlToBytes(vapidPublicKey);
+    let lastEndpoint = '';
+
+    for (let attempt = 1; attempt <= PUSH_SUBSCRIBE_ATTEMPTS_MAX; attempt++) {
+      // 刻意不 try/catch：subscribe() 自己抛错说明权限 / 能力有问题，
+      // 重试只是把同一个错误多抛两遍，直接让它冒出去。
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey
+      });
+
+      const endpoint = typeof subscription?.endpoint === 'string' ? subscription.endpoint : '';
+      if (!endpoint.includes(ZOMBIE_PUSH_ENDPOINT_HOST)) return subscription;
+
+      lastEndpoint = endpoint;
+      // 占位订阅要先退掉，浏览器下一次 subscribe() 才会真的去要新地址。
+      try {
+        await subscription.unsubscribe();
+      } catch {
+        // 退不掉也继续重试：下一次 subscribe() 该给什么还是给什么。
+      }
+
+      if (attempt < PUSH_SUBSCRIBE_ATTEMPTS_MAX) {
+        await sleep(PUSH_SUBSCRIBE_SETTLE_MS * attempt);
+      }
+    }
+
+    throw makeLocalError(
+      'PUSH_ENDPOINT_ZOMBIE',
+      `pushManager.subscribe() returned an unreachable endpoint ${PUSH_SUBSCRIBE_ATTEMPTS_MAX} times in a row`,
+      { attempts: PUSH_SUBSCRIBE_ATTEMPTS_MAX, endpoint: lastEndpoint }
+    );
   }
 
   /**
