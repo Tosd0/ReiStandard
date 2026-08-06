@@ -165,7 +165,7 @@ describe('/client-state endpoints', () => {
     const putRes2 = await putState(worker, env, [
       { namespace: 'notes', key: 'k1', value: 'stale', updatedAt: 50 },
     ]);
-    assert.deepEqual((await putRes2.json()).data, { upserted: 0, skipped: 1 });
+    assert.deepEqual((await putRes2.json()).data, { upserted: 0, skipped: 1, skippedEntries: [{ namespace: 'notes', key: 'k1' }] });
 
     const getRes = await worker.fetch(new Request('https://w.dev/client-state?namespace=notes', {
       method: 'GET', headers: { 'X-User-Id': USER },
@@ -285,7 +285,7 @@ describe('/client-state endpoints', () => {
     const stale = await putState(worker, env, [
       { namespace: 'n', key: 'k', value: '记'.repeat(120_000), updatedAt: 100 },
     ]);
-    assert.deepEqual((await stale.json()).data, { upserted: 0, skipped: 1 });
+    assert.deepEqual((await stale.json()).data, { upserted: 0, skipped: 1, skippedEntries: [{ namespace: 'n', key: 'k' }] });
     const entries = await getEntries(worker, env, 'n');
     assert.deepEqual(entries.map((e) => [e.key, e.value]), [['k', 'fresh']]);
   });

@@ -107,6 +107,32 @@
  *   上面三个方法要么都实现、要么都不实现：缺任何一个，`PUT/GET/DELETE
  *   /push-subscription` 返回 501，`POST /schedule-message` 也会拒绝建任务
  *   （建了也永远发不出去）。内置的 D1 / pg / neon 适配器都实现了。
+ * @property {(taskId: number, leaseUntil: string|Date) => Promise<boolean>} [renewTaskLease]
+ *   （可选）投递期间的租约续期（runScheduledTick 的心跳）。只在行仍是
+ *   pending 且 lease_until 非空时生效——收尾放掉租约之后，迟到的心跳不会把
+ *   它复活。不实现 → 心跳自动关闭，退回一次性长租约（claimLeaseMs）。
+ * @property {(uuid: string, userId: string) => Promise<{ status: string, last_error: string|null }|null>} [getTaskStatusInfo]
+ *   （可选）状态 + last_error 列（脱敏失败摘要的 JSON 串）。GET /message 用
+ *   它把「为什么失败」透给已失败的行；不实现时退回 getTaskStatus（409 里就
+ *   没有 lastError）。
+ * @property {(params: InsertTaskParams, supersedesUuid: string) => Promise<TaskRow & { superseded: boolean }>} [createTaskSuperseding]
+ *   （可选）建新任务的同一事务里取消旧的那条（POST /schedule-message 的
+ *   supersedesUuid）。不实现时 handler 退回「先删再建」两步（失去原子性）。
+ * @property {(userId: string, rows: Array<Object>) => Promise<number>} [appendOutboxMessages]
+ *   （可选；单用户/D1）push 发送前把整批落进 message_outbox（密文 payload），
+ *   (user_id, message_id) 冲突时更新未 ack 的行、不动已 ack 的。
+ * @property {(userId: string, messageIds: string[], deliveredAt: number) => Promise<number>} [markOutboxDelivered]
+ *   （可选；单用户/D1）把发出去的段标 delivered_at。
+ * @property {(userId: string, sinceId: number, limit: number) => Promise<Array<Object>>} [listUnackedOutbox]
+ *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。
+ * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
+ *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
+ * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]
+ *   （可选；单用户/D1）outbox 例行清理（runScheduledTick 每跳顺手调）。
+ *
+ *   outbox 五个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
+ *   发送链路静默跳过落行；缺读取侧的（list / ack），`GET /outbox` 与
+ *   `POST /outbox/ack` 返回 501。内置只有 D1 实现（与 client_state 同待遇）。
  */
 
 export {};

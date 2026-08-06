@@ -66,7 +66,16 @@ export function projectTask(row, decryptedPayload, options = {}) {
     ...(options.includeMetadata ? { metadata: payload.metadata ?? null } : {}),
     // 上一次没发出去的原因（run-tick 记进 payload 的 lastError）。
     // reason 'stale' 表示错过触发时刻太久被判定不再补发；其余是投递失败的
-    // 错误信息。没有记录 → null。
-    lastError: payload.lastError ?? null,
+    // 错误信息。payload 里没有时退回行上的 last_error 列（同形状的脱敏摘要，
+    // 等重试期间的失败也记在那里）。没有记录 → null。
+    lastError: payload.lastError ?? parseRowLastError(row.last_error),
   };
+}
+
+/** 行上 last_error 列的 JSON 解析（形状 { at, occurrence, reason }）；解析不动
+ *  就把原文包成 { reason }，别让一条坏记录把投影拖挂。 */
+function parseRowLastError(raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+  try { return JSON.parse(raw); }
+  catch (_error) { return { reason: raw }; }
 }

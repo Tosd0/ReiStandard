@@ -30,6 +30,8 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
 import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
+import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
+import { isNonRetryableError, sanitizeErrorSummary } from './errors.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
@@ -208,6 +210,11 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // 统一补进每条 push，客户端据此认领这条任务、判断它还会不会再来。
     const occurrenceMs = occurrenceMsOf(task);
 
+    // 先把整批 push 定稿（含可选的 ReasoningPush），再发送。定稿提前是为了
+    // outbox：发送前把每条 push 落进 message_outbox（客户端补收的事实来源，
+    // best-effort，见 lib/outbox-store.js），落的必须是发送时的同一份内容。
+    const pushesToSend = [];
+
     // ReasoningPush — auto-emitted before the content burst when the
     // LLM response carried non-empty reasoning_content. `fixed` and
     // explicit-userMessage paths produce no LLM response, so this
@@ -227,8 +234,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         metadata,
       });
       stampTaskIdentity(reasoningPush, task, decryptedPayload, occurrenceMs);
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
-      await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+      pushesToSend.push(reasoningPush);
     }
 
     for (let i = 0; i < messages.length; i++) {
@@ -248,20 +254,39 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         metadata,
       });
       stampTaskIdentity(contentPush, task, decryptedPayload, occurrenceMs);
+      pushesToSend.push(contentPush);
+    }
 
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
+    await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
 
-      if (i < messages.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+    const sentIds = [];
+    try {
+      for (let i = 0; i < pushesToSend.length; i++) {
+        await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(pushesToSend[i]));
+        sentIds.push(pushesToSend[i].messageId);
+        if (i < pushesToSend.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+        }
       }
+    } finally {
+      // 半途失败也把已发出的段标掉：delivered_at 为 null 的行就是客户端要补
+      // 收的那部分，标多标少都会让补收失真。
+      await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
     }
 
     return { success: true, messagesSent: messages.length };
 
   } catch (error) {
     // errorCode 透传底层错误的稳定 `code`（如 PUSH_SUBSCRIPTION_MISSING），
-    // run-tick 按它区分「重试也好不了」的永久性失败。
-    return { success: false, messagesSent: 0, error: error.message, errorCode: error.code || null };
+    // run-tick 按它区分「重试也好不了」的永久性失败；permanent 是 hook 侧
+    // NonRetryableError 的透传（见 lib/errors.js），语义相同、来源更宽。
+    return {
+      success: false,
+      messagesSent: 0,
+      error: error.message,
+      errorCode: error.code || null,
+      permanent: isNonRetryableError(error)
+    };
   }
 }
 
@@ -312,21 +337,42 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
     const result = await processSingleMessage(task, ctx, masterKey);
 
     if (!result.success) {
-      if (retryCount < maxRetries) {
+      // 确定性失败（NonRetryableError）不进重试：再跑两轮也是同一个错，白让
+      // 调用方多等、白烧 hook 里的计费调用。
+      if (!result.permanent && retryCount < maxRetries) {
         retryCount++;
         await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
         continue;
       }
 
       try {
-        await ctx.db.updateTaskById(task.id, { status: 'failed', retry_count: retryCount });
+        await ctx.db.updateTaskById(task.id, {
+          status: 'failed',
+          retry_count: retryCount,
+          last_error: JSON.stringify({
+            at: new Date().toISOString(),
+            occurrence: task.next_send_at ?? null,
+            reason: sanitizeErrorSummary(result.error)
+          })
+        });
       } catch (_updateError) {
-        // best-effort status update; keep original processing error as primary signal
+        // 缺 last_error 列（升级后还没重跑 /init-tenant）或别的写库问题：退掉
+        // 这个字段再试一次，标 failed 不能被一条锦上添花的记录挡住。
+        try {
+          await ctx.db.updateTaskById(task.id, { status: 'failed', retry_count: retryCount });
+        } catch (_retryError) {
+          // best-effort status update; keep original processing error as primary signal
+        }
       }
 
       return {
         success: false,
-        error: { code: 'PROCESSING_ERROR', message: result.error, retriesAttempted: retryCount }
+        error: {
+          code: 'PROCESSING_ERROR',
+          message: result.error,
+          retriesAttempted: retryCount,
+          ...(result.permanent ? { permanent: true } : {})
+        }
       };
     }
 

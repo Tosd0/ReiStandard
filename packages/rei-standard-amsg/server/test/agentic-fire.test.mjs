@@ -399,6 +399,9 @@ describe('agentic fire loop', () => {
         // server 侧在共享 SessionContext 之上加的任务身份、状态访问器与建任务口
         'taskId', 'taskUuid', 'occurrenceMs',
         'readState', 'writeState', 'scheduleTask',
+        // usage 是共享 SessionContext 新增的便捷字段（llmResponse.usage 的引用）；
+        // cancelTask / renewTask 是 fire 内的任务管理口
+        'usage', 'cancelTask', 'renewTask',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);
@@ -798,7 +801,7 @@ describe('writeState', () => {
           { key: 'note-1', value: '第一版', updatedAt: 100 },
           { key: 'note-2', value: 'keep me', updatedAt: 100 },
         ]);
-        assert.deepEqual(r, { upserted: 2, skipped: 0, deleted: 0 });
+        assert.deepEqual(r, { upserted: 2, skipped: 0, deleted: 0, skippedEntries: [] });
         seen = await ctx.readState('bypass');
       },
     });
@@ -819,7 +822,7 @@ describe('writeState', () => {
     result = await fireWith(adapter, {
       onFire: async (ctx) => {
         const r = await ctx.writeState('bypass', [{ key: 'note-1', value: null, updatedAt: 300 }]);
-        assert.deepEqual(r, { upserted: 0, skipped: 0, deleted: 1 });
+        assert.deepEqual(r, { upserted: 0, skipped: 0, deleted: 1, skippedEntries: [] });
         seen = await ctx.readState('bypass');
       },
     });
@@ -890,7 +893,7 @@ describe('writeState', () => {
       },
     });
     assert.equal(result.success, true);
-    assert.deepEqual(outcome, { upserted: 0, skipped: 1, deleted: 0 });
+    assert.deepEqual(outcome, { upserted: 0, skipped: 1, deleted: 0, skippedEntries: [{ namespace: 'ns', key: 'k' }] });
     assert.deepEqual(seen.map((e) => e.value), ['new']);
   });
 

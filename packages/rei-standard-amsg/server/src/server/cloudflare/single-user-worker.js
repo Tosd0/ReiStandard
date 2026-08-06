@@ -22,6 +22,8 @@
  *   PUT    /push-subscription → 登记 / 覆盖这个用户的 Web Push 订阅
  *   GET    /push-subscription → { exists, updatedAt, endpoint }
  *   DELETE /push-subscription → 删掉这个用户的订阅
+ *   GET  /outbox?since=<cursor> → 拉未 ack 的服务端消息（补收的事实来源）
+ *   POST /outbox/ack        → 确认收到 { messageIds }
  *
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
@@ -39,8 +41,11 @@
  * lib/agentic-fire.js.
  *
  * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
- * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。租期默认 10 分钟，可以
- * 用 config 里的 `claimLeaseMs` 调整。
+ * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。投递期间租约按心跳滚动
+ * 续租（默认 30s 心跳 / 90s 租约）：isolate 中途被回收时任务在 ~90 秒内就能
+ * 被下一跳接手，不用等长租约走完。config 里的 `leaseHeartbeatMs` 可调心跳
+ * 间隔（0 = 关掉心跳，退回一次性长租约，租期由 `claimLeaseMs` 决定，默认
+ * 10 分钟）。
  *
  * 同一个角色（或宿主定义的任何一组）的多条任务不想同时跑，就配一个
  * `serializeBy`；一次 fire 无论什么结局都想收到回执，就配 `onFireSettled`。
@@ -66,9 +71,12 @@ function jsonResponse(status, body, extraHeaders) {
 
 // The custom headers the amsg-client sends; browsers preflight any request
 // carrying them, so cross-origin callers need them echoed in the CORS response.
-const CORS_ALLOW_HEADERS =
+// 导出：在这个 worker 外面再包一层路由的宿主（自己的 fetch 里先答 OPTIONS）
+// 直接 import 这一份，别手抄——两处手抄的列表迟早对不上，preflight 一挂整个
+// 部署看起来就像离线。
+export const CORS_ALLOW_HEADERS =
   'Content-Type, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token';
-const CORS_ALLOW_METHODS = 'GET, POST, PUT, DELETE, OPTIONS';
+export const CORS_ALLOW_METHODS = 'GET, POST, PUT, DELETE, OPTIONS';
 
 /**
  * Resolve the CORS response headers for a request, or null when CORS is off.
@@ -208,6 +216,10 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.clientState.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.DELETE(url, headers);
+      } else if (method === 'GET' && pathname.endsWith('/outbox')) {
+        result = await server.handlers.outbox.GET(url, headers);
+      } else if (method === 'POST' && pathname.endsWith('/outbox/ack')) {
+        result = await server.handlers.outbox.POST(headers, await request.text());
       } else if (method === 'PUT' && pathname.endsWith('/push-subscription')) {
         result = await server.handlers.pushSubscription.PUT(headers, await request.text());
       } else if (method === 'GET' && pathname.endsWith('/push-subscription')) {
@@ -274,8 +286,10 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         // 分组串行：(task) => 分组标识 | null。同一分组的任务同时只跑一条，
         // 跨跳也算（见 lib/run-tick.js）。不配 = 全并发，与以前一致。
         serializeBy: cfg.serializeBy,
-        // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
+        // 任务占位租期（只在心跳关掉时生效；默认 10 分钟，随 totalTimeoutMs 抬高）。
         claimLeaseMs: cfg.claimLeaseMs,
+        // 租约心跳间隔（默认 30s；0 = 关掉心跳，退回一次性长租约）。
+        leaseHeartbeatMs: cfg.leaseHeartbeatMs,
         // 补发新鲜度阈值（默认 60 分钟；见 lib/run-tick.js 的 STALE_AFTER_MS）。
         staleAfterMs: cfg.staleAfterMs
       });

@@ -37,6 +37,18 @@ const EXPECTED_FEATURES = [
   'update-message-contact-name',
   'tick-serialize-by',
   'fire-settled-hook',
+  'client-state-version-guard',
+  'schedule-immediate',
+  'schedule-supersede',
+  'tick-lease-heartbeat',
+  'run-task-entrypoint',
+  'task-last-error',
+  'non-retryable-error',
+  'agentic-cancel-renew-task',
+  'message-outbox',
+  'fire-settled-metadata',
+  'hook-usage',
+  'llm-extra-body',
 ];
 
 function makeWorker(extra = {}) {

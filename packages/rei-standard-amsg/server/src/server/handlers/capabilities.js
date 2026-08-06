@@ -57,6 +57,32 @@ export const SERVER_FEATURES = Object.freeze([
   'tick-serialize-by',
   // 一次 fire 无论什么结局都调 onFireSettled（发完 / 跳过 / 抛错）。
   'fire-settled-hook',
+  // PUT /client-state 的 entry 认 version / builtAt 护栏（按内容新旧比较），
+  // 被拦下的 key 在 data.skippedEntries 逐条回报。
+  'client-state-version-guard',
+  // POST /schedule-message 认 immediate: true（不排未来，下一跳 cron 直接触发）。
+  'schedule-immediate',
+  // POST /schedule-message 认 supersedesUuid（建新任务的同一事务里取消旧的）。
+  'schedule-supersede',
+  // 投递期间租约按心跳滚动续租，isolate 死亡后任务 ~90s 内被下一跳接手。
+  'tick-lease-heartbeat',
+  // 导出 runTask(ctx, uuid)：单任务投递入口（CF Queue 消费者用）。
+  'run-task-entrypoint',
+  // 任务行有 last_error 列（脱敏失败摘要）；GET /message 对已失败的行也透出
+  // （409 的 error.details.lastError）。
+  'task-last-error',
+  // 导出 NonRetryableError：hook 抛它 → 直接终审处置，不进重试阶梯。
+  'non-retryable-error',
+  // fire ctx（fireCtx / sessionCtx）带 cancelTask / renewTask。
+  'agentic-cancel-renew-task',
+  // 服务端消息收件箱：push 发送前落 message_outbox，GET /outbox + POST
+  // /outbox/ack 取代「猜哪些没收到」的补收对账。
+  'message-outbox',
+  // onFireSettled 载荷带解密 metadata 与最后一轮 usage；sessionCtx 带 usage。
+  'fire-settled-metadata',
+  'hook-usage',
+  // schedule-message 认 llmExtraBody（原样展开进 LLM 请求体，核心字段优先）。
+  'llm-extra-body',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

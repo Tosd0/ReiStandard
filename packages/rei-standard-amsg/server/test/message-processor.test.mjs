@@ -511,6 +511,30 @@ describe('messages array support', () => {
     const empty = buildAiRequestBody({ primaryModel: 'm', messages: [{ role: 'user', content: 'hi' }], tools: [] });
     assert.equal('tools' in empty, false);
   });
+
+  it('buildAiRequestBody 展开 llmExtraBody（thinking 之类），核心字段优先', () => {
+    const body = buildAiRequestBody({
+      primaryModel: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      maxTokens: 100,
+      llmExtraBody: {
+        thinking: { type: 'enabled', budget_tokens: 2048 },
+        // 撞核心键：不能盖掉库的口径
+        model: 'evil-model',
+        max_tokens: 999999,
+      },
+    });
+    assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 2048 });
+    assert.equal(body.model, 'm');
+    assert.equal(body.max_tokens, 100);
+
+    // null / 非对象 / 数组：静默忽略，不进请求体
+    for (const bad of [null, 'x', [1]]) {
+      const b = buildAiRequestBody({ primaryModel: 'm', messages: [{ role: 'user', content: 'hi' }], llmExtraBody: bad });
+      assert.equal('thinking' in b, false);
+      assert.equal(b.model, 'm');
+    }
+  });
 });
 
 // ─── splitPattern (v2.3.0) — parity with @rei-standard/amsg-instant ────

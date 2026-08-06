@@ -112,7 +112,7 @@ export class PgAdapter {
 
   async getTaskByUuid(uuid, userId) {
     const rows = await this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
        FROM scheduled_messages
        WHERE uuid = $1 AND user_id = $2 AND status = 'pending'
        LIMIT 1`,
@@ -214,6 +214,11 @@ export class PgAdapter {
     return pgShared.claimTask((text, params) => this._query(text, params), taskId, expectedNextSendAt, leaseUntil, serializeGroup);
   }
 
+  // 投递期间的租约续期（run-tick 心跳；语义见 pg-shared.js）。
+  async renewTaskLease(taskId, leaseUntil) {
+    return pgShared.renewTaskLease((text, params) => this._query(text, params), taskId, leaseUntil);
+  }
+
   async listTasks(userId, opts = {}) {
     const { status = 'all', limit = 20, offset = 0 } = opts;
 
@@ -237,7 +242,7 @@ export class PgAdapter {
 
     const taskParams = [...params, limit, offset];
     const tasks = await this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC
@@ -266,6 +271,11 @@ export class PgAdapter {
       [uuid, userId]
     );
     return rows.length > 0 ? rows[0].status : null;
+  }
+
+  // 状态 + 失败摘要（GET /message 对已失败的行透出原因；语义见 pg-shared.js）。
+  async getTaskStatusInfo(uuid, userId) {
+    return pgShared.getTaskStatusInfo((text, params) => this._query(text, params), uuid, userId);
   }
 
   // ── push_subscriptions（实现见 pg-shared.js，pg / neon 共用一份）─────────

@@ -112,6 +112,7 @@ import { createStateAccessors } from './state-accessors.js';
 import { projectTask } from './task-projection.js';
 import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
+import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -449,6 +450,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       maxTokens: decryptedPayload.maxTokens ?? null,
       temperature: decryptedPayload.temperature ?? null,
       splitPattern: decryptedPayload.splitPattern ?? null,
+      // 与凭据同列的投递配置：中转的非标准参数（thinking 之类）跟着任务走，
+      // 自排的后续任务不该突然掉档。
+      llmExtraBody: decryptedPayload.llmExtraBody ?? null,
       metadata,
     };
 
@@ -489,6 +493,91 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     };
   };
 
+  /**
+   * cancelTask(uuid) —— 取消同一个用户的一条 pending 任务。
+   *
+   * 有了 scheduleTask 却没有它，云端轮的角色「看得见任务、动不了」：用户说
+   * 「取消那个提醒」，角色只能口头答应，任务照旧触发。语义与
+   * `DELETE /cancel-message` 完全一致（按 uuid + user_id 删行），只是给 fire
+   * 内的工具循环用。
+   *
+   * 不允许取消**当前正在 fire 的这条**：它的收尾（删行 / 推进排期 / 标失败）
+   * 归 run-tick 管，fire 中途从底下抽掉行会让收尾写库踩空。当前这条不想发，
+   * 用 onBeforeFire 的 `{ skip: true }` 或 onLLMOutput 的 `skip-push`。
+   *
+   * @param {string} uuid
+   * @returns {Promise<{ cancelled: boolean }>} cancelled=false 表示行不存在
+   *   （已发出 / 已删除）——对「用户要它别响」来说结果已达成，不算错误。
+   */
+  const cancelTask = async (uuid) => {
+    if (typeof uuid !== 'string' || !uuid.trim()) {
+      throw new TypeError('cancelTask(uuid) 需要非空字符串 uuid');
+    }
+    if (task.uuid != null && uuid === task.uuid) {
+      throw new RangeError(
+        'cancelTask: 不能取消当前正在 fire 的任务——这条的收尾归 run-tick 管。' +
+        "这次不想发的话，用 onBeforeFire 的 { skip: true } 或 onLLMOutput 的 'skip-push'。"
+      );
+    }
+    if (!ctx.db || typeof ctx.db.deleteTaskByUuid !== 'function') {
+      throw new Error('AGENTIC_CANCEL_UNSUPPORTED: 当前数据库适配器不支持删任务（缺 deleteTaskByUuid）');
+    }
+    const cancelled = await ctx.db.deleteTaskByUuid(uuid, task.user_id);
+    return { cancelled: !!cancelled };
+  };
+
+  /**
+   * renewTask(uuid, nextSendAt) —— 把同一个用户的一条 pending 任务改到新的
+   * 触发时刻（「那个提醒推迟到明早九点」）。语义与 `PUT /update-message` 只改
+   * nextSendAt 一致：payload 里的 firstSendTime 跟着改、重试计数清零、退避
+   * 放掉。护栏与 scheduleTask 相同：新时刻至少比现在晚 60 秒。
+   *
+   * @param {string} uuid
+   * @param {string} nextSendAt - ISO 8601
+   * @returns {Promise<{ renewed: true, uuid: string, nextSendAt: string }
+   *   | { renewed: false, reason: 'not_found' }>} not_found = 行不存在或已不是
+   *   pending（宿主自己决定要不要转头 scheduleTask 一条新的）。
+   */
+  const renewTask = async (uuid, nextSendAt) => {
+    if (typeof uuid !== 'string' || !uuid.trim()) {
+      throw new TypeError('renewTask(uuid, nextSendAt) 需要非空字符串 uuid');
+    }
+    if (task.uuid != null && uuid === task.uuid) {
+      throw new RangeError('renewTask: 不能改当前正在 fire 的任务——这条的排期推进归 run-tick 管');
+    }
+    if (typeof nextSendAt !== 'string' || !nextSendAt.trim()) {
+      throw new RangeError('renewTask: nextSendAt 必填，且必须是 ISO 8601 字符串');
+    }
+    const sendAt = new Date(nextSendAt);
+    if (Number.isNaN(sendAt.getTime())) {
+      throw new RangeError(`renewTask: nextSendAt 解析不出合法时间：${nextSendAt}`);
+    }
+    const earliest = nowFn() + MIN_SCHEDULE_LEAD_MS;
+    if (sendAt.getTime() < earliest) {
+      throw new RangeError(
+        `renewTask: nextSendAt 至少要比现在晚 ${MIN_SCHEDULE_LEAD_MS / 1000} 秒` +
+        `（最早可排 ${new Date(earliest).toISOString()}，收到 ${sendAt.toISOString()}）`
+      );
+    }
+    if (!ctx.db || typeof ctx.db.getTaskByUuid !== 'function' || typeof ctx.db.updateTaskByUuid !== 'function') {
+      throw new Error('AGENTIC_RENEW_UNSUPPORTED: 当前数据库适配器不支持改任务（缺 getTaskByUuid / updateTaskByUuid）');
+    }
+    const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
+    if (!row) return { renewed: false, reason: 'not_found' };
+    // payload 里的 firstSendTime 跟排期一起改（与 PUT /update-message 的读-改-
+    // 写同构），两处时刻不漂移。
+    const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+    const nextSendAtIso = sendAt.toISOString();
+    const encrypted = await encryptForStorage(JSON.stringify({ ...payload, firstSendTime: nextSendAtIso }), userKey);
+    const updated = await ctx.db.updateTaskByUuid(uuid, task.user_id, encrypted, {
+      next_send_at: nextSendAtIso,
+      retry_count: 0,
+      ...(typeof ctx.db.claimTask === 'function' ? { retry_after: null } : {}),
+    });
+    if (!updated) return { renewed: false, reason: 'not_found' };
+    return { renewed: true, uuid, nextSendAt: nextSendAtIso };
+  };
+
   // 单次 fire 的宿主便签：onBeforeFire 的 fireCtx 和同一次 fire 每轮的
   // sessionCtx（onLLMOutput / executeToolCalls）拿到同一个对象引用，fire 结束
   // （finish / skip-push / 抛错 / 轮数超限）随调用栈丢弃。库自己不读不写、
@@ -501,14 +590,16 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     readState,
     writeState,
     scheduleTask,
+    cancelTask,
+    renewTask,
     now: new Date(nowFn()),
     scratch,
   });
 
   // 本次 fire 的进度。收尾回执（onFireSettled）要照实说「发出去几段、跑了几
   // 轮、为什么没发」，而这些数字在半路抛错时是拿不到返回值的，只能一路记在
-  // 这里。
-  const progress = { sentCount: 0, total: 0, iterations: 0, skipReason: null };
+  // 这里。usage 是最后一轮 LLM 响应的 usage（没跑到 LLM → null）。
+  const progress = { sentCount: 0, total: 0, iterations: 0, skipReason: null, usage: null };
 
   // 结局默认按 failed 记：下面只要有任何一步抛出去，finally 里发出的就是这个。
   let settledStatus = 'failed';
@@ -516,7 +607,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-      readState, writeState, scratch, scheduleTask, fireCtx, progress,
+      readState, writeState, scratch, scheduleTask, cancelTask, renewTask, fireCtx, progress,
     });
     settledStatus = !outcome.handled
       ? 'not-handled'
@@ -534,6 +625,14 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       total: progress.total,
       iterations: progress.iterations,
       error: settledError,
+      // 解密 payload 里的 metadata 子字段（与 onStaleSkip 同待遇）：task 行本
+      // 身是密文，宿主要靠它对上「这是哪个角色的哪类任务」——尤其是 fire 在
+      // onBeforeFire 里就失败、宿主还没来得及自己记账的那种结局。凭据字段
+      // （apiKey / pushSubscription）照旧不透传。
+      metadata: decryptedPayload.metadata ?? null,
+      // 最后一轮 LLM 响应的 usage（prompt/completion tokens；没跑到 LLM →
+      // null）。宿主拿它更新用量记账，不用从 llmResponse 里自己扒。
+      usage: progress.usage,
       scratch,
       readState,
       writeState,
@@ -550,7 +649,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
  */
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-  readState, writeState, scratch, scheduleTask, fireCtx, progress,
+  readState, writeState, scratch, scheduleTask, cancelTask, renewTask, fireCtx, progress,
 }) {
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
@@ -605,6 +704,8 @@ async function runFireChain({
 
     const assistantMessage = extractAssistantMessage(llmResponse);
     messages = [...messages, assistantMessage];
+    // 每轮覆盖：settle 时报出去的就是最后一轮的 usage。
+    progress.usage = (llmResponse && typeof llmResponse === 'object' && llmResponse.usage) || null;
 
     // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂任务身份、
     // 两个状态访问器和 scheduleTask：
@@ -632,6 +733,8 @@ async function runFireChain({
       readState,
       writeState,
       scheduleTask,
+      cancelTask,
+      renewTask,
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
@@ -736,6 +839,7 @@ async function runFireChain({
  *   - scratch：本次 fire 的便签对象，与 onBeforeFire / onLLMOutput 拿到的是
  *     同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读
  *   - readState / writeState：与 fire 级 hook 同一套 client_state 读写口
+ *   - usage：最后一轮 LLM 响应的 usage（prompt/completion tokens；没有 → null）
  *
  * hook 自身抛错只 console.warn，不影响主流程。
  */
@@ -750,9 +854,14 @@ async function notifyAfterSend(ctx, info) {
 
 /**
  * ctx.onFireSettled?.({ task, status, skipReason, sentCount, total,
- * iterations, error, scratch, readState, writeState }) —— 一次 fire 收尾的
- * 可选 hook。**onBeforeFire 被调用过，这个就一定会被调用一次**，无论这次
- * 是发完了、跳过了、还是半路抛错。
+ * iterations, error, metadata, usage, scratch, readState, writeState })
+ * —— 一次 fire 收尾的可选 hook。**onBeforeFire 被调用过，这个就一定会被调用
+ * 一次**，无论这次是发完了、跳过了、还是半路抛错。
+ *
+ * metadata 是解密 payload 里的 metadata 子字段（与 onStaleSkip 同待遇）：
+ * task 行本身是密文，宿主要靠它对上「这是哪个角色的哪类任务」——尤其是链路
+ * 在 onBeforeFire 里就失败、宿主还没来得及自己记账的那种结局。usage 是最后
+ * 一轮 LLM 响应的 usage（没跑到 LLM → null）。凭据字段照旧不透传。
  *
  * 有了 onAfterSend 为什么还要它：onAfterSend 只在「有 push 要发」这条路上
  * 走。hook 判断这次不用说话（`{ skip: true }` / `skip-push`）、或者链路中途
@@ -843,7 +952,8 @@ async function sendHookPushPayloads({
   const total = pushPayloads.length;
   let sentCount = 0;
   progress.total = total;
-  const afterSendBase = { task, total, scratch, readState, writeState };
+  const afterSendBase = { task, total, scratch, readState, writeState, usage: progress.usage };
+  const sentIds = [];
   try {
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
@@ -858,6 +968,10 @@ async function sendHookPushPayloads({
     });
     const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 
+    // 先定稿整批（补 id / index / 任务身份），再发送——发送前整批落进
+    // message_outbox（客户端补收的事实来源，best-effort，见 lib/outbox-store.js），
+    // 落的必须是发送时的同一份内容。
+    const finalized = [];
     for (let i = 0; i < total; i++) {
       const push = { ...pushPayloads[i] };
       if (typeof push.messageId !== 'string' || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
@@ -866,17 +980,25 @@ async function sendHookPushPayloads({
       push.messageIndex = i + 1;
       push.totalMessages = total;
       stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
+      finalized.push(push);
+    }
+    await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
 
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
+    for (let i = 0; i < total; i++) {
+      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(finalized[i]));
       sentCount++;
       progress.sentCount = sentCount;
+      sentIds.push(finalized[i].messageId);
       if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   } catch (error) {
-    // 部分失败也要让宿主知道已经发出去了几段——先通知，再把错误往上抛。
+    // 部分失败：已发出的段在 outbox 里标 delivered（没标的正是要补收的），
+    // 再让宿主知道已经发出去了几段——先通知，再把错误往上抛。
+    await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });
     throw error;
   }
+  await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
   await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error: null });
   return total;
 }

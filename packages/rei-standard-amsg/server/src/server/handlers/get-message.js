@@ -44,11 +44,33 @@ export function createGetMessageHandler(ctx) {
 
     const row = await db.getTaskByUuid(taskUuid, userId);
     if (!row) {
-      const taskStatus = await db.getTaskStatus(taskUuid, userId);
+      // 已完成 / 已失败的行读不回 payload，但「为什么失败」必须读得到——用户
+      // 等到任务失败后来查，只回一句 409 等于「云端没记下原因」。行上的
+      // last_error 列是明文的脱敏摘要（run-tick 失败时写的），随 409 的
+      // details 一起透出去。
+      const statusInfo = typeof db.getTaskStatusInfo === 'function'
+        ? await db.getTaskStatusInfo(taskUuid, userId)
+        : null;
+      const taskStatus = statusInfo ? statusInfo.status : await db.getTaskStatus(taskUuid, userId);
       if (!taskStatus) {
         return { status: 404, body: { success: false, error: { code: 'TASK_NOT_FOUND', message: '指定的任务不存在或已被删除' } } };
       }
-      return { status: 409, body: { success: false, error: { code: 'TASK_ALREADY_COMPLETED', message: '任务已完成或已失败，无法更新' } } };
+      let lastError = null;
+      if (statusInfo && statusInfo.last_error) {
+        try { lastError = JSON.parse(statusInfo.last_error); }
+        catch (_parseError) { lastError = { reason: statusInfo.last_error }; }
+      }
+      return {
+        status: 409,
+        body: {
+          success: false,
+          error: {
+            code: 'TASK_ALREADY_COMPLETED',
+            message: '任务已完成或已失败，无法更新',
+            details: { status: taskStatus, lastError }
+          }
+        }
+      };
     }
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);

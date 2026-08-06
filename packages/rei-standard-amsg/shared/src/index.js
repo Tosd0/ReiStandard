@@ -860,6 +860,7 @@ export function stripReasoningTags(content) {
  * @property {ChatMessage[]}            messages       - Including the just-appended assistant turn.
  * @property {unknown}                  llmResponse    - Full LLM response (choices, usage, …).
  * @property {string}                   llmOutputText  - May be '' for pure tool-call responses.
+ * @property {Record<string, unknown>|null} usage      - `llmResponse.usage` 的直接引用（prompt/completion/total tokens）。响应没带 usage → null。llmResponse 里本来就有，单独提出来是让「记本轮用量」不必依赖响应对象的具体形状。
  * @property {number}                   iteration      - 0-indexed: the round that just finished.
  * @property {Record<string, unknown>}  metadata
  * @property {string}                   contactName
@@ -900,12 +901,17 @@ export function buildSessionContext({
   scratch,
 }) {
   const llmOutputText = readLlmOutputText(llmResponse);
+  const usage = llmResponse && typeof llmResponse === 'object'
+    && /** @type {any} */ (llmResponse).usage && typeof (/** @type {any} */ (llmResponse).usage) === 'object'
+    ? /** @type {Record<string, unknown>} */ (/** @type {any} */ (llmResponse).usage)
+    : null;
   const ctx = {
     sessionId,
     charId,
     messages,
     llmResponse,
     llmOutputText,
+    usage,
     iteration,
     metadata: metadata && typeof metadata === 'object' ? metadata : {},
     contactName,

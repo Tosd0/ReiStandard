@@ -1,5 +1,111 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.15
+
+### Minor Changes
+
+- LLM 请求体支持 `llmExtraBody` 透传（thinking / reasoning_effort 等中转非标准参数）
+
+  - shared 的 `buildLlmRequestBody`：`payload.llmExtraBody`（普通对象）原样展开进请求体，先展开再写核心字段——`model` / `messages` / `temperature` / `max_tokens` / `tools` 永远以库的口径为准，extra body 撞键盖不掉。非对象/数组静默忽略。
+  - server 的 `POST /schedule-message`：payload 白名单加 `llmExtraBody`（存进任务 payload，fire 时随 `buildLlmRequestBody` 进请求体）；fire 里 `ctx.scheduleTask` 自排的后续任务继承它。形状校验只查普通对象——里面的字段是调用方与中转之间的契约。
+
+  特性位：`llm-extra-body`。
+
+### Patch Changes
+
+- Updated dependencies
+  - @rei-standard/amsg-shared@0.4.0-next.5
+
+## 2.6.0-next.14
+
+### Minor Changes
+
+- a384a93: 代码评审加固：存量任务订阅兜底、串行分组写偏斜收口、重试状态重置、错误分类与门禁去重
+
+  **@rei-standard/amsg-server**
+
+  - **升级前创建的任务不再必然投递失败。** 投递时解析订阅新增兜底：用户级 `push_subscriptions` 存储里没有订阅时，回退到旧任务 payload 里内嵌的 `pushSubscription`（存储里有则永远优先用存储的那份）。普通投递路径和 agentic 路径都生效——存量部署升级后，用户来不及打开新客户端登记订阅，旧任务照样发得出去。
+  - **pg / neon 串行分组占位补上写偏斜收口。** READ COMMITTED 下两个并发 tick 各领同组「不同」行时，`NOT EXISTS` 互相看不见对方未提交的租约，同组两条任务可能并发执行。现在占位提交后再复查一次同组活租约，撞上就放掉自己刚写的租约、这一跳不跑（两边都让路也安全：行保持 pending，下一跳重试）。`claimTask` 与 `push_subscriptions` 三方法同时收拢到 `adapters/pg-shared.js`，pg / neon 共用一份 SQL，语义不再可能分歧。
+  - **tick 内串行分组预占用按用户隔离。** 内存侧的占坑键带上 `user_id`，与落库侧 per-user HMAC 的隔离语义对齐——多用户部署下两个用户恰好返回同一个分组 key（如共用的默认角色名）不再互相顶掉对方的任务。
+  - **`PUT /update-message` 重置重试状态。** 更新任务时 `retry_count` 归零、`retry_after` 清空（后者仅在支持 `claimTask` 的适配器上写）——刚修好 apiKey / 改好排期的任务不再背着耗尽的重试预算，下一次瞬时故障不会直接把它打成永久 failed。
+  - **`POST /schedule-message` 的订阅预检改为存在性检查。** 不再解密（解出来的值本来也用不上）；查询本身失败时报可重试的 503 `PUSH_SUBSCRIPTION_LOOKUP_FAILED`，不再把瞬时 DB 故障伪装成 409 `PUSH_SUBSCRIPTION_MISSING` 引导客户端去走多余的重订阅流程。
+  - **订阅类错误带稳定 `code`，投递失败按类别处置。** `resolvePushSubscription` 抛出的错误带 `err.code`（`PUSH_SUBSCRIPTION_MISSING` / `PUSH_SUBSCRIPTION_STORE_UNSUPPORTED`），消费方按 code 分支即可、不必匹配 message 文案；tick 的失败处置对这两类「重试也好不了」的错误短路退避阶梯——一次性任务直接进终审处置，循环任务直接作废本次 occurrence，不再每次白跑 3 轮重试。
+  - **过期守卫两处收紧 / 放开。** 重试链上的任务（`retry_count > 0`）在排定的重试时刻（`retry_after`）本身也被拖过阈值时同样按过期处理——停摆恰好落在重试窗口里的任务不再于恢复后把几天前的旧内容推出去（`getPendingTasks` 随之在返回行里带上 `retry_after`）。阈值本身可用 `ctx.staleAfterMs` 覆盖（单用户 worker 从 config 的 `staleAfterMs` 透传），依赖「再晚也送达」语义的宿主有了官方出口。
+  - **单用户 worker 的两处错误边界补齐。** `cors.origin` 回调抛错按「不放行这个 origin」处理，不再逃出 `fetch()` 变成 Cloudflare 1101 错误页；`scheduled()` 的配置构建失败改为记日志跳过这一跳，不再以未捕获异常崩掉 cron 调用。
+  - **存量多租户租户自动补列。** 多租户侧每个进程首次取得适配器时补跑一遍幂等的 `initSchema`（建表 / `ADD COLUMN IF NOT EXISTS`），升级加列后第一个请求就把 schema 补齐——不再依赖 CHANGELOG 里的手工 DDL 步骤（同 tenantId 重放 `/init-tenant` 到不了 `initSchema` 就 409，此前存量租户没有任何自动迁移路径）。
+  - **门禁与工具函数去重。** X-User-Id 门禁（8 个 handler 里的复制粘贴，文案已分裂成两种）收拢为 `lib/request.js` 的 `requireUserId()`，对同一错误码的 message 统一为「缺少用户标识符」；`UPDATABLE_COLUMNS` 白名单三个适配器共用 `schema.js` 一份；`isValidUrl` 改为 re-export shared 的实现；tenant/blob-store 的 base64url 改用 shared 实现；tick 的预解密 payload 直通投递侧（`processSingleMessage` 新增 `predecrypted` 参数），同一份密文不再解两遍，相关失实注释一并修正；过期跳过的循环/一次性两个近似复制的分支收拢为单一尾部。
+
+  **@rei-standard/amsg-shared**
+
+  - `verifyVapidJwt` 的 JWT payload 解码改用 `webcrypto-utils` 的 `utf8Decode`，兑现本模块「编码辅助只住在 webcrypto-utils」的约定（行为不变）。
+
+- client_state 支持条件写护栏：entry 可带 `version` / `builtAt`，按内容新旧比较而不是请求先后
+
+  同一个 key 有多个写入方时（例如 fire_pack 由常规 flush 和 instant-chat 两条路径写），last-write-wins 按「谁的请求后到」判定就是在赌网络：慢网下晚到的旧包会把先到的新包盖掉，fire 端解出来的就是缺段的旧内容。
+
+  现在 `PUT /client-state` 的每个 entry 接受可选的 `version` 或 `builtAt`（正整数，毫秒时间戳或单调递增版本号，两个名字同一个语义）。带了它，这条的比较值就是它：旧内容（值更小）盖不掉新内容，直接被忽略。被拦下的 key 在响应的 `data.skippedEntries` 里逐条回报（`[{ namespace, key }]`），写入方能区分「写进去了」和「库里已有更新的数据」。hook 的 `ctx.writeState()` 的 entry 同样认 `version`。
+
+  没带 `version` 的写入行为不变（照旧按 `updatedAt` 比较）。特性位：`client-state-version-guard`。
+
+- 任务行新增 `last_error` 列（失败原因的明文脱敏摘要）；导出 `NonRetryableError`（确定性失败不重试）
+
+  **last_error**：之前行标 `failed` 但不存原因——payload 里的 `lastError` 是密文，且 `GET /message` 对非 pending 行只回一句 409，最典型的失败（payload 解析失败、hook 在 onBeforeFire 里拒掉）用户一个字都看不到。现在 `scheduled_messages` 加 `last_error` 列（JSON：`{ at, occurrence, reason }`，`reason` 经 `sanitizeErrorSummary` 脱敏：Bearer/key 形态的 token 遮掉、截断 500 字符）：
+
+  - 每次投递失败都写（等重试期间也看得到当前原因），成功后清掉；
+  - `GET /message?id=` 对已失败/已完成的行，409 响应的 `error.details` 带 `{ status, lastError }`；pending 行的投影里 `lastError` 也会在 payload 没记录时退回这一列；
+  - 升级后还没重跑 `POST /init-tenant`（补列迁移）的库，写入自动退掉这个字段重试，状态推进不受影响。
+
+  **NonRetryableError**：fire_pack 缺失/解析失败这类重试必然同败的错，之前也按投递失败重试 3 次（2/4/6 分钟），用户白等 12 分钟、hook 里的计费调用白烧三轮。现在 hook 抛 `NonRetryableError`（或任何带 `permanent: true` 的错误），run-tick 直接终审处置：一次性任务标 `failed`，循环任务作废本次 occurrence；instant 路径（`processMessagesByUuid`）同样不再重试。判定用 `permanent` 属性而不是 instanceof，跨包/双实例场景安全。
+
+  新导出：`NonRetryableError`、`isNonRetryableError`、`sanitizeErrorSummary`。适配器接口新增可选 `getTaskStatusInfo(uuid, userId)`（三个内置适配器都实现）。特性位：`task-last-error`、`non-retryable-error`。
+
+- 租约按心跳滚动续租，isolate 死亡后任务分钟级被接手；新增 `runTask(ctx, uuid)` 单任务入口
+
+  之前租约是认领时一次性写死的长租约（默认 10 分钟）。isolate 在 claim 后被平台回收（fetch 的 `waitUntil` 预算远小于一次 fire 的上限），行就焊死到租约走完——用户盯着「正在输入…」十几分钟。而且租期是全局一个值，为 instant 场景调短，定时任务的慢投递就会被下一跳重复触发。
+
+  现在投递期间按心跳续租：占位只写一小段租约（默认 90 秒），之后每 30 秒把 `lease_until` 推到 now + 90s。isolate 活着租约永远够用；isolate 死了租约在 ~90 秒内到期，下一分钟的 cron 就能接手。失败路径照旧主动清租约。心跳间隔用 `leaseHeartbeatMs` 配置（0 = 关掉，退回一次性长租约 `claimLeaseMs`）。适配器接口新增可选 `renewTaskLease(taskId, leaseUntil)`（D1 / pg / neon 都已实现；只在行仍持有租约时生效，收尾放掉后迟到的心跳不会复活它）；没实现的自定义适配器自动退回老行为。
+
+  **runTask(ctx, uuid)**：单跑一条任务的官方入口，与 cron tick 走完全同一条投递链（占位、心跳、过期守卫、重试/终态、hook 全套）。给「fetch 里只 enqueue、真正的 fire 交给 CF Queue 消费者（15 分钟预算）跑」的宿主用。行没到点或在退避窗口内不跑（`{ ran: false, reason }`）。
+
+  新导出：`runTask`、`DEFAULT_CLAIM_LEASE_MS`、`DEFAULT_LEASE_HEARTBEAT_MS`、`DEFAULT_HEARTBEAT_LEASE_TTL_MS`。特性位：`tick-lease-heartbeat`、`run-task-entrypoint`。
+
+- 服务端原生消息收件箱（message_outbox + ack）；fire ctx 新增 `cancelTask` / `renewTask`
+
+  **message_outbox**：之前没有收件箱表，「补收」只能靠客户端拿「messageId 在不在本地近 N 条里」猜哪些推送丢了——猜错的每种方式都出过场（删掉的回复复活、多段丢失没人补、与进行中会话竞态重复上屏、重试轮重复生成）。现在：
+
+  - 服务端发出的每条 push（老链路与 agentic 链路都算）在发送前先落一行 `message_outbox`（payload 是整条 push JSON 的 per-user 密文；`(user_id, message_id)` 唯一，重试同一 occurrence 不产生第二行、不复活已 ack 的行）；Web Push 发出后标 `delivered_at`，半途失败只标已发出的段；
+  - 客户端两个端点：`GET /outbox?since=<cursor>[&limit=]` 拉未 ack 的行（id 升序游标翻页，响应走加密信封，逐条带解密后的完整 push + taskUuid/sessionId/messageIndex 等），`POST /outbox/ack { messageIds }` 确认收到（幂等）——「补收」变成「拉未 ack」，不存在猜；
+  - tick 顺手清理：已 ack 的留 7 天，未 ack 的留 28 天（Web Push TTL 上限四周）；
+  - outbox 全程 best-effort：落行失败不影响投递本身。适配器接口新增五个可选方法（`appendOutboxMessages` / `markOutboxDelivered` / `listUnackedOutbox` / `ackOutboxMessages` / `cleanupOutbox`），内置只有 D1 实现（与 client_state 同待遇），没实现的适配器发送链路静默跳过、端点回 501。
+
+  **表结构**：新增 `message_outbox` 表（`initSchema()` / `POST /init-tenant` 会建，幂等）。
+
+  **cancelTask / renewTask**：fire ctx 之前只有 `scheduleTask`，云端轮的角色「看得见任务、动不了」——用户说「取消那个提醒」，角色口头答应，任务照旧触发。现在 `fireCtx` 和每轮 `sessionCtx` 上新增 `ctx.cancelTask(uuid)`（语义同 `DELETE /cancel-message`）与 `ctx.renewTask(uuid, nextSendAt)`（语义同 `PUT /update-message` 只改排期：payload 的 firstSendTime 跟着改、重试计数清零、退避放掉；新时刻至少比现在晚 60 秒）。两者都不许操作当前正在 fire 的这条（收尾归 run-tick 管）。
+
+  特性位：`message-outbox`、`agentic-cancel-renew-task`。
+
+- `POST /schedule-message` 支持 `immediate: true` 与 `supersedesUuid`（原子替换）
+
+  **immediate**：之前 `firstSendTime` 必须严格在未来，想「马上发一条走 cron 链路的任务」只能预留提前量再想办法把行拉回当下——慢网/低端机把提前量吃光就是 400 INVALID_TIMESTAMP。现在 body 里带 `immediate: true` 即可：跳过未来校验，`next_send_at` 落在当下，下一跳 cron（最多一分钟后）直接触发。此时 `firstSendTime` 可省略；对 `instant` 类型明确拒绝（它本就立即投递）。
+
+  **supersedesUuid**：建这条的同时取消旧的那条。D1 适配器新增可选的 `createTaskSuperseding(params, supersedesUuid)`，删旧建新落在同一个 batch（隐式事务、单次往返）——不会出现「旧的删了、新的没建成」的中间态，INSERT 撞 uuid 时整体回滚。适配器没实现时 handler 退回「先删再建」两步。响应里带 `superseded`（旧行是否真的被取消）。
+
+  特性位：`schedule-immediate`、`schedule-supersede`。
+
+- `onFireSettled` 载荷带解密 `metadata` 与最后一轮 `usage`；导出 CORS 头列表与 agentic 预算常量
+
+  - `onFireSettled` 的载荷新增 `metadata`（解密 payload 的 metadata 子字段，与 `onStaleSkip` 同待遇——task 行是密文，宿主要靠它对上是哪个角色的哪类任务，尤其是链路在 onBeforeFire 里就失败、侧信道一条都没写上的那种结局）和 `usage`（最后一轮 LLM 响应的 usage；没跑到 LLM → null）。`onAfterSend` 载荷同样带 `usage`。凭据字段照旧不透传。
+  - 导出 `CORS_ALLOW_HEADERS` / `CORS_ALLOW_METHODS`（单用户 worker 的允许头/方法列表）：在 worker 外面再包一层路由的宿主 import 这一份，不用再手抄第二份等它漂移。
+  - 导出 `DEFAULT_MAX_TOOL_ITERATIONS` / `DEFAULT_TOTAL_TIMEOUT_MS` / `DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE` / `MIN_SCHEDULE_LEAD_MS`：包装层要对齐预算档位时用同一份常量。
+
+  特性位：`fire-settled-metadata`、`hook-usage`。
+
+### Patch Changes
+
+- Updated dependencies [a384a93]
+- Updated dependencies
+  - @rei-standard/amsg-shared@0.4.0-next.4
+
 ## 2.6.0-next.13
 
 ### Patch Changes
