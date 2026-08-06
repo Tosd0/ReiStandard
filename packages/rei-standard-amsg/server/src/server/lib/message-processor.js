@@ -97,17 +97,21 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
  * @param {import('../adapters/interface.js').TaskRow} task
  * @param {ProcessorContext} ctx
  * @param {string} [providedMasterKey]
- * @returns {Promise<{ success: boolean, messagesSent: number, error?: string }>}
+ * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
+ *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
+ * @returns {Promise<{ success: boolean, messagesSent: number, error?: string, errorCode?: string|null }>}
  */
-export async function processSingleMessage(task, ctx, providedMasterKey) {
+export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
       return { success: false, messagesSent: 0, error: 'TENANT_MASTER_KEY_MISSING' };
     }
 
-    const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
-    const decryptedPayload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
+    const userKey = (predecrypted && predecrypted.userKey)
+      || await deriveUserEncryptionKey(task.user_id, masterKey);
+    const decryptedPayload = (predecrypted && predecrypted.payload)
+      || JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
     // Fire-time hooks: when the host configured onBeforeFire and the task
     // needs the LLM, offer the agentic path first. onBeforeFire → null
@@ -170,8 +174,15 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     }
 
     // 订阅是用户级的一份，投递时现读（任务行不携带它）。取不到就抛，走既有
-    // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。
-    const pushSubscription = await resolvePushSubscription({ db: ctx.db, userId: task.user_id, userKey });
+    // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。升级前创建的
+    // 任务把订阅冻结在 payload 里，用户级存储没有时兜底用那一份，存量任务
+    // 不必等用户重新登记。
+    const pushSubscription = await resolvePushSubscription({
+      db: ctx.db,
+      userId: task.user_id,
+      userKey,
+      legacyFallback: decryptedPayload.pushSubscription ?? null
+    });
     // sessionId is shared across the optional ReasoningPush and every
     // ContentPush from this LLM round. Pin it to (task id + 名义触发时刻)
     // when available (scheduled tasks) so retries of the same occurrence
@@ -248,7 +259,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey) {
     return { success: true, messagesSent: messages.length };
 
   } catch (error) {
-    return { success: false, messagesSent: 0, error: error.message };
+    // errorCode 透传底层错误的稳定 `code`（如 PUSH_SUBSCRIPTION_MISSING），
+    // run-tick 按它区分「重试也好不了」的永久性失败。
+    return { success: false, messagesSent: 0, error: error.message, errorCode: error.code || null };
   }
 }
 

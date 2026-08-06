@@ -6,8 +6,8 @@
  */
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
-import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidISO8601, isValidUUIDv4, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
+import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
+import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -26,13 +26,9 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'TASK_ID_REQUIRED', message: '缺少任务ID' } } };
     }
 
-    const userId = getHeader(headers, 'x-user-id');
-    if (!userId) {
-      return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
-    }
-    if (!isValidUUIDv4(userId)) {
-      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
-    }
+    const gate = requireUserId(headers);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
 
     const isEncrypted = getHeader(headers, 'x-payload-encrypted') === 'true';
     const encryptionVersion = getHeader(headers, 'x-encryption-version');
@@ -204,7 +200,16 @@ export function createUpdateMessageHandler(ctx) {
     };
 
     const encryptedPayload = await encryptForStorage(JSON.stringify(updatedData), userKey);
-    const extraFields = updates.nextSendAt ? { next_send_at: updates.nextSendAt } : undefined;
+    // 更新即视为「重新出发」：把重试计数清零、把退避放掉。不清的话，刚修好
+    // apiKey / 改好排期的任务还背着之前攒下的 retry_count，下一次哪怕是瞬时
+    // 故障也可能直接触发终审处置。retry_after 只在支持占位的适配器上写
+    //（与 run-tick 的 updateAndRelease 同一判据——没实现 claimTask 的适配器
+    // 未必有这一列）。
+    const extraFields = {
+      retry_count: 0,
+      ...(typeof db.claimTask === 'function' ? { retry_after: null } : {}),
+      ...(updates.nextSendAt ? { next_send_at: updates.nextSendAt } : {})
+    };
 
     const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
 

@@ -57,8 +57,22 @@ export function createTenantContextManager(options) {
   async function getOrCreateAdapter(dbConfig) {
     const cacheKey = `${dbConfig.driver}:${dbConfig.connectionString}`;
     if (!adapterCache.has(cacheKey)) {
-      const adapter = await adapterFactory(dbConfig);
-      adapterCache.set(cacheKey, adapter);
+      // 缓存的是 promise：并发首次请求只建一次；失败则清掉缓存，下次重试。
+      const created = (async () => {
+        const adapter = await adapterFactory(dbConfig);
+        // 每个进程首次拿到适配器时把 schema 补齐到最新（建表 / ADD COLUMN IF
+        // NOT EXISTS，全部幂等）。存量租户没有别的路径重跑 initSchema——同
+        // tenantId 重放 /init-tenant 在到达 initSchema 前就 409——不在这里补，
+        // 升级加列后每个 tick 都会因缺列报错，直到运维手工执行 DDL。
+        if (typeof adapter.initSchema === 'function') {
+          await adapter.initSchema();
+        }
+        return adapter;
+      })().catch((error) => {
+        adapterCache.delete(cacheKey);
+        throw error;
+      });
+      adapterCache.set(cacheKey, created);
     }
     return adapterCache.get(cacheKey);
   }

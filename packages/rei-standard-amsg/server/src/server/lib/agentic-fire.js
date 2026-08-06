@@ -848,11 +848,13 @@ async function sendHookPushPayloads({
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
     }
-    // 用户级订阅，投递时现读（任务行不携带它）。
+    // 用户级订阅，投递时现读（任务行不携带它）。升级前创建的任务把订阅冻结
+    // 在 payload 里，用户级存储没有时兜底用那一份。
     const pushSubscription = await resolvePushSubscription({
       db: ctx.db,
       userId: task.user_id,
       userKey,
+      legacyFallback: (decryptedPayload && decryptedPayload.pushSubscription) ?? null,
     });
     const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 

@@ -15,15 +15,8 @@ import {
   CLIENT_STATE_TABLE_SQL,
   PUSH_SUBSCRIPTION_TABLE_SQL
 } from './schema.sqlite.js';
-
-// Update methods build a dynamic SET clause from object keys. Callers pass only
-// hardcoded column names today, but enforcing a whitelist keeps a future caller
-// from ever turning a caller-supplied key into interpolated SQL.
-const UPDATABLE_COLUMNS = new Set([
-  'user_id', 'uuid', 'encrypted_payload', 'message_type',
-  'next_send_at', 'lease_until', 'retry_after', 'serialize_group',
-  'status', 'retry_count', 'created_at', 'updated_at'
-]);
+// 列名不分方言：三个适配器共用 schema.js 里的这一份白名单，加列只改一处。
+import { UPDATABLE_COLUMNS } from './schema.js';
 
 // LIKE 前缀转义：用户 key 里的 % _ \ 不能变成通配符/转义符。
 function escapeLikePrefix(prefix) {
@@ -197,7 +190,7 @@ export class D1Adapter {
   async getPendingTasks(limit = 50) {
     const now = this._now();
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= ?
          AND (lease_until IS NULL OR lease_until <= ?)

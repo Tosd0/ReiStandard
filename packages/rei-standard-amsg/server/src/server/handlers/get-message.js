@@ -20,8 +20,7 @@
  */
 
 import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../lib/encryption.js';
-import { getHeader } from '../lib/request.js';
-import { isValidUUIDv4 } from '../lib/validation.js';
+import { requireUserId } from '../lib/request.js';
 import { projectTask } from '../lib/task-projection.js';
 
 export function createGetMessageHandler(ctx) {
@@ -34,20 +33,9 @@ export function createGetMessageHandler(ctx) {
     const tenantCtx = tenantResult.context;
     const db = tenantCtx.db;
     const masterKey = tenantCtx.masterKey;
-    const userId = getHeader(headers, 'x-user-id');
-
-    if (!userId) {
-      return {
-        status: 400,
-        body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '必须提供 X-User-Id 请求头' } }
-      };
-    }
-    if (!isValidUUIDv4(userId)) {
-      return {
-        status: 400,
-        body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } }
-      };
-    }
+    const gate = requireUserId(headers);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
 
     const taskUuid = new URL(url, 'https://dummy').searchParams.get('id');
     if (!taskUuid) {

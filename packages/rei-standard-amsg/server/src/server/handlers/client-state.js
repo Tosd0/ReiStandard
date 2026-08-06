@@ -29,8 +29,7 @@
  */
 
 import { deriveUserEncryptionKey, decryptPayload, encryptPayload, decryptFromStorage } from '../lib/encryption.js';
-import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { isValidUUIDv4 } from '../lib/validation.js';
+import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import {
   STATE_CHUNK_SLICE_BYTES,
   DEFAULT_MAX_STATE_VALUE_BYTES,
@@ -56,13 +55,6 @@ export const MAX_STATE_ENTRIES_PER_REQUEST = MAX_STATE_ENTRIES_PER_BATCH;
 function err(status, code, message, details) {
   const error = details === undefined ? { code, message } : { code, message, details };
   return { status, body: { success: false, error } };
-}
-
-function requireUserId(headers) {
-  const userId = getHeader(headers, 'x-user-id');
-  if (!userId) return { error: err(400, 'USER_ID_REQUIRED', '缺少用户标识符') };
-  if (!isValidUUIDv4(userId)) return { error: err(400, 'INVALID_USER_ID_FORMAT', 'X-User-Id 必须是 UUID v4 格式') };
-  return { userId };
 }
 
 function rejectEntry(entry, index, code, message, extra) {

@@ -3,6 +3,8 @@
  * Keeps body parsing and shape validation consistent across handlers.
  */
 
+import { isValidUUIDv4 } from './validation.js';
+
 export const REQUEST_ERRORS = {
   INVALID_JSON: { code: 'INVALID_JSON', message: '请求体不是有效的 JSON' },
   INVALID_REQUEST_BODY: { code: 'INVALID_REQUEST_BODY', message: '请求体格式无效' },
@@ -117,6 +119,33 @@ export function parseEncryptedBody(body) {
   }
 
   return parsedBody;
+}
+
+/**
+ * 标准错误信封：{ status, body: { success: false, error: { code, message, details? } } }。
+ *
+ * @param {number} status
+ * @param {string} code
+ * @param {string} message
+ * @param {Object} [details]
+ */
+export function errorResponse(status, code, message, details) {
+  const error = details === undefined ? { code, message } : { code, message, details };
+  return { status, body: { success: false, error } };
+}
+
+/**
+ * X-User-Id 门禁。所有按用户读写的端点共用这一份：规则（必填 + UUID v4）和
+ * 文案只此一处，改口径不用挨个 handler 找复制粘贴的副本。
+ *
+ * @param {Record<string, any>} headers
+ * @returns {{ userId: string, error?: undefined } | { error: ReturnType<typeof errorResponse> }}
+ */
+export function requireUserId(headers) {
+  const userId = getHeader(headers, 'x-user-id');
+  if (!userId) return { error: errorResponse(400, 'USER_ID_REQUIRED', '缺少用户标识符') };
+  if (!isValidUUIDv4(userId)) return { error: errorResponse(400, 'INVALID_USER_ID_FORMAT', 'X-User-Id 必须是 UUID v4 格式') };
+  return { userId };
 }
 
 /**

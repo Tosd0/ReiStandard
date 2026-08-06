@@ -1,22 +1,12 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypto';
+// base64url 编解码统一用 shared 的实现（经 lib/webcrypto-utils.js 重导出），
+// 与同目录 token.js 同一份——本文件其余部分仍是刻意的 Node-only（node:crypto）。
+import {
+  bytesToBase64Url as base64UrlEncode,
+  base64UrlToBytes as base64UrlDecode,
+} from '../lib/webcrypto-utils.js';
 
 const inMemoryNamespaces = new Map();
-
-function base64UrlEncode(input) {
-  return Buffer.from(input)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function base64UrlDecode(input) {
-  const normalized = input
-    .replace(/-/g, '+')
-    .replace(/_/g, '/');
-  const padLength = (4 - (normalized.length % 4)) % 4;
-  return Buffer.from(normalized + '='.repeat(padLength), 'base64');
-}
 
 function getKekBuffer(kek) {
   const value = String(kek || '').trim();
