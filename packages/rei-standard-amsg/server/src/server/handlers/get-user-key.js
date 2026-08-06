@@ -6,8 +6,7 @@
  */
 
 import { deriveUserEncryptionKey } from '../lib/encryption.js';
-import { getHeader } from '../lib/request.js';
-import { isValidUUIDv4 } from '../lib/validation.js';
+import { requireUserId } from '../lib/request.js';
 
 export function createGetUserKeyHandler(ctx) {
   async function GET(url, headers) {
@@ -18,21 +17,9 @@ export function createGetUserKeyHandler(ctx) {
     }
 
     const { masterKey } = tenantResult.context;
-    const userId = getHeader(effectiveHeaders, 'x-user-id');
-
-    if (!userId) {
-      return {
-        status: 400,
-        body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } }
-      };
-    }
-
-    if (!isValidUUIDv4(userId)) {
-      return {
-        status: 400,
-        body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } }
-      };
-    }
+    const gate = requireUserId(effectiveHeaders);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
 
     return {
       status: 200,

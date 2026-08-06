@@ -5,8 +5,7 @@
  * @returns {{ DELETE: function }}
  */
 
-import { isValidUUIDv4 } from '../lib/validation.js';
-import { getHeader } from '../lib/request.js';
+import { requireUserId } from '../lib/request.js';
 
 export function createCancelMessageHandler(ctx) {
   async function DELETE(url, headers) {
@@ -23,13 +22,9 @@ export function createCancelMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'TASK_ID_REQUIRED', message: '缺少任务ID' } } };
     }
 
-    const userId = getHeader(headers, 'x-user-id');
-    if (!userId) {
-      return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
-    }
-    if (!isValidUUIDv4(userId)) {
-      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
-    }
+    const gate = requireUserId(headers);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
 
     const deleted = await db.deleteTaskByUuid(taskUuid, userId);
 

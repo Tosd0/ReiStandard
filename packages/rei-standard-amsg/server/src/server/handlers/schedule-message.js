@@ -8,9 +8,9 @@
 import { randomUUID } from '../lib/webcrypto-utils.js';
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../lib/encryption.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
-import { getHeader, isPlainObject, parseEncryptedBody } from '../lib/request.js';
-import { validateScheduleMessagePayload, isValidUUIDv4 } from '../lib/validation.js';
-import { loadPushSubscription, supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
+import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
+import { validateScheduleMessagePayload } from '../lib/validation.js';
+import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
 
 export function createScheduleMessageHandler(ctx) {
@@ -25,17 +25,13 @@ export function createScheduleMessageHandler(ctx) {
     const masterKey = tenantCtx.masterKey;
     const isEncrypted = getHeader(headers, 'x-payload-encrypted') === 'true';
     const encryptionVersion = getHeader(headers, 'x-encryption-version');
-    const userId = getHeader(headers, 'x-user-id');
 
     if (!isEncrypted) {
       return { status: 400, body: { success: false, error: { code: 'ENCRYPTION_REQUIRED', message: '请求体必须加密' } } };
     }
-    if (!userId) {
-      return { status: 400, body: { success: false, error: { code: 'USER_ID_REQUIRED', message: '缺少用户标识符' } } };
-    }
-    if (!isValidUUIDv4(userId)) {
-      return { status: 400, body: { success: false, error: { code: 'INVALID_USER_ID_FORMAT', message: 'X-User-Id 必须是 UUID v4 格式' } } };
-    }
+    const gate = requireUserId(headers);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
     if (encryptionVersion !== '1') {
       return { status: 400, body: { success: false, error: { code: 'UNSUPPORTED_ENCRYPTION_VERSION', message: '加密版本不支持' } } };
     }
@@ -75,13 +71,25 @@ export function createScheduleMessageHandler(ctx) {
     if (!supportsPushSubscriptionStore(db)) {
       return { status: 501, body: { success: false, error: { code: 'PUSH_SUBSCRIPTION_NOT_SUPPORTED', message: '当前数据库适配器不支持用户级推送订阅存储' } } };
     }
-    let storedSubscription = null;
+    // 只做存在性检查（不解密——解出来的订阅这里也用不上）。查询本身失败是
+    // 基础设施问题，按可重试的 503 报出去，别伪装成「没登记」把客户端引去
+    // 走一遍多余的重订阅流程。
+    let subscriptionRow;
     try {
-      storedSubscription = await loadPushSubscription({ db, userId, userKey });
+      subscriptionRow = await db.getPushSubscription(userId);
     } catch (_error) {
-      storedSubscription = null;
+      return {
+        status: 503,
+        body: {
+          success: false,
+          error: {
+            code: 'PUSH_SUBSCRIPTION_LOOKUP_FAILED',
+            message: '推送订阅读取失败，请稍后重试'
+          }
+        }
+      };
     }
-    if (!storedSubscription) {
+    if (!subscriptionRow || typeof subscriptionRow.subscription !== 'string' || !subscriptionRow.subscription) {
       return {
         status: 409,
         body: {

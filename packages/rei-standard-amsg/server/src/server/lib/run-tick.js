@@ -21,7 +21,7 @@
  * 等租约到期才会被接手——这是租约本身的代价，把租期设得比最慢的一次投递长
  * 一点就行。
  *
- * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, serializeBy?, onStaleSkip? }
+ * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
  *   ctx.serializeBy?.(task)：可选的分组串行。返回一个分组标识（同一个角色、
  *   同一份台账……宿主自己定义），同一分组的任务同时只放行一条；返回 null /
  *   空串 / 不配这个函数 = 这条任务不参与串行，行为与以前完全一致。参数是与
@@ -56,8 +56,14 @@ const CLAIM_LEASE_MARGIN_MS = 2 * 60 * 1000;
 // 补发新鲜度：错过名义触发时刻超过这个时长的任务不再照常补发。服务停摆几天
 // 恢复后，一次性任务不该把攒了几天的旧话一口气倒出来，循环任务更不该每分钟
 // 补发一天。正在重试链上的任务（retry_count > 0）不算过期——它的 next_send_at
-// 一直是名义时刻，重试拖过一小时不等于用户错过了它。
+// 一直是名义时刻，重试拖过一小时不等于用户错过了它——但重试时刻（retry_after）
+// 本身也被拖过了这个时长的除外：那说明停摆发生在重试窗口里，内容一样旧。
+// 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
+
+function resolveStaleAfterMs(ctx) {
+  return positiveNumber(ctx.staleAfterMs) || STALE_AFTER_MS;
+}
 
 /**
  * @typedef {Object} StaleSkipInfo
@@ -112,6 +118,7 @@ export async function runScheduledTick(ctx) {
   const db = ctx.db;
   const masterKey = ctx.masterKey;
   const claimLeaseMs = resolveClaimLeaseMs(ctx);
+  const staleAfterMs = resolveStaleAfterMs(ctx);
   const serializeBy = typeof ctx.serializeBy === 'function' ? ctx.serializeBy : null;
 
   const startTime = Date.now();
@@ -192,8 +199,12 @@ export async function runScheduledTick(ctx) {
       return { taken: true, rawKey: null };
     }
     if (typeof rawKey !== 'string' || !rawKey) return { taken: false, rawKey: null };
-    if (groupsTakenThisTick.has(rawKey)) return { taken: true, rawKey };
-    groupsTakenThisTick.add(rawKey);
+    // 占坑的键带上 user_id：分组是按用户隔离的（落库那侧靠 per-user HMAC 天然
+    // 隔开，见 deriveSerializeGroup），内存这侧不带用户维度的话，两个用户恰好
+    // 返回同一个 rawKey（例如共用的默认角色名）会互相顶掉对方的任务。
+    const scopedKey = `${task.user_id}\u0000${rawKey}`;
+    if (groupsTakenThisTick.has(scopedKey)) return { taken: true, rawKey };
+    groupsTakenThisTick.add(scopedKey);
     return { taken: false, rawKey };
   }
 
@@ -250,11 +261,16 @@ export async function runScheduledTick(ctx) {
    * 久漂了。没有这两列的适配器（没实现 claimTask）退回老行为，把重试时刻写
    * 进 next_send_at。
    */
-  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey) {
+  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey, errorCode = null) {
     results.failedCount++;
     const tzId = decryptedPayload ? (decryptedPayload.tzId ?? null) : null;
+    // 重试也好不了的失败（订阅没登记 / 适配器不支持订阅存储）不进退避阶梯：
+    // 一次性任务直接进终审处置，循环任务直接作废本次 occurrence——在用户重新
+    // 登记订阅之前，隔两分钟再试三次只是白跑。
+    const permanent = errorCode === 'PUSH_SUBSCRIPTION_MISSING'
+      || errorCode === 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED';
     try {
-      if (task.retry_count >= 3) {
+      if (permanent || task.retry_count >= 3) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason);
         if (isRecurringType(recurrenceType)) {
           const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
@@ -362,9 +378,8 @@ export async function runScheduledTick(ctx) {
       return;
     }
 
-    // recurrenceType 是过期判定、终审失败处置的依据。解密不了的话投递也必然
-    // 失败（processSingleMessage 解的是同一份），按投递失败走既有的重试/终态
-    // 逻辑。
+    // recurrenceType 是过期判定、终审失败处置的依据。解密不了的话投递也无从
+    // 谈起（投递用的就是这份解密结果），按投递失败走既有的重试/终态逻辑。
     if (!decrypted.ok) {
       await handleDeliveryFailure(task, (decrypted.error && decrypted.error.message) || '任务载荷解密失败', null, null, null);
       return;
@@ -377,12 +392,17 @@ export async function runScheduledTick(ctx) {
     // 服务停摆 N 天恢复后，攒下的旧任务不照常补发：一次性任务标 'failed'；
     // 循环任务把排期快进到未来第一个名义时刻。两边都写 lastError、都调
     // onStaleSkip——「昨天那次没响」对用户是一样的事实，循环任务不该无声无息
-    // 地把它抹掉。正在重试链上的（retry_count > 0）不算过期，见 STALE_AFTER_MS
-    // 的注释。
+    // 地把它抹掉。正在重试链上的（retry_count > 0）不算过期——除非排定的重试
+    // 时刻（retry_after）本身也被拖过了 staleAfterMs：正常退避只有几分钟，
+    // 拖过一小时说明停摆恰好落在重试窗口里，这时内容跟没进重试链的一样旧。
+    // 见 STALE_AFTER_MS 的注释。
     const occurrenceMs = Date.parse(task.next_send_at);
+    const retryAfterMs = task.retry_after ? Date.parse(task.retry_after) : NaN;
+    const notOnFreshRetryChain = (task.retry_count || 0) === 0
+      || (Number.isFinite(retryAfterMs) && Date.now() - retryAfterMs > staleAfterMs);
     if (Number.isFinite(occurrenceMs)
-        && Date.now() - occurrenceMs > STALE_AFTER_MS
-        && (task.retry_count || 0) === 0) {
+        && Date.now() - occurrenceMs > staleAfterMs
+        && notOnFreshRetryChain) {
       try {
         // hook 的 client_state 读写口：过期跳过往往正是宿主要留一条痕迹的时
         // 候（服务停摆恢复后的第一跳，此前这个 tick 里可能一次 fire 都没跑
@@ -394,62 +414,47 @@ export async function runScheduledTick(ctx) {
           maxStateValueBytes: ctx.maxStateValueBytes
         });
 
-        if (isRecurringType(recurrenceType)) {
-          const plan = planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
-          const nextSendAt = new Date(plan.nextMs).toISOString();
-          const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, 'stale', {
-            skippedCount: plan.skippedCount,
-            nextSendAt
-          });
-          await updateAndRelease(task.id, {
-            next_send_at: nextSendAt,
-            retry_count: 0,
-            ...(encrypted ? { encrypted_payload: encrypted } : {})
-          });
-          results.staleTasks.push({
-            taskId: task.id,
-            reason: 'stale',
-            action: 'fast_forwarded',
-            nextSendAt,
-            skippedCount: plan.skippedCount
-          });
-          await notifyStaleSkip(task, {
-            reason: 'stale',
-            action: 'fast_forwarded',
-            metadata: decryptedPayload.metadata ?? null,
-            recurrenceType,
-            occurrenceMs,
-            skippedCount: plan.skippedCount,
-            skippedOccurrences: plan.skippedOccurrences,
-            skippedTruncated: plan.skippedTruncated,
-            nextSendAt,
-            ...stateAccessors
-          });
-        } else {
-          const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, 'stale');
-          await updateAndRelease(task.id, {
-            status: 'failed',
-            ...(encrypted ? { encrypted_payload: encrypted } : {})
-          });
-          results.staleTasks.push({ taskId: task.id, reason: 'stale', action: 'expired', skippedCount: 1 });
-          // 消费方用它写「错过了」回执；best-effort，hook 抛错不影响主流程。
-          // task 是数据库行原样（metadata 锁在 encrypted_payload 密文里），所以
-          // 把解密出的 metadata 单独递过去，hook 才能对上是哪个角色的任务。
-          // 只透传 metadata 这一个子字段——解密 payload 里还有 apiKey /
-          // pushSubscription 等凭据，不能整个递出去。
-          await notifyStaleSkip(task, {
-            reason: 'stale',
-            action: 'expired',
-            metadata: decryptedPayload.metadata ?? null,
-            recurrenceType: recurrenceType || 'none',
-            occurrenceMs,
-            skippedCount: 1,
-            skippedOccurrences: [occurrenceMs],
-            skippedTruncated: false,
-            nextSendAt: null,
-            ...stateAccessors
-          });
-        }
+        // 循环任务快进（fast_forwarded）与一次性任务作废（expired）的收尾
+        // 完全同构：写 lastError → 写库 → 记 staleTasks → 调 onStaleSkip。
+        // 差异全部收进 plan 里，尾部只写一遍——两个近似复制的分支各改各的，
+        // 漏改一边是迟早的事。
+        const recurring = isRecurringType(recurrenceType);
+        const plan = recurring ? planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId) : null;
+        const nextSendAt = recurring ? new Date(plan.nextMs).toISOString() : null;
+        const action = recurring ? 'fast_forwarded' : 'expired';
+        const skippedCount = recurring ? plan.skippedCount : 1;
+        const encrypted = await encryptPayloadWithLastError(
+          task, decryptedPayload, userKey, 'stale',
+          recurring ? { skippedCount, nextSendAt } : undefined
+        );
+        await updateAndRelease(task.id, {
+          ...(recurring ? { next_send_at: nextSendAt, retry_count: 0 } : { status: 'failed' }),
+          ...(encrypted ? { encrypted_payload: encrypted } : {})
+        });
+        results.staleTasks.push({
+          taskId: task.id,
+          reason: 'stale',
+          action,
+          ...(recurring ? { nextSendAt } : {}),
+          skippedCount
+        });
+        // 消费方用它写「错过了」回执；best-effort，hook 抛错不影响主流程。
+        // task 是数据库行原样（metadata 锁在 encrypted_payload 密文里），所以
+        // 把解密出的 metadata 单独递过去，hook 才能对上是哪个角色的任务。
+        // 只透传 metadata 这一个子字段——解密 payload 里还有 apiKey /
+        // pushSubscription 等凭据，不能整个递出去。
+        await notifyStaleSkip(task, {
+          reason: 'stale',
+          action,
+          metadata: decryptedPayload.metadata ?? null,
+          recurrenceType: recurrenceType || 'none',
+          occurrenceMs,
+          skippedCount,
+          skippedOccurrences: recurring ? plan.skippedOccurrences : [occurrenceMs],
+          skippedTruncated: recurring ? plan.skippedTruncated : false,
+          nextSendAt,
+          ...stateAccessors
+        });
       } catch (error) {
         results.failedCount++;
         results.failedTasks.push({ taskId: task.id, reason: error.message || '过期任务处理失败', status: 'stale_update_failed' });
@@ -459,14 +464,18 @@ export async function runScheduledTick(ctx) {
 
     let sendResult;
     try {
-      sendResult = await processSingleMessage(task, { ...ctx, db, masterKey }, masterKey);
+      // 预扫描解好的 payload 一并递过去，投递侧不再解第二遍。
+      sendResult = await processSingleMessage(
+        task, { ...ctx, db, masterKey }, masterKey,
+        { userKey, payload: decryptedPayload }
+      );
     } catch (error) {
-      await handleDeliveryFailure(task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey);
+      await handleDeliveryFailure(task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey, error.code || null);
       return;
     }
 
     if (!sendResult.success) {
-      await handleDeliveryFailure(task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey);
+      await handleDeliveryFailure(task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey, sendResult.errorCode || null);
       return;
     }
 
@@ -493,8 +502,9 @@ export async function runScheduledTick(ctx) {
   // 一条来」：并发解密谁先跑完是没准的，让它来决定同组谁先放行的话，两条都到
   // 点时晚的那条可能抢在早的前面发出去——这正是分组串行想避免的事。
   //
-  // 没配 serializeBy 时这一步只是顺手把 payload 解出来（下面不会再解第二遍），
-  // 谁都不拦。
+  // 没配 serializeBy 时这一步只是顺手把 payload 解出来，谁都不拦。解好的
+  // payload 会随任务一路递到投递侧（processSingleMessage 的 predecrypted
+  // 参数），全程只解这一遍。
   const taskQueue = [];
   for (const task of tasks) {
     const decrypted = await decryptTask(task);

@@ -83,14 +83,19 @@ for (const backend of BACKENDS) {
 
   // 分组串行：判定和占位必须在同一条语句里。拆成「先查这组忙不忙、再占位」的
   // 话，两个 tick 的查询都会在对方占位之前返回「不忙」，双双进同一个分组。
+  // 占位提交之后另有一次复查（READ COMMITTED 写偏斜的收口，见 pg-shared.js）：
+  // 两个 tick 各领同组「不同」行时 NOT EXISTS 互相看不见对方未提交的租约，
+  // 复查发生在自己的租约提交之后，至少一方看得见冲突并让路。
   test(`${backend.name}: 带 serializeGroup 时，分组判定和占位是同一条 UPDATE`, async () => {
-    const { adapter, calls } = backend.make(() => [{ id: 1 }]);
+    const { adapter, calls } = backend.make((text) =>
+      /^\s*SELECT 1 FROM scheduled_messages busy/i.test(text) ? [] : [{ id: 1 }]
+    );
     const lease = '2026-01-01T00:10:00.000Z';
 
     assert.equal(await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', lease, 'grp-abc'), true);
 
-    assert.equal(calls.length, 1, '只发一条语句，不能先查一次再占一次');
-    const { text, params } = calls.at(-1);
+    assert.equal(calls.length, 2, '判定+占位合一的 UPDATE，加一次占位提交后的复查');
+    const { text, params } = calls[0];
     // 子查询自带 WHERE，这里就不切段了，直接对整条语句断言。
     const sql = flat(text);
     // 同一分组里有别的行拿着未到期的租约就领不走。
@@ -102,6 +107,29 @@ for (const backend of BACKENDS) {
     // 领到的同时把分组写在行上，下一跳靠它判断这组忙不忙。
     assert.match(setClauseOf(text), /serialize_group\s*=\s*\$4/);
     assert.deepEqual(params, [lease, 7, '2026-01-01T00:00:00.000Z', 'grp-abc']);
+    // 复查只看同组其他行的活租约。
+    const verify = flat(calls[1].text);
+    assert.match(verify, /^SELECT 1 FROM scheduled_messages busy/i);
+    assert.match(verify, /busy\.lease_until > NOW\(\)/i);
+    assert.deepEqual(calls[1].params, ['grp-abc', 7]);
+  });
+
+  test(`${backend.name}: 占位后复查撞上同组另一条活租约 → 放掉租约、返回 false`, async () => {
+    const { adapter, calls } = backend.make((text) =>
+      /^\s*SELECT 1 FROM scheduled_messages busy/i.test(text) ? [{ ok: 1 }] : [{ id: 1 }]
+    );
+
+    assert.equal(
+      await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z', 'grp-abc'),
+      false
+    );
+
+    // 最后一条语句把自己刚写的租约放掉（两边都让路也没事：行保持 pending，
+    // 下一跳重试）。
+    const release = flat(calls.at(-1).text);
+    assert.match(release, /SET lease_until = NULL/i);
+    assert.match(release, /WHERE id = \$1/i);
+    assert.deepEqual(calls.at(-1).params, [7]);
   });
 
   test(`${backend.name}: 不传 serializeGroup 时语句里没有分组门`, async () => {

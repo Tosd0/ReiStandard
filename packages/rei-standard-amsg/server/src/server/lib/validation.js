@@ -2,10 +2,15 @@
  * Validation utility library (SDK version)
  */
 
-import { validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
+import { isValidUrl, validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
 import { isValidTimeZoneId } from './recurrence.js';
 
 export { isValidTimeZoneId };
+
+// URL 校验统一走 shared 的实现（validateAvatarUrl 内部用的也是同一份），
+// 两个包对「什么算 URL」不再各持一版。此处重导出，保持本模块及
+// `createReiServer` 的公开导出不变。
+export { isValidUrl };
 
 /**
  * Validate ISO 8601 date string.
@@ -15,20 +20,6 @@ export { isValidTimeZoneId };
 export function isValidISO8601(dateString) {
   const date = new Date(dateString);
   return date instanceof Date && !isNaN(date.getTime());
-}
-
-/**
- * Validate URL format.
- * @param {string} urlString
- * @returns {boolean}
- */
-export function isValidUrl(urlString) {
-  try {
-    new URL(urlString);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**

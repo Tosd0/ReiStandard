@@ -130,7 +130,7 @@ export const COLUMNS_SQL = `
 // Update methods build a dynamic SET clause from object keys. Callers pass only
 // hardcoded column names today, but enforcing a whitelist keeps a future caller
 // from ever turning a caller-supplied key into interpolated SQL.
-// (The D1 adapter enforces the same list with its own in-file copy.)
+// 列名不分方言：pg / neon / D1 三个适配器 import 的都是这一份，加列只改这里。
 export const UPDATABLE_COLUMNS = new Set([
   'user_id', 'uuid', 'encrypted_payload', 'message_type',
   'next_send_at', 'lease_until', 'retry_after', 'serialize_group',

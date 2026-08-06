@@ -69,24 +69,41 @@ export async function loadPushSubscription({ db, userId, userKey }) {
   return { subscription, updatedAt: row.updated_at ?? null };
 }
 
+/** 带稳定 `code` 属性的错误：消费方按 error.code 分支，不用字符串匹配 message。 */
+function codedError(code, message) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  return error;
+}
+
 /**
  * 投递前取订阅。取不到就抛——静默不发会让任务「成功」地什么都没做，用户
  * 只看到消息凭空消失。抛出去走既有的重试 / 标记逻辑，原因也会记进 payload
- * 的 lastError，`GET /messages` 上看得见。
+ * 的 lastError，`GET /messages` 上看得见。抛出的错误带稳定的 `code` 属性
+ * （'PUSH_SUBSCRIPTION_MISSING' / 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED'），
+ * 按类别分支请用它，别匹配 message 文案。
+ *
+ * `legacyFallback`：用户级存储里没有订阅时的兜底（升级前创建的任务把订阅
+ * 冻结在自己的 payload 里，这份订阅仍然有效）。存储里有订阅时永远用存储的
+ * 那份——它是用户最近一次登记的。
  *
  * @param {Object} args
  * @param {import('../adapters/interface.js').DbAdapter} args.db
  * @param {string} args.userId
  * @param {string} args.userKey
+ * @param {unknown} [args.legacyFallback] - 旧任务 payload 里内嵌的订阅（可选）
  * @returns {Promise<Object>} 明文订阅对象
  */
-export async function resolvePushSubscription({ db, userId, userKey }) {
+export async function resolvePushSubscription({ db, userId, userKey, legacyFallback = null }) {
+  const fallback = isPushSubscriptionShape(legacyFallback) ? legacyFallback : null;
   if (!supportsPushSubscriptionStore(db)) {
-    throw new Error('PUSH_SUBSCRIPTION_STORE_UNSUPPORTED: 当前数据库适配器不支持用户级推送订阅存储');
+    if (fallback) return fallback;
+    throw codedError('PUSH_SUBSCRIPTION_STORE_UNSUPPORTED', '当前数据库适配器不支持用户级推送订阅存储');
   }
   const stored = await loadPushSubscription({ db, userId, userKey });
   if (!stored) {
-    throw new Error('PUSH_SUBSCRIPTION_MISSING: 该用户还没有登记推送订阅（PUT /push-subscription）');
+    if (fallback) return fallback;
+    throw codedError('PUSH_SUBSCRIPTION_MISSING', '该用户还没有登记推送订阅（PUT /push-subscription）');
   }
   return stored.subscription;
 }

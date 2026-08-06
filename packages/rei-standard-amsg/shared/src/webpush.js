@@ -26,6 +26,7 @@ import {
   concatBytes,
   base64UrlToBytes,
   utf8,
+  utf8Decode,
   bytesToBase64Url,
   jsonToBase64Url,
   randomBytes,
@@ -329,7 +330,7 @@ export async function verifyVapidJwt(jwt, publicKey) {
   );
   if (!ok) throw new Error('VAPID JWT: signature mismatch');
 
-  const payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(p)));
+  const payload = JSON.parse(utf8Decode(base64UrlToBytes(p)));
   if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
     throw new Error('VAPID JWT: expired');
   }

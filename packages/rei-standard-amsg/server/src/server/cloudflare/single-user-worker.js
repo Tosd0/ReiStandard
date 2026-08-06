@@ -80,9 +80,19 @@ const CORS_ALLOW_METHODS = 'GET, POST, PUT, DELETE, OPTIONS';
  */
 function corsHeadersFor(cors, requestOrigin) {
   if (!cors || cors.origin == null) return null;
-  const allowOrigin = typeof cors.origin === 'function'
-    ? cors.origin(requestOrigin) || null
-    : cors.origin; // e.g. '*' or a fixed origin like 'https://app.example.com'
+  let allowOrigin;
+  if (typeof cors.origin === 'function') {
+    // 宿主的回调抛错不能让整个请求逃出错误边界（这个函数在 fetch() 的
+    // try 之外也会被调）：按「不放行这个 origin」处理，响应照常走 JSON 包体。
+    try {
+      allowOrigin = cors.origin(requestOrigin) || null;
+    } catch (error) {
+      console.warn('[amsg single-user] cors.origin 回调抛错，按不放行处理:', error && error.message);
+      allowOrigin = null;
+    }
+  } else {
+    allowOrigin = cors.origin; // e.g. '*' or a fixed origin like 'https://app.example.com'
+  }
   if (!allowOrigin) return null;
 
   const headers = {
@@ -216,7 +226,15 @@ export function createSingleUserCloudflareWorker(buildConfig) {
   }
 
   async function scheduled(event, env /* , ctx */) {
-    const cfg = await resolveConfig(env);
+    // fetch() 对 buildConfig 失败有降级路径，cron 这边同样不该以未捕获异常
+    // 崩掉：记日志跳过这一跳，行保持 pending，配置修好后下一跳照常。
+    let cfg;
+    try {
+      cfg = await resolveConfig(env);
+    } catch (error) {
+      console.error('[amsg single-user] scheduled(): config build failed; skipping tick:', error && error.message);
+      return;
+    }
     const vapid = cfg.vapid || {};
     if (!cfg.webpush || !vapid.email || !vapid.publicKey || !vapid.privateKey) {
       console.error('[amsg single-user] scheduled(): VAPID/webpush not configured; skipping tick');
@@ -257,7 +275,9 @@ export function createSingleUserCloudflareWorker(buildConfig) {
         // 跨跳也算（见 lib/run-tick.js）。不配 = 全并发，与以前一致。
         serializeBy: cfg.serializeBy,
         // 任务占位租期（默认 10 分钟，随 totalTimeoutMs 抬高）。
-        claimLeaseMs: cfg.claimLeaseMs
+        claimLeaseMs: cfg.claimLeaseMs,
+        // 补发新鲜度阈值（默认 60 分钟；见 lib/run-tick.js 的 STALE_AFTER_MS）。
+        staleAfterMs: cfg.staleAfterMs
       });
     } catch (error) {
       console.error('[amsg single-user] scheduled(): tick failed:', error && error.message);
