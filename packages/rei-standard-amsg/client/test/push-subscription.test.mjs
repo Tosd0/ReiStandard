@@ -113,3 +113,124 @@ test('deletePushSubscription() DELETE /push-subscription', async () => {
   assert.equal(captured[0].method, 'DELETE');
   assert.equal(result.data.deleted, true);
 });
+
+// ─── subscribePush()：僵尸 endpoint 检测 ─────────────────────────
+
+const VAPID = 'BFakeKeyForTests'.padEnd(88, 'A'); // base64url，内容不重要
+const ZOMBIE_ENDPOINT = 'https://permanently-removed.invalid/fEEr7Xz9';
+const LIVE_ENDPOINT = 'https://fcm.googleapis.com/fcm/send/abc123';
+
+/**
+ * 造一个 registration.pushManager，按 endpoints 顺序吐订阅。
+ * `endpoints` 里放 Error 就表示这次 subscribe() 抛错。
+ */
+function makeRegistration(endpoints) {
+  const calls = { subscribe: [], unsubscribed: [] };
+  let i = 0;
+  return {
+    calls,
+    pushManager: {
+      subscribe: async (opts) => {
+        calls.subscribe.push(opts);
+        const next = endpoints[i++];
+        if (next instanceof Error) throw next;
+        return {
+          endpoint: next,
+          keys: { p256dh: 'k', auth: 'a' },
+          unsubscribe: async () => { calls.unsubscribed.push(next); return true; }
+        };
+      }
+    }
+  };
+}
+
+/** 换掉退避等待，不让测试真的睡 800/1600ms；返回记下的等待时长。 */
+function stubSleep(client) {
+  const waits = [];
+  client._pushSubscribeSleep = (ms) => { waits.push(ms); return Promise.resolve(); };
+  return waits;
+}
+
+test('subscribePush() 第一次就拿到活 endpoint：只订一次，直接返回', async () => {
+  const client = await makeInitializedClient();
+  const waits = stubSleep(client);
+  const registration = makeRegistration([LIVE_ENDPOINT]);
+
+  const subscription = await client.subscribePush(VAPID, registration);
+
+  assert.equal(subscription.endpoint, LIVE_ENDPOINT);
+  assert.equal(registration.calls.subscribe.length, 1);
+  assert.equal(registration.calls.subscribe[0].userVisibleOnly, true);
+  assert.deepEqual(registration.calls.unsubscribed, []);
+  assert.deepEqual(waits, []);
+});
+
+test('subscribePush() 首次僵尸、二次活的：返回活的那个，僵尸那条被退订', async () => {
+  const client = await makeInitializedClient();
+  const waits = stubSleep(client);
+  const registration = makeRegistration([ZOMBIE_ENDPOINT, LIVE_ENDPOINT]);
+
+  const subscription = await client.subscribePush(VAPID, registration);
+
+  assert.equal(subscription.endpoint, LIVE_ENDPOINT);
+  assert.equal(registration.calls.subscribe.length, 2);
+  assert.deepEqual(registration.calls.unsubscribed, [ZOMBIE_ENDPOINT]);
+  assert.deepEqual(waits, [800]);
+});
+
+test('subscribePush() 三次全僵尸：抛 PUSH_ENDPOINT_ZOMBIE，中间按 800/1600 退避', async () => {
+  const client = await makeInitializedClient();
+  const waits = stubSleep(client);
+  const registration = makeRegistration([ZOMBIE_ENDPOINT, ZOMBIE_ENDPOINT, ZOMBIE_ENDPOINT]);
+
+  await assert.rejects(
+    () => client.subscribePush(VAPID, registration),
+    (err) => {
+      assert.equal(err.code, 'PUSH_ENDPOINT_ZOMBIE');
+      assert.equal(err.details.attempts, 3);
+      assert.equal(err.details.endpoint, ZOMBIE_ENDPOINT);
+      return true;
+    }
+  );
+
+  assert.equal(registration.calls.subscribe.length, 3);
+  assert.equal(registration.calls.unsubscribed.length, 3);
+  // 最后一次失败后不再等待。
+  assert.deepEqual(waits, [800, 1600]);
+});
+
+test('subscribePush() 僵尸那条退订失败也照样重试', async () => {
+  const client = await makeInitializedClient();
+  stubSleep(client);
+  const registration = makeRegistration([ZOMBIE_ENDPOINT, LIVE_ENDPOINT]);
+  const realSubscribe = registration.pushManager.subscribe;
+  registration.pushManager.subscribe = async (opts) => {
+    const sub = await realSubscribe(opts);
+    sub.unsubscribe = async () => { throw new Error('unsubscribe blew up'); };
+    return sub;
+  };
+
+  const subscription = await client.subscribePush(VAPID, registration);
+  assert.equal(subscription.endpoint, LIVE_ENDPOINT);
+  assert.equal(registration.calls.subscribe.length, 2);
+});
+
+test('subscribePush() 里 subscribe() 自己抛错时原样往外抛，不重试', async () => {
+  const client = await makeInitializedClient();
+  const waits = stubSleep(client);
+  const denied = new Error('Registration failed - permission denied');
+  denied.name = 'NotAllowedError';
+  const registration = makeRegistration([denied, LIVE_ENDPOINT]);
+
+  await assert.rejects(
+    () => client.subscribePush(VAPID, registration),
+    (err) => {
+      assert.equal(err, denied);
+      assert.equal(err.code, undefined);
+      return true;
+    }
+  );
+
+  assert.equal(registration.calls.subscribe.length, 1);
+  assert.deepEqual(waits, []);
+});
