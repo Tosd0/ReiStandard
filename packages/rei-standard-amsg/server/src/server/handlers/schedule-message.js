@@ -104,13 +104,19 @@ export function createScheduleMessageHandler(ctx) {
 
     const taskUuid = payload.uuid || randomUUID();
 
+    // immediate：不排未来，next_send_at = 现在，下一跳 cron（最多一分钟后）
+    // 直接捞走。客户端不用再为「严格在未来」预留提前量。
+    const effectiveSendTime = payload.immediate === true
+      ? new Date().toISOString()
+      : payload.firstSendTime;
+
     const fullTaskData = {
       contactName: payload.contactName,
       avatarUrl: payload.avatarUrl || null,
       messageType: payload.messageType,
       messageSubtype: payload.messageSubtype || 'chat',
       userMessage: payload.userMessage || null,
-      firstSendTime: payload.firstSendTime,
+      firstSendTime: effectiveSendTime,
       recurrenceType: payload.recurrenceType || 'none',
       // daily / weekly 按这个时区的墙钟推进（同一钟点，日期 +1 天 / +7 天）。
       // 不传 → null → 按 UTC 推进。
@@ -129,6 +135,9 @@ export function createScheduleMessageHandler(ctx) {
       // the message processor to chunk LLM output into individual pushes.
       // null → processor falls back to the default /([。！？!?]+)/ regex.
       splitPattern: payload.splitPattern ?? null,
+      // 透传给 LLM 中转的非标准参数（thinking 之类），buildLlmRequestBody 会
+      // 把它展开进请求体（核心字段优先）。
+      llmExtraBody: payload.llmExtraBody ?? null,
       metadata: payload.metadata || {}
     };
 
@@ -174,15 +183,29 @@ export function createScheduleMessageHandler(ctx) {
     }
 
     // Insert into database
+    const createParams = {
+      user_id: userId,
+      uuid: taskUuid,
+      encrypted_payload: encryptedPayload,
+      next_send_at: effectiveSendTime,
+      message_type: payload.messageType
+    };
+    // supersede：建这条的同时取消旧的那条。适配器支持原子形态（删旧 + 建新落
+    // 在同一事务，见 D1 的 createTaskSuperseding）就走它；不支持的退回「先删
+    // 再建」两步——语义相同，只是失去原子性和那次省下的往返。
+    const supersedesUuid = payload.supersedesUuid || null;
+    let superseded = false;
     let dbResult;
     try {
-      dbResult = await db.createTask({
-        user_id: userId,
-        uuid: taskUuid,
-        encrypted_payload: encryptedPayload,
-        next_send_at: payload.firstSendTime,
-        message_type: payload.messageType
-      });
+      if (supersedesUuid && typeof db.createTaskSuperseding === 'function') {
+        dbResult = await db.createTaskSuperseding(createParams, supersedesUuid);
+        superseded = !!(dbResult && dbResult.superseded);
+      } else {
+        if (supersedesUuid) {
+          superseded = await db.deleteTaskByUuid(supersedesUuid, userId);
+        }
+        dbResult = await db.createTask(createParams);
+      }
     } catch (error) {
       if (isUniqueViolation(error)) {
         return {
@@ -227,7 +250,8 @@ export function createScheduleMessageHandler(ctx) {
               messagesSent: sendResult.messagesSent,
               sentAt: new Date().toISOString(),
               status: 'sent',
-              retriesUsed: sendResult.retriesUsed || 0
+              retriesUsed: sendResult.retriesUsed || 0,
+              ...(supersedesUuid ? { superseded } : {})
             }
           }
         };
@@ -247,7 +271,10 @@ export function createScheduleMessageHandler(ctx) {
           contactName: payload.contactName,
           nextSendAt: dbResult.next_send_at,
           status: dbResult.status,
-          createdAt: dbResult.created_at
+          createdAt: dbResult.created_at,
+          // supersede 的结果：true = 旧行确实被取消了；false = 旧行本就不存在
+          // （已发出 / 已删除），新任务照常建立。
+          ...(supersedesUuid ? { superseded } : {})
         }
       }
     };

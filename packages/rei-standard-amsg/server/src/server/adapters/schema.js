@@ -26,6 +26,7 @@ export const TABLE_SQL = `
     serialize_group VARCHAR(64),
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     retry_count INTEGER DEFAULT 0,
+    last_error TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
   )
@@ -51,6 +52,14 @@ export const MIGRATIONS = [
     name: 'add_serialize_group',
     sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS serialize_group VARCHAR(64)',
     description: 'Serialization group for runScheduledTick serializeBy (2.6.0)'
+  },
+  {
+    name: 'add_last_error',
+    // 上一次投递失败的脱敏摘要（JSON：{ at, occurrence, reason }）。payload 里
+    // 的 lastError 是密文里的完整记录，这一列是它的明文出口——payload 本身
+    // 解密失败时也写得进去，GET /message 对已失败的行也读得出来。
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS last_error TEXT',
+    description: 'Sanitized last delivery-failure summary (2.6.0)'
   }
 ];
 
@@ -134,5 +143,5 @@ export const COLUMNS_SQL = `
 export const UPDATABLE_COLUMNS = new Set([
   'user_id', 'uuid', 'encrypted_payload', 'message_type',
   'next_send_at', 'lease_until', 'retry_after', 'serialize_group',
-  'status', 'retry_count', 'created_at', 'updated_at'
+  'status', 'retry_count', 'last_error', 'created_at', 'updated_at'
 ]);

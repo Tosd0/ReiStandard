@@ -50,6 +50,7 @@ import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
 import { createClientStateHandler } from './handlers/client-state.js';
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createCapabilitiesHandler } from './handlers/capabilities.js';
+import { createOutboxHandler } from './handlers/outbox.js';
 
 export function createSingleUserServer(config) {
   if (!config || !config.db) throw new Error('[amsg-server single-user] config.db is required');
@@ -99,7 +100,8 @@ export function createSingleUserServer(config) {
       vapidPublicKey: createVapidPublicKeyHandler(ctx),
       clientState: createClientStateHandler(ctx),
       pushSubscription: createPushSubscriptionHandler(ctx),
-      capabilities: createCapabilitiesHandler(ctx)
+      capabilities: createCapabilitiesHandler(ctx),
+      outbox: createOutboxHandler(ctx)
     }
   };
 }

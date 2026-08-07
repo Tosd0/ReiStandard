@@ -12,6 +12,9 @@
  * 不区分是谁写的。
  *
  *   PUT    /client-state                 batch upsert, last-write-wins on updatedAt
+ *                                        （entry 可带 version / builtAt 护栏，按内容
+ *                                        新旧而非请求先后比较；被拦下的 key 在
+ *                                        data.skippedEntries 里逐条回报）
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
  *   DELETE /client-state                 wipe every entry of this user
  *
@@ -93,6 +96,13 @@ function validateEntry(entry, index, maxValueBytes) {
   if (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0) {
     return rejectEntry(entry, index, 'INVALID_STATE_UPDATED_AT', `entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
   }
+  // 条件写护栏（可选）：`version` 与 `builtAt` 是同一个东西的两个名字——内容
+  // 本身的构建时刻（或单调递增版本号）。带了它，last-write-wins 比较用它而
+  // 不是 updatedAt：慢网下晚到的旧包（builtAt 更小）盖不掉先到的新包。
+  const guard = entry.version ?? entry.builtAt;
+  if (guard !== undefined && (!Number.isInteger(guard) || guard <= 0)) {
+    return rejectEntry(entry, index, 'INVALID_STATE_VERSION', `entries[${index}].version / builtAt 必须是正整数（毫秒时间戳或单调递增版本号）`);
+  }
   return null;
 }
 
@@ -143,7 +153,14 @@ export function createClientStateHandler(ctx) {
     const rejected = [];
     for (let i = 0; i < entries.length; i++) {
       const rejection = validateEntry(entries[i], i, maxValueBytes);
-      if (rejection) rejected.push(rejection); else accepted.push(entries[i]);
+      if (rejection) {
+        rejected.push(rejection);
+      } else {
+        const entry = entries[i];
+        // builtAt 归一成 version（两个名字同一个语义，见 validateEntry）。
+        const guard = entry.version ?? entry.builtAt;
+        accepted.push(guard !== undefined ? { ...entry, version: guard } : entry);
+      }
     }
 
     if (typeof db.upsertClientState !== 'function') {
@@ -152,9 +169,12 @@ export function createClientStateHandler(ctx) {
 
     // 落库（加密 + 大值分块 + 旧切片清理）与 hook 的 ctx.writeState() 共用
     // lib/client-state-store.js。这条路径只写不删，所以 deleted 恒为 0。
-    const { upserted, skipped } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
+    const { upserted, skipped, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
 
     const data = { upserted, skipped };
+    // 被 last-write-wins（含 version 护栏）拦下的 key 逐条回报：带护栏的写入
+    // 方要靠它区分「写进去了」和「库里已有更新的数据、这次被忽略」。
+    if (skippedEntries.length > 0) data.skippedEntries = skippedEntries;
     if (rejected.length > 0) data.rejected = rejected;
     return { status: 200, body: { success: true, data } };
   }

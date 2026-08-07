@@ -45,6 +45,13 @@ export function stateValueBytes(value) {
  * 两者都受同一套 last-write-wins 约束：`updatedAt` 比库里已有值旧的写入
  * （或删除）不生效，陈旧批次盖不掉新数据。
  *
+ * 条件写护栏：条目可带可选的 `version`（毫秒时间戳或单调递增整数）。带了它，
+ * 比较用的就是这个值而不是 `updatedAt`——同一个 key 有多个写入方时（例如
+ * fire_pack 由常规 flush 和 instant-chat 两条路径写），谁的**内容**新谁赢，
+ * 而不是谁的请求后到谁赢：慢网下晚到的旧包带着旧 `version`，盖不掉先到的新
+ * 包。护栏值落在行的 updated_at 列上（client_state 的比较列本来就是它），
+ * 没带 `version` 的写入照旧按 `updatedAt` 比。
+ *
  * 条目本身的合法性（namespace / key 字符、value 大小）由调用方先校验好：
  * HTTP handler 逐条拒绝并把原因回给客户端，`writeState()` 直接抛错给 hook。
  *
@@ -52,23 +59,29 @@ export function stateValueBytes(value) {
  * @param {{ upsertClientState: Function }} args.db
  * @param {string} args.userId
  * @param {CryptoKey|string} args.userKey - 该用户的存储密钥（value 用它加密）
- * @param {Array<{ namespace: string, key: string, value: string|null, updatedAt: number }>} args.entries
- * @returns {Promise<{ upserted: number, skipped: number, deleted: number }>}
+ * @param {Array<{ namespace: string, key: string, value: string|null, updatedAt: number, version?: number }>} args.entries
+ *   `version`（可选）：条件写护栏值，见文件头。带了它，这条的 last-write-wins
+ *   比较用它（写进行的 updated_at 列）；没带照旧用 `updatedAt`。
+ * @returns {Promise<{ upserted: number, skipped: number, deleted: number, skippedEntries: Array<{ namespace: string, key: string }> }>}
  *   `upserted` / `skipped` 按逻辑条目计（切片行不计）；`deleted` 是请求删除的
- *   key 数，不代表这些 key 原本一定存在。
+ *   key 数，不代表这些 key 原本一定存在。`skippedEntries` 逐条列出被
+ *   last-write-wins 拦下的 key（适配器不回 outcomes 时为空数组——分不清是哪条）。
  */
 export async function writeClientStateEntries({ db, userId, userKey, entries }) {
   const physicalRows = [];
   const cleanups = [];
   const rootRowIndexes = [];
+  const rootRowEntries = [];
   let deleted = 0;
 
   for (const entry of entries) {
+    // 条件写护栏：带 version 的条目按 version 比新旧（见文件头）。
+    const guardAt = Number.isInteger(entry.version) && entry.version > 0 ? entry.version : entry.updatedAt;
     // 不管写还是删，都先清掉这个 key 上一次写入留下的切片行（同一批里先删后写）。
     cleanups.push({
       namespace: chunkNamespaceFor(entry.namespace),
       keyPrefix: chunkKeyPrefixFor(entry.key),
-      updatedAt: entry.updatedAt,
+      updatedAt: guardAt,
     });
 
     if (entry.value === null) {
@@ -76,19 +89,20 @@ export async function writeClientStateEntries({ db, userId, userKey, entries }) 
       cleanups.push({
         namespace: entry.namespace,
         key: entry.key,
-        updatedAt: entry.updatedAt,
+        updatedAt: guardAt,
       });
       deleted++;
       continue;
     }
 
     rootRowIndexes.push(physicalRows.length);
+    rootRowEntries.push(entry);
     if (stateValueBytes(entry.value) <= STATE_CHUNK_SLICE_BYTES) {
       physicalRows.push({
         namespace: entry.namespace,
         key: entry.key,
         value: await encryptForStorage(entry.value, userKey),
-        updatedAt: entry.updatedAt,
+        updatedAt: guardAt,
       });
     } else {
       const slices = splitStateValue(entry.value);
@@ -96,7 +110,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries }) 
         namespace: entry.namespace,
         key: entry.key,
         value: buildChunkedRootValue(slices.length),
-        updatedAt: entry.updatedAt,
+        updatedAt: guardAt,
       });
       const encryptedSlices = await Promise.all(slices.map((slice) => encryptForStorage(slice, userKey)));
       for (let c = 0; c < encryptedSlices.length; c++) {
@@ -104,28 +118,37 @@ export async function writeClientStateEntries({ db, userId, userKey, entries }) 
           namespace: chunkNamespaceFor(entry.namespace),
           key: chunkKeyFor(entry.key, c),
           value: encryptedSlices[c],
-          updatedAt: entry.updatedAt,
+          updatedAt: guardAt,
         });
       }
     }
   }
 
   if (physicalRows.length === 0 && cleanups.length === 0) {
-    return { upserted: 0, skipped: 0, deleted: 0 };
+    return { upserted: 0, skipped: 0, deleted: 0, skippedEntries: [] };
   }
 
   const result = await db.upsertClientState(userId, physicalRows, cleanups);
   let upserted = 0;
   let skipped = 0;
+  const skippedEntries = [];
   if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
     // 逻辑计数：一条条目的 upserted/skipped 看它的根行，切片行不计数。
-    for (const rootIndex of rootRowIndexes) {
-      if (result.outcomes[rootIndex]) upserted++; else skipped++;
+    for (let i = 0; i < rootRowIndexes.length; i++) {
+      if (result.outcomes[rootRowIndexes[i]]) {
+        upserted++;
+      } else {
+        skipped++;
+        // 被拦下的 key 逐条回报：写入方（尤其带 version 护栏的）要靠它知道
+        // 「这个 key 库里已有更新的数据」，而不是只拿到一个总数去猜。
+        const entry = rootRowEntries[i];
+        skippedEntries.push({ namespace: entry.namespace, key: entry.key });
+      }
     }
   } else {
     // 自定义 adapter 只回老形状 { upserted, skipped } 时按物理行计数兜底。
     upserted = result.upserted;
     skipped = result.skipped;
   }
-  return { upserted, skipped, deleted };
+  return { upserted, skipped, deleted, skippedEntries };
 }

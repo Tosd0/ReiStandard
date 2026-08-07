@@ -93,6 +93,43 @@ export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, s
   return false;
 }
 
+/**
+ * 投递期间的租约续期（run-tick 的心跳用）。只在行仍是 pending 且确实持有
+ * 租约（lease_until 非空）时生效——收尾把租约放掉之后，迟到的心跳不会把
+ * 租约复活。
+ *
+ * @param {PgQuery} query
+ * @param {number} taskId
+ * @param {string|Date} leaseUntil - 新的租期末尾
+ * @returns {Promise<boolean>} true = 续上了
+ */
+export async function renewTaskLease(query, taskId, leaseUntil) {
+  const rows = await query(
+    `UPDATE scheduled_messages SET lease_until = $1
+      WHERE id = $2 AND status = 'pending' AND lease_until IS NOT NULL
+     RETURNING id`,
+    [leaseUntil, taskId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * 状态 + 失败摘要（GET /message 用它把「为什么失败」透给已失败的行）。
+ *
+ * @param {PgQuery} query
+ * @param {string} uuid
+ * @param {string} userId
+ * @returns {Promise<{ status: string, last_error: string|null }|null>}
+ */
+export async function getTaskStatusInfo(query, uuid, userId) {
+  const rows = await query(
+    'SELECT status, last_error FROM scheduled_messages WHERE uuid = $1 AND user_id = $2 LIMIT 1',
+    [uuid, userId]
+  );
+  if (rows.length === 0) return null;
+  return { status: rows[0].status, last_error: rows[0].last_error ?? null };
+}
+
 // ── push_subscriptions (user-level Web Push subscription) ──────────────
 
 /**

@@ -141,12 +141,45 @@ export function validateScheduleMessagePayload(payload) {
     return { valid: false, errorCode: 'INVALID_MESSAGE_TYPE', errorMessage: '消息类型无效', details: { providedType: payload.messageType, allowedTypes: ['fixed', 'prompted', 'auto', 'instant'] } };
   }
 
-  if (!payload.firstSendTime || !isValidISO8601(payload.firstSendTime)) {
-    return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间格式无效', details: { field: 'firstSendTime' } };
+  // immediate：这条任务不排未来，落库后由下一跳 cron（最多一分钟后）直接
+  // 触发。有了它，「马上发一条走 cron 链路的任务」不用再预留提前量凑
+  // firstSendTime——慢网/低端机把提前量吃光就会 400 的那类竞态从此不存在。
+  if (payload.immediate !== undefined && typeof payload.immediate !== 'boolean') {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'immediate 必须是布尔值', details: { invalidFields: ['immediate'] } };
+  }
+  const immediate = payload.immediate === true;
+  if (immediate && payload.messageType === 'instant') {
+    // instant 的语义本来就是「建行的那一刻就投递」，immediate 对它是重复修饰；
+    // 明确拒掉比静默接受好——接受了会让人以为两者组合有额外含义。
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: "messageType 'instant' 本就立即投递，不能再带 immediate", details: { invalidFields: ['immediate'] } };
   }
 
-  if (payload.firstSendTime && new Date(payload.firstSendTime) <= new Date()) {
-    return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间必须在未来', details: { field: 'firstSendTime', reason: 'must be in the future' } };
+  if (immediate) {
+    // immediate 时 firstSendTime 可省略（服务端取当前时刻）；传了只校验格式，
+    // 不再要求在未来——它只是客户端本地的「想发的时刻」，不参与排期。
+    if (payload.firstSendTime !== undefined && payload.firstSendTime !== null && !isValidISO8601(payload.firstSendTime)) {
+      return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间格式无效', details: { field: 'firstSendTime' } };
+    }
+  } else {
+    if (!payload.firstSendTime || !isValidISO8601(payload.firstSendTime)) {
+      return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间格式无效', details: { field: 'firstSendTime' } };
+    }
+
+    if (payload.firstSendTime && new Date(payload.firstSendTime) <= new Date()) {
+      return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间必须在未来', details: { field: 'firstSendTime', reason: 'must be in the future' } };
+    }
+  }
+
+  // supersedesUuid：建这条的同时取消旧的那条（同一用户）。与「先 DELETE 再
+  // POST」两次请求的差别在原子性：适配器支持时删旧建新落在同一事务里，不会
+  // 出现「旧的删了、新的没建成」的中间态，也省一次串行往返。
+  if (payload.supersedesUuid !== undefined && payload.supersedesUuid !== null) {
+    if (typeof payload.supersedesUuid !== 'string' || !isValidUUID(payload.supersedesUuid)) {
+      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'supersedesUuid 必须是合法 UUID', details: { invalidFields: ['supersedesUuid'] } };
+    }
+    if (payload.uuid && payload.supersedesUuid === payload.uuid) {
+      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'supersedesUuid 不能与本条任务的 uuid 相同', details: { invalidFields: ['supersedesUuid'] } };
+    }
   }
 
   // 推送订阅是用户级的一份（`PUT /push-subscription`），任务不携带它，到点
@@ -270,6 +303,16 @@ export function validateScheduleMessagePayload(payload) {
   const splitErr = validateSplitPattern(payload.splitPattern);
   if (splitErr) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: splitErr, details: { invalidFields: ['splitPattern'] } };
+  }
+
+  // 透传给 LLM 中转的非标准参数（thinking 之类）。只查形状（普通对象）——
+  // 里面的字段库不认识也不该认识，中转认不认是调用方与中转之间的契约。
+  if (
+    payload.llmExtraBody !== undefined &&
+    payload.llmExtraBody !== null &&
+    (typeof payload.llmExtraBody !== 'object' || Array.isArray(payload.llmExtraBody))
+  ) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'llmExtraBody 必须是普通对象', details: { invalidFields: ['llmExtraBody'] } };
   }
 
   return { valid: true };

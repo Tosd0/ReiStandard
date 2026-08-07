@@ -153,7 +153,29 @@ export async function createReiServer(config) {
 export { createAdapter } from './adapters/factory.js';
 export { createD1Adapter } from './adapters/d1.js';
 export { createSingleUserServer } from './single-user.js';
-export { runScheduledTick } from './lib/run-tick.js';
+export {
+  runScheduledTick,
+  // 单任务入口：宿主接 CF Queue 消费者（15 分钟预算）跑 fire 时用它，
+  // fetch 里只负责 enqueue。见 lib/run-tick.js。
+  runTask,
+  DEFAULT_CLAIM_LEASE_MS,
+  DEFAULT_LEASE_HEARTBEAT_MS,
+  DEFAULT_HEARTBEAT_LEASE_TTL_MS,
+  sanitizeErrorSummary,
+} from './lib/run-tick.js';
+// hook 侧标注「重试也好不了」的失败：run-tick 收到即直接终审处置，不进退避
+// 阶梯（见 lib/errors.js）。
+export { NonRetryableError, isNonRetryableError } from './lib/errors.js';
+// agentic 循环的默认预算——包装层要对齐自己的档位时 import 这一份，别各写各的。
+export {
+  DEFAULT_MAX_TOOL_ITERATIONS,
+  DEFAULT_TOTAL_TIMEOUT_MS,
+  DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE,
+  MIN_SCHEDULE_LEAD_MS,
+} from './lib/agentic-fire.js';
+// 单用户 worker 的 CORS 允许头/方法列表（外层再包路由的宿主 import 这一份，
+// 别手抄第二份）。
+export { CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS } from './cloudflare/single-user-worker.js';
 export {
   createWebCryptoWebPush,
   measurePushPayload,

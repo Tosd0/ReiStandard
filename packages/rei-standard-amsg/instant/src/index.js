@@ -21,7 +21,7 @@
  */
 
 import { validateInstantPayload, validateContinuePayload } from './validation.js';
-import { processInstantMessage, sendPushWithMaybeBlob, ensureStableMessageId } from './message-processor.js';
+import { processInstantMessage, sendPushWithMaybeBlob, ensureStableMessageId, DEFAULT_MAX_LOOP_ITERATIONS } from './message-processor.js';
 import { MESSAGE_TYPE, PUSH_SOURCE, buildErrorPush } from '@rei-standard/amsg-shared';
 import { HookError, PayloadTooLargeError, LlmCallError } from './errors.js';
 import {
@@ -204,7 +204,7 @@ export function createInstantHandler(options) {
   const blobStore = options.blobStore || null;
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
-    : 10;
+    : DEFAULT_MAX_LOOP_ITERATIONS;
   // Default true: reasoning emission "just works" out of the box for
   // most hook callers. The legacy path ignores this setting and
   // always auto-emits.
@@ -833,11 +833,16 @@ function buildCorsHeaders(cors) {
   const allowOrigin = (cors && typeof cors.allowOrigin === 'string' && cors.allowOrigin.trim())
     ? cors.allowOrigin.trim()
     : '*';
+  // 宿主在本 handler 外面再挂自己的路由（多带自定义头）时，用 allowHeaders
+  // 覆盖；不覆盖就是导出的 CORS_ALLOW_HEADERS 这一份，别在宿主里手抄第二份。
+  const allowHeaders = (cors && typeof cors.allowHeaders === 'string' && cors.allowHeaders.trim())
+    ? cors.allowHeaders.trim()
+    : CORS_ALLOW_HEADERS;
 
   const headers = {
     'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding',
+    'Access-Control-Allow-Headers': allowHeaders,
     'Access-Control-Max-Age': '86400',
   };
   if (allowOrigin !== '*') {
@@ -845,6 +850,12 @@ function buildCorsHeaders(cors) {
   }
   return headers;
 }
+
+/**
+ * 本 handler 的 CORS 允许头列表。导出给「在外面自己答 OPTIONS / 包了一层
+ * 路由」的宿主 import——上游和宿主各写各的列表，漂移的那天 preflight 就挂。
+ */
+export const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding';
 
 function jsonResponse(status, body, extraHeaders) {
   return new Response(JSON.stringify(body), {
@@ -861,6 +872,41 @@ function isVapidConfigValid(vapid) {
   // Don't fully parse here — sendWebPush will throw a precise error on bad
   // key shape. Just ensure none of the three fields are blank.
   return true;
+}
+
+/**
+ * X-Client-Token 的独立校验口（导出）。
+ *
+ * createInstantHandler 内部走的就是这一套（presence 检查 + 常时比较）。导出
+ * 是给「在同一个 worker 里挂自己路由」的宿主用的：那些路由的鉴权语义应该和
+ * 本 handler 完全一致，宿主此前只能照抄内部实现——抄的那份不会跟着上游修。
+ *
+ * @param {Request} request
+ * @param {string} expectedToken - 部署配置里的共享密钥（AMSG_CLIENT_TOKEN）
+ * @returns {{ ok: true } | { ok: false, status: 401, body: Object }}
+ *   ok=false 时 body 就是本 handler 401 时的响应体，宿主直接
+ *   `new Response(JSON.stringify(body), { status })` 即可。
+ *   expectedToken 为空串 = 部署没配共享密钥，一律放行（与 handler 行为一致）。
+ */
+export function validateClientAuth(request, expectedToken) {
+  const expected = expectedToken ? String(expectedToken) : '';
+  if (!expected) return { ok: true };
+  const received = getHeader(request, 'x-client-token');
+  if (!received) {
+    return {
+      ok: false,
+      status: 401,
+      body: { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' } }
+    };
+  }
+  if (!timingSafeEqualBytes(utf8(received), utf8(expected))) {
+    return {
+      ok: false,
+      status: 401,
+      body: { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' } }
+    };
+  }
+  return { ok: true };
 }
 
 function verifyClientToken(request, expectedBytes, respond) {
@@ -954,6 +1000,7 @@ export {
   normalizeAiApiUrl,
   sendPushWithMaybeBlob,
   readReasoningContent,
+  DEFAULT_MAX_LOOP_ITERATIONS,
 } from './message-processor.js';
 export { buildMultipartPushPayloads } from './multipart.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';

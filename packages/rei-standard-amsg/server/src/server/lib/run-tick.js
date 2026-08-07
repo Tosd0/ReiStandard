@@ -18,10 +18,15 @@
  * （见下）会把一条闲着的任务当成「这个分组忙着」，同组别的任务白等一轮退避。
  *
  * 领了任务的 tick 中途没了（Worker 被回收之类）就没人来放租约，这条任务要
- * 等租约到期才会被接手——这是租约本身的代价，把租期设得比最慢的一次投递长
- * 一点就行。
+ * 等租约到期才会被接手。为了把这个空窗压到分钟级而不是租期级，投递期间按
+ * 心跳滚动续租：占位时只写一小段租约（默认 90 秒），之后每隔一个心跳（默认
+ * 30 秒）把租约再推到 now + 90s。isolate 活着，租约永远够用；isolate 死了，
+ * 租约在 ~90 秒内到期，下一跳 cron 就能接手——不用再为最慢的投递把租期焊死
+ * 成十几分钟。适配器没实现 renewTaskLease（自定义适配器）、或宿主把
+ * ctx.leaseHeartbeatMs 设成 0 时，退回一次性长租约的老行为
+ * （claimLeaseMs，默认 10 分钟）。
  *
- * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
+ * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, leaseHeartbeatMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
  *   ctx.serializeBy?.(task)：可选的分组串行。返回一个分组标识（同一个角色、
  *   同一份台账……宿主自己定义），同一分组的任务同时只放行一条；返回 null /
  *   空串 / 不配这个函数 = 这条任务不参与串行，行为与以前完全一致。参数是与
@@ -39,19 +44,30 @@
  */
 
 import { hmacSha256, bytesToBase64Url, utf8 } from './webcrypto-utils.js';
+import { sanitizeErrorSummary } from './errors.js';
 import { deriveUserEncryptionKey, decryptFromStorage, encryptForStorage } from './encryption.js';
 import { processSingleMessage } from './message-processor.js';
 import { buildHookTask } from './agentic-fire.js';
 import { createStateAccessors } from './state-accessors.js';
 import { nextFutureOccurrence, planNextOccurrence } from './recurrence.js';
 
-// 占位租期：要盖住最慢的一次投递。老链路单次 LLM 调用上限 300s，agentic 链路
-// 整链默认 240s，再留出推送节奏的余量。
+// 占位租期（一次性长租约的老行为）：要盖住最慢的一次投递。老链路单次 LLM
+// 调用上限 300s，agentic 链路整链默认 240s，再留出推送节奏的余量。只在心跳
+// 续租不可用（适配器没实现 renewTaskLease，或 ctx.leaseHeartbeatMs = 0）时
+// 生效——心跳可用时租约是滚动的短租约，见 DEFAULT_LEASE_HEARTBEAT_MS。
 export const DEFAULT_CLAIM_LEASE_MS = 10 * 60 * 1000;
 // 宿主把 totalTimeoutMs 调大时租期跟着抬，别让下一跳在投递还没跑完时就把行
 // 捞回去。（onBeforeFire 里按次放宽的预算这里看不到，那种情况请显式设
 // ctx.claimLeaseMs。）
 const CLAIM_LEASE_MARGIN_MS = 2 * 60 * 1000;
+
+// 心跳续租：投递期间每隔这么久把租约推到 now + DEFAULT_HEARTBEAT_LEASE_TTL_MS。
+// isolate 被平台回收（fetch 的 waitUntil 预算耗尽之类）后没人再续，租约在
+// ~90 秒内到期，任务被下一跳接手——用户不用盯着「正在输入…」等一个十分钟的
+// 死租约走完。宿主可用 ctx.leaseHeartbeatMs 覆盖心跳间隔（0 = 关掉心跳，退
+// 回一次性长租约）。
+export const DEFAULT_LEASE_HEARTBEAT_MS = 30 * 1000;
+export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 
 // 补发新鲜度：错过名义触发时刻超过这个时长的任务不再照常补发。服务停摆几天
 // 恢复后，一次性任务不该把攒了几天的旧话一口气倒出来，循环任务更不该每分钟
@@ -92,6 +108,10 @@ function positiveNumber(value) {
   return (typeof value === 'number' && Number.isFinite(value) && value > 0) ? value : 0;
 }
 
+// 脱敏实现住在 lib/errors.js（message-processor 也要用，而它已经被本模块
+// import——放这边会成环）。此处转口导出，公开出口不变。
+export { sanitizeErrorSummary };
+
 function resolveClaimLeaseMs(ctx) {
   return positiveNumber(ctx.claimLeaseMs)
     || Math.max(DEFAULT_CLAIM_LEASE_MS, positiveNumber(ctx.totalTimeoutMs) + CLAIM_LEASE_MARGIN_MS);
@@ -115,14 +135,78 @@ export async function deriveSerializeGroup(userKey, rawKey) {
 }
 
 export async function runScheduledTick(ctx) {
+  const tasks = await ctx.db.getPendingTasks(50);
+  const summary = await deliverTasks(ctx, tasks);
+  await ctx.db.cleanupOldTasks(7);
+  // outbox 的顺手清理（适配器支持才做）：已 ack 的留 7 天，未 ack 的留 28 天
+  // （Web Push 的 TTL 上限四周，比它更老的推送客户端也永远收不到了）。
+  if (typeof ctx.db.cleanupOutbox === 'function') {
+    try {
+      await ctx.db.cleanupOutbox({
+        ackedBeforeMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+        allBeforeMs: Date.now() - 28 * 24 * 60 * 60 * 1000,
+      });
+    } catch (error) {
+      console.warn('[amsg-server] cleanupOutbox 失败（已忽略）:', error && error.message);
+    }
+  }
+  return summary;
+}
+
+/**
+ * 只跑一条任务的官方入口，给「fetch 里只来得及 enqueue、真正的 fire 交给
+ * CF Queue 消费者（15 分钟预算）跑」这类宿主用——不用再依赖 cron 恰好捞到。
+ *
+ * 与 cron tick 走完全同一条投递链：占位（含心跳续租）、过期守卫、分组串行
+ * （单任务场景下退化为占位时的跨 tick 分组门）、失败重试/终态、hook 全套。
+ * 行没到点（next_send_at 在未来）或正处在退避窗口（retry_after 未到点）时不
+ * 跑——这个入口只是换了个触发器，不是绕过排期的后门。
+ *
+ * @param {Object} ctx - 与 runScheduledTick 同一份 ctx
+ * @param {string} uuid - 任务 uuid（pending 行）
+ * @returns {Promise<{ ran: false, reason: 'not_found'|'not_due'|'retry_pending', nextSendAt?: string, retryAfter?: string }
+ *   | { ran: true, summary: Object }>} summary 与 runScheduledTick 的返回同构
+ *   （totalTasks 恒为 1）；任务被别的执行者占着时体现在 summary.details.claimSkippedTasks。
+ */
+export async function runTask(ctx, uuid) {
+  if (typeof uuid !== 'string' || !uuid.trim()) {
+    throw new TypeError('runTask(ctx, uuid) requires a non-empty uuid string');
+  }
+  const task = await ctx.db.getTaskByUuidOnly(uuid);
+  if (!task) return { ran: false, reason: 'not_found' };
+  const dueMs = Date.parse(task.next_send_at);
+  if (Number.isFinite(dueMs) && dueMs > Date.now()) {
+    return { ran: false, reason: 'not_due', nextSendAt: task.next_send_at };
+  }
+  const retryAfterMs = task.retry_after ? Date.parse(task.retry_after) : NaN;
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > Date.now()) {
+    return { ran: false, reason: 'retry_pending', retryAfter: task.retry_after };
+  }
+  return { ran: true, summary: await deliverTasks(ctx, [task]) };
+}
+
+/**
+ * 一批任务的投递主体（不含捞取与收尾清库）。runScheduledTick 喂它 cron 捞到
+ * 的到点任务，runTask 喂它单条——两个入口共享同一条投递链。
+ */
+async function deliverTasks(ctx, tasks) {
   const db = ctx.db;
   const masterKey = ctx.masterKey;
   const claimLeaseMs = resolveClaimLeaseMs(ctx);
   const staleAfterMs = resolveStaleAfterMs(ctx);
   const serializeBy = typeof ctx.serializeBy === 'function' ? ctx.serializeBy : null;
 
+  // 心跳续租可用吗？三个条件：适配器支持占位、支持续租、宿主没显式关掉。
+  const heartbeatMs = ctx.leaseHeartbeatMs === 0
+    ? 0
+    : (positiveNumber(ctx.leaseHeartbeatMs) || DEFAULT_LEASE_HEARTBEAT_MS);
+  const heartbeatEnabled = heartbeatMs > 0
+    && typeof db.claimTask === 'function'
+    && typeof db.renewTaskLease === 'function';
+  // 滚动租约的时长：至少盖住两个心跳（一次续租失败不至于立刻被抢走）。
+  const heartbeatLeaseTtlMs = Math.max(DEFAULT_HEARTBEAT_LEASE_TTL_MS, heartbeatMs * 2);
+
   const startTime = Date.now();
-  const tasks = await db.getPendingTasks(50);
 
   const MAX_CONCURRENT = 8;
   const results = {
@@ -148,8 +232,75 @@ export async function runScheduledTick(ctx) {
 
   async function claimForThisTick(task, serializeGroup) {
     if (!supportsClaim) return true;
-    const leaseUntil = new Date(Date.now() + claimLeaseMs).toISOString();
+    // 心跳可用时占位只写一小段滚动租约（isolate 死亡 → ~90s 内被接手）；
+    // 不可用时保持一次性长租约的老行为。
+    const leaseUntil = new Date(
+      Date.now() + (heartbeatEnabled ? heartbeatLeaseTtlMs : claimLeaseMs)
+    ).toISOString();
     return !!(await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup));
+  }
+
+  /**
+   * 投递期间的租约心跳：每 heartbeatMs 把 lease_until 推到 now + TTL。
+   * 返回停止函数——投递收尾（不管成败）必须调，不然定时器抱着 db 绑定活到
+   * 请求结束之后。续租失败只告警：租约还有一个 TTL 的余量，下一跳心跳再试；
+   * 真续不上，行为退化成「租约到期被接手」，正是心跳想要的兜底方向。
+   */
+  function startLeaseHeartbeat(task) {
+    if (!heartbeatEnabled) return () => {};
+    let stopped = false;
+    let timer = null;
+    const beat = async () => {
+      if (stopped) return;
+      try {
+        await db.renewTaskLease(task.id, new Date(Date.now() + heartbeatLeaseTtlMs).toISOString());
+      } catch (error) {
+        console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
+      }
+      if (!stopped) schedule();
+    };
+    const schedule = () => {
+      timer = setTimeout(beat, heartbeatMs);
+      // Node 下别让心跳定时器拖住进程退出；Workers 的 setTimeout 没有 unref。
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }
+
+  // last_error 列跟 lease 那几列一个待遇：跟着包内 schema 走的适配器（实现
+  // 了 claimTask 的）才写；自定义适配器多半没这一列，塞过去只会被它的白名单
+  // 拒掉。
+  const supportsLastError = supportsClaim;
+
+  /**
+   * updateTaskById 的包一层：升级后还没重跑 /init-tenant 的库缺 last_error
+   * 列时，退掉这个字段重写一次——状态推进（标 failed / 推进排期 / 放租约）
+   * 不能被一条锦上添花的记录挡住。
+   */
+  async function updateTaskWithLastError(taskId, fields) {
+    try {
+      return await db.updateTaskById(taskId, fields);
+    } catch (error) {
+      if (Object.prototype.hasOwnProperty.call(fields, 'last_error') && /last_error/i.test(error.message || '')) {
+        const { last_error: _omit, ...rest } = fields;
+        return db.updateTaskById(taskId, rest);
+      }
+      throw error;
+    }
+  }
+
+  /** 落进 last_error 列的 JSON（形状与 payload 里的 lastError 一致，reason 已脱敏）。 */
+  function lastErrorJson(task, reason, extra) {
+    return JSON.stringify({
+      at: new Date().toISOString(),
+      occurrence: task.next_send_at ?? null,
+      reason: sanitizeErrorSummary(reason),
+      ...(extra || {}),
+    });
   }
 
   /**
@@ -160,7 +311,7 @@ export async function runScheduledTick(ctx) {
    * 这两个字段了。
    */
   async function updateAndRelease(taskId, fields) {
-    return db.updateTaskById(
+    return updateTaskWithLastError(
       taskId,
       supportsClaim ? { ...fields, lease_until: null, retry_after: null } : fields
     );
@@ -261,13 +412,17 @@ export async function runScheduledTick(ctx) {
    * 久漂了。没有这两列的适配器（没实现 claimTask）退回老行为，把重试时刻写
    * 进 next_send_at。
    */
-  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey, errorCode = null) {
+  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey, errorCode = null, permanentFlag = false) {
     results.failedCount++;
     const tzId = decryptedPayload ? (decryptedPayload.tzId ?? null) : null;
-    // 重试也好不了的失败（订阅没登记 / 适配器不支持订阅存储）不进退避阶梯：
-    // 一次性任务直接进终审处置，循环任务直接作废本次 occurrence——在用户重新
-    // 登记订阅之前，隔两分钟再试三次只是白跑。
-    const permanent = errorCode === 'PUSH_SUBSCRIPTION_MISSING'
+    // 重试也好不了的失败不进退避阶梯：一次性任务直接进终审处置，循环任务直接
+    // 作废本次 occurrence。两个来源：
+    //   - 已知的永久性错误码（订阅没登记 / 适配器不支持订阅存储）；
+    //   - hook 侧抛出的 NonRetryableError（permanentFlag，见 lib/errors.js）——
+    //     fire_pack 缺失、解析失败这类重试必然同败的错，隔两分钟再试三次只是
+    //     让用户多白等十二分钟，还把情绪评估之类的计费重跑三遍。
+    const permanent = permanentFlag === true
+      || errorCode === 'PUSH_SUBSCRIPTION_MISSING'
       || errorCode === 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED';
     try {
       if (permanent || task.retry_count >= 3) {
@@ -277,23 +432,28 @@ export async function runScheduledTick(ctx) {
           await updateAndRelease(task.id, {
             next_send_at: nextSendAt,
             retry_count: 0,
-            ...(encrypted ? { encrypted_payload: encrypted } : {})
+            ...(encrypted ? { encrypted_payload: encrypted } : {}),
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
           });
-          results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'occurrence_skipped', nextSendAt });
+          results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'occurrence_skipped', nextSendAt, ...(permanent ? { permanent: true } : {}) });
         } else {
           await updateAndRelease(task.id, {
             status: 'failed',
-            ...(encrypted ? { encrypted_payload: encrypted } : {})
+            ...(encrypted ? { encrypted_payload: encrypted } : {}),
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
           });
-          results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed' });
+          results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed', ...(permanent ? { permanent: true } : {}) });
         }
       } else {
         const nextRetryTime = new Date(Date.now() + (task.retry_count + 1) * 2 * 60 * 1000);
         if (supportsClaim) {
-          await db.updateTaskById(task.id, {
+          // 等重试的行也带上 last_error：客户端不用等三轮跑完才知道「为什么
+          // 还没来」，中途查 GET /message 就看得到当前的失败原因。
+          await updateTaskWithLastError(task.id, {
             retry_after: nextRetryTime.toISOString(),
             lease_until: null,
-            retry_count: task.retry_count + 1
+            retry_count: task.retry_count + 1,
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
           });
         } else {
           await db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
@@ -378,6 +538,22 @@ export async function runScheduledTick(ctx) {
       return;
     }
 
+    // 占位成功，投递期间滚动续租（见 startLeaseHeartbeat）。收尾必须停心跳，
+    // 不管下面哪条路径退出——finally 兜住。
+    const stopHeartbeat = startLeaseHeartbeat(task);
+    try {
+      await deliverClaimedTask(task, decrypted);
+    } finally {
+      stopHeartbeat();
+    }
+  }
+
+  /** 占位之后的投递主体（从解密守卫到发送收尾），从 processTask 拆出来只是
+   *  为了让心跳的 try/finally 能整段兜住它。 */
+  async function deliverClaimedTask(task, decrypted) {
+    const decryptedPayload = decrypted.ok ? decrypted.payload : null;
+    const userKey = decrypted.ok ? decrypted.userKey : null;
+
     // recurrenceType 是过期判定、终审失败处置的依据。解密不了的话投递也无从
     // 谈起（投递用的就是这份解密结果），按投递失败走既有的重试/终态逻辑。
     if (!decrypted.ok) {
@@ -429,7 +605,10 @@ export async function runScheduledTick(ctx) {
         );
         await updateAndRelease(task.id, {
           ...(recurring ? { next_send_at: nextSendAt, retry_count: 0 } : { status: 'failed' }),
-          ...(encrypted ? { encrypted_payload: encrypted } : {})
+          ...(encrypted ? { encrypted_payload: encrypted } : {}),
+          ...(supportsLastError
+            ? { last_error: lastErrorJson(task, 'stale', recurring ? { skippedCount, nextSendAt } : undefined) }
+            : {})
         });
         results.staleTasks.push({
           taskId: task.id,
@@ -470,12 +649,18 @@ export async function runScheduledTick(ctx) {
         { userKey, payload: decryptedPayload }
       );
     } catch (error) {
-      await handleDeliveryFailure(task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey, error.code || null);
+      await handleDeliveryFailure(
+        task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
+        error.code || null, error.permanent === true
+      );
       return;
     }
 
     if (!sendResult.success) {
-      await handleDeliveryFailure(task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey, sendResult.errorCode || null);
+      await handleDeliveryFailure(
+        task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey,
+        sendResult.errorCode || null, sendResult.permanent === true
+      );
       return;
     }
 
@@ -485,8 +670,13 @@ export async function runScheduledTick(ctx) {
         results.deletedOnceOffTasks++;
       } else {
         // 以这条任务原本的触发时刻为基准往后推（推进到未来第一个名义时刻）。
+        // 这次成功了，把上一轮失败留下的 last_error 一并清掉。
         const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
-        await updateAndRelease(task.id, { next_send_at: nextSendAt, retry_count: 0 });
+        await updateAndRelease(task.id, {
+          next_send_at: nextSendAt,
+          retry_count: 0,
+          ...(supportsLastError ? { last_error: null } : {})
+        });
         results.updatedRecurringTasks++;
       }
 
@@ -534,8 +724,6 @@ export async function runScheduledTick(ctx) {
       await Promise.race(processing);
     }
   }
-
-  await db.cleanupOldTasks(7);
 
   const executionTime = Date.now() - startTime;
 

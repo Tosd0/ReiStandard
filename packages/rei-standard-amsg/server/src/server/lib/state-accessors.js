@@ -127,11 +127,17 @@ export function createStateAccessors({ db, userId, userKey, maxStateValueBytes, 
       if (entry.updatedAt !== undefined && (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0)) {
         throw new TypeError(`writeState: entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
       }
+      // 条件写护栏（与 PUT /client-state 同语义）：带 version 的条目按内容新旧
+      // 比较，而不是按写入先后——hook 和客户端写同一个 key 时旧内容盖不掉新的。
+      if (entry.version !== undefined && (!Number.isInteger(entry.version) || entry.version <= 0)) {
+        throw new TypeError(`writeState: entries[${index}].version 必须是正整数（毫秒时间戳或单调递增版本号）`);
+      }
       return {
         namespace,
         key: entry.key,
         value: entry.value,
         updatedAt: entry.updatedAt ?? at,
+        ...(entry.version !== undefined ? { version: entry.version } : {}),
       };
     });
 

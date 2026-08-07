@@ -41,7 +41,9 @@ import {
 } from './multipart.js';
 
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
-const DEFAULT_MAX_LOOP_ITERATIONS = 10;
+// agentic 循环的默认轮数上限。导出：包装层要和上游对齐这个档位时 import 这
+// 一份，各写各的默认值迟早对不上（一边调大、一边还按旧值算预算）。
+export const DEFAULT_MAX_LOOP_ITERATIONS = 10;
 const DEFAULT_MAX_INLINE_BYTES = 2600;
 const DEFAULT_BLOB_TTL_SECONDS = 60;
 const PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();

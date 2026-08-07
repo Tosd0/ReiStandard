@@ -113,6 +113,11 @@ export async function callLlm(payload, options = {}) {
  * non-empty payload.tools. An empty array is treated as "no tools"
  * because some OpenAI-compatible relays reject `tools: []`.
  *
+ * `payload.llmExtraBody`（可选，普通对象）：原样展开进请求体，给上游中转的
+ * 非标准参数用（thinking / reasoning_effort 之类库不认识也不该认识的字段）。
+ * 先展开它、再写核心字段——model / messages / temperature / max_tokens /
+ * tools 永远以库的口径为准，extra body 撞了这些键也盖不掉。
+ *
  * @param {Object} payload
  * @param {{ stream?: boolean, forwardTools?: boolean }} [options]
  *   stream — set to include an explicit `stream` field in the body
@@ -125,7 +130,13 @@ export function buildLlmRequestBody(payload, options = {}) {
     ? payload.messages
     : [{ role: 'user', content: payload.completePrompt }];
 
+  const extraBody = payload.llmExtraBody && typeof payload.llmExtraBody === 'object' && !Array.isArray(payload.llmExtraBody)
+    ? payload.llmExtraBody
+    : null;
+
   const requestBody = {
+    // 先展开 extra body，核心字段随后写入（撞键时核心字段赢）。
+    ...(extraBody || {}),
     model: payload.primaryModel,
     messages: llmMessages,
   };

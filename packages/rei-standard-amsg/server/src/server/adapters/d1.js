@@ -13,7 +13,9 @@ import {
   SQLITE_INDEXES,
   SQLITE_MIGRATIONS,
   CLIENT_STATE_TABLE_SQL,
-  PUSH_SUBSCRIPTION_TABLE_SQL
+  PUSH_SUBSCRIPTION_TABLE_SQL,
+  MESSAGE_OUTBOX_TABLE_SQL,
+  MESSAGE_OUTBOX_INDEX_SQL
 } from './schema.sqlite.js';
 // 列名不分方言：三个适配器共用 schema.js 里的这一份白名单，加列只改一处。
 import { UPDATABLE_COLUMNS } from './schema.js';
@@ -48,6 +50,8 @@ export class D1Adapter {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
     await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
     await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
+    await this._db.prepare(MESSAGE_OUTBOX_TABLE_SQL).run();
+    await this._db.prepare(MESSAGE_OUTBOX_INDEX_SQL).run();
 
     // SQLite 的 ALTER TABLE 没有 ADD COLUMN IF NOT EXISTS，列已经在了就会
     // 报 duplicate column name。那正是「这一步不用做」的意思，跳过即可；
@@ -92,6 +96,7 @@ export class D1Adapter {
     await this._db.prepare('DROP TABLE IF EXISTS scheduled_messages').run();
     await this._db.prepare('DROP TABLE IF EXISTS client_state').run();
     await this._db.prepare('DROP TABLE IF EXISTS push_subscriptions').run();
+    await this._db.prepare('DROP TABLE IF EXISTS message_outbox').run();
   }
 
   async createTask(params) {
@@ -109,9 +114,52 @@ export class D1Adapter {
     ).bind(id).first();
   }
 
+  /**
+   * 建新任务的同时取消旧的那条（`POST /schedule-message` 的 supersedesUuid）。
+   *
+   * 两条语句走一次 batch（D1 的隐式事务 + 单次网络往返）：不会出现「旧的删了、
+   * 新的没建成」的中间态——INSERT 撞 uuid 唯一索引时整个 batch 回滚，旧行原样
+   * 留着，调用方按既有的 409 冲突路径处理。
+   *
+   * @param {import('./interface.js').InsertTaskParams} params
+   * @param {string} supersedesUuid - 要取消的旧任务 uuid（同一 user_id 下）
+   * @returns {Promise<Object>} createTask 的返回行 + `superseded`（旧行是否
+   *   真的被删掉；false = 旧行本就不存在）
+   */
+  async createTaskSuperseding(params, supersedesUuid) {
+    const now = this._now();
+    const nextSendAt = this._iso(params.next_send_at);
+    const statements = [
+      this._db.prepare(
+        'DELETE FROM scheduled_messages WHERE uuid = ? AND user_id = ?'
+      ).bind(supersedesUuid, params.user_id),
+      this._db.prepare(
+        `INSERT INTO scheduled_messages
+          (user_id, uuid, encrypted_payload, next_send_at, message_type, status, retry_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)`
+      ).bind(params.user_id, params.uuid, params.encrypted_payload, nextSendAt, params.message_type, now, now),
+    ];
+
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      // 没有 batch() 的绑定退回顺序执行——失去原子性，但语义一致。
+      results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+    }
+
+    const superseded = (results[0].meta.changes || 0) > 0;
+    const id = results[1].meta.last_row_id;
+    const row = await this._db.prepare(
+      'SELECT id, uuid, next_send_at, status, created_at FROM scheduled_messages WHERE id = ?'
+    ).bind(id).first();
+    return { ...row, superseded };
+  }
+
   async getTaskByUuid(uuid, userId) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
        FROM scheduled_messages
        WHERE uuid = ? AND user_id = ? AND status = 'pending'
        LIMIT 1`
@@ -120,7 +168,7 @@ export class D1Adapter {
 
   async getTaskByUuidOnly(uuid) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
        FROM scheduled_messages
        WHERE uuid = ? AND status = 'pending'
        LIMIT 1`
@@ -272,6 +320,23 @@ export class D1Adapter {
     return (res.meta.changes || 0) > 0;
   }
 
+  /**
+   * 投递期间的租约续期（run-tick 的心跳用）。只在行仍是 pending 且确实持有
+   * 租约（lease_until 非空）时生效——收尾把租约放掉之后，迟到的心跳不会把
+   * 租约复活。
+   *
+   * @param {number} taskId
+   * @param {string|Date} leaseUntil - 新的租期末尾
+   * @returns {Promise<boolean>} true = 续上了
+   */
+  async renewTaskLease(taskId, leaseUntil) {
+    const res = await this._db.prepare(
+      `UPDATE scheduled_messages SET lease_until = ?
+       WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL`
+    ).bind(this._iso(leaseUntil), taskId).run();
+    return (res.meta.changes || 0) > 0;
+  }
+
   async listTasks(userId, opts = {}) {
     const { status = 'all', limit = 20, offset = 0 } = opts;
     const conditions = ['user_id = ?'];
@@ -288,7 +353,7 @@ export class D1Adapter {
     const total = Number(countRow.count) || 0;
 
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, created_at, updated_at
+      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC
@@ -313,6 +378,21 @@ export class D1Adapter {
       'SELECT status FROM scheduled_messages WHERE uuid = ? AND user_id = ? LIMIT 1'
     ).bind(uuid, userId).first();
     return row ? row.status : null;
+  }
+
+  /**
+   * 状态 + 失败摘要（GET /message 用它把「为什么失败」透给已失败的行——那些
+   * 行 getTaskByUuid 读不到，payload 里的 lastError 也就够不着了）。
+   *
+   * @param {string} uuid
+   * @param {string} userId
+   * @returns {Promise<{ status: string, last_error: string|null }|null>}
+   */
+  async getTaskStatusInfo(uuid, userId) {
+    const row = await this._db.prepare(
+      'SELECT status, last_error FROM scheduled_messages WHERE uuid = ? AND user_id = ? LIMIT 1'
+    ).bind(uuid, userId).first();
+    return row ? { status: row.status, last_error: row.last_error ?? null } : null;
   }
 
   // ── client_state (single-user cloud state mirror) ──────────────────────
@@ -461,6 +541,128 @@ export class D1Adapter {
   async deletePushSubscription(userId) {
     const res = await this._db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId).run();
     return (res.meta.changes || 0) > 0;
+  }
+
+  // ── message_outbox（服务端消息收件箱，客户端 ack）────────────────────────
+
+  /**
+   * 发送前把这一批 push 落进 outbox（一次 batch）。(user_id, message_id)
+   * 唯一：重试同一 occurrence 带着同一批 messageId 再来时更新 payload、不加
+   * 第二行；客户端已经 ack 过的行不动（ack 是终态，重试不该把它拉回未读）。
+   *
+   * @param {string} userId
+   * @param {Array<{ message_id: string, task_uuid?: string|null, session_id?: string|null,
+   *   message_index?: number|null, total_messages?: number|null, payload: string, created_at: number }>} rows
+   *   `payload` 是整条 push JSON 的 encryptForStorage 密文。
+   * @returns {Promise<number>} 实际写入/更新的行数
+   */
+  async appendOutboxMessages(userId, rows) {
+    if (!rows || rows.length === 0) return 0;
+    const SQL =
+      `INSERT INTO message_outbox
+         (user_id, message_id, task_uuid, session_id, message_index, total_messages, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, message_id) DO UPDATE SET
+         payload = excluded.payload,
+         created_at = excluded.created_at,
+         delivered_at = NULL
+       WHERE message_outbox.acked_at IS NULL`;
+    const statements = rows.map((r) =>
+      this._db.prepare(SQL).bind(
+        userId, r.message_id, r.task_uuid ?? null, r.session_id ?? null,
+        r.message_index ?? null, r.total_messages ?? null, r.payload, r.created_at
+      )
+    );
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+    }
+    return results.reduce((n, res) => n + ((res.meta.changes || 0) > 0 ? 1 : 0), 0);
+  }
+
+  /**
+   * 把这一批标记为「Web Push 已发出」。发送失败的段不标——delivered_at 为
+   * null 的行正是客户端最需要拉的那部分。
+   *
+   * @param {string} userId
+   * @param {string[]} messageIds
+   * @param {number} deliveredAt - epoch 毫秒
+   * @returns {Promise<number>}
+   */
+  async markOutboxDelivered(userId, messageIds, deliveredAt) {
+    if (!messageIds || messageIds.length === 0) return 0;
+    const placeholders = messageIds.map(() => '?').join(', ');
+    const res = await this._db.prepare(
+      `UPDATE message_outbox SET delivered_at = ?
+       WHERE user_id = ? AND message_id IN (${placeholders})`
+    ).bind(deliveredAt, userId, ...messageIds).run();
+    return res.meta.changes || 0;
+  }
+
+  /**
+   * 未 ack 的行（id 升序，游标翻页）。payload 仍是密文，解密在 handler。
+   *
+   * @param {string} userId
+   * @param {number} sinceId - 上一页游标（0 = 从头）
+   * @param {number} limit
+   * @returns {Promise<Array<{ id: number, message_id: string, task_uuid: string|null,
+   *   session_id: string|null, message_index: number|null, total_messages: number|null,
+   *   payload: string, created_at: number, delivered_at: number|null }>>}
+   */
+  async listUnackedOutbox(userId, sinceId = 0, limit = 50) {
+    const res = await this._db.prepare(
+      `SELECT id, message_id, task_uuid, session_id, message_index, total_messages, payload, created_at, delivered_at
+       FROM message_outbox
+       WHERE user_id = ? AND acked_at IS NULL AND id > ?
+       ORDER BY id ASC
+       LIMIT ?`
+    ).bind(userId, sinceId, limit).all();
+    return res.results || [];
+  }
+
+  /**
+   * 客户端确认收到这一批（幂等：已 ack 的行再 ack 不动）。
+   *
+   * @param {string} userId
+   * @param {string[]} messageIds
+   * @param {number} ackedAt - epoch 毫秒
+   * @returns {Promise<number>} 本次真正被 ack 的行数
+   */
+  async ackOutboxMessages(userId, messageIds, ackedAt) {
+    if (!messageIds || messageIds.length === 0) return 0;
+    const placeholders = messageIds.map(() => '?').join(', ');
+    const res = await this._db.prepare(
+      `UPDATE message_outbox SET acked_at = ?
+       WHERE user_id = ? AND acked_at IS NULL AND message_id IN (${placeholders})`
+    ).bind(ackedAt, userId, ...messageIds).run();
+    return res.meta.changes || 0;
+  }
+
+  /**
+   * outbox 的例行清理（run-tick 每跳顺手调）：已 ack 的行留短一些，未 ack 的
+   * 也不无限留（Web Push TTL 上限四周，比它更老的推送谁也收不到了）。
+   *
+   * @param {{ ackedBeforeMs?: number, allBeforeMs?: number }} opts - epoch 毫秒阈值
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async cleanupOutbox({ ackedBeforeMs, allBeforeMs } = {}) {
+    let deleted = 0;
+    if (Number.isFinite(ackedBeforeMs)) {
+      const res = await this._db.prepare(
+        'DELETE FROM message_outbox WHERE acked_at IS NOT NULL AND acked_at < ?'
+      ).bind(ackedBeforeMs).run();
+      deleted += res.meta.changes || 0;
+    }
+    if (Number.isFinite(allBeforeMs)) {
+      const res = await this._db.prepare(
+        'DELETE FROM message_outbox WHERE created_at < ?'
+      ).bind(allBeforeMs).run();
+      deleted += res.meta.changes || 0;
+    }
+    return deleted;
   }
 }
 
