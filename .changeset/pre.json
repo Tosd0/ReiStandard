@@ -27,6 +27,7 @@
     "amsg-server-agentic-schedule-task",
     "amsg-server-before-fire-skip",
     "amsg-server-client-state-version-guard",
+    "amsg-server-expose-capabilities",
     "amsg-server-fire-settled",
     "amsg-server-hook-contract-identity",
     "amsg-server-hook-write-state",
