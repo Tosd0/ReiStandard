@@ -17,6 +17,7 @@
     "amsg-client-server-token",
     "amsg-client-state-chunking",
     "amsg-client-zombie-push-endpoint",
+    "amsg-credrefs-inherit-fix",
     "amsg-engines-range-align",
     "amsg-instant-auth-exports",
     "amsg-llm-call-to-shared",
