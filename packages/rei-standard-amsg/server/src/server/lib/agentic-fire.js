@@ -114,6 +114,7 @@ import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import {
   hasChatCredRef,
+  hasCredRefs,
   resolveFireCredentials,
   resolveLlmCredential as resolveLlmCredentialFromStore,
   supportsLlmCredentialsStore,
@@ -449,10 +450,15 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       firstSendTime: nextSendAt,
       recurrenceType,
       tzId,
-      // 凭据：父任务带 credRefs 就复制**引用**（换 Key 只要覆盖 llm_credentials
-      // 里那一行，自排链上的后代自动跟随），不复制内联；存量内联任务照旧复制
-      // 三件套——这正是「自排链传旧 Key」那个洞的修口。
-      ...(decryptedPayload.credRefs && typeof decryptedPayload.credRefs === 'object' && !Array.isArray(decryptedPayload.credRefs) && Object.keys(decryptedPayload.credRefs).length > 0
+      // 凭据继承按 **credRefs.chat** 分支：
+      //   - 父带 chat 引用 → 复制整份引用、内联置空（换 Key 只要覆盖
+      //     llm_credentials 里那一行，自排链上的后代自动跟随——「自排链传旧
+      //     Key」那个洞的修口）；
+      //   - 父只带非 chat 引用（如仅 emotion）→ 引用与内联**都**复制：引用归
+      //     hook 用途，聊天凭据在内联那份里，只复制引用会造出既无引用可解析
+      //     又无内联的空壳后代；
+      //   - 父没带引用 → 照旧复制内联三件套。
+      ...(hasChatCredRef(decryptedPayload)
         ? {
           apiUrl: null,
           apiKey: null,
@@ -463,7 +469,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
           apiUrl: decryptedPayload.apiUrl || null,
           apiKey: decryptedPayload.apiKey || null,
           primaryModel: decryptedPayload.primaryModel || null,
-          credRefs: null,
+          credRefs: hasCredRefs(decryptedPayload) ? { ...decryptedPayload.credRefs } : null,
         }),
       // 见文件头：fire-time hook 每次现场重组 prompt，旧 prompt 带过去只会在新
       // 任务走回老链路时顶替宿主的意图。
