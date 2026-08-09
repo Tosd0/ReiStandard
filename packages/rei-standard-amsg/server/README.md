@@ -197,8 +197,13 @@ ctx / metadata / push 上）。
 - fire 时的解析顺序：`credRefs.chat` → 查表；行没了 → 退回任务里的内联三件套
   （如有）；都没有 → 本轮失败，`lastError` 记 `CREDENTIAL_MISSING`，走常规重
   试——补传凭据后下一轮自愈。
-- hook 的 `ctx.scheduleTask()` 自排任务时：父任务带 `credRefs` 就复制**引用**
-  （不复制凭据本体），换 Key 自动作用于整条自排链；存量内联任务照旧复制三件套。
+- hook 的 `ctx.scheduleTask()` 自排任务时按 **`credRefs.chat`** 分支：父任务带
+  chat 引用 → 复制整份引用、不复制凭据本体，换 Key 自动作用于整条自排链；父任
+  务只带非 chat 引用（如仅 emotion）→ 引用与内联三件套**都**复制（引用归 hook
+  用途，聊天凭据在内联那份里）；存量内联任务照旧复制三件套。
+- `prompted` / `auto` 任务 fire 时既无 `credRefs.chat` 也无内联三件套 → 按
+  `CREDENTIAL_MISSING` 失败进常规重试（不会被静默判成「不需要 LLM」）。
+  `instant` 保持「无凭据 = 纯推送 `userMessage`」的路由语义。
 - 任务投影（`GET /messages` / hook 的 `ctx.task`）带 `credRefs`（只是名字，不
   是机密），客户端对账用；凭据本体照旧被白名单挡在外面。
 - 数据库侧是 `llm_credentials` 表（`(user_id, cred_id)` 主键，`encrypted_value`

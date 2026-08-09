@@ -119,6 +119,19 @@ export function hasChatCredRef(payload) {
 }
 
 /**
+ * payload 带没带非空的 credRefs 映射（不管里面是什么 purpose）。自排继承要在
+ * 「有 chat 引用」和「只有非 chat 引用」之间分支，这是后者用的那半个判据。
+ *
+ * @param {Object|null|undefined} payload
+ * @returns {boolean}
+ */
+export function hasCredRefs(payload) {
+  const refs = payload && payload.credRefs;
+  return !!refs && typeof refs === 'object' && !Array.isArray(refs)
+    && Object.keys(refs).length > 0;
+}
+
+/**
  * 批量写入（覆盖）这个用户的凭据。value 在这里加密。
  *
  * @param {Object} args
@@ -219,7 +232,22 @@ function codedError(code, message) {
  * @returns {Promise<{ apiUrl: string, apiKey: string, primaryModel: string }|null>}
  */
 export async function resolveFireCredentials({ db, userId, userKey, decryptedPayload }) {
-  if (!hasChatCredRef(decryptedPayload)) return null;
+  if (!hasChatCredRef(decryptedPayload)) {
+    // prompted / auto 没有 chat 引用就必须有内联三件套——都没有（或缺件）的
+    // 任务要在这里响亮失败进常规重试，不能拿着空凭据去撞 LLM 接口、换回一句
+    // 跟凭据登记对不上号的「Invalid apiUrl」。instant 的「无凭据 = 纯推送」
+    // 路由语义不归这里管（调用方先按 taskNeedsLlm / hasChatSource 分流，
+    // 走到这儿的 instant 必然带着齐全的内联）。
+    const type = decryptedPayload.messageType;
+    const hasInlineTrio = !!(decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel);
+    if ((type === 'prompted' || type === 'auto') && !hasInlineTrio) {
+      throw codedError(
+        'CREDENTIAL_MISSING',
+        '任务既无 credRefs.chat 也无内联 apiUrl / apiKey / primaryModel（补传凭据或更新任务后，下一轮重试即自愈）'
+      );
+    }
+    return null;
+  }
   const credId = decryptedPayload.credRefs.chat;
 
   if (supportsLlmCredentialsStore(db)) {

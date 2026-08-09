@@ -257,6 +257,35 @@ describe('POST /schedule-message with credRefs', () => {
     assert.equal((await res.json()).error.code, 'INVALID_PARAMETERS');
   });
 
+  test('credRefs.chat 与单个内联字段（仅 apiKey）混传 → 同样 400', async () => {
+    const { adapter, worker, env } = await freshWorker();
+    await seedCred(adapter);
+
+    const res = await scheduleTask(worker, env, {
+      credRefs: { chat: CRED_ID },
+      apiKey: 'sk-inline',
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.code, 'INVALID_PARAMETERS');
+  });
+
+  test('仅非 chat purpose 的 credRefs + 内联三件套 → 合法组合，正常建任务', async () => {
+    const { adapter, worker, env } = await freshWorker();
+    await seedCred(adapter, 'char:c1/emotion', { ...CRED_VALUE, apiKey: 'sk-emotion' });
+
+    const res = await scheduleTask(worker, env, {
+      credRefs: { emotion: 'char:c1/emotion' },
+      apiUrl: 'https://inline.example.com', apiKey: 'sk-inline', primaryModel: 'inline-model',
+    });
+    assert.equal(res.status, 201);
+    const { data } = await res.json();
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const row = await adapter.getTaskByUuid(data.uuid, USER);
+    const stored = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+    assert.deepEqual(stored.credRefs, { emotion: 'char:c1/emotion' });
+    assert.equal(stored.apiKey, 'sk-inline');
+  });
+
   test('引用不存在 → 409 CREDENTIAL_NOT_FOUND 且点名', async () => {
     const { worker, env } = await freshWorker();
     const res = await scheduleTask(worker, env, { credRefs: { chat: 'char:ghost/chat' } });
@@ -364,6 +393,73 @@ describe('fire 时的凭据解析', () => {
       llm.restore();
     }
   });
+
+  test('空凭据 auto（只带 emotion 引用、无内联）→ CREDENTIAL_MISSING，不静默', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
+
+    const { task } = await makeTaskRow({ credRefs: { emotion: 'char:c1/emotion' } });
+    const llm = stubLlm([contentRound]);
+    try {
+      const result = await processSingleMessage(task, fireCtx(adapter));
+      assert.equal(result.success, false);
+      assert.equal(result.errorCode, 'CREDENTIAL_MISSING');
+      assert.ok(!result.permanent);
+      assert.equal(llm.calls.length, 0);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('空凭据 auto 走 agentic 路径 → onBeforeFire 照常被调，仍 CREDENTIAL_MISSING', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
+
+    const { task } = await makeTaskRow({ credRefs: { emotion: 'char:c1/emotion' } });
+    let beforeFireCalled = false;
+    const hooks = {
+      onBeforeFire: async () => { beforeFireCalled = true; return [{ role: 'user', content: 'U' }]; },
+      onLLMOutput: async () => ({ decision: 'skip-push' }),
+    };
+    const llm = stubLlm([contentRound]);
+    try {
+      const result = await processSingleMessage(task, fireCtx(adapter, { hooks }));
+      // 空凭据不是「不需要 LLM」：任务照常进 fire 链，在凭据解析处响亮失败。
+      assert.equal(beforeFireCalled, true);
+      assert.equal(result.success, false);
+      assert.equal(result.errorCode, 'CREDENTIAL_MISSING');
+      assert.equal(llm.calls.length, 0);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('instant 无凭据 + userMessage（带 emotion 引用）→ 纯推送路由不变，不走 LLM', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
+
+    const { task } = await makeTaskRow({
+      messageType: 'instant',
+      userMessage: '在吗',
+      credRefs: { emotion: 'char:c1/emotion' },
+    });
+    const pushes = [];
+    const llm = stubLlm([contentRound]);
+    try {
+      const result = await processSingleMessage(task, fireCtx(adapter, { pushSpy: (_s, p) => pushes.push(p) }));
+      assert.equal(result.success, true);
+      assert.equal(llm.calls.length, 0);
+      assert.ok(pushes.length >= 1);
+    } finally {
+      llm.restore();
+    }
+  });
 });
 
 describe('自排链与泄漏防线', () => {
@@ -412,6 +508,62 @@ describe('自排链与泄漏防线', () => {
       const result = await processSingleMessage(childRow, fireCtx(adapter));
       assert.equal(result.success, true);
       assert.equal(llm2.calls[0].headers.Authorization, 'Bearer sk-rotated');
+    } finally {
+      llm2.restore();
+    }
+  });
+
+  test('空壳后代守卫：父只带 emotion 引用 + 内联 → 子任务引用与内联都复制、fire 正常', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    await seedPushSubscription(adapter, USER, MASTER_KEY);
+
+    const inline = {
+      apiUrl: 'https://inline.example.com/v1/chat/completions',
+      apiKey: 'sk-inline',
+      primaryModel: 'inline-model',
+    };
+    const { task, payload } = await makeTaskRow({
+      credRefs: { emotion: 'char:c1/emotion' },
+      ...inline,
+    });
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async (sessionCtx) => {
+        await sessionCtx.scheduleTask({ firstSendTime: futureIso(120_000) });
+        return { decision: 'skip-push' };
+      },
+    };
+    const llm = stubLlm([contentRound]);
+    let childRow;
+    try {
+      const result = await processSingleMessage(task, fireCtx(adapter, { hooks }));
+      assert.equal(result.success, true);
+      // 父自己的 fire 用内联聊天凭据（emotion 引用 + 内联是合法组合）。
+      assert.equal(llm.calls[0].headers.Authorization, 'Bearer sk-inline');
+
+      const { tasks } = await adapter.listTasks(USER, {});
+      assert.equal(tasks.length, 1);
+      childRow = tasks[0];
+      const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+      const childPayload = JSON.parse(await decryptFromStorage(childRow.encrypted_payload, userKey));
+      // 引用与内联**都**要在（旧行为在这里挂：内联被一刀切置空，产出既无
+      // chat 引用又无内联的空壳后代）。
+      assert.deepEqual(childPayload.credRefs, payload.credRefs);
+      assert.equal(childPayload.apiUrl, inline.apiUrl);
+      assert.equal(childPayload.apiKey, inline.apiKey);
+      assert.equal(childPayload.primaryModel, inline.primaryModel);
+    } finally {
+      llm.restore();
+    }
+
+    // 子任务到点照常生成（老路径，无 hooks）。
+    const llm2 = stubLlm([contentRound]);
+    try {
+      const result = await processSingleMessage(childRow, fireCtx(adapter));
+      assert.equal(result.success, true);
+      assert.equal(llm2.calls[0].headers.Authorization, 'Bearer sk-inline');
     } finally {
       llm2.restore();
     }
