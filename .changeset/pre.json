@@ -19,6 +19,7 @@
     "amsg-engines-range-align",
     "amsg-instant-auth-exports",
     "amsg-llm-call-to-shared",
+    "amsg-llm-credentials",
     "amsg-llm-extra-body",
     "amsg-protocol-constants-to-shared",
     "amsg-review-hardening",
