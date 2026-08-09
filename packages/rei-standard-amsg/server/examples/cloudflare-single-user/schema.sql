@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
   serialize_group TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
   retry_count INTEGER NOT NULL DEFAULT 0,
+  -- last_error：上一次投递失败的脱敏摘要（JSON），payload 里那份的明文出口
+  last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -26,6 +28,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 -- ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT;
 -- ALTER TABLE scheduled_messages ADD COLUMN retry_after TEXT;
 -- ALTER TABLE scheduled_messages ADD COLUMN serialize_group TEXT;
+-- ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pending_tasks_optimized
   ON scheduled_messages (status, next_send_at, id, retry_count)
@@ -64,3 +67,27 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   subscription TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- 服务端消息收件箱（/outbox 与 /outbox/ack 用）。每条 push 发送前先落一行，
+-- 客户端上线后拉未 ack 的补收。payload 是整条 push JSON 的密文；delivered_at
+-- 记 Web Push 有没有发出去；acked_at 由客户端确认时写。
+CREATE TABLE IF NOT EXISTS message_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  task_uuid TEXT,
+  session_id TEXT,
+  message_index INTEGER,
+  total_messages INTEGER,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  acked_at INTEGER,
+  UNIQUE (user_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_unacked
+  ON message_outbox (user_id, id)
+  WHERE acked_at IS NULL;
+
+-- 手工建完想确认够不够用：worker.getSchemaVersion(env) 会逐条点名缺的表 / 列 /
+-- 关键索引，worker.ensureSchema(env) 直接补齐。

@@ -164,8 +164,12 @@ export {
   sanitizeErrorSummary,
 } from './lib/run-tick.js';
 // hook 侧标注「重试也好不了」的失败：run-tick 收到即直接终审处置，不进退避
-// 阶梯（见 lib/errors.js）。
-export { NonRetryableError, isNonRetryableError } from './lib/errors.js';
+// 阶梯（见 lib/errors.js）。summarizeErrorCause 是 500 响应体里 error.cause 的
+// 组装口（宿主自己包一层路由、想回同样形状时用同一份）。
+export { NonRetryableError, isNonRetryableError, summarizeErrorCause } from './lib/errors.js';
+// Schema 自查 / 补齐：升级后老部署的表没跟上时，cron 会每分钟静默挂在缺的那
+// 一列上（见 lib/schema-version.js）。
+export { getSchemaVersion, ensureSchema, SCHEMA_VERSION } from './lib/schema-version.js';
 // agentic 循环的默认预算——包装层要对齐自己的档位时 import 这一份，别各写各的。
 export {
   DEFAULT_MAX_TOOL_ITERATIONS,

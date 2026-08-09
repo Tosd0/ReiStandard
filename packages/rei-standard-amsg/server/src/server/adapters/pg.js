@@ -132,6 +132,21 @@ export class PgAdapter {
     return rows[0] || null;
   }
 
+  /**
+   * 这条 uuid 现在是什么状态——不限用户，也不限状态（上面那个只看 pending
+   * 行）。`runTask` 用它把「这条已经跑完了」和「压根没这条」分开回报。
+   *
+   * @param {string} uuid
+   * @returns {Promise<{ status: string }|null>}
+   */
+  async getTaskStatusByUuidOnly(uuid) {
+    const rows = await this._query(
+      `SELECT status FROM scheduled_messages WHERE uuid = $1 LIMIT 1`,
+      [uuid]
+    );
+    return rows[0] ? { status: rows[0].status } : null;
+  }
+
   async updateTaskById(taskId, updates) {
     const sets = [];
     const values = [];

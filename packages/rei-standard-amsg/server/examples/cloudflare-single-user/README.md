@@ -363,6 +363,49 @@ Worker 中途被回收就没人来放租约，这条任务会等到租约到期�
 
 任务表用到三列 `lease_until` / `retry_after` / `serialize_group`。部署后 `POST /init-tenant` 会自动给已有的表补上（跑几次都没事）；手工建表的看 `schema.sql`。
 
+## 升级之后先看一眼表结构
+
+建表是 `CREATE TABLE IF NOT EXISTS`，已经存在的表不会被改动。库升级带来新列而这个部署没再建过表的话，cron 会每分钟挂在缺的那一列上，任务一条都不发，而前端界面一切正常。
+
+Worker 上有两个方法可以查、可以补：
+
+```js
+const state = await worker.getSchemaVersion(env);
+// → { current: '2.6.0' | null, required: '2.6.0', ok, missing: ['column:scheduled_messages.last_error', …] }
+
+if (!state.ok) await worker.ensureSchema(env); // 建表 + 补列 + 建索引，重复调没事
+```
+
+什么时候调由你决定（部署后跑一次、或者做成一个自己的管理端点）；库不会在每次请求里偷偷迁移。`POST /init-tenant` 做的是同一件事。
+
+## 让某一条任务立刻跑起来
+
+`scheduled()` 是「扫一遍所有到期任务」。刚落库的那条想马上跑，用 `runTask`——同一条投递链（占位、租约心跳、过期守卫、重试 / 终态、hook 全套），只是换了个触发器：
+
+```js
+const result = await worker.runTask(uuid, env);
+// → { ran: true, summary } 或 { ran: false, reason: 'not_found' | 'already_settled' |
+//     'not_due' | 'retry_pending' | 'not_configured', … }
+```
+
+没到点、还在退避窗口里的不跑——这个入口不是绕过排期的后门。
+
+## 出错时想知道真因
+
+`fetch()` 兜底的 500 除了固定的 `code` / `message`，还带一个 `error.cause`：`{ stage, name, message }`（`stage` = `config` 构建配置时炸的 / `request` 处理器抛的）。消息已脱敏、截断。
+
+cron 那条路上没有调用方能读到响应，所以出错的信号从工厂第二个参数走：
+
+```js
+export default createSingleUserCloudflareWorker(buildConfig, {
+  onError({ stage, error, cause, path }) {
+    // fetch / cron 任何一段出错都会调一次；自己记到哪儿由你定
+  },
+});
+```
+
+它故意不在 `buildConfig` 的返回值里：`buildConfig` 自己抛错（少个 binding、环境变量丢了）时配置一个字段都读不到，而那正是最需要被看见的一种故障。
+
 ## 导入入口
 
 Worker 从 `@rei-standard/amsg-server/cloudflare` 导入（不是包根）。这个子路径只含单用户 + D1 + Web Crypto 推送那条路径，不牵扯 pg / neon / web-push，所以只装了 D1 的环境也能打包通过。

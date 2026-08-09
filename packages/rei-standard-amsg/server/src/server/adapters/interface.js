@@ -41,6 +41,10 @@
  * @typedef {Object} DbAdapter
  * @property {() => Promise<InitSchemaResult>} initSchema
  *   Create the scheduled_messages table and all indexes.
+ * @property {() => Promise<{ tables: Record<string, string[]>, indexes: string[] }>} [describeSchema]
+ *   （可选）活库里现在实际有哪些表 / 列 / 索引，只读不写。
+ *   `getSchemaVersion` / `ensureSchema`（lib/schema-version.js）拿它跟这一版
+ *   需要的清单对照；不实现的适配器调那两个函数会抛错。内置只有 D1 实现。
  * @property {() => Promise<void>} dropSchema
  *   Drop the scheduled_messages table (CASCADE).
  * @property {(params: InsertTaskParams) => Promise<TaskRow>} createTask
@@ -49,6 +53,10 @@
  *   Fetch a single pending task by uuid + user_id.
  * @property {(uuid: string) => Promise<TaskRow|null>} getTaskByUuidOnly
  *   Fetch a single pending task by uuid only (used by instant processing).
+ * @property {(uuid: string) => Promise<{ status: string }|null>} [getTaskStatusByUuidOnly]
+ *   （可选）这条 uuid 现在是什么状态——不限用户，也不限状态。`runTask` 用它
+ *   把「这条已经跑完进终态了」和「压根没这条」分开回报；不实现时两种都归
+ *   `not_found`。
  * @property {(taskId: number, updates: Object) => Promise<TaskRow|null>} updateTaskById
  *   Partially update a task row by its numeric id.
  *   实现了 `claimTask` 的适配器还要认 `lease_until` 和 `retry_after`（含写

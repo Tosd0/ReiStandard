@@ -180,3 +180,69 @@ export const MESSAGE_OUTBOX_INDEX_SQL = `
     ON message_outbox (user_id, id)
     WHERE acked_at IS NULL
 `;
+
+// ── schema 自查用的「这一版需要什么」 ─────────────────────────────────────
+//
+// 建表语句是 CREATE TABLE IF NOT EXISTS，已经存在的表不会被改动，所以升级后
+// 老部署的表可能缺列。lib/schema-version.js 拿下面这份清单和活库里实际有的表
+// 列对照，回答「够不够用」。
+//
+// 清单不手抄，直接从上面那几段 DDL 里解析出来：手抄一份就会漏——加了列忘了同
+// 步，自查照样报「一切正常」，而 cron 每分钟静默挂在那条缺的列上。
+
+/** CREATE TABLE 语句里的表名。 */
+function parseTableName(sql) {
+  const match = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)/i.exec(sql);
+  return match ? match[1] : '';
+}
+
+/**
+ * CREATE TABLE 语句里的列名。按括号深度切顶层逗号（CHECK (... IN ('a', 'b'))
+ * 里的逗号不算），再把 PRIMARY KEY (…) / UNIQUE (…) 这类表级约束行滤掉。
+ */
+function parseColumnNames(sql) {
+  const body = sql.slice(sql.indexOf('(') + 1, sql.lastIndexOf(')'));
+  const parts = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of body) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+
+  const TABLE_CONSTRAINTS = new Set(['primary', 'unique', 'foreign', 'check', 'constraint']);
+  return parts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.split(/\s+/)[0])
+    .filter((name) => !TABLE_CONSTRAINTS.has(name.toLowerCase()));
+}
+
+function describeTable(sql) {
+  return [parseTableName(sql), parseColumnNames(sql)];
+}
+
+/**
+ * 这一版代码跑起来需要的表 / 列 / 索引。
+ *
+ * 索引只列 critical 的那几个（uidx_uuid 之类）：其余索引缺了只是慢，缺了它则
+ * 是正确性问题。
+ *
+ * @type {{ tables: Record<string, string[]>, indexes: string[] }}
+ */
+export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
+  tables: Object.freeze(Object.fromEntries([
+    describeTable(SQLITE_TABLE_SQL),
+    describeTable(CLIENT_STATE_TABLE_SQL),
+    describeTable(PUSH_SUBSCRIPTION_TABLE_SQL),
+    describeTable(MESSAGE_OUTBOX_TABLE_SQL)
+  ])),
+  indexes: Object.freeze(SQLITE_INDEXES.filter((index) => index.critical).map((index) => index.name))
+});

@@ -62,3 +62,46 @@ export function sanitizeErrorSummary(reason) {
   if (s.length > 500) s = `${s.slice(0, 497)}…`;
   return s;
 }
+
+/**
+ * @typedef {Object} ErrorCause
+ * @property {'config'|'request'|'tick'} stage - 在哪一段炸的
+ * @property {string} name - 错误类型（`error.name`，认不出来时是 'Error'）
+ * @property {string} message - 脱敏后的错误消息
+ * @property {string} [code] - 错误自带的 `code` 字符串（有才带）
+ */
+
+/**
+ * 把一个异常整理成能随响应体一起回给调用方的机读原因。
+ *
+ * 500 只回一句「服务器内部错误」的话，真因（`D1_ERROR: no such table:
+ * message_outbox`、存储层写超时……）就只剩 console.error 里那一行，调用方拿不
+ * 到，用户看到的也只是「服务器内部错误」——不知道哪儿坏了，也不知道该点哪里。
+ * 这个函数把异常压成几个固定字段，让调用方能机读、能展示。
+ *
+ * 只带错误类型和消息文本。消息先过 `sanitizeErrorSummary`（遮掉长得像凭据的
+ * 串、截断到 500 字符）；密钥、用户数据、任务正文都不在 `error.message` 上，
+ * 也不往这里放。
+ *
+ * @param {unknown} error - 捕获到的异常，也收 `{ name, message }` 这样的普通对象
+ * @param {'config'|'request'|'tick'} stage - 'config' = 构建配置时抛的（少了
+ *   binding / 环境变量）；'request' = 路由或处理器抛的；'tick' = cron 那一跳抛的
+ * @returns {ErrorCause}
+ */
+export function summarizeErrorCause(error, stage) {
+  const raw = (error && typeof error === 'object') ? /** @type {any} */ (error) : {};
+  const name = typeof raw.name === 'string' && raw.name ? raw.name : 'Error';
+  const rawMessage = typeof raw.message === 'string' && raw.message
+    ? raw.message
+    : String(error ?? '');
+  /** @type {ErrorCause} */
+  const cause = {
+    stage,
+    name: sanitizeErrorSummary(name).slice(0, 100),
+    message: sanitizeErrorSummary(rawMessage)
+  };
+  if (typeof raw.code === 'string' && raw.code) {
+    cause.code = sanitizeErrorSummary(raw.code).slice(0, 100);
+  }
+  return cause;
+}

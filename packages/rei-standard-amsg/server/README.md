@@ -382,6 +382,108 @@ await runScheduledTick({
 
 `lease_until` / `retry_after` / `serialize_group`（都可空）。走 `POST /init-tenant`（或任何一次 `initSchema`）会自动给已有的表补上，跑几次都没事；手工维护表结构的看 `examples/cloudflare-single-user/schema.sql`，Postgres 侧对应三句 `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS …`。分组串行还多一个索引 `idx_serialize_group_lease`，`initSchema` 一并建。
 
+## 表结构自查（`getSchemaVersion` / `ensureSchema`）
+
+建表语句是 `CREATE TABLE IF NOT EXISTS`，已经存在的表不会被改动，后加的列靠 `initSchema()` 里的 ALTER 补。升级到新版之后没人再跑一次建表的话，这个部署的表就停在旧形状上——cron 每分钟挂在缺的那一列上，任务一条都不发，而前端界面一切正常。
+
+这两个函数把「我需要什么 / 现在是什么 / 帮我补齐」露出来：
+
+```js
+import { getSchemaVersion, ensureSchema } from '@rei-standard/amsg-server/cloudflare';
+
+const state = await getSchemaVersion(db);
+// → { current: '2.6.0' | null, required: '2.6.0', ok: true | false, missing: [] }
+
+if (!state.ok) {
+  const fixed = await ensureSchema(db); // 建表 + 补列 + 建索引，重复调没事
+  // → { current, required, ok, missing, migrated: true, schema }
+}
+```
+
+| 字段 | 是什么 |
+|---|---|
+| `required` | 这一版代码需要的表结构版本（导出常量 `SCHEMA_VERSION`）。表结构自己的版本号，只在表 / 列 / 关键索引变化时抬，与包版本各走各的 |
+| `current` | 活库当前满足的版本：够用就是 `required` 那个值，缺东西就是 `null`（只知道不够用，不知道它停在哪一版） |
+| `ok` | 需要的表 / 列 / 关键索引是不是都在 |
+| `missing` | 缺什么，形如 `table:message_outbox` / `column:scheduled_messages.last_error` / `index:uidx_uuid`。整张表缺席时只报这一张表，不逐列展开 |
+| `migrated`（只有 `ensureSchema` 有） | 这次有没有真的跑 `initSchema()`。本来就够用 → `false`，`schema` 也是 `null` |
+
+「需要什么」是从建表语句里解析出来的，不是另抄一份清单：抄的那份漏掉新列的话，自查会对着一个缺列的库回「一切正常」。
+
+什么时候调、缺了怎么提示用户，由宿主决定——库不会在每次请求里偷偷迁移。`POST /init-tenant` 的行为一点没变（它内部做的就是 `initSchema()`）。
+
+单用户 Worker 上有走 `env` 的同名方法：`worker.getSchemaVersion(env)` / `worker.ensureSchema(env)`，省得自己再造一次适配器。
+
+自查要求适配器实现 `describeSchema()`（活库里现在有哪些表 / 列 / 索引，只读）。内置适配器里目前只有 D1 实现了；别的适配器调这两个函数会抛错，而不是假装一切正常。
+
+## 只跑指定那一条任务（`runTask`）
+
+`scheduled()` 的语义是「扫一遍所有到期任务」。刚落库的任务想立刻跑起来时，触发一次全量扫描是能达到目的，但那样多个执行者会去扫同一批任务，宿主只能退回单实例串行才不重复发。
+
+`runTask` 只跑指定那一条，走的是 cron 完全同一条投递链（占位、租约心跳、过期守卫、失败重试 / 终态、hook 全套）：
+
+```js
+// 单用户 Worker：从 env 拿库和配置
+const result = await worker.runTask(uuid, env);
+
+// 自己攒 ctx 的宿主（和 runScheduledTick 同一份 ctx）
+import { runTask } from '@rei-standard/amsg-server/cloudflare';
+const result = await runTask(ctx, uuid);
+```
+
+跑起来了是 `{ ran: true, summary }`（`summary` 与 `runScheduledTick` 的返回同构，`totalTasks` 恒为 1）。不跑的几种情形分开回报，宿主不用猜：
+
+| `reason` | 什么意思 | 附带 |
+|---|---|---|
+| `not_found` | 没有这条 uuid。一次性任务发完即删，所以「已经发完了」的那条也落在这里 | — |
+| `already_settled` | 行还在，但已经是终态 | `status`（`sent` / `failed`） |
+| `not_due` | 还没到触发时刻 | `nextSendAt` |
+| `retry_pending` | 上次投递失败，还在退避窗口里 | `retryAfter` |
+| `not_configured` | VAPID / webpush 没配齐，跑了也只是白扣这条任务一次重试（只有 `worker.runTask` 有这一种） | — |
+
+这个入口只是换了个触发器，不是绕过排期的后门：没到点、在退避窗口里的都不跑。`already_settled` 要求适配器实现 `getTaskStatusByUuidOnly(uuid)`（D1 / pg / neon 都实现了）；不实现的自定义适配器把这种情况并进 `not_found`。
+
+## 出错时的真实原因
+
+`fetch()` 兜底的 500 一直是 `{ success: false, error: { code: 'INTERNAL_ERROR', message: '服务器内部错误' } }`。这两个字段一个没动，真因加在 `error.cause` 上：
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "服务器内部错误",
+    "cause": {
+      "stage": "request",
+      "name": "Error",
+      "message": "D1_ERROR: no such table: message_outbox"
+    }
+  }
+}
+```
+
+| 字段 | 是什么 |
+|---|---|
+| `stage` | 在哪一段炸的：`config` = 构建配置时（少了 binding、环境变量丢了），`request` = 路由或处理器抛错 |
+| `name` | 错误类型（`error.name`，认不出来时是 `Error`） |
+| `message` | 错误消息，长得像凭据的串已遮掉、超长截断到 500 字符 |
+| `code` | 错误自带的 `code` 字符串，有才带 |
+
+只带错误类型和消息文本：密钥、用户数据、任务正文都不在 `error.message` 上，也不往这里放。
+
+cron 那条路上没有调用方能读到响应，所以另开两个出口：
+
+```js
+export default createSingleUserCloudflareWorker(buildConfig, {
+  onError({ stage, error, cause, path }) {
+    // fetch / cron 任何一段出错都会调一次（best-effort，自身抛错只记日志）
+  },
+});
+```
+
+- `onError` 放在工厂的第二个参数上，而不是 `buildConfig` 的返回值里：`buildConfig` 自己抛错时配置里的东西一个都读不到，而那恰恰是最需要被看见的一种故障。`stage` 在 cron 路径上是 `config`（配置构建失败 / VAPID 没配齐）或 `tick`（那一跳抛错）。VAPID 没配齐这一支没有异常对象，`error` 为 `null`、`cause.name` 是 `VapidNotConfigured`。
+- `scheduled()` 现在有返回值：`{ ok: true, summary }` 或 `{ ok: false, cause }`。Cloudflare 不看它，是给「自己包一层再转调 `scheduled`」的宿主和测试用的。
+
 ## 导出 API（Exports）
 
 包根（`@rei-standard/amsg-server`）：
@@ -391,6 +493,10 @@ await runScheduledTick({
 - `createSingleUserCloudflareWorker` — 单用户 Cloudflare Worker 一键装配（`fetch` + `scheduled` 两个入口）
 - `createAdapter` / `createD1Adapter` — pg·neon / Cloudflare D1 数据库适配器
 - `runScheduledTick` — 手动触发一轮到期任务投递（自定义 cron 宿主、要调 `claimLeaseMs` 时用）
+- `runTask` — 只跑指定那一条任务（与 cron 同一条投递链）
+- `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION` — 表结构自查与补齐
+- `summarizeErrorCause` — 把异常压成响应体里 `error.cause` 那个形状（自己包一层路由、想回同样形状时用同一份）
+- `NonRetryableError` / `isNonRetryableError` — hook 侧标注「重试也好不了」的失败
 - `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
 - `createTenantToken` / `verifyTenantToken`
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
@@ -401,7 +507,9 @@ await runScheduledTick({
 
 `@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
 
-- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick`
+- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick` / `runTask`
+- `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION`
+- `summarizeErrorCause` / `NonRetryableError` / `isNonRetryableError`
 - `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
 
