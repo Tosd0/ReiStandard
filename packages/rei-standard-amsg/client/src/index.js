@@ -540,6 +540,11 @@ export class ReiClient {
    * schedule still ships, just without an avatar. If `maxPayloadBytes` is
    * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
+   * 凭据两种给法（amsg-server 2.7.0+ 支持后者）：内联 `apiUrl` / `apiKey` /
+   * `primaryModel`（冻结在任务行里），或 `credRefs: { chat: '<credId>' }` 引用
+   * `putLlmCredentials()` 登记过的凭据（到点现读，换 Key 只要覆盖那一行）。
+   * 两种同时给会被服务端 400。
+   *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
    */
@@ -1338,6 +1343,97 @@ export class ReiClient {
     const res = await fetch(`${this._baseUrl}/push-subscription`, {
       method: 'DELETE',
       headers: this._withServerToken({ 'X-User-Id': this._userId })
+    });
+
+    return res.json();
+  }
+
+  // ─── LLM Credentials ─────────────────────────────────────────────
+
+  /**
+   * 批量登记（或覆盖）用户级 LLM 凭据（amsg-server 2.7.0+ 的
+   * `PUT /llm-credentials`）。
+   *
+   * 任务不再冻结 apiUrl / apiKey / primaryModel，改在排程 payload 里带
+   * `credRefs: { chat: '<credId>' }` 引用这里登记的行，到点现读。换 Key 时
+   * 覆盖对应 credId 那一行就够了——已排的任务、包括角色在 fire 里给自己排的
+   * 那些，下次触发用的都是新凭据。
+   *
+   * `credId` 由客户端起名（服务端只当不透明字符串，1–128 字符、不含控制
+   * 字符）。约定：`char:<charId>/<purpose>`、`global/<purpose>`。
+   *
+   * 载荷像其它接口一样加密（需要先 `init()`），服务端落库时再用 per-user
+   * key 加密一次。幂等覆盖，重复调没有副作用。
+   *
+   * @param {Array<{ credId: string, value: { apiUrl: string, apiKey: string, primaryModel: string } }>} credentials
+   * @returns {Promise<Object>} `{ success, data?: { upserted }, error? }`
+   */
+  async putLlmCredentials(credentials) {
+    if (!Array.isArray(credentials) || credentials.length === 0) {
+      throw new TypeError('[rei-standard-amsg-client] credentials must be a non-empty array');
+    }
+    const json = JSON.stringify({ credentials });
+    this._assertPayloadSize(json, 'putLlmCredentials');
+    const encrypted = await this._encrypt(json);
+
+    const res = await fetch(`${this._baseUrl}/llm-credentials`, {
+      method: 'PUT',
+      headers: this._withServerToken({
+        'Content-Type': 'application/json',
+        'X-User-Id': this._userId,
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      }),
+      body: JSON.stringify(encrypted)
+    });
+
+    return res.json();
+  }
+
+  /**
+   * 服务端登记的凭据对账清单。只有 `credId` 和 `updatedAt`——凭据本体永远
+   * 不回传（判断「云端有哪些、新旧如何」这些就够了；本体留在服务端，不必
+   * 再在网络上跑一遍）。
+   *
+   * @returns {Promise<Object>} `{ success, data?: { credentials: [{ credId, updatedAt }] }, error? }`
+   */
+  async listLlmCredentials() {
+    const res = await fetch(`${this._baseUrl}/llm-credentials`, {
+      method: 'GET',
+      headers: this._withServerToken({ 'X-User-Id': this._userId })
+    });
+
+    return res.json();
+  }
+
+  /**
+   * 删掉服务端登记的凭据。`{ credIds: [...] }` 删指定那几行（角色删除时清
+   * 它名下的），`{ all: true }` 全删（「清空云端数据」）。
+   *
+   * 删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，不会静默
+   * 消失；重新登记同名 credId 即恢复。
+   *
+   * @param {{ credIds?: string[], all?: boolean }} opts
+   * @returns {Promise<Object>} `{ success, data?: { deleted }, error? }`
+   */
+  async deleteLlmCredentials(opts) {
+    const wantsAll = opts && opts.all === true;
+    const credIds = opts && opts.credIds;
+    if (!wantsAll && (!Array.isArray(credIds) || credIds.length === 0)) {
+      throw new TypeError('[rei-standard-amsg-client] pass { credIds: [...] } or { all: true }');
+    }
+    const body = wantsAll ? { all: true } : { credIds };
+    const encrypted = await this._encrypt(JSON.stringify(body));
+
+    const res = await fetch(`${this._baseUrl}/llm-credentials`, {
+      method: 'DELETE',
+      headers: this._withServerToken({
+        'Content-Type': 'application/json',
+        'X-User-Id': this._userId,
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      }),
+      body: JSON.stringify(encrypted)
     });
 
     return res.json();
