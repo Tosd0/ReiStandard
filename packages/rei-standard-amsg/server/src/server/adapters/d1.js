@@ -14,6 +14,7 @@ import {
   SQLITE_MIGRATIONS,
   CLIENT_STATE_TABLE_SQL,
   PUSH_SUBSCRIPTION_TABLE_SQL,
+  LLM_CREDENTIALS_TABLE_SQL,
   MESSAGE_OUTBOX_TABLE_SQL,
   MESSAGE_OUTBOX_INDEX_SQL
 } from './schema.sqlite.js';
@@ -50,6 +51,7 @@ export class D1Adapter {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
     await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
     await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
+    await this._db.prepare(LLM_CREDENTIALS_TABLE_SQL).run();
     await this._db.prepare(MESSAGE_OUTBOX_TABLE_SQL).run();
     await this._db.prepare(MESSAGE_OUTBOX_INDEX_SQL).run();
 
@@ -128,6 +130,7 @@ export class D1Adapter {
     await this._db.prepare('DROP TABLE IF EXISTS scheduled_messages').run();
     await this._db.prepare('DROP TABLE IF EXISTS client_state').run();
     await this._db.prepare('DROP TABLE IF EXISTS push_subscriptions').run();
+    await this._db.prepare('DROP TABLE IF EXISTS llm_credentials').run();
     await this._db.prepare('DROP TABLE IF EXISTS message_outbox').run();
   }
 
@@ -587,6 +590,96 @@ export class D1Adapter {
   async deletePushSubscription(userId) {
     const res = await this._db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId).run();
     return (res.meta.changes || 0) > 0;
+  }
+
+  // ── llm_credentials (user-level LLM API credentials) ───────────────────
+
+  /**
+   * 批量 upsert 这个用户的凭据（value 已是密文，加密在上层）。已存在的行
+   * 覆盖 encrypted_value 并刷 updated_at，created_at 保留首次写入的时刻。
+   *
+   * @param {string} userId
+   * @param {Array<{ credId: string, encryptedValue: string }>} entries
+   * @returns {Promise<number>} 实际写入/覆盖的行数
+   */
+  async upsertLlmCredentials(userId, entries) {
+    if (!entries || entries.length === 0) return 0;
+    const now = this._now();
+    const SQL =
+      `INSERT INTO llm_credentials (user_id, cred_id, encrypted_value, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, cred_id) DO UPDATE SET
+         encrypted_value = excluded.encrypted_value,
+         updated_at = excluded.updated_at`;
+    const statements = entries.map((entry) =>
+      this._db.prepare(SQL).bind(userId, entry.credId, entry.encryptedValue, now, now)
+    );
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+    }
+    return results.reduce((n, res) => n + ((res.meta.changes || 0) > 0 ? 1 : 0), 0);
+  }
+
+  /**
+   * 按 cred_id 批量读这个用户的凭据行（`encrypted_value` 是密文，解密在上
+   * 层）。排程时的存在性检查和 fire 时的解析共用这一个口。
+   *
+   * @param {string} userId
+   * @param {string[]} credIds
+   * @returns {Promise<Array<{ cred_id: string, encrypted_value: string, updated_at: string }>>}
+   */
+  async getLlmCredentials(userId, credIds) {
+    if (!credIds || credIds.length === 0) return [];
+    const placeholders = credIds.map(() => '?').join(', ');
+    const res = await this._db.prepare(
+      `SELECT cred_id, encrypted_value, updated_at
+       FROM llm_credentials
+       WHERE user_id = ? AND cred_id IN (${placeholders})`
+    ).bind(userId, ...credIds).all();
+    return res.results || [];
+  }
+
+  /**
+   * 这个用户名下所有凭据的对账清单（只有 cred_id 和 updated_at，密文不出
+   * 这个方法）。按 cred_id 排序，输出稳定。
+   *
+   * @param {string} userId
+   * @returns {Promise<Array<{ cred_id: string, updated_at: string }>>}
+   */
+  async listLlmCredentials(userId) {
+    const res = await this._db.prepare(
+      `SELECT cred_id, updated_at FROM llm_credentials
+       WHERE user_id = ? ORDER BY cred_id ASC`
+    ).bind(userId).all();
+    return res.results || [];
+  }
+
+  /**
+   * 删凭据。`credIds` 传数组删指定那几行；传 null 删这个用户的全部
+   * （「清空云端数据」用）。
+   *
+   * @param {string} userId
+   * @param {string[]|null} credIds
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async deleteLlmCredentials(userId, credIds = null) {
+    if (credIds !== null && credIds.length === 0) return 0;
+    let res;
+    if (credIds === null) {
+      res = await this._db.prepare(
+        'DELETE FROM llm_credentials WHERE user_id = ?'
+      ).bind(userId).run();
+    } else {
+      const placeholders = credIds.map(() => '?').join(', ');
+      res = await this._db.prepare(
+        `DELETE FROM llm_credentials WHERE user_id = ? AND cred_id IN (${placeholders})`
+      ).bind(userId, ...credIds).run();
+    }
+    return res.meta.changes || 0;
   }
 
   // ── message_outbox（服务端消息收件箱，客户端 ack）────────────────────────

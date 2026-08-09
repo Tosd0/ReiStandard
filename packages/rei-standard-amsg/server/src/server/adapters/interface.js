@@ -115,6 +115,21 @@
  *   上面三个方法要么都实现、要么都不实现：缺任何一个，`PUT/GET/DELETE
  *   /push-subscription` 返回 501，`POST /schedule-message` 也会拒绝建任务
  *   （建了也永远发不出去）。内置的 D1 / pg / neon 适配器都实现了。
+ * @property {(userId: string, entries: Array<{ credId: string, encryptedValue: string }>) => Promise<number>} [upsertLlmCredentials]
+ *   批量覆盖写这个用户的 LLM 凭据（`encryptedValue` 是密文，加密在上层）。
+ *   已存在的行覆盖 encrypted_value 并刷 updated_at。返回实际写入/覆盖的行数。
+ * @property {(userId: string, credIds: string[]) => Promise<Array<{ cred_id: string, encrypted_value: string, updated_at: string }>>} [getLlmCredentials]
+ *   按 cred_id 批量读凭据行（密文原样返回）。排程时的存在性检查和 fire 时的
+ *   解析共用这一个口。
+ * @property {(userId: string) => Promise<Array<{ cred_id: string, updated_at: string }>>} [listLlmCredentials]
+ *   这个用户名下所有凭据的对账清单（只有 cred_id 和 updated_at，密文不出这个
+ *   方法）。按 cred_id 排序。
+ * @property {(userId: string, credIds: string[]|null) => Promise<number>} [deleteLlmCredentials]
+ *   删凭据：数组删指定那几行，null 删全部。返回删掉的行数。
+ *
+ *   llm_credentials 四个方法要么都实现、要么都不实现：缺任何一个，
+ *   `PUT/GET/DELETE /llm-credentials` 返回 501，带 `credRefs` 的
+ *   `POST /schedule-message` 也会被拒。内置的 D1 / pg / neon 适配器都实现了。
  * @property {(taskId: number, leaseUntil: string|Date) => Promise<boolean>} [renewTaskLease]
  *   （可选）投递期间的租约续期（runScheduledTick 的心跳）。只在行仍是
  *   pending 且 lease_until 非空时生效——收尾放掉租约之后，迟到的心跳不会把

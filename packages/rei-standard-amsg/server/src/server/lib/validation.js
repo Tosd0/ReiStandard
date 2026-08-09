@@ -4,6 +4,7 @@
 
 import { isValidUrl, validateAvatarUrl, validateLlmMessagesShape } from '@rei-standard/amsg-shared';
 import { isValidTimeZoneId } from './recurrence.js';
+import { hasChatCredRef, validateCredRefs } from './llm-credentials-store.js';
 
 export { isValidTimeZoneId };
 
@@ -248,12 +249,36 @@ export function validateScheduleMessagePayload(payload) {
   }
   const hasPrompt = promptCheck.hasCompletePrompt || promptCheck.hasMessages;
 
+  // credRefs：任务不冻结凭据、改带引用（{ <purpose>: <cred_id> }，服务端只认
+  // `chat` 这个 purpose，其余归宿主 hook）。形状校验一份口径（update-message
+  // 复用同一个 validateCredRefs）。
+  if (payload.credRefs !== undefined && payload.credRefs !== null) {
+    const credRefsErr = validateCredRefs(payload.credRefs);
+    if (credRefsErr) {
+      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: credRefsErr, details: { invalidFields: ['credRefs'] } };
+    }
+  }
+  const hasChatRef = hasChatCredRef(payload);
+  // chat 凭据只能有一个来源：带了 credRefs.chat 就不许再带内联三件套的任何
+  // 一个（新 API 没有存量调用方，混着传只会留下「到底用哪份」的歧义）。
+  if (hasChatRef && (payload.apiUrl || payload.apiKey || payload.primaryModel)) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'credRefs.chat 与内联 apiUrl / apiKey / primaryModel 不能同时提供（二选一）', details: { invalidFields: ['credRefs.chat', 'apiUrl', 'apiKey', 'primaryModel'] } };
+  }
+
   if (payload.messageType === 'prompted' || payload.messageType === 'auto') {
     const missingAiFields = [];
     if (!hasPrompt) missingAiFields.push('completePrompt or messages');
-    if (!payload.apiUrl) missingAiFields.push('apiUrl');
-    if (!payload.apiKey) missingAiFields.push('apiKey');
-    if (!payload.primaryModel) missingAiFields.push('primaryModel');
+    if (!hasChatRef) {
+      const hasAnyInline = !!(payload.apiUrl || payload.apiKey || payload.primaryModel);
+      if (!hasAnyInline) {
+        // 三件套整个缺席时提示两条路都行，而不是只报内联那条。
+        missingAiFields.push('credRefs.chat or (apiUrl + apiKey + primaryModel)');
+      } else {
+        if (!payload.apiUrl) missingAiFields.push('apiUrl');
+        if (!payload.apiKey) missingAiFields.push('apiKey');
+        if (!payload.primaryModel) missingAiFields.push('primaryModel');
+      }
+    }
     if (missingAiFields.length > 0) {
       return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { missingFields: missingAiFields } };
     }
@@ -263,10 +288,10 @@ export function validateScheduleMessagePayload(payload) {
     if (payload.recurrenceType && payload.recurrenceType !== 'none') {
       return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型的 recurrenceType 必须为 none', details: { invalidFields: ['recurrenceType (must be "none" for instant type)'] } };
     }
-    const hasAiConfig = hasPrompt && payload.apiUrl && payload.apiKey && payload.primaryModel;
+    const hasAiConfig = hasPrompt && (hasChatRef || (payload.apiUrl && payload.apiKey && payload.primaryModel));
     const hasUserMessage = payload.userMessage;
     if (!hasAiConfig && !hasUserMessage) {
-      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型必须提供 userMessage 或完整的 AI 配置', details: { missingFields: ['userMessage or ((completePrompt | messages) + apiUrl + apiKey + primaryModel)'] } };
+      return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'instant 类型必须提供 userMessage 或完整的 AI 配置', details: { missingFields: ['userMessage or ((completePrompt | messages) + (credRefs.chat | apiUrl + apiKey + primaryModel))'] } };
     }
   }
 

@@ -22,6 +22,9 @@
  *   PUT    /push-subscription → 登记 / 覆盖这个用户的 Web Push 订阅
  *   GET    /push-subscription → { exists, updatedAt, endpoint }
  *   DELETE /push-subscription → 删掉这个用户的订阅
+ *   PUT    /llm-credentials  → 批量登记 / 覆盖 LLM 凭据（任务 payload 的 credRefs 引用它们）
+ *   GET    /llm-credentials  → 对账清单 { credentials: [{ credId, updatedAt }] }（永不回凭据本体）
+ *   DELETE /llm-credentials  → 删除（{ credIds } 或 { all: true }）
  *   GET  /outbox?since=<cursor> → 拉未 ack 的服务端消息（补收的事实来源）
  *   POST /outbox/ack        → 确认收到 { messageIds }
  *
@@ -333,6 +336,13 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         result = await server.handlers.pushSubscription.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/push-subscription')) {
         result = await server.handlers.pushSubscription.DELETE(url, headers);
+      } else if (method === 'PUT' && pathname.endsWith('/llm-credentials')) {
+        result = await server.handlers.llmCredentials.PUT(headers, await request.text());
+      } else if (method === 'GET' && pathname.endsWith('/llm-credentials')) {
+        result = await server.handlers.llmCredentials.GET(url, headers);
+      } else if (method === 'DELETE' && pathname.endsWith('/llm-credentials')) {
+        // DELETE 带加密 body（{ credIds } 或 { all: true }），与 PUT 同一套信封。
+        result = await server.handlers.llmCredentials.DELETE(url, headers, await request.text());
       } else {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }

@@ -145,6 +145,25 @@ export const PUSH_SUBSCRIPTION_TABLE_SQL = `
   )
 `;
 
+// llm_credentials: LLM API 凭据（apiUrl / apiKey / primaryModel）的用户级存放
+// 处，任务行不再各自冻结一份、改带 credRefs 引用（payload 里的
+// `credRefs: { <purpose>: <cred_id> }`），到点解析时按 cred_id 现读这里。
+// 换 Key 覆盖对应行就够了，不用把每条任务翻出来逐行刷（角色自排的任务客户端
+// 根本不知道存在，逐行刷本来也刷不到它——与 push_subscriptions 同一个动机）。
+// `cred_id` 是客户端起名的不透明字符串（约定形如 `char:<id>/<purpose>`、
+// `global/<purpose>`，服务端不解释）；`encrypted_value` 是 encryptForStorage
+// 密文（与任务 payload 同一把 per-user key）；时间戳是 ISO8601 UTC TEXT。
+export const LLM_CREDENTIALS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS llm_credentials (
+    user_id TEXT NOT NULL,
+    cred_id TEXT NOT NULL,
+    encrypted_value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, cred_id)
+  )
+`;
+
 // message_outbox: 服务端发出的每条 push 在发送前先落一行，客户端上线后
 // `GET /outbox?since=` 拉未 ack 的、收到（或删除/重 roll）后 `POST
 // /outbox/ack` 确认。有了 ack 语义，「哪些消息没送到」是查出来的事实，
@@ -242,6 +261,7 @@ export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
     describeTable(SQLITE_TABLE_SQL),
     describeTable(CLIENT_STATE_TABLE_SQL),
     describeTable(PUSH_SUBSCRIPTION_TABLE_SQL),
+    describeTable(LLM_CREDENTIALS_TABLE_SQL),
     describeTable(MESSAGE_OUTBOX_TABLE_SQL)
   ])),
   indexes: Object.freeze(SQLITE_INDEXES.filter((index) => index.critical).map((index) => index.name))

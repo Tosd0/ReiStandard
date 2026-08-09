@@ -402,6 +402,8 @@ describe('agentic fire loop', () => {
         // usage 是共享 SessionContext 新增的便捷字段（llmResponse.usage 的引用）；
         // cancelTask / renewTask 是 fire 内的任务管理口
         'usage', 'cancelTask', 'renewTask',
+        // 按 cred_id 现读一份凭据（返回新对象，不挂在 ctx 上——这里只是方法本身）
+        'resolveLlmCredential',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);

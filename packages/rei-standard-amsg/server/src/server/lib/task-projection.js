@@ -25,6 +25,7 @@
  * @property {string|null}  updatedAt
  * @property {string|null}  charId        - 取自 metadata.charId
  * @property {string|null}  clientTaskId  - 取自 metadata.amsgClientTaskId
+ * @property {Object|null}  credRefs      - 凭据引用（{ <purpose>: <cred_id> }）；引用不是机密，客户端对账要看。没带 → null
  * @property {Object|null}  [metadata]    - 只有 includeMetadata 时才有，见下
  * @property {{ at: string, occurrence: string, reason: string }|null} lastError
  */
@@ -62,6 +63,9 @@ export function projectTask(row, decryptedPayload, options = {}) {
     // 靠它按角色过滤（contactName 会跨角色重名）。缺席 → null。
     charId: metadata.charId ?? null,
     clientTaskId: metadata.amsgClientTaskId ?? null,
+    // 凭据引用只是名字（cred_id），本体在 llm_credentials 表里，凭据字段本身
+    // 照旧被白名单挡在外面。
+    credRefs: payload.credRefs ?? null,
     // 整份 metadata 只在单条查询里给（见上面的 includeMetadata）。
     ...(options.includeMetadata ? { metadata: payload.metadata ?? null } : {}),
     // 上一次没发出去的原因（run-tick 记进 payload 的 lastError）。

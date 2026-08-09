@@ -52,6 +52,7 @@ const EXPECTED_FEATURES = [
   'error-cause',
   'schema-self-check',
   'worker-run-task',
+  'llm-credentials',
 ];
 
 function makeWorker(extra = {}) {

@@ -30,6 +30,7 @@ import { createCancelMessageHandler } from './handlers/cancel-message.js';
 import { createMessagesHandler } from './handlers/messages.js';
 import { createGetMessageHandler } from './handlers/get-message.js';
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
+import { createLlmCredentialsHandler } from './handlers/llm-credentials.js';
 import { createTenantBlobStore } from './tenant/blob-store.js';
 import { createTenantContextManager } from './tenant/context.js';
 import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
@@ -69,6 +70,7 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @property {{ GET: function }} messages
  * @property {{ GET: function }} getMessage
  * @property {{ PUT: function, GET: function, DELETE: function }} pushSubscription
+ * @property {{ PUT: function, GET: function, DELETE: function }} llmCredentials
  */
 
 /**
@@ -144,7 +146,8 @@ export async function createReiServer(config) {
       cancelMessage: createCancelMessageHandler(ctx),
       messages: createMessagesHandler(ctx),
       getMessage: createGetMessageHandler(ctx),
-      pushSubscription: createPushSubscriptionHandler(ctx)
+      pushSubscription: createPushSubscriptionHandler(ctx),
+      llmCredentials: createLlmCredentialsHandler(ctx)
     }
   };
 }
@@ -191,5 +194,19 @@ export {
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
+// 用户级 LLM 凭据存储（llm_credentials 表；任务 payload 的 credRefs 引用它）。
+// 自定义适配器 / 自己包路由的宿主用得到校验和解析口。
+export {
+  supportsLlmCredentialsStore,
+  isValidCredId,
+  validateCredRefs,
+  validateCredValue,
+  hasChatCredRef,
+  resolveLlmCredential,
+  CRED_ID_MAX_LENGTH,
+  CRED_PUT_BATCH_MAX,
+  CRED_ROWS_PER_USER_MAX,
+  CRED_REFS_MAX_ENTRIES,
+} from './lib/llm-credentials-store.js';
 export { advanceOccurrence, nextFutureOccurrence, planNextOccurrence } from './lib/recurrence.js';
 export { createTenantToken, verifyTenantToken } from './tenant/token.js';
