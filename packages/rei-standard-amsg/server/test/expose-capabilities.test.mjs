@@ -41,6 +41,26 @@ async function freshAdapter() {
   return { raw, adapter };
 }
 
+/**
+ * 把测试库伪装成一个真实的新建 D1 库：多一张 Cloudflare 自己建的内部表 `_cf_KV`，
+ * 且对它跑 `PRAGMA table_info` 会被 D1 的 authorizer 拒掉——下面那句报错是真机上
+ * 的原话。除这一条语句外全部照常走底下的 SQLite。
+ */
+function withCloudflareInternalTable(raw) {
+  raw._raw.prepare('CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB)').run();
+  const passthrough = raw.prepare;
+  return {
+    ...raw,
+    prepare(sql) {
+      if (/^\s*PRAGMA\s+table_info\(\s*_cf_KV\s*\)/i.test(sql)) {
+        const denied = async () => { throw new Error('D1_ERROR: not authorized: SQLITE_AUTH'); };
+        return { bind() { return this; }, run: denied, first: denied, all: denied };
+      }
+      return passthrough(sql);
+    }
+  };
+}
+
 async function seedTask(adapter, { uuid, nextSendAt, recurrenceType = 'none' }) {
   await seedPushSubscription(adapter, USER, MASTER_KEY);
   const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
@@ -287,6 +307,37 @@ describe('schema self-check', () => {
     for (const index of SQLITE_REQUIRED_SCHEMA.indexes) {
       assert.ok(live.indexes.includes(index), `索引 ${index} 没建出来`);
     }
+  });
+
+  // Cloudflare 会在每个新建的 D1 库里放一张自己的内部表 `_cf_KV`，而对它跑
+  // `PRAGMA table_info` 会被 D1 的 authorizer 拒掉。自查一路遍历到它就整个抛出
+  // 去，宿主拿到的是「查不了表结构」——新部署的后端必中，早先建的老库反而没有
+  // 这张表、一切正常，所以很难被发现。
+  test('库里有 D1 内部表 _cf_KV：自查照常出结果，不被 SQLITE_AUTH 带崩', async () => {
+    const raw = createTestD1();
+    const adapter = createD1Adapter(withCloudflareInternalTable(raw));
+    await adapter.initSchema();
+
+    const live = await adapter.describeSchema();
+    assert.equal('_cf_KV' in live.tables, false, '内部表不属于本库的 schema');
+    for (const table of Object.keys(SQLITE_REQUIRED_SCHEMA.tables)) {
+      assert.ok(live.tables[table]?.length > 0, `${table} 的列没读出来`);
+    }
+
+    const result = await getSchemaVersion(adapter);
+    assert.equal(result.ok, true);
+    assert.equal(result.current, SCHEMA_VERSION);
+    assert.deepEqual(result.missing, []);
+  });
+
+  // 排除内部表不能靠 SQL 的 `NOT LIKE '_cf_%'`：LIKE 里的 `_` 是「任意单个字符」
+  // 通配符，那样写会把 `acfg_notes` 这类正常表名一起吃掉。
+  test('名字里碰巧带 cf 的表不会被当成内部表滤掉', async () => {
+    const { raw, adapter } = await freshAdapter();
+    raw._raw.prepare('CREATE TABLE acfg_notes (id INTEGER PRIMARY KEY)').run();
+
+    const live = await adapter.describeSchema();
+    assert.deepEqual(live.tables.acfg_notes, ['id']);
   });
 
   test('不支持自查的适配器：抛错说清楚，不假装一切正常', async () => {

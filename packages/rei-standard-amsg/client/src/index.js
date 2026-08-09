@@ -353,6 +353,15 @@ const PUSH_SUBSCRIBE_SETTLE_MS = 800;
 /** Total `pushManager.subscribe()` attempts, first try included. */
 const PUSH_SUBSCRIBE_ATTEMPTS_MAX = 3;
 
+/**
+ * 服务端 `GET /outbox` 单页条数上限（amsg-server `MAX_OUTBOX_PAGE_SIZE`）。
+ * 本地先拦一道，省得为一个必然被 400 的 limit 跑一趟网络。
+ */
+const MAX_OUTBOX_PAGE_SIZE = 100;
+
+/** 服务端 `POST /outbox/ack` 单次 ack 条数上限（amsg-server `MAX_OUTBOX_ACK_IDS`）。 */
+const MAX_OUTBOX_ACK_IDS = 200;
+
 function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1427,6 +1436,121 @@ export class ReiClient {
 
     const res = await fetch(`${this._baseUrl}/llm-credentials`, {
       method: 'DELETE',
+      headers: this._withServerToken({
+        'Content-Type': 'application/json',
+        'X-User-Id': this._userId,
+        'X-Payload-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      }),
+      body: JSON.stringify(encrypted)
+    });
+
+    return res.json();
+  }
+
+  // ─── Message outbox（服务端投递账本） ─────────────────────────────
+
+  /**
+   * 拉这个用户还没确认收到的服务端消息（`GET /outbox`，amsg-server 2.7.0+
+   * 单用户线）。
+   *
+   * 服务端在每条 Web Push 发出去之前先把它记进账本，所以「哪些消息客户端还
+   * 没收下」是查得出来的事实，不用再拿本地最近几条记录去比对着猜。应用启动、
+   * 或者从后台回到前台时拉一次，把 `entries` 补进界面，落库成功之后再用
+   * {@link ReiClient#ackOutbox} 销账。
+   *
+   * 每条 entry 的 `push` 就是**推送信封本身**，与 Service Worker 收到的那一份
+   * 逐字一致——可以原样交给已有的推送处理逻辑，不必另写一套映射。
+   *
+   * 翻页：首次不传 `since`；响应里的 `cursor` 就是下一页的 `since`，
+   * `hasMore` 为 `true` 时接着拉，直到它变成 `false`。销账与翻页各走各的
+   * ——ack 过的条目下次不再出现，`cursor` 只负责往前走。
+   *
+   * 响应走加密信封（同 {@link ReiClient#getClientState}），方法内解密后返回
+   * 明文；需要先 `init()`。
+   *
+   * @param {Object} [opts]
+   * @param {number} [opts.since] - 上一页响应里的 `cursor`，非负整数。缺省从头拉。
+   * @param {number} [opts.limit] - 单页条数，1–100 的整数。缺省由服务端定（50）。
+   * @returns {Promise<Object>} `{ success, data?: { entries, cursor, hasMore }, error? }`，
+   *   其中 `entries` 为 `Array<{ id, messageId, taskUuid, sessionId, messageIndex,
+   *   totalMessages, createdAt, deliveredAt, push }>`。
+   * @throws {TypeError} `since` 不是非负整数，或 `limit` 不是 1–100 的整数。
+   */
+  async getOutbox(opts = {}) {
+    const { since, limit } = opts || {};
+    const params = new URLSearchParams();
+    if (since != null) {
+      if (!Number.isInteger(since) || since < 0) {
+        throw new TypeError('[rei-standard-amsg-client] since must be a non-negative integer');
+      }
+      params.set('since', String(since));
+    }
+    if (limit != null) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > MAX_OUTBOX_PAGE_SIZE) {
+        throw new TypeError(
+          `[rei-standard-amsg-client] limit must be an integer between 1 and ${MAX_OUTBOX_PAGE_SIZE}`
+        );
+      }
+      params.set('limit', String(limit));
+    }
+
+    const qs = params.toString();
+    const res = await fetch(`${this._baseUrl}/outbox${qs ? '?' + qs : ''}`, {
+      method: 'GET',
+      headers: this._withServerToken({
+        'X-User-Id': this._userId,
+        'X-Response-Encrypted': 'true',
+        'X-Encryption-Version': '1'
+      })
+    });
+
+    const json = await res.json();
+    if (!json?.success || json?.encrypted !== true) return json;
+
+    return {
+      success: true,
+      encrypted: true,
+      version: json.version || 1,
+      data: await this._decrypt(json.data)
+    };
+  }
+
+  /**
+   * 告诉服务端这些消息已经收下了（`POST /outbox/ack`）。
+   *
+   * 销过账的 `messageId` 之后不会再出现在 {@link ReiClient#getOutbox} 的结果
+   * 里。顺序要紧：先把消息真正写进本地存储，写成功之后再 ack——反过来的话，
+   * 账已经销了而落库半途失败，这条消息就再也补不回来。
+   *
+   * 幂等：同一批重复 ack 不会出错，服务端只在第一次真正销账。
+   *
+   * 请求体加密（同 {@link ReiClient#putClientState}），需要先 `init()`。
+   *
+   * @param {string[]} messageIds - 非空字符串数组，单次最多 200 个（服务端上限，
+   *   超过的自己分批）。
+   * @returns {Promise<Object>} `{ success, data?: { acked }, error? }`
+   * @throws {TypeError} 不是非空数组、含有非字符串 / 空串、或超过 200 条。
+   */
+  async ackOutbox(messageIds) {
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      throw new TypeError('[rei-standard-amsg-client] messageIds must be a non-empty array');
+    }
+    if (messageIds.length > MAX_OUTBOX_ACK_IDS) {
+      throw new TypeError(
+        `[rei-standard-amsg-client] messageIds must hold at most ${MAX_OUTBOX_ACK_IDS} ids per call`
+      );
+    }
+    if (!messageIds.every((id) => typeof id === 'string' && id.trim())) {
+      throw new TypeError('[rei-standard-amsg-client] every messageId must be a non-empty string');
+    }
+
+    const json = JSON.stringify({ messageIds });
+    this._assertPayloadSize(json, 'ackOutbox');
+    const encrypted = await this._encrypt(json);
+
+    const res = await fetch(`${this._baseUrl}/outbox/ack`, {
+      method: 'POST',
       headers: this._withServerToken({
         'Content-Type': 'application/json',
         'X-User-Id': this._userId,

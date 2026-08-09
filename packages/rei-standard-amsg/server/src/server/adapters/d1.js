@@ -26,6 +26,24 @@ function escapeLikePrefix(prefix) {
   return prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
+// 库里除了本库建的表，还有两类内部表：SQLite 自己的（`sqlite_` 开头）和
+// Cloudflare 塞进 D1 的（`_cf_` 开头，新建的库自带一张 `_cf_KV`）。它们都不属于
+// 本库的 schema，describeSchema() 要跳过。
+//
+// `_cf_` 这一类还有更硬的理由：对它跑 `PRAGMA table_info` 会被 D1 的 authorizer
+// 直接拒掉（`D1_ERROR: not authorized: SQLITE_AUTH`），异常会把整个
+// describeSchema() 带崩，schema 自查跟着一起废。新建的库自带 `_cf_KV`、早先建的
+// 老库没有，症状因此是「新部署的后端必挂、老部署反而一切正常」。
+//
+// 判断放在 JS 侧、不写进 SQL 的 WHERE：LIKE 里的 `_` 是「任意单个字符」通配符，
+// `NOT LIKE '_cf_%'` 会顺手吃掉 `acfg_notes` 这类正常表名，要写对还得额外挂
+// ESCAPE 子句。用 startsWith 就没有这层坑。
+const INTERNAL_TABLE_PREFIXES = ['sqlite_', '_cf_'];
+
+function isInternalTableName(name) {
+  return INTERNAL_TABLE_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
 export class D1Adapter {
   /** @param {{ prepare: (sql: string) => any }} db - Cloudflare D1 binding */
   constructor(db) {
@@ -106,17 +124,20 @@ export class D1Adapter {
    */
   async describeSchema() {
     const tableRes = await this._db.prepare(
-      `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
+      `SELECT name FROM sqlite_master WHERE type = 'table'`
     ).all();
 
     /** @type {Record<string, string[]>} */
     const tables = {};
     for (const row of tableRes.results || []) {
+      const name = String(row.name ?? '');
+      // SQLite / Cloudflare 的内部表跳过，理由见 INTERNAL_TABLE_PREFIXES。
+      if (isInternalTableName(name)) continue;
       // PRAGMA 不接受绑定参数，表名只能拼进去。名字来自 sqlite_master（我们自己
       // 建的表），仍按标识符白名单过一道，拼接里不留任何余地。
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(row.name)) continue;
-      const columnRes = await this._db.prepare(`PRAGMA table_info(${row.name})`).all();
-      tables[row.name] = (columnRes.results || []).map((column) => column.name);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+      const columnRes = await this._db.prepare(`PRAGMA table_info(${name})`).all();
+      tables[name] = (columnRes.results || []).map((column) => column.name);
     }
 
     const indexRes = await this._db.prepare(
