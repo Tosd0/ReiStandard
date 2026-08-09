@@ -549,7 +549,8 @@ export class ReiClient {
    * schedule still ships, just without an avatar. If `maxPayloadBytes` is
    * configured, oversized JSON payloads throw `PAYLOAD_TOO_LARGE_LOCAL`.
    *
-   * 凭据两种给法（amsg-server 2.7.0+ 支持后者）：内联 `apiUrl` / `apiKey` /
+   * 凭据两种给法（后者要 worker 支持——用 `getCapabilities()` 探测 features
+   * 含 `llm-credentials`，别判版本号）：内联 `apiUrl` / `apiKey` /
    * `primaryModel`（冻结在任务行里），或 `credRefs: { chat: '<credId>' }` 引用
    * `putLlmCredentials()` 登记过的凭据（到点现读，换 Key 只要覆盖那一行）。
    * 两种同时给会被服务端 400。
@@ -1360,8 +1361,8 @@ export class ReiClient {
   // ─── LLM Credentials ─────────────────────────────────────────────
 
   /**
-   * 批量登记（或覆盖）用户级 LLM 凭据（amsg-server 2.7.0+ 的
-   * `PUT /llm-credentials`）。
+   * 批量登记（或覆盖）用户级 LLM 凭据（`PUT /llm-credentials`；worker 支不
+   * 支持用 `getCapabilities()` 探测 features 含 `llm-credentials`，别判版本号）。
    *
    * 任务不再冻结 apiUrl / apiKey / primaryModel，改在排程 payload 里带
    * `credRefs: { chat: '<credId>' }` 引用这里登记的行，到点现读。换 Key 时
