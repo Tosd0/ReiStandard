@@ -10,6 +10,7 @@ import {
   INDEXES,
   MIGRATIONS,
   PUSH_SUBSCRIPTION_TABLE_SQL,
+  LLM_CREDENTIALS_TABLE_SQL,
   VERIFY_TABLE_SQL,
   COLUMNS_SQL,
   UPDATABLE_COLUMNS
@@ -38,6 +39,7 @@ export class NeonAdapter {
 
     await sql.query(TABLE_SQL);
     await sql.query(PUSH_SUBSCRIPTION_TABLE_SQL);
+    await sql.query(LLM_CREDENTIALS_TABLE_SQL);
     for (const migration of MIGRATIONS) {
       await sql.query(migration.sql);
     }
@@ -91,6 +93,7 @@ export class NeonAdapter {
     const sql = this._getSql();
     await sql.query('DROP TABLE IF EXISTS scheduled_messages CASCADE');
     await sql.query('DROP TABLE IF EXISTS push_subscriptions CASCADE');
+    await sql.query('DROP TABLE IF EXISTS llm_credentials CASCADE');
   }
 
   async createTask(params) {
@@ -317,5 +320,27 @@ export class NeonAdapter {
   async deletePushSubscription(userId) {
     const sql = this._getSql();
     return pgShared.deletePushSubscription((text, params) => sql.query(text, params), userId);
+  }
+
+  // ── llm_credentials（实现见 pg-shared.js，pg / neon 共用一份）───────────
+
+  async upsertLlmCredentials(userId, entries) {
+    const sql = this._getSql();
+    return pgShared.upsertLlmCredentials((text, params) => sql.query(text, params), userId, entries, new Date().toISOString());
+  }
+
+  async getLlmCredentials(userId, credIds) {
+    const sql = this._getSql();
+    return pgShared.getLlmCredentials((text, params) => sql.query(text, params), userId, credIds);
+  }
+
+  async listLlmCredentials(userId) {
+    const sql = this._getSql();
+    return pgShared.listLlmCredentials((text, params) => sql.query(text, params), userId);
+  }
+
+  async deleteLlmCredentials(userId, credIds = null) {
+    const sql = this._getSql();
+    return pgShared.deleteLlmCredentials((text, params) => sql.query(text, params), userId, credIds);
   }
 }

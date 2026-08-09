@@ -186,3 +186,80 @@ export async function deletePushSubscription(query, userId) {
   );
   return rows.length > 0;
 }
+
+// ── llm_credentials (user-level LLM API credentials) ──────────────────
+
+/**
+ * 批量 upsert 这个用户的凭据（value 已是密文，加密在上层）。已存在的行覆盖
+ * encrypted_value 并刷 updated_at，created_at 保留首次写入的时刻。
+ *
+ * @param {PgQuery} query
+ * @param {string} userId
+ * @param {Array<{ credId: string, encryptedValue: string }>} entries
+ * @param {string} now - ISO8601 时间戳（与 SQLite 侧同口径的 TEXT）
+ * @returns {Promise<number>} 实际写入/覆盖的行数
+ */
+export async function upsertLlmCredentials(query, userId, entries, now) {
+  let upserted = 0;
+  for (const entry of entries) {
+    const rows = await query(
+      `INSERT INTO llm_credentials (user_id, cred_id, encrypted_value, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $4)
+       ON CONFLICT (user_id, cred_id) DO UPDATE SET
+         encrypted_value = EXCLUDED.encrypted_value,
+         updated_at = EXCLUDED.updated_at
+       RETURNING cred_id`,
+      [userId, entry.credId, entry.encryptedValue, now]
+    );
+    if (rows.length > 0) upserted++;
+  }
+  return upserted;
+}
+
+/**
+ * 按 cred_id 批量读这个用户的凭据行（密文原样返回，解密在上层）。
+ *
+ * @param {PgQuery} query
+ * @param {string} userId
+ * @param {string[]} credIds
+ * @returns {Promise<Array<{ cred_id: string, encrypted_value: string, updated_at: string }>>}
+ */
+export async function getLlmCredentials(query, userId, credIds) {
+  if (!credIds || credIds.length === 0) return [];
+  return query(
+    `SELECT cred_id, encrypted_value, updated_at
+     FROM llm_credentials
+     WHERE user_id = $1 AND cred_id = ANY($2)`,
+    [userId, credIds]
+  );
+}
+
+/**
+ * 这个用户名下所有凭据的对账清单（只有 cred_id 和 updated_at）。
+ *
+ * @param {PgQuery} query
+ * @param {string} userId
+ * @returns {Promise<Array<{ cred_id: string, updated_at: string }>>}
+ */
+export async function listLlmCredentials(query, userId) {
+  return query(
+    'SELECT cred_id, updated_at FROM llm_credentials WHERE user_id = $1 ORDER BY cred_id ASC',
+    [userId]
+  );
+}
+
+/**
+ * 删凭据。`credIds` 传数组删指定那几行；传 null 删这个用户的全部。
+ *
+ * @param {PgQuery} query
+ * @param {string} userId
+ * @param {string[]|null} credIds
+ * @returns {Promise<number>} 删掉的行数
+ */
+export async function deleteLlmCredentials(query, userId, credIds = null) {
+  if (credIds !== null && credIds.length === 0) return 0;
+  const rows = credIds === null
+    ? await query('DELETE FROM llm_credentials WHERE user_id = $1 RETURNING cred_id', [userId])
+    : await query('DELETE FROM llm_credentials WHERE user_id = $1 AND cred_id = ANY($2) RETURNING cred_id', [userId, credIds]);
+  return rows.length;
+}

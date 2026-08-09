@@ -30,6 +30,7 @@ import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
 import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
+import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
 import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
 import { isNonRetryableError, sanitizeErrorSummary } from './errors.js';
 
@@ -137,8 +138,13 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     } else if (decryptedPayload.messageType === 'instant') {
       const hasPrompt = !!decryptedPayload.completePrompt
         || (Array.isArray(decryptedPayload.messages) && decryptedPayload.messages.length > 0);
-      if (hasPrompt && decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel) {
-        const aiResult = await callLlm(decryptedPayload);
+      const hasChatSource = hasChatCredRef(decryptedPayload)
+        || !!(decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel);
+      if (hasPrompt && hasChatSource) {
+        // credRefs.chat 任务按引用现读凭据；解析结果只合进发给 callLlm 的这
+        // 一个对象，不写回 decryptedPayload（那份会流向 hook / push）。
+        const chatCred = await resolveFireCredentials({ db: ctx.db, userId: task.user_id, userKey, decryptedPayload });
+        const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload);
         messageContent = aiResult.content;
         llmResponse = aiResult.response;
       } else if (decryptedPayload.userMessage) {
@@ -148,7 +154,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       }
 
     } else if (decryptedPayload.messageType === 'prompted' || decryptedPayload.messageType === 'auto') {
-      const aiResult = await callLlm(decryptedPayload);
+      const chatCred = await resolveFireCredentials({ db: ctx.db, userId: task.user_id, userKey, decryptedPayload });
+      const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload);
       messageContent = aiResult.content;
       llmResponse = aiResult.response;
     } else {

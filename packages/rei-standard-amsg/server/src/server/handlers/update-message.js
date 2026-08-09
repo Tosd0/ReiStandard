@@ -8,6 +8,7 @@
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
+import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs } from '../lib/llm-credentials-store.js';
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -149,6 +150,31 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'PUSH_SUBSCRIPTION_NOT_ACCEPTED', message: 'pushSubscription 不再随任务更新，改用 PUT /push-subscription 覆盖用户级订阅', details: { invalidFields: ['pushSubscription'] } } } };
     }
 
+    // credRefs：整体替换（语义同 metadata，不做深合并），同样做存在性检查。
+    // 与内联三件套在同一个请求里混着传打回——两份 chat 凭据来源到底改哪个说
+    // 不清。传了 credRefs 不动存量内联三件套：那份留作 fire 时表行缺失的兜底。
+    if (updates.credRefs !== undefined && updates.credRefs !== null) {
+      const credRefsErr = validateCredRefs(updates.credRefs);
+      if (credRefsErr) {
+        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: credRefsErr, details: { invalidFields: ['credRefs'] } } } };
+      }
+      if (updates.apiUrl || updates.apiKey || updates.primaryModel) {
+        return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'credRefs 与内联 apiUrl / apiKey / primaryModel 不能同时更新（二选一）', details: { invalidFields: ['credRefs', 'apiUrl', 'apiKey', 'primaryModel'] } } } };
+      }
+      if (!supportsLlmCredentialsStore(db)) {
+        return { status: 501, body: { success: false, error: { code: 'LLM_CREDENTIALS_NOT_SUPPORTED', message: '当前数据库适配器不支持用户级 LLM 凭据存储' } } };
+      }
+      let missingCredIds;
+      try {
+        missingCredIds = await findMissingCredIds({ db, userId, credRefs: updates.credRefs });
+      } catch (_error) {
+        return { status: 503, body: { success: false, error: { code: 'LLM_CREDENTIALS_LOOKUP_FAILED', message: '凭据读取失败，请稍后重试' } } };
+      }
+      if (missingCredIds.length > 0) {
+        return { status: 409, body: { success: false, error: { code: 'CREDENTIAL_NOT_FOUND', message: `credRefs 引用的凭据不存在：${missingCredIds.join(', ')}（先 PUT /llm-credentials 登记）`, details: { missingCredIds } } } };
+      }
+    }
+
     // Fetch existing task
     const existingTask = await db.getTaskByUuid(taskUuid, userId);
 
@@ -191,6 +217,9 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.apiUrl && { apiUrl: updates.apiUrl }),
       ...(updates.apiKey && { apiKey: updates.apiKey }),
       ...(updates.primaryModel && { primaryModel: updates.primaryModel }),
+      // credRefs 整体替换；truthy spread——显式传 null 只是「不改」，摘掉引用
+      // 退回内联没有已知用途，真要清就 DELETE 凭据行让 fire 走兜底。
+      ...(updates.credRefs && { credRefs: updates.credRefs }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'maxTokens') && { maxTokens: updates.maxTokens ?? null }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'temperature') && { temperature: updates.temperature ?? null }),
       // splitPattern: hasOwnProperty so that explicit `null` (= revert to

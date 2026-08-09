@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   updated_at INTEGER NOT NULL
 );
 
+-- LLM API 凭据（/llm-credentials 端点用）。任务 payload 里的 credRefs 按
+-- cred_id 引用这里的行，到点解析时现读——换 Key 覆盖对应行就够，不用逐任务
+-- 刷。encrypted_value 是密文；时间戳是 ISO8601 UTC 文本。
+CREATE TABLE IF NOT EXISTS llm_credentials (
+  user_id TEXT NOT NULL,
+  cred_id TEXT NOT NULL,
+  encrypted_value TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, cred_id)
+);
+
 -- 服务端消息收件箱（/outbox 与 /outbox/ack 用）。每条 push 发送前先落一行，
 -- 客户端上线后拉未 ack 的补收。payload 是整条 push JSON 的密文；delivered_at
 -- 记 Web Push 有没有发出去；acked_at 由客户端确认时写。

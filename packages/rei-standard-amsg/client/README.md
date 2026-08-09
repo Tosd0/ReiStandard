@@ -531,6 +531,9 @@ try {
 - `putPushSubscription(subscription, opts?)` —— 登记 / 覆盖这个用户的 Web Push 订阅（`PUT /push-subscription`）。传 `pushManager.subscribe()` 的结果（或它的 `toJSON()`）即可，方法内部会取 `toJSON`。服务端一个用户存一份，所有定时任务到点投递时都读它——包括角色在 fire 里给自己排的、客户端根本不知道存在的那些任务。`opts.updatedAt` 是 epoch 毫秒，不传由服务端取当前时刻
 - `getPushSubscription()` —— 服务端登记的订阅现状：`{ exists, updatedAt, endpoint }`，不含订阅的密钥部分。设置页显示状态、或者拿 `endpoint` 跟本地订阅对一下是不是同一个
 - `deletePushSubscription()` —— 删掉服务端登记的订阅（设置页的「停止接收推送」）。删掉之后已有的定时任务到点会投递失败并记下原因，不会静默消失
+- `putLlmCredentials(credentials)` —— 批量登记 / 覆盖用户级 LLM 凭据（`PUT /llm-credentials`，amsg-server 2.7.0+ 单用户线）。credentials 为 `[{ credId, value: { apiUrl, apiKey, primaryModel } }]`；`credId` 由客户端起名（约定 `char:<charId>/<purpose>`、`global/<purpose>`）。登记后排程 payload 用 `credRefs: { chat: credId }` 引用它，任务到点现读——换 Key 覆盖对应行就够，所有引用它的任务（含角色自排的）自动跟随
+- `listLlmCredentials()` —— 云端凭据对账清单 `{ credentials: [{ credId, updatedAt }] }`，凭据本体永远不回传
+- `deleteLlmCredentials(opts)` —— 删凭据：`{ credIds: [...] }` 删指定那几行（如角色删除时清它名下的），`{ all: true }` 全删（「清空云端数据」）。删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，重新登记同名 credId 即恢复
 
 以及从 `@rei-standard/amsg-shared` re-export 的运行时常量 / builder / type guard：
 

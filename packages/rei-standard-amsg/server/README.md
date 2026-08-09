@@ -47,6 +47,9 @@ const rei = await createReiServer({
 // PUT  /api/v1/push-subscription    -> rei.handlers.pushSubscription.PUT
 // GET  /api/v1/push-subscription    -> rei.handlers.pushSubscription.GET
 // DELETE /api/v1/push-subscription  -> rei.handlers.pushSubscription.DELETE
+// PUT  /api/v1/llm-credentials      -> rei.handlers.llmCredentials.PUT
+// GET  /api/v1/llm-credentials      -> rei.handlers.llmCredentials.GET
+// DELETE /api/v1/llm-credentials    -> rei.handlers.llmCredentials.DELETE
 ```
 
 ## 关于 `messageType: 'instant'`
@@ -160,6 +163,51 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 装不下的内容（长文、附件详情）建议走旁路：正文存进 `client_state`，push 里只带一个引用键，客户端上线后用 `GET /client-state` 取回。单用户 Worker 的 fire-time hook 用 `ctx.writeState()` 写，见 [`examples/cloudflare-single-user/README.md`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/examples/cloudflare-single-user/README.md)。
 
+## LLM 凭据（用户级）与 credRefs
+
+LLM API 凭据（`apiUrl` / `apiKey` / `primaryModel`）有两种给法：
+
+- **内联**：随排程请求带三件套，冻结进任务行（一直以来的方式，继续支持）。
+- **引用**：凭据先用 `PUT /llm-credentials` 集中登记，排程 payload 里只带
+  `credRefs: { chat: '<credId>' }`。到点投递时按 credId 现读——换 Key 覆盖对应
+  行就够了，所有引用它的任务（包括角色在 fire 里给自己排的、客户端根本不知道
+  存在的那些）下次触发用的都是新凭据。
+
+| 端点 | 语义 |
+|---|---|
+| `PUT /llm-credentials` | 批量登记 / 覆盖。body =（加密后的）`{ credentials: [{ credId, value: { apiUrl, apiKey, primaryModel } }] }`，一批 ≤100 条，单用户 ≤500 行 |
+| `GET /llm-credentials` | 对账清单 `{ credentials: [{ credId, updatedAt }] }`。**凭据本体永远不回传** |
+| `DELETE /llm-credentials` | 删除。body =（加密后的）`{ credIds: [...] }` 或 `{ all: true }` |
+
+客户端侧对应 `client.putLlmCredentials(credentials)` / `listLlmCredentials()` / `deleteLlmCredentials(opts)`。
+
+`credId` 是客户端起名的**不透明字符串**（1–128 字符、不含控制字符），服务端不
+解释语义。约定：`char:<charId>/<purpose>`（角色级）、`global/<purpose>`（全
+局）。`credRefs` 的 purpose 键里只有 `chat` 由服务端消费（fire 时的主 LLM 调
+用）；其余 purpose（如情绪评估的副 API）归宿主 hook 侧，fire hook 的 ctx 上有
+`resolveLlmCredential(credId)` 可按需取用（每次返回新对象；拿到就用，别挂到
+ctx / metadata / push 上）。
+
+配套的规则：
+
+- 排程 / 更新时对 `credRefs` 里的**全部** credId 做存在性检查，缺的返回
+  `409 CREDENTIAL_NOT_FOUND` 并点名（先登记再排程）。
+- `credRefs.chat` 与内联三件套在同一个请求里不能都传（`400`）：chat 凭据只能
+  有一个来源。
+- fire 时的解析顺序：`credRefs.chat` → 查表；行没了 → 退回任务里的内联三件套
+  （如有）；都没有 → 本轮失败，`lastError` 记 `CREDENTIAL_MISSING`，走常规重
+  试——补传凭据后下一轮自愈。
+- hook 的 `ctx.scheduleTask()` 自排任务时：父任务带 `credRefs` 就复制**引用**
+  （不复制凭据本体），换 Key 自动作用于整条自排链；存量内联任务照旧复制三件套。
+- 任务投影（`GET /messages` / hook 的 `ctx.task`）带 `credRefs`（只是名字，不
+  是机密），客户端对账用；凭据本体照旧被白名单挡在外面。
+- 数据库侧是 `llm_credentials` 表（`(user_id, cred_id)` 主键，`encrypted_value`
+  密文，时间戳 ISO8601 文本）。内置的 D1 / pg / neon 适配器都实现了，
+  `initSchema()` 会建表。自定义适配器要补 `upsertLlmCredentials` /
+  `getLlmCredentials` / `listLlmCredentials` / `deleteLlmCredentials` 四个方法，
+  缺任何一个这几个端点返回 501、带 `credRefs` 的排程也会被拒。
+- 特性探测：`GET /capabilities` 的 `features` 含 `'llm-credentials'`。
+
 ## 读一条任务：列表 vs 单条
 
 | 端点 | 给什么 |
@@ -173,12 +221,13 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 ## 更新任务时能改哪些字段
 
-`PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `maxTokens` / `temperature` / `splitPattern`，以及凭据三件套 `apiUrl` / `apiKey` / `primaryModel`。
+`PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `maxTokens` / `temperature` / `splitPattern`、凭据三件套 `apiUrl` / `apiKey` / `primaryModel`，以及凭据引用 `credRefs`。
 
 - `contactName` 必须是非空字符串（口径与排程时一致），空串 / `null` / 非字符串一律 `400`。用户给角色改了名之后，之前排的任务推送出来的通知标题（「来自 <contactName>」）靠它跟着改。
 - `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。
 - `avatarUrl` 显式传 `null` 是「不改」而不是「清空」（§6.2 的软清空策略要求非法头像被摘掉时保留旧头像，「摘掉」和「传了个 null」在这一层是同一件事）。
 - 凭据三件套传 `null` 同样只是忽略：清掉任何一个，任务到点就发不出去。
+- `credRefs` 是整体替换（语义同 `metadata`），同样做存在性检查；与内联三件套在同一个请求里混着传返回 `400`。给存量内联任务补 `credRefs` 时不动已存的三件套——那份留作 fire 时表行缺失的兜底。
 - `pushSubscription` 不收（`400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`），它是用户级的一份，走 `PUT /push-subscription`。
 
 ## 推送自带任务身份

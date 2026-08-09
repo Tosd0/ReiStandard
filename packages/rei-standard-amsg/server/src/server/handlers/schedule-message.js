@@ -11,6 +11,7 @@ import { isUniqueViolation } from '../lib/db-errors.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import { validateScheduleMessagePayload } from '../lib/validation.js';
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
+import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
 
 export function createScheduleMessageHandler(ctx) {
@@ -102,6 +103,36 @@ export function createScheduleMessageHandler(ctx) {
       };
     }
 
+    // credRefs 引用的凭据必须已经登记过（PUT /llm-credentials）。没登记就建
+    // 任务的话，这条任务到点只会失败一次又一次——早点点名比让它安静地烂在库
+    // 里强（先例：上面那段推送订阅的存在性检查）。检查过后被 DELETE 掉属
+    // TOCTOU 竞态，由 fire 时的 CREDENTIAL_MISSING 兜底。
+    if (payload.credRefs) {
+      if (!supportsLlmCredentialsStore(db)) {
+        return { status: 501, body: { success: false, error: { code: 'LLM_CREDENTIALS_NOT_SUPPORTED', message: '当前数据库适配器不支持用户级 LLM 凭据存储' } } };
+      }
+      let missingCredIds;
+      try {
+        missingCredIds = await findMissingCredIds({ db, userId, credRefs: payload.credRefs });
+      } catch (_error) {
+        // 查询失败是基础设施问题，按可重试的 503 报，别伪装成「没登记」。
+        return { status: 503, body: { success: false, error: { code: 'LLM_CREDENTIALS_LOOKUP_FAILED', message: '凭据读取失败，请稍后重试' } } };
+      }
+      if (missingCredIds.length > 0) {
+        return {
+          status: 409,
+          body: {
+            success: false,
+            error: {
+              code: 'CREDENTIAL_NOT_FOUND',
+              message: `credRefs 引用的凭据不存在：${missingCredIds.join(', ')}（先 PUT /llm-credentials 登记）`,
+              details: { missingCredIds }
+            }
+          }
+        };
+      }
+    }
+
     const taskUuid = payload.uuid || randomUUID();
 
     // immediate：不排未来，next_send_at = 现在，下一跳 cron（最多一分钟后）
@@ -124,6 +155,9 @@ export function createScheduleMessageHandler(ctx) {
       apiUrl: payload.apiUrl || null,
       apiKey: payload.apiKey || null,
       primaryModel: payload.primaryModel || null,
+      // 凭据引用（{ <purpose>: <cred_id> }）。带它的任务到点按引用现读
+      // llm_credentials，凭据本体不冻结在行里。
+      credRefs: payload.credRefs || null,
       // Prompt is one-of: legacy completePrompt (string) OR messages (OpenAI-
       // style array). Validation has already enforced exactly-one-of, so
       // exactly one of these will be non-null when an AI config is provided.

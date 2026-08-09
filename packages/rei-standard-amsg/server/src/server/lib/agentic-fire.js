@@ -112,6 +112,12 @@ import { createStateAccessors } from './state-accessors.js';
 import { projectTask } from './task-projection.js';
 import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
+import {
+  hasChatCredRef,
+  resolveFireCredentials,
+  resolveLlmCredential as resolveLlmCredentialFromStore,
+  supportsLlmCredentialsStore,
+} from './llm-credentials-store.js';
 import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
@@ -177,7 +183,10 @@ export function taskNeedsLlm(decryptedPayload) {
   const type = decryptedPayload.messageType;
   if (type === 'prompted' || type === 'auto') return true;
   if (type === 'instant') {
-    return !!(decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel);
+    // 凭据来源有两种：credRefs.chat 引用（fire 时现读 llm_credentials）或
+    // 冻结在行里的内联三件套（存量任务）。有任一即走 LLM。
+    return hasChatCredRef(decryptedPayload)
+      || !!(decryptedPayload.apiUrl && decryptedPayload.apiKey && decryptedPayload.primaryModel);
   }
   return false;
 }
@@ -440,9 +449,22 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       firstSendTime: nextSendAt,
       recurrenceType,
       tzId,
-      apiUrl: decryptedPayload.apiUrl || null,
-      apiKey: decryptedPayload.apiKey || null,
-      primaryModel: decryptedPayload.primaryModel || null,
+      // 凭据：父任务带 credRefs 就复制**引用**（换 Key 只要覆盖 llm_credentials
+      // 里那一行，自排链上的后代自动跟随），不复制内联；存量内联任务照旧复制
+      // 三件套——这正是「自排链传旧 Key」那个洞的修口。
+      ...(decryptedPayload.credRefs && typeof decryptedPayload.credRefs === 'object' && !Array.isArray(decryptedPayload.credRefs) && Object.keys(decryptedPayload.credRefs).length > 0
+        ? {
+          apiUrl: null,
+          apiKey: null,
+          primaryModel: null,
+          credRefs: { ...decryptedPayload.credRefs },
+        }
+        : {
+          apiUrl: decryptedPayload.apiUrl || null,
+          apiKey: decryptedPayload.apiKey || null,
+          primaryModel: decryptedPayload.primaryModel || null,
+          credRefs: null,
+        }),
       // 见文件头：fire-time hook 每次现场重组 prompt，旧 prompt 带过去只会在新
       // 任务走回老链路时顶替宿主的意图。
       completePrompt: null,
@@ -578,6 +600,23 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     return { renewed: true, uuid, nextSendAt: nextSendAtIso };
   };
 
+  /**
+   * resolveLlmCredential(credId) —— 按 cred_id 现读一份凭据，每次调用返回
+   * **新对象**；没有这行 / 适配器不支持 → null。宿主 hook 用它取非 chat 用途
+   * 的副 API（如情绪评估），凭据从此不必随 metadata 走。
+   *
+   * 红线：拿到就用（当场发请求），**不得**把结果挂到 ctx / task / metadata /
+   * push 上——那些对象会流向 hook 与 push，凭据跟着走就把
+   * CREDENTIAL_PAYLOAD_KEYS 那道防线绕空了。
+   */
+  const resolveLlmCredential = async (credId) => {
+    if (typeof credId !== 'string' || !credId.trim()) {
+      throw new TypeError('resolveLlmCredential(credId) 需要非空字符串 credId');
+    }
+    if (!supportsLlmCredentialsStore(ctx.db)) return null;
+    return resolveLlmCredentialFromStore({ db: ctx.db, userId: task.user_id, userKey, credId });
+  };
+
   // 单次 fire 的宿主便签：onBeforeFire 的 fireCtx 和同一次 fire 每轮的
   // sessionCtx（onLLMOutput / executeToolCalls）拿到同一个对象引用，fire 结束
   // （finish / skip-push / 抛错 / 轮数超限）随调用栈丢弃。库自己不读不写、
@@ -592,6 +631,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     scheduleTask,
     cancelTask,
     renewTask,
+    resolveLlmCredential,
     now: new Date(nowFn()),
     scratch,
   });
@@ -607,7 +647,8 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-      readState, writeState, scratch, scheduleTask, cancelTask, renewTask, fireCtx, progress,
+      readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+      resolveLlmCredential, fireCtx, progress,
     });
     settledStatus = !outcome.handled
       ? 'not-handled'
@@ -649,7 +690,8 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
  */
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-  readState, writeState, scratch, scheduleTask, cancelTask, renewTask, fireCtx, progress,
+  readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+  resolveLlmCredential, fireCtx, progress,
 }) {
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
@@ -683,6 +725,14 @@ async function runFireChain({
   const occurrenceMs = occurrenceMsOf(task);
   let messages = normalized.messages.slice();
 
+  // chat 凭据进循环前解析一次（多轮共用同一份；credRefs.chat 缺席时是 null，
+  // 存量内联任务零开销）。解析结果只合进每轮传给 callLlm 的请求对象，不写回
+  // decryptedPayload——那份会流向 hook 与 push。解析不到（行被删且无内联兜底）
+  // 抛 CREDENTIAL_MISSING，走任务的常规失败/重试。
+  const chatCred = await resolveFireCredentials({
+    db: ctx.db, userId: task.user_id, userKey, decryptedPayload,
+  });
+
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
     if (nowFn() >= deadline) {
       throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
@@ -696,6 +746,7 @@ async function runFireChain({
     const { response: llmResponse } = await callLlm(
       {
         ...decryptedPayload,
+        ...(chatCred || {}),
         messages,
         ...(normalized.tools ? { tools: normalized.tools, toolChoice: normalized.toolChoice } : {}),
       },
@@ -735,6 +786,7 @@ async function runFireChain({
       scheduleTask,
       cancelTask,
       renewTask,
+      resolveLlmCredential,
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);

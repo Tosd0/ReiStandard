@@ -90,6 +90,10 @@ export const SERVER_FEATURES = Object.freeze([
   'schema-self-check',
   // 单用户 Worker 上有 runTask(uuid, env)：只跑指定那一条任务。
   'worker-run-task',
+  // 用户级 LLM 凭据存储：PUT/GET/DELETE /llm-credentials，任务 payload 认
+  // credRefs（fire 时按引用现读、自排任务复制引用），hook ctx 带
+  // resolveLlmCredential。
+  'llm-credentials',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

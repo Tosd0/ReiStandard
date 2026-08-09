@@ -121,6 +121,22 @@ export const PUSH_SUBSCRIPTION_TABLE_SQL = `
   )
 `;
 
+// llm_credentials: LLM API 凭据（apiUrl / apiKey / primaryModel）的用户级存放
+// 处，任务行不再各自冻结一份、改带 credRefs 引用，到点解析时按 cred_id 现读
+// 这里（动机同 push_subscriptions：换 Key 覆盖对应行就够，角色自排的任务也
+// 自动跟着变）。`encrypted_value` 是 encryptForStorage 密文；时间戳存 ISO8601
+// UTC TEXT（与 SQLite 侧同口径，handler 不用分方言）。
+export const LLM_CREDENTIALS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS llm_credentials (
+    user_id VARCHAR(255) NOT NULL,
+    cred_id VARCHAR(128) NOT NULL,
+    encrypted_value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, cred_id)
+  )
+`;
+
 export const VERIFY_TABLE_SQL = `
   SELECT table_name
   FROM information_schema.tables
