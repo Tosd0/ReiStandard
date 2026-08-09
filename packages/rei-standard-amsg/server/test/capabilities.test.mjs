@@ -49,6 +49,9 @@ const EXPECTED_FEATURES = [
   'fire-settled-metadata',
   'hook-usage',
   'llm-extra-body',
+  'error-cause',
+  'schema-self-check',
+  'worker-run-task',
 ];
 
 function makeWorker(extra = {}) {

@@ -162,9 +162,18 @@ export async function runScheduledTick(ctx) {
  * 行没到点（next_send_at 在未来）或正处在退避窗口（retry_after 未到点）时不
  * 跑——这个入口只是换了个触发器，不是绕过排期的后门。
  *
+ * 四种不跑的情形分开回报，调用方不用猜：
+ *   - `not_found`：没有这条 uuid。一次性任务发完即删，所以「发完了」的那条也
+ *     落在这里；行还在但已经是终态的走下面那条。
+ *   - `already_settled`：行还在，但已经是 sent / failed（`status` 带上是哪
+ *     个）。适配器没实现 `getTaskStatusByUuidOnly` 时这种情况并进 `not_found`。
+ *   - `not_due`：还没到 `next_send_at`（`nextSendAt` 带上是什么时候）。
+ *   - `retry_pending`：上次投递失败，还在退避窗口里（`retryAfter` 带上什么时
+ *     候到点）。
+ *
  * @param {Object} ctx - 与 runScheduledTick 同一份 ctx
  * @param {string} uuid - 任务 uuid（pending 行）
- * @returns {Promise<{ ran: false, reason: 'not_found'|'not_due'|'retry_pending', nextSendAt?: string, retryAfter?: string }
+ * @returns {Promise<{ ran: false, reason: 'not_found'|'already_settled'|'not_due'|'retry_pending', status?: string, nextSendAt?: string, retryAfter?: string }
  *   | { ran: true, summary: Object }>} summary 与 runScheduledTick 的返回同构
  *   （totalTasks 恒为 1）；任务被别的执行者占着时体现在 summary.details.claimSkippedTasks。
  */
@@ -173,7 +182,15 @@ export async function runTask(ctx, uuid) {
     throw new TypeError('runTask(ctx, uuid) requires a non-empty uuid string');
   }
   const task = await ctx.db.getTaskByUuidOnly(uuid);
-  if (!task) return { ran: false, reason: 'not_found' };
+  if (!task) {
+    // 捞不到 pending 行有两种可能：这条压根不存在，或者它已经跑完进了终态。
+    // 后者对调用方是「不用再催了」，前者是「uuid 传错了」——两件事分开说。
+    if (typeof ctx.db.getTaskStatusByUuidOnly === 'function') {
+      const settled = await ctx.db.getTaskStatusByUuidOnly(uuid);
+      if (settled) return { ran: false, reason: 'already_settled', status: settled.status };
+    }
+    return { ran: false, reason: 'not_found' };
+  }
   const dueMs = Date.parse(task.next_send_at);
   if (Number.isFinite(dueMs) && dueMs > Date.now()) {
     return { ran: false, reason: 'not_due', nextSendAt: task.next_send_at };

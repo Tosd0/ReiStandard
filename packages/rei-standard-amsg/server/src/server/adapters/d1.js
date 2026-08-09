@@ -92,6 +92,38 @@ export class D1Adapter {
     };
   }
 
+  /**
+   * 活库里现在实际有哪些表 / 列 / 索引。
+   *
+   * 只读不写，纯粹如实回报：拿它跟这一版需要的清单对照的活儿在
+   * lib/schema-version.js（`getSchemaVersion` / `ensureSchema`）。库升级后表结
+   * 构变了而老部署没跑过 initSchema 时，cron 会每分钟静默挂在缺的那一列上，
+   * 界面上一切正常——这个方法就是让宿主查得出来。
+   *
+   * @returns {Promise<{ tables: Record<string, string[]>, indexes: string[] }>}
+   */
+  async describeSchema() {
+    const tableRes = await this._db.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
+    ).all();
+
+    /** @type {Record<string, string[]>} */
+    const tables = {};
+    for (const row of tableRes.results || []) {
+      // PRAGMA 不接受绑定参数，表名只能拼进去。名字来自 sqlite_master（我们自己
+      // 建的表），仍按标识符白名单过一道，拼接里不留任何余地。
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(row.name)) continue;
+      const columnRes = await this._db.prepare(`PRAGMA table_info(${row.name})`).all();
+      tables[row.name] = (columnRes.results || []).map((column) => column.name);
+    }
+
+    const indexRes = await this._db.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL`
+    ).all();
+
+    return { tables, indexes: (indexRes.results || []).map((row) => row.name) };
+  }
+
   async dropSchema() {
     await this._db.prepare('DROP TABLE IF EXISTS scheduled_messages').run();
     await this._db.prepare('DROP TABLE IF EXISTS client_state').run();
@@ -173,6 +205,20 @@ export class D1Adapter {
        WHERE uuid = ? AND status = 'pending'
        LIMIT 1`
     ).bind(uuid).first();
+  }
+
+  /**
+   * 这条 uuid 现在是什么状态——不限用户，也不限状态（getTaskByUuidOnly 只看
+   * pending 行）。`runTask` 用它把「这条已经跑完了」和「压根没这条」分开回报。
+   *
+   * @param {string} uuid
+   * @returns {Promise<{ status: string }|null>}
+   */
+  async getTaskStatusByUuidOnly(uuid) {
+    const row = await this._db.prepare(
+      'SELECT status FROM scheduled_messages WHERE uuid = ? LIMIT 1'
+    ).bind(uuid).first();
+    return row ? { status: row.status } : null;
   }
 
   async updateTaskById(taskId, updates) {

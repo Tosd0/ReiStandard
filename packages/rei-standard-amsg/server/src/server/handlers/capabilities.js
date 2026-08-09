@@ -83,6 +83,13 @@ export const SERVER_FEATURES = Object.freeze([
   'hook-usage',
   // schedule-message 认 llmExtraBody（原样展开进 LLM 请求体，核心字段优先）。
   'llm-extra-body',
+  // 500 响应体的 error.cause 带真实原因（stage / name / message），调用方不用
+  // 再去日志里捞「到底哪儿坏了」。
+  'error-cause',
+  // 导出 getSchemaVersion / ensureSchema：表结构够不够用查得出来，也补得上。
+  'schema-self-check',
+  // 单用户 Worker 上有 runTask(uuid, env)：只跑指定那一条任务。
+  'worker-run-task',
 ]);
 
 export function createCapabilitiesHandler(ctx) {
