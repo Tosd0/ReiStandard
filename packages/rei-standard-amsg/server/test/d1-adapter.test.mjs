@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
-import { createTestD1 } from './helpers/sqlite-d1.mjs';
+import { createTestD1, createSpyD1 } from './helpers/sqlite-d1.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -292,4 +292,140 @@ test('uuid uniqueness violation surfaces as an error matched by isUniqueViolatio
     adapter.createTask(baseTask({ uuid: 'dup' })),
     (err) => /unique constraint/i.test(err.message)
   );
+});
+
+// ─── D1 单条语句 100 个绑定参数的上限 ────────────────────────────────────────
+//
+// D1 对单条语句的绑定参数数量卡死在 100，第 101 个直接报
+// `too many SQL variables`（D1_ERROR 7500）。这个数算的是整条语句的参数总数，
+// 不只是 IN (...) 里那部分。
+//
+// 跟 LIKE pattern 那条限制一样，本地跑不出来：better-sqlite3 的
+// SQLITE_MAX_VARIABLE_NUMBER 是几百到三万多（看编译参数），喂 202 个照样跑得
+// 通，功能测试在修复前也是绿的。所以守卫得盯「发出去的每条语句绑了几个参数」。
+
+const D1_MAX_BOUND_PARAMS = 100;
+
+/** 这一批调用里，每条语句的绑定参数个数都不许超过 D1 的上限。 */
+function assertBoundParamBudget(calls) {
+  for (const call of calls) {
+    assert.ok(
+      call.args.length <= D1_MAX_BOUND_PARAMS,
+      `单条语句绑了 ${call.args.length} 个参数，超过 D1 的 ${D1_MAX_BOUND_PARAMS} 上限：${call.sql}`
+    );
+  }
+}
+
+/** 造 n 条 outbox 行，返回它们的 messageId。 */
+async function seedOutbox(adapter, n) {
+  const ids = Array.from({ length: n }, (_, i) => `msg-${String(i).padStart(4, '0')}`);
+  await adapter.appendOutboxMessages(USER, ids.map((id) => ({
+    message_id: id, payload: 'enc', created_at: 1000,
+  })));
+  return ids;
+}
+
+/** 造 n 条凭据行，返回它们的 credId。 */
+async function seedCredentials(adapter, n) {
+  const ids = Array.from({ length: n }, (_, i) => `char:${String(i).padStart(4, '0')}/chat`);
+  await adapter.upsertLlmCredentials(USER, ids.map((id) => ({ credId: id, encryptedValue: 'enc' })));
+  return ids;
+}
+
+test('IN (...) 的四个批量口都不给单条语句喂超过 100 个绑定参数', async () => {
+  const { db, calls } = createSpyD1();
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+
+  // MAX_OUTBOX_ACK_IDS = 200，是契约允许的最大值。
+  const messageIds = await seedOutbox(adapter, 200);
+  const credIds = await seedCredentials(adapter, 200);
+
+  calls.length = 0;
+  await adapter.markOutboxDelivered(USER, messageIds, 2000);
+  await adapter.ackOutboxMessages(USER, messageIds, 3000);
+  await adapter.getLlmCredentials(USER, credIds);
+  await adapter.deleteLlmCredentials(USER, credIds);
+
+  assert.ok(calls.length > 0, '这几个调用应该真的发出了语句');
+  assertBoundParamBudget(calls);
+});
+
+test('切批按语句自己的固定参数算额度，不是写死 100 个 id 一批', async () => {
+  const { db, calls } = createSpyD1();
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+  const messageIds = await seedOutbox(adapter, 200);
+  const credIds = await seedCredentials(adapter, 200);
+
+  // ack：SET acked_at = ? 和 user_id = ? 占掉 2 个，一批最多 98 个 id
+  const ackBatches = async (n) => {
+    calls.length = 0;
+    await adapter.ackOutboxMessages(USER, messageIds.slice(0, n), 3000);
+    return calls.length;
+  };
+  assert.equal(await ackBatches(98), 1, '98 个 id + 2 个固定参数 = 100，正好一条');
+  assert.equal(await ackBatches(99), 2, '再多一个就得拆');
+  assert.equal(await ackBatches(100), 2);
+  assert.equal(await ackBatches(101), 2);
+  assert.equal(await ackBatches(200), 3);
+
+  // 删凭据：只有 user_id = ? 占 1 个，一批能放 99 个，批次划分跟 ack 不一样
+  const delBatches = async (n) => {
+    calls.length = 0;
+    await adapter.deleteLlmCredentials(USER, credIds.slice(0, n));
+    return calls.length;
+  };
+  assert.equal(await delBatches(99), 1, '99 个 id + 1 个固定参数 = 100，正好一条');
+  assert.equal(await delBatches(100), 2);
+});
+
+test('分批之后返回值是各批合计，不是最后一批', async () => {
+  const { adapter } = await freshAdapter();
+  const messageIds = await seedOutbox(adapter, 200);
+  const credIds = await seedCredentials(adapter, 200);
+
+  assert.equal(await adapter.markOutboxDelivered(USER, messageIds, 2000), 200);
+  assert.equal(await adapter.ackOutboxMessages(USER, messageIds, 3000), 200);
+  // ack 幂等：已经 ack 过的行不再计数
+  assert.equal(await adapter.ackOutboxMessages(USER, messageIds, 4000), 0);
+
+  assert.equal((await adapter.getLlmCredentials(USER, credIds)).length, 200);
+  assert.equal(await adapter.deleteLlmCredentials(USER, credIds), 200);
+  assert.equal((await adapter.listLlmCredentials(USER)).length, 0);
+});
+
+test('分批写仍然原子：中间一批炸了，前面那批也不留痕迹', async () => {
+  const raw = createTestD1();
+  const seedAdapter = createD1Adapter(raw);
+  await seedAdapter.initSchema();
+  const messageIds = await seedOutbox(seedAdapter, 200);
+
+  // 第二条 ack 语句执行时抛错，模拟 D1 半路报错
+  let ackStatements = 0;
+  const flaky = {
+    prepare(sql) {
+      const inner = raw.prepare(sql);
+      const isAck = /UPDATE message_outbox SET acked_at/.test(sql);
+      const shouldFail = isAck && ++ackStatements === 2;
+      const wrapper = {
+        bind(...args) { inner.bind(...args); return wrapper; },
+        run: () => (shouldFail ? Promise.reject(new Error('D1_ERROR: boom')) : inner.run()),
+        first: () => inner.first(),
+        all: () => inner.all(),
+      };
+      return wrapper;
+    },
+    batch: raw.batch,
+  };
+  const adapter = createD1Adapter(flaky);
+
+  await assert.rejects(adapter.ackOutboxMessages(USER, messageIds, 3000), /boom/);
+
+  // 第一批的 98 条不能留下已 ack 的痕迹——整批回滚，一条都不算 ack
+  const acked = raw._raw
+    .prepare('SELECT COUNT(*) AS n FROM message_outbox WHERE acked_at IS NOT NULL')
+    .get().n;
+  assert.equal(acked, 0, 'batch 是事务，中途失败必须整批回滚');
+  assert.equal((await seedAdapter.listUnackedOutbox(USER, 0, 500)).length, 200);
 });

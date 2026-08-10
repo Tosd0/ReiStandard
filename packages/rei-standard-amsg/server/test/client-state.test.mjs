@@ -1,13 +1,38 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { createTestD1 } from './helpers/sqlite-d1.mjs';
+import { createTestD1, createSpyD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
 import { deriveUserEncryptionKey, encryptPayload, decryptPayload, encryptForStorage } from '../src/server/lib/encryption.js';
 import { chunkNamespaceFor, chunkKeyFor, chunkKeyPrefixFor } from '../src/server/lib/state-chunks.js';
+import { MAX_KEY_CHARS } from '../src/server/lib/client-state-store.js';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
+
+// D1 把 SQLite 的 SQLITE_LIMIT_LIKE_PATTERN_LENGTH 压到了 50 字节（SQLite 默认
+// 50000）。超过这个长度的 LIKE / GLOB pattern 在真实 D1 上直接报
+// `LIKE or GLOB pattern too complex: SQLITE_ERROR`，而 batch() 是原子的——一条
+// cleanup 炸掉，同批的 upsert 全部回滚。
+const D1_LIKE_PATTERN_MAX_BYTES = 50;
+
+const utf8ByteLength = (value) => new TextEncoder().encode(value).length;
+
+/**
+ * 一条语句里每个 LIKE / GLOB 右操作数（`?`）绑到的值。
+ * SQL 里只有位置参数，数一下这个 `?` 前面有几个 `?` 就知道它是第几个绑定值。
+ */
+function likePatternArgs({ sql, args }) {
+  const patterns = [];
+  const re = /\b(?:LIKE|GLOB)\s*\?/gi;
+  let match;
+  while ((match = re.exec(sql)) !== null) {
+    const questionIndex = sql.indexOf('?', match.index);
+    const paramIndex = (sql.slice(0, questionIndex).match(/\?/g) || []).length;
+    patterns.push(args[paramIndex]);
+  }
+  return patterns;
+}
 
 describe('D1 adapter client_state', () => {
   test('initSchema creates client_state; upsert is last-write-wins on updatedAt', async () => {
@@ -81,7 +106,7 @@ describe('D1 adapter client_state', () => {
     );
   });
 
-  test('cleanups：LIKE 前缀删除只删自己 key 的切片、尊重 LWW、% 通配符被转义', async () => {
+  test('cleanups：前缀删除只删自己 key 的切片、尊重 LWW、% 不当通配符使', async () => {
     const adapter = createD1Adapter(createTestD1());
     await adapter.initSchema();
     const chunkNs = chunkNamespaceFor('n');
@@ -124,6 +149,99 @@ describe('D1 adapter client_state', () => {
       (await adapter.getClientState(USER, chunkNs)).map((x) => [x.key, x.value]),
       [[chunkKeyFor('ab', 0), 'new0'], [chunkKeyFor('ab', 1), 'new1']]
     );
+  });
+
+  // 回归守卫，盯的是「发出去的 SQL 长什么样」而不是执行结果：本地跑的是
+  // better-sqlite3，它的 LIKE pattern 上限是 SQLite 默认的 50000，长 pattern
+  // 在这里根本不报错，只有真实 D1 才炸。所以断言必须落在绑定值的字节长度上。
+  test('前缀清理不给 SQL 喂超长 LIKE / GLOB pattern（D1 上限 50 字节）', async () => {
+    const { db, calls } = createSpyD1();
+    const adapter = createD1Adapter(db);
+    await adapter.initSchema();
+
+    // 真实事故形态：`emotion_update:<UUID>` = 51 字符。key 里还带一个下划线，
+    // LIKE 写法要转义它，pattern 因此更长。
+    const key = `emotion_update:${USER}`;
+    assert.equal(key.length, 51);
+    calls.length = 0;
+    await adapter.upsertClientState(
+      USER,
+      [{ namespace: 'n', key, value: 'enc', updatedAt: 100 }],
+      [{ namespace: chunkNamespaceFor('n'), keyPrefix: chunkKeyPrefixFor(key), updatedAt: 100 }]
+    );
+
+    const cleanupCalls = calls.filter((c) => /DELETE\s+FROM\s+client_state/i.test(c.sql));
+    assert.equal(cleanupCalls.length, 1, '这一批应该发出一条前缀清理语句');
+
+    for (const call of calls) {
+      for (const pattern of likePatternArgs(call)) {
+        assert.ok(
+          typeof pattern === 'string' && utf8ByteLength(pattern) <= D1_LIKE_PATTERN_MAX_BYTES,
+          `LIKE / GLOB pattern 超过 D1 的 ${D1_LIKE_PATTERN_MAX_BYTES} 字节上限：` +
+          `${utf8ByteLength(String(pattern))} 字节，语句 ${call.sql}`
+        );
+      }
+    }
+  });
+
+  test('长 key 的切片清理：51 / 256 字符照样清得掉，根行留着，特殊字符不误伤', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const chunkNs = chunkNamespaceFor('n');
+
+    const longKey = `emotion_update:${USER}`;               // 51 字符，真实事故形态
+    const maxKey = 'k'.repeat(MAX_KEY_CHARS);               // 契约上限 256 字符
+    const wildKey = `${'w'.repeat(60)}%_\\`;                // 长且带 % _ \ 三种特殊字符
+    const wildSibling = `${'w'.repeat(60)}%_\\x`;           // 只多一个字符的兄弟 key
+    assert.equal(maxKey.length, MAX_KEY_CHARS);
+
+    const rows = [
+      { namespace: 'n', key: longKey, value: 'root-long', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(longKey, 0), value: 'c0', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(longKey, 1), value: 'c1', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(`${longKey}-sibling`, 0), value: 'sib', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(maxKey, 0), value: 'max0', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(wildKey, 0), value: 'wild0', updatedAt: 100 },
+      { namespace: chunkNs, key: chunkKeyFor(wildSibling, 0), value: 'wild-sib', updatedAt: 100 },
+    ];
+    const initial = await adapter.upsertClientState(USER, rows);
+    assert.equal(initial.upserted, rows.length);
+
+    // 51 字符的 key：自己的切片清干净，兄弟 key 的切片和用户 namespace 的根行都在
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor(longKey), updatedAt: 150 },
+    ]);
+    let keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key);
+    assert.ok(!keys.includes(chunkKeyFor(longKey, 0)) && !keys.includes(chunkKeyFor(longKey, 1)));
+    assert.ok(keys.includes(chunkKeyFor(`${longKey}-sibling`, 0)));
+    assert.deepEqual(
+      (await adapter.getClientState(USER, 'n')).map((r) => [r.key, r.value]),
+      [[longKey, 'root-long']]
+    );
+
+    // 带 % _ \ 的长 key：前缀只匹配自己，多一个字符的兄弟 key 不受影响
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor(wildKey), updatedAt: 150 },
+    ]);
+    keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key);
+    assert.ok(!keys.includes(chunkKeyFor(wildKey, 0)));
+    assert.ok(keys.includes(chunkKeyFor(wildSibling, 0)));
+
+    // 256 字符的 key：陈旧批次删不动（LWW），更新的批次才删得掉
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor(maxKey), updatedAt: 50 },
+    ]);
+    keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key);
+    assert.ok(keys.includes(chunkKeyFor(maxKey, 0)), '陈旧 cleanup 不该删掉更新的行');
+
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor(maxKey), updatedAt: 200 },
+    ]);
+    keys = (await adapter.getClientState(USER, chunkNs)).map((r) => r.key).sort();
+    assert.deepEqual(keys, [
+      chunkKeyFor(`${longKey}-sibling`, 0),
+      chunkKeyFor(wildSibling, 0),
+    ].sort());
   });
 });
 

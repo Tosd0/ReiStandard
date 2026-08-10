@@ -33,15 +33,25 @@ export function createTestD1() {
     return stmt;
   }
 
-  // Mirrors D1's batch(): one call executes every statement (D1 wraps them
-  // in an implicit transaction and does a single network round trip; here
-  // it's just sequential in-process execution, which is equivalent for tests).
+  // Mirrors D1's batch(): one call executes every statement, inside a
+  // transaction. D1 documents batches as SQL transactions — "if a statement in
+  // the sequence fails ... it aborts or rolls back the entire sequence" — and
+  // adapter code relies on that (a failed cleanup must not leave half a batch
+  // applied). BEGIN/COMMIT here so a failing statement rolls the whole batch
+  // back the way D1 does, instead of leaving the earlier ones committed.
   async function batch(statements) {
-    const results = [];
-    for (const stmt of statements) {
-      results.push(await stmt.run());
+    db.exec('BEGIN');
+    try {
+      const results = [];
+      for (const stmt of statements) {
+        results.push(await stmt.run());
+      }
+      db.exec('COMMIT');
+      return results;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
     }
-    return results;
   }
 
   return {
@@ -52,4 +62,35 @@ export function createTestD1() {
       db.close();
     }
   };
+}
+
+/**
+ * 同一个 shim，外面包一层记录：每条 `prepare(sql).bind(...args)` 都记进
+ * `calls`，语句照常执行（底下还是真的 SQLite）。
+ *
+ * 用来断言「发出去的 SQL 长什么样」——D1 的几条平台限制（LIKE pattern 50 字
+ * 节、单条语句 100 个绑定参数）本地 SQLite 全都不触发，只能盯语句形态，盯不
+ * 了执行结果。
+ *
+ * @returns {{ db: { prepare: Function, batch: Function }, calls: Array<{ sql: string, args: unknown[] }> }}
+ */
+export function createSpyD1() {
+  const d1 = createTestD1();
+  /** @type {Array<{ sql: string, args: unknown[] }>} */
+  const calls = [];
+  const prepare = (sql) => {
+    const inner = d1.prepare(sql);
+    const wrapper = {
+      bind(...args) {
+        calls.push({ sql, args });
+        inner.bind(...args);
+        return wrapper;
+      },
+      run: () => inner.run(),
+      first: () => inner.first(),
+      all: () => inner.all(),
+    };
+    return wrapper;
+  };
+  return { db: { prepare, batch: d1.batch }, calls, _raw: d1._raw };
 }

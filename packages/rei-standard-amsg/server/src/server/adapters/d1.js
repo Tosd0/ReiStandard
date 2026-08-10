@@ -21,9 +21,73 @@ import {
 // 列名不分方言：三个适配器共用 schema.js 里的这一份白名单，加列只改一处。
 import { UPDATABLE_COLUMNS } from './schema.js';
 
-// LIKE 前缀转义：用户 key 里的 % _ \ 不能变成通配符/转义符。
-function escapeLikePrefix(prefix) {
-  return prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+/**
+ * 「key 以 prefix 开头」的字典序上界：`key >= prefix AND key < prefixRangeEnd(prefix)`。
+ *
+ * 上界的算法是把 prefix 的最后一个码位换成它的下一个码位。SQLite 的默认排序
+ * （BINARY）按 UTF-8 字节比大小，而 UTF-8 的字节序与码位序一致，所以这样得到
+ * 的正是「所有以 prefix 开头的字符串」之后紧邻的那个位置，不多不少。
+ * client_state 的 key 列是普通 TEXT、没有 COLLATE NOCASE（见
+ * adapters/schema.sqlite.js 的 CLIENT_STATE_TABLE_SQL），这个前提成立。
+ *
+ * 两种码位没有「下一个」，退一步改前一个码位：
+ *   - U+D7FF：+1 会落进代理区（U+D800-U+DFFF），那不是合法字符，直接跨到 U+E000；
+ *   - U+10FFFF：已经是最大码位，没有下一个，改前一个码位（不会多删——以
+ *     U+10FFFF 开头的那批本来就排在同前缀那一族的最后面）。
+ * 一路退到空串表示这个 prefix 没有上界，范围条件因此一行都匹配不上；宁可少删
+ * 留下几行孤儿切片，也不能多删把别的 key 的切片带走。实际用到的 prefix 结尾固
+ * 定是 \u001f（见 lib/state-chunks.js 的 SEP），这两条走不到，写全只是为了以后
+ * 换分隔符时不出意外。
+ *
+ * @param {string} prefix
+ * @returns {string} 上界；空串表示没有上界
+ */
+function prefixRangeEnd(prefix) {
+  const points = Array.from(prefix); // 按码位切，别把代理对劈成两半
+  while (points.length > 0) {
+    const cp = points[points.length - 1].codePointAt(0);
+    if (cp === 0xd7ff) {
+      points[points.length - 1] = String.fromCodePoint(0xe000);
+      return points.join('');
+    }
+    if (cp < 0x10ffff) {
+      points[points.length - 1] = String.fromCodePoint(cp + 1);
+      return points.join('');
+    }
+    points.pop();
+  }
+  return '';
+}
+
+// D1 单条语句最多 100 个绑定参数，第 101 个直接报 `too many SQL variables`
+// （D1_ERROR 7500），语句根本执行不了。这个数算的是**整条语句**的参数总数，
+// 不只是 IN (...) 里那部分。
+const D1_MAX_BOUND_PARAMS = 100;
+
+/**
+ * 把要塞进 IN (...) 的一串值按 D1 的绑定参数上限切批。
+ *
+ * 额度按语句实际算、不是写死一批 100 个：每条语句除了 IN 列表还有自己的固定
+ * 参数（`user_id = ?`、`SET acked_at = ?` 这些），可用额度是
+ * `D1_MAX_BOUND_PARAMS - 固定参数个数`。所以同样 200 个 id，只有 `user_id`
+ * 一个固定参数的 DELETE 切成 99+99+2，多一个 SET 的 UPDATE 切成 98+98+4。
+ *
+ * @param {unknown[]} values - IN 列表里的值
+ * @param {number} fixedParams - 同一条语句里除 IN 列表之外的绑定参数个数
+ * @returns {unknown[][]} 每批一个数组；values 为空时返回空数组
+ */
+function chunkForBoundParams(values, fixedParams) {
+  const perStatement = D1_MAX_BOUND_PARAMS - fixedParams;
+  if (perStatement < 1) {
+    throw new Error(
+      `[amsg-server D1] 固定参数已占满 ${D1_MAX_BOUND_PARAMS} 个绑定位，IN 列表放不下`
+    );
+  }
+  const batches = [];
+  for (let i = 0; i < values.length; i += perStatement) {
+    batches.push(values.slice(i, i + perStatement));
+  }
+  return batches;
 }
 
 // 库里除了本库建的表，还有两类内部表：SQLite 自己的（`sqlite_` 开头）和
@@ -63,6 +127,56 @@ export class D1Adapter {
       throw new Error(`[amsg-server D1] invalid timestamp: ${value}`);
     }
     return d.toISOString();
+  }
+
+  /**
+   * 组一组带 `IN (...)` 的语句：值多到一条塞不下时，按 D1 的绑定参数上限切成
+   * 几条（见 chunkForBoundParams）。
+   *
+   * 只有拿得到事务的绑定才切。没有 batch() 的绑定（测试 shim、自定义适配器，
+   * 都不是真实 D1）原样发一条不切的语句：切批是为 D1 那条上限服务的，这类绑
+   * 定不受它约束，切了反倒会因为没有事务而多出一个「写一半」的中间态。
+   *
+   * @private
+   * @param {(placeholders: string) => string} buildSql - 拿占位符串（`?, ?, ?`）组 SQL
+   * @param {unknown[]} leadingParams - IN 列表之前的固定参数，按出现顺序
+   * @param {unknown[]} values - IN 列表里的全部值
+   * @returns {any[]} 已经 bind 好的语句
+   */
+  _prepareInClauseStatements(buildSql, leadingParams, values) {
+    const batches = typeof this._db.batch === 'function'
+      ? chunkForBoundParams(values, leadingParams.length)
+      : [values];
+    return batches.map((batch) => this._db
+      .prepare(buildSql(batch.map(() => '?').join(', ')))
+      .bind(...leadingParams, ...batch));
+  }
+
+  /**
+   * 带 `IN (...)` 的批量写，切成几条也仍然是一次原子操作。
+   *
+   * 一条语句本来天然原子，拆开之后这份保证得自己补回来，否则就会多出「只删掉
+   * 前 99 个」「只 ack 了前 98 条」这类比原问题更难查的中间态。D1 的 batch()
+   * 是隐式事务——其中一条失败，整批回滚——正好接住这件事。
+   *
+   * 一条就够时照旧单发，跟切批以前走的是同一条路，常见调用（一次三五个 id）
+   * 的行为一个字节都没变。
+   *
+   * @private
+   * @param {(placeholders: string) => string} buildSql
+   * @param {unknown[]} leadingParams
+   * @param {unknown[]} values
+   * @returns {Promise<number>} 各批影响行数之和
+   */
+  async _runInClauseWrite(buildSql, leadingParams, values) {
+    const statements = this._prepareInClauseStatements(buildSql, leadingParams, values);
+    if (statements.length === 0) return 0;
+    if (statements.length === 1) {
+      const res = await statements[0].run();
+      return res.meta.changes || 0;
+    }
+    const results = await this._db.batch(statements);
+    return results.reduce((n, res) => n + (res.meta.changes || 0), 0);
   }
 
   async initSchema() {
@@ -502,9 +616,19 @@ export class D1Adapter {
          value = excluded.value,
          updated_at = excluded.updated_at
        WHERE excluded.updated_at >= client_state.updated_at`;
+    // 前缀匹配走字典序范围（`key >= prefix AND key < 上界`），不用 LIKE：
+    //   - D1 把 LIKE pattern 的长度上限压到了 50 字节（SQLite 默认 50000，官方
+    //     文档没写这一条）。pattern 是「key + 分隔符 + %」再加上转义字符，key
+    //     一到 49 字符就超限，整条语句报 `LIKE or GLOB pattern too complex`。
+    //     batch() 是原子的，这一炸同批的 upsert 全部回滚——库自己声明 key 可以
+    //     写到 256 字符（lib/client-state-store.js 的 MAX_KEY_CHARS），实际却
+    //     只有 48 能落库。范围比较没有任何长度上限。
+    //   - 范围条件能直接吃 (user_id, namespace, key) 主键索引，LIKE 和
+    //     substr(key, 1, ?) = ? 都得逐行算。
+    //   - 前缀里的 % _ \ 不再是通配符，转义那一层跟着一起去掉了。
     const CLEANUP_PREFIX_SQL =
       `DELETE FROM client_state
-       WHERE user_id = ? AND namespace = ? AND key LIKE ? ESCAPE '\\' AND updated_at <= ?`;
+       WHERE user_id = ? AND namespace = ? AND key >= ? AND key < ? AND updated_at <= ?`;
     const CLEANUP_KEY_SQL =
       `DELETE FROM client_state
        WHERE user_id = ? AND namespace = ? AND key = ? AND updated_at <= ?`;
@@ -513,7 +637,8 @@ export class D1Adapter {
       ...cleanups.map((c) => (
         typeof c.key === 'string'
           ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt)
-          : this._db.prepare(CLEANUP_PREFIX_SQL).bind(userId, c.namespace, `${escapeLikePrefix(c.keyPrefix)}%`, c.updatedAt)
+          : this._db.prepare(CLEANUP_PREFIX_SQL)
+            .bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt)
       )),
       ...entries.map((entry) =>
         this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
@@ -655,13 +780,21 @@ export class D1Adapter {
    */
   async getLlmCredentials(userId, credIds) {
     if (!credIds || credIds.length === 0) return [];
-    const placeholders = credIds.map(() => '?').join(', ');
-    const res = await this._db.prepare(
-      `SELECT cred_id, encrypted_value, updated_at
-       FROM llm_credentials
-       WHERE user_id = ? AND cred_id IN (${placeholders})`
-    ).bind(userId, ...credIds).all();
-    return res.results || [];
+    // 读不走 _runInClauseWrite：分批读没有「写一半」那种中间态，用不上事务。
+    const statements = this._prepareInClauseStatements(
+      (placeholders) =>
+        `SELECT cred_id, encrypted_value, updated_at
+         FROM llm_credentials
+         WHERE user_id = ? AND cred_id IN (${placeholders})`,
+      [userId],
+      credIds
+    );
+    const rows = [];
+    for (const stmt of statements) {
+      const res = await stmt.all();
+      rows.push(...(res.results || []));
+    }
+    return rows;
   }
 
   /**
@@ -689,18 +822,17 @@ export class D1Adapter {
    */
   async deleteLlmCredentials(userId, credIds = null) {
     if (credIds !== null && credIds.length === 0) return 0;
-    let res;
     if (credIds === null) {
-      res = await this._db.prepare(
+      const res = await this._db.prepare(
         'DELETE FROM llm_credentials WHERE user_id = ?'
       ).bind(userId).run();
-    } else {
-      const placeholders = credIds.map(() => '?').join(', ');
-      res = await this._db.prepare(
-        `DELETE FROM llm_credentials WHERE user_id = ? AND cred_id IN (${placeholders})`
-      ).bind(userId, ...credIds).run();
+      return res.meta.changes || 0;
     }
-    return res.meta.changes || 0;
+    return this._runInClauseWrite(
+      (placeholders) => `DELETE FROM llm_credentials WHERE user_id = ? AND cred_id IN (${placeholders})`,
+      [userId],
+      credIds
+    );
   }
 
   // ── message_outbox（服务端消息收件箱，客户端 ack）────────────────────────
@@ -754,12 +886,13 @@ export class D1Adapter {
    */
   async markOutboxDelivered(userId, messageIds, deliveredAt) {
     if (!messageIds || messageIds.length === 0) return 0;
-    const placeholders = messageIds.map(() => '?').join(', ');
-    const res = await this._db.prepare(
-      `UPDATE message_outbox SET delivered_at = ?
-       WHERE user_id = ? AND message_id IN (${placeholders})`
-    ).bind(deliveredAt, userId, ...messageIds).run();
-    return res.meta.changes || 0;
+    return this._runInClauseWrite(
+      (placeholders) =>
+        `UPDATE message_outbox SET delivered_at = ?
+         WHERE user_id = ? AND message_id IN (${placeholders})`,
+      [deliveredAt, userId],
+      messageIds
+    );
   }
 
   /**
@@ -793,12 +926,13 @@ export class D1Adapter {
    */
   async ackOutboxMessages(userId, messageIds, ackedAt) {
     if (!messageIds || messageIds.length === 0) return 0;
-    const placeholders = messageIds.map(() => '?').join(', ');
-    const res = await this._db.prepare(
-      `UPDATE message_outbox SET acked_at = ?
-       WHERE user_id = ? AND acked_at IS NULL AND message_id IN (${placeholders})`
-    ).bind(ackedAt, userId, ...messageIds).run();
-    return res.meta.changes || 0;
+    return this._runInClauseWrite(
+      (placeholders) =>
+        `UPDATE message_outbox SET acked_at = ?
+         WHERE user_id = ? AND acked_at IS NULL AND message_id IN (${placeholders})`,
+      [ackedAt, userId],
+      messageIds
+    );
   }
 
   /**
