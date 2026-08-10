@@ -77,6 +77,22 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
+// 推送服务给的「这条订阅没了」：410 Gone = 订阅已注销或过期，404 = 端点压根
+// 不存在。同一条订阅再推一万次也是同一个答复，所以这两个码算终态。
+//
+// 投递是先生成后推送（跑完 LLM 才拿订阅推），留在退避阶梯里的话每一跳重试都
+// 要重新生成一轮内容——真花 token，一条也发不出去。
+//
+// 判成终态不代表要去删 push_subscriptions 里那一行：删了之后「云端登记了收件
+// 设备吗」会变成 false，客户端多半会把用户引去重新登记，而重新登记只是把同一
+// 条死订阅再写一遍。这件事靠 last_error 里的 pushStatus 说给下游听。
+const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
+
+/** 推送服务回的状态码；拿不到（不是推送失败，或宿主的 webpush 实现没带）→ null。 */
+function toPushStatus(value) {
+  return Number.isInteger(value) ? value : null;
+}
+
 function resolveStaleAfterMs(ctx) {
   return positiveNumber(ctx.staleAfterMs) || STALE_AFTER_MS;
 }
@@ -310,7 +326,13 @@ async function deliverTasks(ctx, tasks) {
     }
   }
 
-  /** 落进 last_error 列的 JSON（形状与 payload 里的 lastError 一致，reason 已脱敏）。 */
+  /**
+   * 落进 last_error 列的 JSON（形状与 payload 里的 lastError 一致，reason 已脱敏）。
+   *
+   * 投递失败时 extra 会带上 `pushStatus`（推送服务回的状态码）：下游要判断
+   * 「是不是订阅失效了」，读这个数就够，不用去正则匹配 reason 那句人话——那句
+   * 是给用户看的，措辞随时会变。
+   */
   function lastErrorJson(task, reason, extra) {
     return JSON.stringify({
       at: new Date().toISOString(),
@@ -428,36 +450,49 @@ async function deliverTasks(ctx, tasks) {
    * 它是循环推进和过期判定的基准，被退避时间改写过一次，这条任务的钟点就永
    * 久漂了。没有这两列的适配器（没实现 claimTask）退回老行为，把重试时刻写
    * 进 next_send_at。
+   *
+   * @param {Object} [failure] - 这次失败的机读标注
+   * @param {string|null} [failure.errorCode] - 底层错误的稳定 `code`
+   * @param {boolean} [failure.permanent] - hook 侧 NonRetryableError 的透传
+   * @param {number|null} [failure.pushStatus] - 推送服务回的 HTTP 状态码
    */
-  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey, errorCode = null, permanentFlag = false) {
+  async function handleDeliveryFailure(task, reason, recurrenceType, decryptedPayload, userKey, failure = {}) {
     results.failedCount++;
+    const errorCode = failure.errorCode ?? null;
+    const pushStatus = toPushStatus(failure.pushStatus);
     const tzId = decryptedPayload ? (decryptedPayload.tzId ?? null) : null;
     // 重试也好不了的失败不进退避阶梯：一次性任务直接进终审处置，循环任务直接
-    // 作废本次 occurrence。两个来源：
+    // 作废本次 occurrence。三个来源：
     //   - 已知的永久性错误码（订阅没登记 / 适配器不支持订阅存储）；
-    //   - hook 侧抛出的 NonRetryableError（permanentFlag，见 lib/errors.js）——
+    //   - hook 侧抛出的 NonRetryableError（failure.permanent，见 lib/errors.js）——
     //     fire_pack 缺失、解析失败这类重试必然同败的错，隔两分钟再试三次只是
-    //     让用户多白等十二分钟，还把情绪评估之类的计费重跑三遍。
-    const permanent = permanentFlag === true
+    //     让用户多白等十二分钟，还把情绪评估之类的计费重跑三遍；
+    //   - 推送服务判了这条订阅的死刑（410 / 404，见 TERMINAL_PUSH_STATUSES）。
+    const permanent = failure.permanent === true
       || errorCode === 'PUSH_SUBSCRIPTION_MISSING'
-      || errorCode === 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED';
+      || errorCode === 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED'
+      || TERMINAL_PUSH_STATUSES.has(pushStatus);
+    // 状态码跟着 reason 一起记：reason 是给用户看的人话，pushStatus 是给下游
+    // 判定用的数。两处 lastError 都要带上——投影优先读 payload 里那一份，只写
+    // 行上的列的话下游根本看不到。
+    const errorExtra = pushStatus === null ? undefined : { pushStatus };
     try {
       if (permanent || task.retry_count >= 3) {
-        const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason);
+        const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
         if (isRecurringType(recurrenceType)) {
           const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
           await updateAndRelease(task.id, {
             next_send_at: nextSendAt,
             retry_count: 0,
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
           });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'occurrence_skipped', nextSendAt, ...(permanent ? { permanent: true } : {}) });
         } else {
           await updateAndRelease(task.id, {
             status: 'failed',
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
           });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed', ...(permanent ? { permanent: true } : {}) });
         }
@@ -470,7 +505,7 @@ async function deliverTasks(ctx, tasks) {
             retry_after: nextRetryTime.toISOString(),
             lease_until: null,
             retry_count: task.retry_count + 1,
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason) } : {})
+            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
           });
         } else {
           await db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
@@ -668,7 +703,7 @@ async function deliverTasks(ctx, tasks) {
     } catch (error) {
       await handleDeliveryFailure(
         task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
-        error.code || null, error.permanent === true
+        { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: error.statusCode }
       );
       return;
     }
@@ -676,7 +711,7 @@ async function deliverTasks(ctx, tasks) {
     if (!sendResult.success) {
       await handleDeliveryFailure(
         task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey,
-        sendResult.errorCode || null, sendResult.permanent === true
+        { errorCode: sendResult.errorCode || null, permanent: sendResult.permanent === true, pushStatus: sendResult.pushStatusCode }
       );
       return;
     }

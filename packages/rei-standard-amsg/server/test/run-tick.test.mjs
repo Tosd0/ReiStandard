@@ -4,6 +4,7 @@ import { runScheduledTick } from '../src/server/lib/run-tick.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptForStorage, decryptFromStorage } from '../src/server/lib/encryption.js';
+import { projectTask } from '../src/server/lib/task-projection.js';
 import { seedPushSubscription } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
@@ -932,4 +933,153 @@ test('onStaleSkip 自带的 readState 读得到客户端同步上来的状态', 
   });
 
   assert.deepEqual(seen, [{ namespace: 'notes', key: 'k', value: 'hello', updatedAt: 42 }]);
+});
+
+// ─── 推送服务判死刑的订阅（410 / 404） ───────────────────────────────────
+
+/**
+ * 推送服务硬失败：错误形状与 shared 的 sendWebPush 一致（code + statusCode）。
+ */
+function webpushRejectingWithStatus(statusCode, statusText) {
+  const calls = { count: 0 };
+  return {
+    calls,
+    async sendNotification() {
+      calls.count++;
+      const error = new Error(
+        `Web Push delivery failed: ${statusCode} ${statusText} — push subscription is no longer valid`
+      );
+      error.code = 'PUSH_SEND_FAILED';
+      error.statusCode = statusCode;
+      throw error;
+    }
+  };
+}
+
+// 投递是先生成后推送。410 要是留在 2/4/6 分钟的退避阶梯里，同一条消息会被重
+// 新生成四轮（首次 + 三次重试），每轮都真花 LLM 的钱，而那条订阅已经注销了，
+// 一句也发不出去。
+test('推送回 410：一次性任务当场进终态，不再走 2/4/6 分钟的重试梯子', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'gone-once', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const webpush = webpushRejectingWithStatus(410, 'Gone');
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.failedCount, 1);
+  assert.equal(res.details.failedTasks[0].status, 'permanently_failed');
+  assert.equal(res.details.failedTasks[0].permanent, true);
+  assert.equal(res.details.failedTasks[0].nextRetryAt, undefined, '不该排下一次重试');
+
+  const row = await findTaskAnyStatus(adapter, 'gone-once');
+  assert.equal(row.status, 'failed');
+  assert.equal(row.retry_count, 0, '410 一次都不该进退避阶梯');
+  assert.equal(webpush.calls.count, 1, '这一跳只推一次，之后不再重跑生成');
+});
+
+// 订阅失效不等于「用户没登记过设备」：把行删掉的话，客户端的体检面板会显示
+// 「云端没有收件设备」，把用户引去重新登记——而重新登记只是把同一条死订阅再
+// 写一遍。这个事实靠 last_error 里的 pushStatus 传给下游，不靠删行表达。
+test('410 判终态不动 push_subscriptions 里那行订阅', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'gone-keeps-sub', recurrenceType: 'none', nextSendAt: recentDue() });
+  const before = await adapter.getPushSubscription(USER);
+
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(410, 'Gone')
+  });
+
+  const after = await adapter.getPushSubscription(USER);
+  assert.ok(after, '订阅行还在');
+  assert.equal(after.subscription, before.subscription);
+});
+
+test('410 的失败记录带 pushStatus: 410，reason 仍是那句人话摘要', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'gone-detail', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(410, 'Gone')
+  });
+
+  const row = await findTaskAnyStatus(adapter, 'gone-detail');
+  const rowLastError = JSON.parse(row.last_error);
+  assert.equal(rowLastError.pushStatus, 410);
+  assert.match(rowLastError.reason, /Web Push delivery failed: 410 Gone/);
+
+  // 投影优先读 payload 里那份 lastError，所以两处都得有——只写行上那一列的
+  // 话，GET /messages 交出去的记录里 pushStatus 会凭空消失。
+  const payload = await decryptPayloadOf(row);
+  assert.equal(payload.lastError.pushStatus, 410);
+  assert.equal(payload.lastError.reason, rowLastError.reason);
+  assert.equal(projectTask(row, payload).lastError.pushStatus, 410);
+});
+
+test('推送回 404（端点压根不存在）同样当终态', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'missing-endpoint', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(404, 'Not Found')
+  });
+
+  assert.equal(res.details.failedTasks[0].status, 'permanently_failed');
+  assert.equal(res.details.failedTasks[0].permanent, true);
+  const row = await findTaskAnyStatus(adapter, 'missing-endpoint');
+  assert.equal(row.status, 'failed');
+  assert.equal(row.retry_count, 0);
+  assert.equal(JSON.parse(row.last_error).pushStatus, 404);
+});
+
+// 推送服务抖一下（500 / 502 之类）跟订阅失效是两回事，别一起判死。
+test('推送回 500：照旧走重试梯子，不当订阅失效处理', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'push-500', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(500, 'Internal Server Error')
+  });
+
+  assert.equal(res.details.failedTasks[0].retryCount, 1);
+  assert.ok(res.details.failedTasks[0].nextRetryAt, '排了下一次重试');
+  assert.equal(res.details.failedTasks[0].permanent, undefined);
+
+  const pending = await adapter.getTaskByUuidOnly('push-500');
+  assert.equal(pending.status, 'pending');
+  assert.equal(pending.retry_count, 1);
+  assert.ok(pending.retry_after, '退避写在 retry_after 上');
+
+  const lastError = JSON.parse((await adapter.getTaskStatusInfo('push-500', USER)).last_error);
+  assert.equal(lastError.pushStatus, 500);
+  assert.ok(lastError.pushStatus !== 410 && lastError.pushStatus !== 404);
+});
+
+test('循环任务撞上 410：跳到下一次 occurrence，不进 failed 终态', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, { uuid: 'gone-daily', recurrenceType: 'daily', nextSendAt: dueAt });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(410, 'Gone')
+  });
+
+  assert.equal(res.details.failedTasks[0].status, 'occurrence_skipped');
+  assert.equal(res.details.failedTasks[0].permanent, true);
+
+  const row = await adapter.getTaskByUuidOnly('gone-daily');
+  assert.equal(row.status, 'pending', '循环任务不该进 failed 终态');
+  assert.equal(row.next_send_at, plusMs(dueAt, DAY));
+  assert.equal(row.retry_count, 0);
+  assert.equal(JSON.parse((await adapter.getTaskStatusInfo('gone-daily', USER)).last_error).pushStatus, 410);
 });
