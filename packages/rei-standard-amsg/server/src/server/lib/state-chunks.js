@@ -16,8 +16,12 @@
  * 不抛错、不吐半截数据。
  *
  * 保留字符：namespace / key 里的 C0 控制字符（\u0000-\u001f）为库内部保留，
- * handler 对用户输入逐条拒绝。内部分隔符选 \u001f 而不是 NUL，因为 SQLite 的
- * LIKE 在 \u0000 处截断 pattern，前缀清理会失效。
+ * handler 对用户输入逐条拒绝。内部分隔符用 \u001f（Unit Separator）而不是 NUL：
+ * SQLite 里带 \u0000 的 TEXT 在不少地方会被当成「字符串到此为止」（length() 就
+ * 只数到第一个 NUL），拿它当分隔符容易在某个环节丢掉后半截。
+ *
+ * 切片行的前缀清理走字典序范围查询（`key >= 前缀 AND key < 上界`），见
+ * adapters/d1.js 的 prefixRangeEnd：前缀多长都行，里面的 % _ \ 也只是普通字符。
  */
 
 import { chunkReasoningByUtf8Bytes } from '@rei-standard/amsg-shared';
