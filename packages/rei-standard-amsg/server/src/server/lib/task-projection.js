@@ -27,7 +27,8 @@
  * @property {string|null}  clientTaskId  - 取自 metadata.amsgClientTaskId
  * @property {Object|null}  credRefs      - 凭据引用（{ <purpose>: <cred_id> }）；引用不是机密，客户端对账要看。没带 → null
  * @property {Object|null}  [metadata]    - 只有 includeMetadata 时才有，见下
- * @property {{ at: string, occurrence: string, reason: string }|null} lastError
+ * @property {{ at: string, occurrence: string, reason: string, pushStatus?: number }|null} lastError
+ *   `pushStatus` 只在投递失败于推送这一步时出现，值是推送服务回的 HTTP 状态码。
  */
 
 /**
@@ -72,6 +73,9 @@ export function projectTask(row, decryptedPayload, options = {}) {
     // reason 'stale' 表示错过触发时刻太久被判定不再补发；其余是投递失败的
     // 错误信息。payload 里没有时退回行上的 last_error 列（同形状的脱敏摘要，
     // 等重试期间的失败也记在那里）。没有记录 → null。
+    // 记进去的字段整份带出来，不再挑一遍——`pushStatus`（410 = 订阅已注销，
+    // 404 = 端点不存在）这类机读标注就是给客户端看的，白名单挡在这一层的话，
+    // 客户端只能回去正则匹配 reason 那句人话。
     lastError: payload.lastError ?? parseRowLastError(row.last_error),
   };
 }

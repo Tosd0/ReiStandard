@@ -102,7 +102,8 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @returns {Promise<{ success: boolean, messagesSent: number, error?: string, errorCode?: string|null }>}
+ * @returns {Promise<{ success: boolean, messagesSent: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean }>}
+ *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
  */
 export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
   try {
@@ -287,11 +288,15 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // errorCode 透传底层错误的稳定 `code`（如 PUSH_SUBSCRIPTION_MISSING），
     // run-tick 按它区分「重试也好不了」的永久性失败；permanent 是 hook 侧
     // NonRetryableError 的透传（见 lib/errors.js），语义相同、来源更宽。
+    // pushStatusCode 是推送服务回的 HTTP 状态码（sendWebPush 挂在错误上的
+    // statusCode）：410 / 404 说明这条订阅已经没了，run-tick 据此判终态——不
+    // 传出来的话，那个事实只剩错误消息里的一句人话，谁想用都得去正则匹配。
     return {
       success: false,
       messagesSent: 0,
       error: error.message,
       errorCode: error.code || null,
+      pushStatusCode: Number.isInteger(error.statusCode) ? error.statusCode : null,
       permanent: isNonRetryableError(error)
     };
   }
