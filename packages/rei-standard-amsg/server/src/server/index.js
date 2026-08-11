@@ -194,6 +194,10 @@ export {
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
+// 一条任务正文的明文字节上限（超了 POST /schedule-message、PUT /update-message
+// 回 400 TASK_PAYLOAD_TOO_LARGE）。客户端想在提交前自己预算就读这一份，别手抄
+// 第二个数——它是按 D1 的单行上限反推出来的，见 lib/validation.js。
+export { MAX_TASK_PAYLOAD_BYTES } from './lib/validation.js';
 // 用户级 LLM 凭据存储（llm_credentials 表；任务 payload 的 credRefs 引用它）。
 // 自定义适配器 / 自己包路由的宿主用得到校验和解析口。
 export {

@@ -9,7 +9,7 @@ import { randomUUID } from '../lib/webcrypto-utils.js';
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../lib/encryption.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
-import { validateScheduleMessagePayload } from '../lib/validation.js';
+import { validateScheduleMessagePayload, validateTaskPayloadSize } from '../lib/validation.js';
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
@@ -175,7 +175,17 @@ export function createScheduleMessageHandler(ctx) {
       metadata: payload.metadata || {}
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
+    // 正文落库前先量一次大小。加密后走 hex，字节数正好翻倍，D1 的单行上限就是
+    // 这么被顶穿的——在这里 400 并报出实际字节数，好过到 D1 那儿换回一句
+    // `string or blob too big` 的 500。量的是真正要加密的那个字符串，不是请求
+    // 里的 payload：两者不是同一份（这里补了默认值、丢了不认识的字段）。
+    const serializedTaskData = JSON.stringify(fullTaskData);
+    const sizeError = validateTaskPayloadSize(serializedTaskData);
+    if (sizeError) {
+      return { status: 400, body: { success: false, error: sizeError } };
+    }
+
+    const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
     /**
      * In-server instant path. Delivers an instant message through this

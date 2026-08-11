@@ -7,7 +7,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
-import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
+import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize } from '../lib/validation.js';
 import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs } from '../lib/llm-credentials-store.js';
 
 export function createUpdateMessageHandler(ctx) {
@@ -228,7 +228,16 @@ export function createUpdateMessageHandler(ctx) {
       ...(Object.prototype.hasOwnProperty.call(updates, 'splitPattern') && { splitPattern: updates.splitPattern ?? null })
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(updatedData), userKey);
+    // 大小闸门量的是合并之后的正文，不是这次的 patch：patch 本身可能很小，但
+    // 叠到存量正文上就顶穿了 D1 的单行上限（口径与 schedule-message 同一份，
+    // 见 lib/validation.js）。
+    const serializedUpdatedData = JSON.stringify(updatedData);
+    const sizeError = validateTaskPayloadSize(serializedUpdatedData);
+    if (sizeError) {
+      return { status: 400, body: { success: false, error: sizeError } };
+    }
+
+    const encryptedPayload = await encryptForStorage(serializedUpdatedData, userKey);
     // 更新即视为「重新出发」：把重试计数清零、把退避放掉。不清的话，刚修好
     // apiKey / 改好排期的任务还背着之前攒下的 retry_count，下一次哪怕是瞬时
     // 故障也可能直接触发终审处置。retry_after 只在支持占位的适配器上写
