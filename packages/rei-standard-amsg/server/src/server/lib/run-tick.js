@@ -26,6 +26,12 @@
  * ctx.leaseHeartbeatMs 设成 0 时，退回一次性长租约的老行为
  * （claimLeaseMs，默认 10 分钟）。
  *
+ * 心跳还兼着取消的耳朵：续租是条件写（只更新仍持有租约的 pending 行），没匹配
+ * 到行就说明这条任务在投递期间被删了——`DELETE /message` 取消、或
+ * `supersedesUuid` 顶替。占位到推送之间投递侧不再读库，这是唯一能知道这件事的
+ * 信号，所以收到之后剩下的推送一条都不发，这一跳把它记进 details.cancelledTasks，
+ * 既不算成功也不算失败。
+ *
  * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, leaseHeartbeatMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
  *   ctx.serializeBy?.(task)：可选的分组串行。返回一个分组标识（同一个角色、
  *   同一份台账……宿主自己定义），同一分组的任务同时只放行一条；返回 null /
@@ -88,9 +94,90 @@ export const STALE_AFTER_MS = 60 * 60 * 1000;
 // 条死订阅再写一遍。这件事靠 last_error 里的 pushStatus 说给下游听。
 const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
 
+// 「这条内容装不下」：本地大小护栏在加密前就抛 PUSH_PAYLOAD_TOO_LARGE
+// （lib/webpush-webcrypto.js，超一个字节都不发），推送服务在密文超限时回 413。
+// 两处说的是同一件事，只是发现得早晚不同，而这件事跟本次生成出来的内容绑死：
+// 隔两分钟重来一遍，得先把 LLM 那一整轮重跑一次（真花钱），再撞同一堵墙。所以
+// 不进退避阶梯，一次就作废本次 occurrence，让下游拿 errorCode / pushStatus 去
+// 决定怎么裁短内容。
+//
+// VAPID 配错回的 400 / 401 / 403 不在此列，虽然重试同样好不了：那是整个部署级
+// 别的故障（一把钥匙配错，所有任务一起发不出去），判终态会把这段时间内每一条
+// 一次性任务都永久标 failed，配置修好也回不来了。这类失败留在退避阶梯里，原因
+// 靠 last_error 里的 errorCode / pushStatus 说清楚。
+const PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
+
+// 重试也好不了的错误码：订阅压根没登记、适配器不支持订阅存储、payload 超限。
+const PERMANENT_ERROR_CODES = new Set([
+  'PUSH_SUBSCRIPTION_MISSING',
+  'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED',
+  'PUSH_PAYLOAD_TOO_LARGE',
+]);
+
+// 投递期间发现「这条已经不归我了」时，推送侧抛的错误码（见 guardWebpushWithLease）。
+const TASK_CANCELLED_CODE = 'TASK_CANCELLED';
+
 /** 推送服务回的状态码；拿不到（不是推送失败，或宿主的 webpush 实现没带）→ null。 */
 function toPushStatus(value) {
   return Number.isInteger(value) ? value : null;
+}
+
+/**
+ * lastError 里的机读标注：`errorCode` 是底层错误的稳定 code，`pushStatus` 是推
+ * 送服务回的 HTTP 状态码。两个都没有 → undefined，不往记录里塞空字段。
+ *
+ * code 是标识符不是人话，不用脱敏，但也别让一个来路不明的超长 code 撑大明文
+ * 列——截到 64 字符，够放所有约定过的码。
+ */
+function buildErrorExtra(errorCode, pushStatus) {
+  const extra = {};
+  if (typeof errorCode === 'string' && errorCode) extra.errorCode = errorCode.slice(0, 64);
+  if (pushStatus !== null) extra.pushStatus = pushStatus;
+  return Object.keys(extra).length > 0 ? extra : undefined;
+}
+
+/**
+ * 收尾写库有没有落到行上。适配器契约里 `updateTaskById` 是 `TaskRow|null`、
+ * `deleteTaskById` 是 `boolean`，所以只把明确的「没匹配到行」当成行已消失；
+ * 什么都不返回的自定义适配器按老行为算成功——宁可少报一次，也不能把一次正常
+ * 投递误判成取消。
+ */
+function rowVanished(writeResult) {
+  return writeResult === null || writeResult === false;
+}
+
+/**
+ * 给 ctx.webpush 套一层取消检查。
+ *
+ * 推送是这条链上唯一不可撤销的一步——发出去就落到用户设备上了，撤不回来。所以
+ * 取消的检查点就放在它前面：心跳一旦发现这条任务已经不归自己管（见
+ * startLeaseHeartbeat 的 lost），后面每一条 push 都当场抛 TASK_CANCELLED，一条
+ * 也不发；整批发到一半才被取消的，剩下的那些就此打住。
+ *
+ * 心跳没开（适配器没实现 renewTaskLease，或宿主把 leaseHeartbeatMs 设成 0）时
+ * 拿不到这个信号，行为与以前一致。
+ *
+ * @param {Object} webpush - 宿主给的 webpush 实现
+ * @param {{ lost: boolean }} lease - 租约状态（心跳会就地改 lost）
+ */
+function guardWebpushWithLease(webpush, lease) {
+  if (!webpush || typeof webpush.sendNotification !== 'function') return webpush;
+  return new Proxy(webpush, {
+    get(target, prop) {
+      if (prop === 'sendNotification') {
+        return async (...args) => {
+          if (lease.lost) {
+            const error = new Error('任务在投递期间被取消或顶替，推送已中止');
+            error.code = TASK_CANCELLED_CODE;
+            throw error;
+          }
+          return target.sendNotification(...args);
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
 }
 
 function resolveStaleAfterMs(ctx) {
@@ -251,6 +338,7 @@ async function deliverTasks(ctx, tasks) {
     deletedOnceOffTasks: 0,
     updatedRecurringTasks: 0,
     staleTasks: [],
+    cancelledTasks: [],
     failedTasks: []
   };
 
@@ -274,21 +362,39 @@ async function deliverTasks(ctx, tasks) {
   }
 
   /**
-   * 投递期间的租约心跳：每 heartbeatMs 把 lease_until 推到 now + TTL。
-   * 返回停止函数——投递收尾（不管成败）必须调，不然定时器抱着 db 绑定活到
-   * 请求结束之后。续租失败只告警：租约还有一个 TTL 的余量，下一跳心跳再试；
-   * 真续不上，行为退化成「租约到期被接手」，正是心跳想要的兜底方向。
+   * 投递期间的租约心跳：每 heartbeatMs 把 lease_until 推到 now + TTL，顺带盯着
+   * 「这条还归不归我」。返回 { lost, stop }：
+   *
+   *   - `lost`：续租的条件写没匹配到行。renewTaskLease 只更新「仍是 pending 且
+   *     还持有租约」的行，所以返回 false 的意思是这条任务已经不在原处了——
+   *     `DELETE /message` 取消、`supersedesUuid` 顶替，或者被别的执行者收尾。
+   *     从占位到推送之间投递侧不再读库，这是唯一能知道这件事的信号；丢掉它就
+   *     会出现「接口回了取消成功，消息照样发出去」。
+   *   - `stop`：投递收尾（不管成败）必须调，不然定时器抱着 db 绑定活到请求结
+   *     束之后。
+   *
+   * 续租抛错只告警：租约还有一个 TTL 的余量，下个心跳再试；真续不上，行为退化
+   * 成「租约到期被接手」，正是心跳想要的兜底方向。抛错不等于行没了，所以不置
+   * lost；同理，只有明确的 false 才算行没了，什么都不返回的自定义适配器照旧。
    */
   function startLeaseHeartbeat(task) {
-    if (!heartbeatEnabled) return () => {};
+    const lease = { lost: false, stop: () => {} };
+    if (!heartbeatEnabled) return lease;
     let stopped = false;
     let timer = null;
     const beat = async () => {
       if (stopped) return;
+      let renewed;
       try {
-        await db.renewTaskLease(task.id, new Date(Date.now() + heartbeatLeaseTtlMs).toISOString());
+        renewed = await db.renewTaskLease(task.id, new Date(Date.now() + heartbeatLeaseTtlMs).toISOString());
       } catch (error) {
         console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
+      }
+      if (renewed === false) {
+        // 行已经不归这次投递管了，续也没得续，别再敲库。
+        lease.lost = true;
+        console.warn(`[amsg-server] 任务 ${task.id} 的租约已失效（行被取消或顶替），剩余推送将中止`);
+        return;
       }
       if (!stopped) schedule();
     };
@@ -298,10 +404,11 @@ async function deliverTasks(ctx, tasks) {
       if (timer && typeof timer.unref === 'function') timer.unref();
     };
     schedule();
-    return () => {
+    lease.stop = () => {
       stopped = true;
       if (timer) clearTimeout(timer);
     };
+    return lease;
   }
 
   // last_error 列跟 lease 那几列一个待遇：跟着包内 schema 走的适配器（实现
@@ -399,9 +506,28 @@ async function deliverTasks(ctx, tasks) {
   }
 
   /**
-   * 把这次的错误记进 payload 的 lastError（best-effort）：GET /messages 解密
-   * payload 时会把它透出来，宿主能看到「上次为什么没发出去」。加密不了就算了，
-   * 记录失败不该拖垮状态推进。
+   * 投递期间这条任务不再归本次投递管：行被 `DELETE /message` 取消、被
+   * `supersedesUuid` 顶替，或被别的执行者收尾了。
+   *
+   * 这里一个字段都不写——行已经不在了，写回去只会把一条用户已经取消的任务复
+   * 活。既不算成功也不算失败：算成功的话「回了取消成功却照样发出去」在 tick
+   * summary 里完全看不出来，算失败又会让接入方以为该去查投递链路。
+   */
+  function recordCancelled(task, status) {
+    results.cancelledTasks.push({
+      taskId: task.id,
+      reason: '任务在投递期间被取消或顶替',
+      status
+    });
+    console.warn(`[amsg-server] 任务 ${task.id} 在投递期间被取消或顶替（${status}）`);
+  }
+
+  /**
+   * 把这次的错误记进 payload 的 lastError（best-effort）。
+   *
+   * 行上的 last_error 列才是投影读的权威那一份（每次失败刷新、成功清空），密
+   * 文里这一份是给没有那一列的适配器兜底的——投影读不到列时才会回退到它，见
+   * lib/task-projection.js。加密不了就算了，记录失败不该拖垮状态推进。
    *
    * @param {Object} task
    * @param {Object} decryptedPayload
@@ -421,6 +547,25 @@ async function deliverTasks(ctx, tasks) {
           ...(extra || {})
         }
       }), userKey);
+    } catch (_encryptError) {
+      return null;
+    }
+  }
+
+  /**
+   * 把 payload 里的 lastError 剔掉再加密（best-effort）。只有没有 last_error
+   * 列的适配器用得上：有那一列时，行上那一份才是投影读的权威，成功时写 null
+   * 就够了，不必为一条记录重写整份密文。
+   *
+   * @param {Object} decryptedPayload
+   * @param {string} userKey
+   * @returns {Promise<string|null>} 加密不了 → null（调用方原样不动 payload）
+   */
+  async function encryptPayloadWithoutLastError(decryptedPayload, userKey) {
+    if (!decryptedPayload || !userKey) return null;
+    try {
+      const { lastError: _cleared, ...rest } = decryptedPayload;
+      return await encryptForStorage(JSON.stringify(rest), userKey);
     } catch (_encryptError) {
       return null;
     }
@@ -462,20 +607,21 @@ async function deliverTasks(ctx, tasks) {
     const pushStatus = toPushStatus(failure.pushStatus);
     const tzId = decryptedPayload ? (decryptedPayload.tzId ?? null) : null;
     // 重试也好不了的失败不进退避阶梯：一次性任务直接进终审处置，循环任务直接
-    // 作废本次 occurrence。三个来源：
-    //   - 已知的永久性错误码（订阅没登记 / 适配器不支持订阅存储）；
+    // 作废本次 occurrence。四个来源：
+    //   - 已知的永久性错误码（见 PERMANENT_ERROR_CODES）；
     //   - hook 侧抛出的 NonRetryableError（failure.permanent，见 lib/errors.js）——
     //     fire_pack 缺失、解析失败这类重试必然同败的错，隔两分钟再试三次只是
     //     让用户多白等十二分钟，还把情绪评估之类的计费重跑三遍；
-    //   - 推送服务判了这条订阅的死刑（410 / 404，见 TERMINAL_PUSH_STATUSES）。
+    //   - 推送服务判了这条订阅的死刑（410 / 404，见 TERMINAL_PUSH_STATUSES）；
+    //   - 推送服务说这条 payload 太大（413，见 PUSH_PAYLOAD_TOO_LARGE_STATUS）。
     const permanent = failure.permanent === true
-      || errorCode === 'PUSH_SUBSCRIPTION_MISSING'
-      || errorCode === 'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED'
-      || TERMINAL_PUSH_STATUSES.has(pushStatus);
-    // 状态码跟着 reason 一起记：reason 是给用户看的人话，pushStatus 是给下游
-    // 判定用的数。两处 lastError 都要带上——投影优先读 payload 里那一份，只写
-    // 行上的列的话下游根本看不到。
-    const errorExtra = pushStatus === null ? undefined : { pushStatus };
+      || PERMANENT_ERROR_CODES.has(errorCode)
+      || TERMINAL_PUSH_STATUSES.has(pushStatus)
+      || pushStatus === PUSH_PAYLOAD_TOO_LARGE_STATUS;
+    // 机读标注跟着 reason 一起记：reason 是给用户看的人话（措辞随时会变），
+    // errorCode / pushStatus 是给下游判定用的。判终态的依据也在这两个字段里，
+    // 不写出去的话下游只知道「失败了」，不知道该让用户重建订阅还是裁短内容。
+    const errorExtra = buildErrorExtra(errorCode, pushStatus);
     try {
       if (permanent || task.retry_count >= 3) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
@@ -592,17 +738,17 @@ async function deliverTasks(ctx, tasks) {
 
     // 占位成功，投递期间滚动续租（见 startLeaseHeartbeat）。收尾必须停心跳，
     // 不管下面哪条路径退出——finally 兜住。
-    const stopHeartbeat = startLeaseHeartbeat(task);
+    const lease = startLeaseHeartbeat(task);
     try {
-      await deliverClaimedTask(task, decrypted);
+      await deliverClaimedTask(task, decrypted, lease);
     } finally {
-      stopHeartbeat();
+      lease.stop();
     }
   }
 
   /** 占位之后的投递主体（从解密守卫到发送收尾），从 processTask 拆出来只是
    *  为了让心跳的 try/finally 能整段兜住它。 */
-  async function deliverClaimedTask(task, decrypted) {
+  async function deliverClaimedTask(task, decrypted, lease) {
     const decryptedPayload = decrypted.ok ? decrypted.payload : null;
     const userKey = decrypted.ok ? decrypted.userKey : null;
 
@@ -696,11 +842,17 @@ async function deliverTasks(ctx, tasks) {
     let sendResult;
     try {
       // 预扫描解好的 payload 一并递过去，投递侧不再解第二遍。
+      // webpush 套一层取消检查（见 guardWebpushWithLease）：投递期间任务被取消
+      // 的话，推送在发出去之前就被拦下。
       sendResult = await processSingleMessage(
-        task, { ...ctx, db, masterKey }, masterKey,
+        task, { ...ctx, db, masterKey, webpush: guardWebpushWithLease(ctx.webpush, lease) }, masterKey,
         { userKey, payload: decryptedPayload }
       );
     } catch (error) {
+      if (lease.lost) {
+        recordCancelled(task, 'cancelled_mid_delivery');
+        return;
+      }
       await handleDeliveryFailure(
         task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
         { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: error.statusCode }
@@ -709,6 +861,12 @@ async function deliverTasks(ctx, tasks) {
     }
 
     if (!sendResult.success) {
+      // 取消是拦下来的，不是发失败——按失败走会给一条已经不存在的行排重试，
+      // 也会把这件事混进 failedTasks 里。
+      if (lease.lost) {
+        recordCancelled(task, 'cancelled_mid_delivery');
+        return;
+      }
       await handleDeliveryFailure(
         task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey,
         { errorCode: sendResult.errorCode || null, permanent: sendResult.permanent === true, pushStatus: sendResult.pushStatusCode }
@@ -717,18 +875,35 @@ async function deliverTasks(ctx, tasks) {
     }
 
     try {
+      // 收尾写库匹配不到行 = 推送都发完了才发现这条已经被取消或顶替（心跳的
+      // 间隔盖不住的那段窗口）。消息确实发出去了，但这一跳不能记成功——记成功
+      // 的话，「取消接口回了 200、消息照样送达」在 summary 里一点痕迹都没有。
       if (recurrenceType === 'none') {
-        await db.deleteTaskById(task.id);
+        if (rowVanished(await db.deleteTaskById(task.id))) {
+          recordCancelled(task, 'cancelled_after_delivery');
+          return;
+        }
         results.deletedOnceOffTasks++;
       } else {
         // 以这条任务原本的触发时刻为基准往后推（推进到未来第一个名义时刻）。
-        // 这次成功了，把上一轮失败留下的 last_error 一并清掉。
+        // 这次成功了，把上一轮失败留下的记录一并清掉：有 last_error 列的写
+        // null；没有那一列的适配器，失败原因只落在密文 payload 里，得把它重
+        // 新加密一份剔掉——不清的话，用户重新登记订阅、之后天天正常送达，
+        // GET /message 里还挂着那次 410。
         const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
-        await updateAndRelease(task.id, {
+        const clearedPayload = (!supportsLastError && decryptedPayload && decryptedPayload.lastError)
+          ? await encryptPayloadWithoutLastError(decryptedPayload, userKey)
+          : null;
+        const updated = await updateAndRelease(task.id, {
           next_send_at: nextSendAt,
           retry_count: 0,
-          ...(supportsLastError ? { last_error: null } : {})
+          ...(supportsLastError ? { last_error: null } : {}),
+          ...(clearedPayload ? { encrypted_payload: clearedPayload } : {})
         });
+        if (rowVanished(updated)) {
+          recordCancelled(task, 'cancelled_after_delivery');
+          return;
+        }
         results.updatedRecurringTasks++;
       }
 
@@ -793,6 +968,10 @@ async function deliverTasks(ctx, tasks) {
       deletedOnceOffTasks: results.deletedOnceOffTasks,
       updatedRecurringTasks: results.updatedRecurringTasks,
       staleTasks: results.staleTasks,
+      // 投递期间行被取消 / 顶替的任务。`cancelled_mid_delivery` = 推送在发出去
+      // 之前被拦下；`cancelled_after_delivery` = 推送已经发完，收尾写库才发现
+      // 行没了。两种都不计入 successCount / failedCount。
+      cancelledTasks: results.cancelledTasks,
       failedTasks: results.failedTasks
     }
   };

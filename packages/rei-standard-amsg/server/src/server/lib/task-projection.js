@@ -27,8 +27,10 @@
  * @property {string|null}  clientTaskId  - 取自 metadata.amsgClientTaskId
  * @property {Object|null}  credRefs      - 凭据引用（{ <purpose>: <cred_id> }）；引用不是机密，客户端对账要看。没带 → null
  * @property {Object|null}  [metadata]    - 只有 includeMetadata 时才有，见下
- * @property {{ at: string, occurrence: string, reason: string, pushStatus?: number }|null} lastError
- *   `pushStatus` 只在投递失败于推送这一步时出现，值是推送服务回的 HTTP 状态码。
+ * @property {{ at: string, occurrence: string, reason: string, errorCode?: string, pushStatus?: number }|null} lastError
+ *   `errorCode` 是底层错误的稳定 code（如 `PUSH_PAYLOAD_TOO_LARGE`），拿得到就
+ *   带上；`pushStatus` 只在投递失败于推送这一步时出现，值是推送服务回的 HTTP
+ *   状态码。判断该怎么处置读这两个字段，别去正则匹配 `reason`。
  */
 
 /**
@@ -69,15 +71,29 @@ export function projectTask(row, decryptedPayload, options = {}) {
     credRefs: payload.credRefs ?? null,
     // 整份 metadata 只在单条查询里给（见上面的 includeMetadata）。
     ...(options.includeMetadata ? { metadata: payload.metadata ?? null } : {}),
-    // 上一次没发出去的原因（run-tick 记进 payload 的 lastError）。
-    // reason 'stale' 表示错过触发时刻太久被判定不再补发；其余是投递失败的
-    // 错误信息。payload 里没有时退回行上的 last_error 列（同形状的脱敏摘要，
-    // 等重试期间的失败也记在那里）。没有记录 → null。
-    // 记进去的字段整份带出来，不再挑一遍——`pushStatus`（410 = 订阅已注销，
-    // 404 = 端点不存在）这类机读标注就是给客户端看的，白名单挡在这一层的话，
-    // 客户端只能回去正则匹配 reason 那句人话。
-    lastError: payload.lastError ?? parseRowLastError(row.last_error),
+    // 上一次没发出去的原因。reason 'stale' 表示错过触发时刻太久被判定不再补
+    // 发；其余是投递失败的错误信息。没有记录 → null。
+    //
+    // 行上的 last_error 列是权威的那一份：每次失败刷新、成功时清空。密文
+    // payload 里那份是给没有这一列的适配器兜底的（run-tick 只在终审处置和过期
+    // 快进时写它，成功时不会去重写整份密文）。所以只要行带着这一列——哪怕值是
+    // NULL，那正说明「最近一次投递没失败」——就以它为准；反过来让 payload 优先
+    // 的话，一次 410 会永远挂在这条任务上，用户重新登记订阅、之后天天正常送达
+    // 也擦不掉。
+    //
+    // 记进去的字段整份带出来，不再挑一遍——`errorCode` 和 `pushStatus`（410 =
+    // 订阅已注销，404 = 端点不存在）这类机读标注就是给客户端看的，白名单挡在
+    // 这一层的话，客户端只能回去正则匹配 reason 那句人话。
+    lastError: hasRowLastError(row)
+      ? parseRowLastError(row.last_error)
+      : (payload.lastError ?? null),
   };
+}
+
+/** 这一行到底带没带 last_error 列。自定义适配器的行可能压根没有这个键，所以
+ *  用「有没有这个属性」判断，而不是判空——NULL 是有意义的值（没有失败记录）。 */
+function hasRowLastError(row) {
+  return !!row && Object.prototype.hasOwnProperty.call(row, 'last_error');
 }
 
 /** 行上 last_error 列的 JSON 解析（形状 { at, occurrence, reason }）；解析不动
