@@ -16,23 +16,38 @@
  * standalone `ReasoningPush` **before** the `ContentPush` burst.
  * `messagesSent` in the return value continues to reflect the sentence
  * count only (reasoning is an auxiliary push, not a sentence).
+ * 思考过程是正文之外的附赠内容：它发不出去只影响它自己，正文照发（见
+ * `deliverReasoningPush`）。一条 push 装不下的思考过程切成 `_multipart`
+ * 分片发，sw 收齐后还原。
  */
 
 import { randomUUID } from './webcrypto-utils.js';
 import {
   buildContentPush,
+  buildMultipartPushPayloads,
   buildReasoningPush,
   readReasoningContent,
   stripReasoningTags,
+  DEFAULT_MULTIPART_MAX_CHUNKS,
+  DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
 } from '@rei-standard/amsg-shared';
+import { measurePushPayload } from './webpush-webcrypto.js';
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
 import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
-import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
-import { isNonRetryableError, sanitizeErrorSummary } from './errors.js';
+import { appendPushesToOutbox, discardPushesFromOutbox, markPushesDelivered } from './outbox-store.js';
+import {
+  buildErrorExtra,
+  isNonRetryableError,
+  isPermanentDeliveryFailure,
+  isTaskCancelledError,
+  readPushStatusCode,
+  sanitizeErrorSummary,
+  tagPushStatusCode,
+} from './errors.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 
@@ -40,6 +55,12 @@ const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 // between content sentences) so the client renders a natural typing cadence.
 // Kept equal to amsg-instant's SLEEP_BETWEEN_MESSAGES_MS default.
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
+
+// 思考过程切片时给分片标的重组窗口。sw 那边按 min(这个值, 它自己的
+// multipart.ttlMs) 取，两边谁更紧听谁的。定时消息是设备离线也要送到的
+// （传输层 TTL 四周），所以发送端这边不再额外收窄——窗口开多大由 sw 的
+// multipart.ttlMs 说了算。
+const REASONING_MULTIPART_TTL_MS = 2_419_200_000; // 4 weeks
 
 /**
  * Split a single chunk by one regex; on no-match return [chunk] so a later
@@ -85,6 +106,60 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
   }
 
   return chunks.length > 0 ? chunks : [messageContent];
+}
+
+/**
+ * 发这一轮的 ReasoningPush。
+ *
+ * 思考过程是正文之外的附赠内容，所以这一步的失败就地吞掉、只留一行日志，
+ * 调用方照常发正文。
+ *
+ * 单条 push 的明文有上限（见 lib/webpush-webcrypto.js 的
+ * MAX_PUSH_PAYLOAD_BYTES，约 3993 字节 ≈ 1300 汉字），推理模型的思考过程
+ * 常常一条装不下。装不下就切成通用 `_multipart` 分片逐条发，sw 收齐后还原
+ * 成原样的 ReasoningPush 再走正常派发（切片格式在
+ * @rei-standard/amsg-shared，amsg-instant 发的是同一种）。
+ *
+ * @param {ProcessorContext} ctx
+ * @param {Object} pushSubscription
+ * @param {Object} reasoningPush
+ * @returns {Promise<boolean>} 送出去了没有。false = 这条没发成，正文继续发。
+ */
+async function deliverReasoningPush(ctx, pushSubscription, reasoningPush) {
+  try {
+    const serialized = JSON.stringify(reasoningPush);
+    const { bytes, withinLimit } = measurePushPayload(serialized);
+
+    if (withinLimit) {
+      await ctx.webpush.sendNotification(pushSubscription, serialized);
+      return true;
+    }
+
+    // 分片也有量级上限，接收端按同一组默认值收——超了就别发，发出去也是被
+    // sw 按 maxTotalBytes / maxChunks 拒收。
+    if (bytes > DEFAULT_MULTIPART_MAX_TOTAL_BYTES) {
+      throw new Error(`思考过程 ${bytes} 字节，超过分片传输的 ${DEFAULT_MULTIPART_MAX_TOTAL_BYTES} 字节上限`);
+    }
+    const parts = buildMultipartPushPayloads(reasoningPush, {
+      serializedPayload: serialized,
+      ttlMs: REASONING_MULTIPART_TTL_MS,
+    });
+    if (parts.length > DEFAULT_MULTIPART_MAX_CHUNKS) {
+      throw new Error(`思考过程要切 ${parts.length} 片，超过分片传输的 ${DEFAULT_MULTIPART_MAX_CHUNKS} 片上限`);
+    }
+
+    for (const part of parts) {
+      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(part));
+    }
+    return true;
+
+  } catch (error) {
+    console.warn(
+      '[amsg-server] 思考过程未送达（正文照常发送）:',
+      sanitizeErrorSummary(error && error.message)
+    );
+    return false;
+  }
 }
 
 /**
@@ -221,14 +296,15 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // 先把整批 push 定稿（含可选的 ReasoningPush），再发送。定稿提前是为了
     // outbox：发送前把每条 push 落进 message_outbox（客户端补收的事实来源，
     // best-effort，见 lib/outbox-store.js），落的必须是发送时的同一份内容。
-    const pushesToSend = [];
+    const contentPushes = [];
 
     // ReasoningPush — auto-emitted before the content burst when the
     // LLM response carried non-empty reasoning_content. `fixed` and
     // explicit-userMessage paths produce no LLM response, so this
     // block is naturally skipped for them (llmResponse stays null).
+    let reasoningPush = null;
     if (reasoning) {
-      const reasoningPush = buildReasoningPush({
+      reasoningPush = buildReasoningPush({
         messageType: decryptedPayload.messageType,
         source,
         messageId: `${messageIdBase}_reasoning`,
@@ -242,7 +318,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         metadata,
       });
       stampTaskIdentity(reasoningPush, task, decryptedPayload, occurrenceMs);
-      pushesToSend.push(reasoningPush);
     }
 
     for (let i = 0; i < messages.length; i++) {
@@ -262,24 +337,61 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         metadata,
       });
       stampTaskIdentity(contentPush, task, decryptedPayload, occurrenceMs);
-      pushesToSend.push(contentPush);
+      contentPushes.push(contentPush);
     }
 
+    // outbox 落的是逻辑上的那几条 push：思考过程走分片时，落进去的也是没切
+    // 之前的整条——补收走的是 HTTP，没有单条体积上限。
+    const pushesToSend = reasoningPush ? [reasoningPush, ...contentPushes] : contentPushes;
     await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
 
     const sentIds = [];
+    let cancelledMidBurst = false;
     try {
-      for (let i = 0; i < pushesToSend.length; i++) {
-        await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(pushesToSend[i]));
-        sentIds.push(pushesToSend[i].messageId);
-        if (i < pushesToSend.length - 1) {
+      // 思考过程先发，且只影响它自己：发不出去（超限、推送服务拒收……）就跳
+      // 过，正文一条不少地照发。它排在最前面又和正文共用一个循环的话，一次
+      // 失败会把整条消息一起带走。
+      if (reasoningPush) {
+        const reasoningShipped = await deliverReasoningPush(ctx, pushSubscription, reasoningPush);
+        if (reasoningShipped) {
+          sentIds.push(reasoningPush.messageId);
           await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
         }
       }
+
+      for (let i = 0; i < contentPushes.length; i++) {
+        try {
+          await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPushes[i]));
+        } catch (error) {
+          // 标一下「这是发 push 那一步抛的」，下面的 catch 才认它的 statusCode。
+          throw tagPushStatusCode(error);
+        }
+        sentIds.push(contentPushes[i].messageId);
+        if (i < contentPushes.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+        }
+      }
+    } catch (error) {
+      cancelledMidBurst = isTaskCancelledError(error);
+      throw error;
     } finally {
       // 半途失败也把已发出的段标掉：delivered_at 为 null 的行就是客户端要补
       // 收的那部分，标多标少都会让补收失真。
       await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
+      if (cancelledMidBurst) {
+        // 取消只拦住了 Web Push 这一路，可整批在发送前就落进 outbox 了。剩下
+        // 这几条不撤掉的话，客户端下一次 GET /outbox 会照样把它们拉回去——用户
+        // 看到的就是「取消接口回了成功，消息还是来了」。
+        // 投递失败不走这里：那种情况下这些行正是要留着补收的。
+        const delivered = new Set(sentIds);
+        await discardPushesFromOutbox({
+          db: ctx.db,
+          userId: task.user_id,
+          messageIds: pushesToSend
+            .map(push => push.messageId)
+            .filter(messageId => !delivered.has(messageId)),
+        });
+      }
     }
 
     return { success: true, messagesSent: messages.length };
@@ -288,15 +400,18 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // errorCode 透传底层错误的稳定 `code`（如 PUSH_SUBSCRIPTION_MISSING），
     // run-tick 按它区分「重试也好不了」的永久性失败；permanent 是 hook 侧
     // NonRetryableError 的透传（见 lib/errors.js），语义相同、来源更宽。
-    // pushStatusCode 是推送服务回的 HTTP 状态码（sendWebPush 挂在错误上的
-    // statusCode）：410 / 404 说明这条订阅已经没了，run-tick 据此判终态——不
-    // 传出来的话，那个事实只剩错误消息里的一句人话，谁想用都得去正则匹配。
+    // pushStatusCode 是推送服务回的 HTTP 状态码：410 / 404 说明这条订阅已经
+    // 没了，run-tick 据此判终态——不传出来的话，那个事实只剩错误消息里的一句
+    // 人话，谁想用都得去正则匹配。只认发 push 那一步标过的错误（见
+    // lib/errors.js 的 tagPushStatusCode），别改成直接读 `error.statusCode`：
+    // 这个 catch 收的是整个函数的异常，LLM 调用、fire-time hook、解密都在里
+    // 面，那些错误上的 `statusCode` 不是推送状态码。
     return {
       success: false,
       messagesSent: 0,
       error: error.message,
       errorCode: error.code || null,
-      pushStatusCode: Number.isInteger(error.statusCode) ? error.statusCode : null,
+      pushStatusCode: readPushStatusCode(error),
       permanent: isNonRetryableError(error)
     };
   }
@@ -349,9 +464,17 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
     const result = await processSingleMessage(task, ctx, masterKey);
 
     if (!result.success) {
-      // 确定性失败（NonRetryableError）不进重试：再跑两轮也是同一个错，白让
-      // 调用方多等、白烧 hook 里的计费调用。
-      if (!result.permanent && retryCount < maxRetries) {
+      // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮
+      // LLM 和 hook 里的计费调用。判定口径跟定时任务那条退避阶梯共用一份（见
+      // lib/errors.js 的 isPermanentDeliveryFailure）——订阅压根没登记、推送服
+      // 务回 410 说订阅没了，这些在哪条链路上都是重试必然同败。
+      const permanent = isPermanentDeliveryFailure({
+        permanent: result.permanent,
+        errorCode: result.errorCode,
+        pushStatus: result.pushStatusCode
+      });
+
+      if (!permanent && retryCount < maxRetries) {
         retryCount++;
         await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
         continue;
@@ -361,10 +484,15 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
         await ctx.db.updateTaskById(task.id, {
           status: 'failed',
           retry_count: retryCount,
+          // 记录的形状跟定时任务那条路一致（同一个 buildErrorExtra）：reason
+          // 是给用户看的人话，errorCode / pushStatus 是给下游判定用的——410 =
+          // 订阅已注销，客户端要据此引导用户重新登记，而不是回去正则匹配
+          // reason 里那句话。
           last_error: JSON.stringify({
             at: new Date().toISOString(),
             occurrence: task.next_send_at ?? null,
-            reason: sanitizeErrorSummary(result.error)
+            reason: sanitizeErrorSummary(result.error),
+            ...(buildErrorExtra(result.errorCode, result.pushStatusCode) || {})
           })
         });
       } catch (_updateError) {
@@ -383,7 +511,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
           code: 'PROCESSING_ERROR',
           message: result.error,
           retriesAttempted: retryCount,
-          ...(result.permanent ? { permanent: true } : {})
+          ...(permanent ? { permanent: true } : {})
         }
       };
     }

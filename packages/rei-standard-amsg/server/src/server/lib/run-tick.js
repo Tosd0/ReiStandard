@@ -50,7 +50,12 @@
  */
 
 import { hmacSha256, bytesToBase64Url, utf8 } from './webcrypto-utils.js';
-import { sanitizeErrorSummary } from './errors.js';
+import {
+  buildErrorExtra,
+  isPermanentDeliveryFailure,
+  sanitizeErrorSummary,
+  TASK_CANCELLED_CODE,
+} from './errors.js';
 import { deriveUserEncryptionKey, decryptFromStorage, encryptForStorage } from './encryption.js';
 import { processSingleMessage } from './message-processor.js';
 import { buildHookTask } from './agentic-fire.js';
@@ -83,57 +88,15 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
-// 推送服务给的「这条订阅没了」：410 Gone = 订阅已注销或过期，404 = 端点压根
-// 不存在。同一条订阅再推一万次也是同一个答复，所以这两个码算终态。
-//
-// 投递是先生成后推送（跑完 LLM 才拿订阅推），留在退避阶梯里的话每一跳重试都
-// 要重新生成一轮内容——真花 token，一条也发不出去。
-//
-// 判成终态不代表要去删 push_subscriptions 里那一行：删了之后「云端登记了收件
-// 设备吗」会变成 false，客户端多半会把用户引去重新登记，而重新登记只是把同一
-// 条死订阅再写一遍。这件事靠 last_error 里的 pushStatus 说给下游听。
-const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
+// 「重试也好不了」的判定（永久性错误码、终态推送状态码、payload 超限）住在
+// lib/errors.js —— 定时任务的退避阶梯和 instant 任务的三轮重试用同一份口径。
 
-// 「这条内容装不下」：本地大小护栏在加密前就抛 PUSH_PAYLOAD_TOO_LARGE
-// （lib/webpush-webcrypto.js，超一个字节都不发），推送服务在密文超限时回 413。
-// 两处说的是同一件事，只是发现得早晚不同，而这件事跟本次生成出来的内容绑死：
-// 隔两分钟重来一遍，得先把 LLM 那一整轮重跑一次（真花钱），再撞同一堵墙。所以
-// 不进退避阶梯，一次就作废本次 occurrence，让下游拿 errorCode / pushStatus 去
-// 决定怎么裁短内容。
-//
-// VAPID 配错回的 400 / 401 / 403 不在此列，虽然重试同样好不了：那是整个部署级
-// 别的故障（一把钥匙配错，所有任务一起发不出去），判终态会把这段时间内每一条
-// 一次性任务都永久标 failed，配置修好也回不来了。这类失败留在退避阶梯里，原因
-// 靠 last_error 里的 errorCode / pushStatus 说清楚。
-const PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
-
-// 重试也好不了的错误码：订阅压根没登记、适配器不支持订阅存储、payload 超限。
-const PERMANENT_ERROR_CODES = new Set([
-  'PUSH_SUBSCRIPTION_MISSING',
-  'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED',
-  'PUSH_PAYLOAD_TOO_LARGE',
-]);
-
-// 投递期间发现「这条已经不归我了」时，推送侧抛的错误码（见 guardWebpushWithLease）。
-const TASK_CANCELLED_CODE = 'TASK_CANCELLED';
+// 投递期间发现「这条已经不归我了」时，推送侧抛的错误码住在 lib/errors.js
+// （见 guardWebpushWithLease）：发送方要靠它把「取消」和「发失败」分开处置。
 
 /** 推送服务回的状态码；拿不到（不是推送失败，或宿主的 webpush 实现没带）→ null。 */
 function toPushStatus(value) {
   return Number.isInteger(value) ? value : null;
-}
-
-/**
- * lastError 里的机读标注：`errorCode` 是底层错误的稳定 code，`pushStatus` 是推
- * 送服务回的 HTTP 状态码。两个都没有 → undefined，不往记录里塞空字段。
- *
- * code 是标识符不是人话，不用脱敏，但也别让一个来路不明的超长 code 撑大明文
- * 列——截到 64 字符，够放所有约定过的码。
- */
-function buildErrorExtra(errorCode, pushStatus) {
-  const extra = {};
-  if (typeof errorCode === 'string' && errorCode) extra.errorCode = errorCode.slice(0, 64);
-  if (pushStatus !== null) extra.pushStatus = pushStatus;
-  return Object.keys(extra).length > 0 ? extra : undefined;
 }
 
 /**
@@ -157,27 +120,34 @@ function rowVanished(writeResult) {
  * 心跳没开（适配器没实现 renewTaskLease，或宿主把 leaseHeartbeatMs 设成 0）时
  * 拿不到这个信号，行为与以前一致。
  *
+ * 做法是拿宿主那个对象当原型现造一层影子对象，只在影子上盖住
+ * `sendNotification`，其余属性照旧走原型链读到原件。不用 Proxy：宿主按常见写法
+ * 传 `Object.freeze({ sendNotification })` 时，冻结对象上的属性是
+ * non-writable + non-configurable，get trap 返回包装函数会踩 Proxy 不变式当场
+ * 抛 TypeError——那个部署下每一条定时消息都会发不出去。
+ *
  * @param {Object} webpush - 宿主给的 webpush 实现
  * @param {{ lost: boolean }} lease - 租约状态（心跳会就地改 lost）
  */
 function guardWebpushWithLease(webpush, lease) {
   if (!webpush || typeof webpush.sendNotification !== 'function') return webpush;
-  return new Proxy(webpush, {
-    get(target, prop) {
-      if (prop === 'sendNotification') {
-        return async (...args) => {
-          if (lease.lost) {
-            const error = new Error('任务在投递期间被取消或顶替，推送已中止');
-            error.code = TASK_CANCELLED_CODE;
-            throw error;
-          }
-          return target.sendNotification(...args);
-        };
+  const guarded = Object.create(webpush);
+  // 用 defineProperty 而不是赋值：原件冻结时赋值会顺着原型链撞上那个
+  // non-writable 的同名属性，在 ESM 的严格模式下直接抛。
+  Object.defineProperty(guarded, 'sendNotification', {
+    value: async (...args) => {
+      if (lease.lost) {
+        const error = new Error('任务在投递期间被取消或顶替，推送已中止');
+        error.code = TASK_CANCELLED_CODE;
+        throw error;
       }
-      const value = target[prop];
-      return typeof value === 'function' ? value.bind(target) : value;
-    }
+      return webpush.sendNotification(...args);
+    },
+    writable: true,
+    enumerable: true,
+    configurable: true,
   });
+  return guarded;
 }
 
 function resolveStaleAfterMs(ctx) {
@@ -411,10 +381,17 @@ async function deliverTasks(ctx, tasks) {
     return lease;
   }
 
-  // last_error 列跟 lease 那几列一个待遇：跟着包内 schema 走的适配器（实现
-  // 了 claimTask 的）才写；自定义适配器多半没这一列，塞过去只会被它的白名单
-  // 拒掉。
-  const supportsLastError = supportsClaim;
+  // last_error 一律往行上写，能不能写得进去交给存储说了算（写不进去的库由
+  // updateTaskWithLastError 退掉这个字段重写一次）。
+  //
+  // 不能拿「实现了 claimTask 吗」当判据：投影那边只看行上带不带 last_error 这
+  // 个键，而 claimTask 是可选的——跟着包内 schema 建表、却没实现 claimTask 的
+  // 适配器，行上有这一列、投影认它权威，可写入侧从来不写，`lastError` 就永远
+  // 读成 null，客户端看不到上次为什么没发出去。
+  //
+  // 也不能拿「捞回来的这一行带不带这个键」当判据：投递用的列集
+  // （TASK_DELIVERY_COLUMNS）本来就不含 last_error，投递时没必要把上一次的失
+  // 败原因一起读出来。
 
   /**
    * updateTaskById 的包一层：升级后还没重跑 /init-tenant 的库缺 last_error
@@ -553,16 +530,34 @@ async function deliverTasks(ctx, tasks) {
   }
 
   /**
-   * 把 payload 里的 lastError 剔掉再加密（best-effort）。只有没有 last_error
-   * 列的适配器用得上：有那一列时，行上那一份才是投影读的权威，成功时写 null
-   * 就够了，不必为一条记录重写整份密文。
+   * 把 payload 里的 lastError 剔掉再加密（best-effort）。
    *
+   * 行上有 last_error 列时，投影读的是行上那一份，密文里这一份是给没有那一列
+   * 的适配器兜底的；但两份都得清干净——同一个部署换个适配器、或者投影从不同的
+   * 列集读行，剩下的那一份就会翻出来当成「最近一次失败」。
+   *
+   * 手里这份 payload 是占位时的快照，而一次投递可能跑几十秒——其间用户
+   * `PUT /update-message` 改过这条任务的话，把快照原样写回去就等于把那次修改
+   * 静默回滚了（这条路上的适配器没实现 claimTask，也就没有租约拦着）。所以写
+   * 之前先确认行上的密文还是同一份，变了就不清了：留一条过时的 lastError，比
+   * 吞掉用户刚保存的改动强，而且下一次成功投递会自己把它清掉。
+   *
+   * @param {Object} task - 数据库行（占位时那一份）
    * @param {Object} decryptedPayload
    * @param {string} userKey
-   * @returns {Promise<string|null>} 加密不了 → null（调用方原样不动 payload）
+   * @returns {Promise<string|null>} 不该写 / 加密不了 → null（调用方原样不动 payload）
    */
-  async function encryptPayloadWithoutLastError(decryptedPayload, userKey) {
+  async function encryptPayloadWithoutLastError(task, decryptedPayload, userKey) {
     if (!decryptedPayload || !userKey) return null;
+    if (typeof db.getTaskByUuid === 'function' && task.uuid) {
+      try {
+        const current = await db.getTaskByUuid(task.uuid, task.user_id);
+        if (!current || current.encrypted_payload !== task.encrypted_payload) return null;
+      } catch (_readError) {
+        // 读不到就当它可能变过，别赌。
+        return null;
+      }
+    }
     try {
       const { lastError: _cleared, ...rest } = decryptedPayload;
       return await encryptForStorage(JSON.stringify(rest), userKey);
@@ -607,17 +602,8 @@ async function deliverTasks(ctx, tasks) {
     const pushStatus = toPushStatus(failure.pushStatus);
     const tzId = decryptedPayload ? (decryptedPayload.tzId ?? null) : null;
     // 重试也好不了的失败不进退避阶梯：一次性任务直接进终审处置，循环任务直接
-    // 作废本次 occurrence。四个来源：
-    //   - 已知的永久性错误码（见 PERMANENT_ERROR_CODES）；
-    //   - hook 侧抛出的 NonRetryableError（failure.permanent，见 lib/errors.js）——
-    //     fire_pack 缺失、解析失败这类重试必然同败的错，隔两分钟再试三次只是
-    //     让用户多白等十二分钟，还把情绪评估之类的计费重跑三遍；
-    //   - 推送服务判了这条订阅的死刑（410 / 404，见 TERMINAL_PUSH_STATUSES）；
-    //   - 推送服务说这条 payload 太大（413，见 PUSH_PAYLOAD_TOO_LARGE_STATUS）。
-    const permanent = failure.permanent === true
-      || PERMANENT_ERROR_CODES.has(errorCode)
-      || TERMINAL_PUSH_STATUSES.has(pushStatus)
-      || pushStatus === PUSH_PAYLOAD_TOO_LARGE_STATUS;
+    // 作废本次 occurrence。判定口径见 lib/errors.js 的 isPermanentDeliveryFailure。
+    const permanent = isPermanentDeliveryFailure({ permanent: failure.permanent, errorCode, pushStatus });
     // 机读标注跟着 reason 一起记：reason 是给用户看的人话（措辞随时会变），
     // errorCode / pushStatus 是给下游判定用的。判终态的依据也在这两个字段里，
     // 不写出去的话下游只知道「失败了」，不知道该让用户重建订阅还是裁短内容。
@@ -631,14 +617,14 @@ async function deliverTasks(ctx, tasks) {
             next_send_at: nextSendAt,
             retry_count: 0,
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
+            last_error: lastErrorJson(task, reason, errorExtra)
           });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'occurrence_skipped', nextSendAt, ...(permanent ? { permanent: true } : {}) });
         } else {
           await updateAndRelease(task.id, {
             status: 'failed',
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
+            last_error: lastErrorJson(task, reason, errorExtra)
           });
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed', ...(permanent ? { permanent: true } : {}) });
         }
@@ -651,10 +637,14 @@ async function deliverTasks(ctx, tasks) {
             retry_after: nextRetryTime.toISOString(),
             lease_until: null,
             retry_count: task.retry_count + 1,
-            ...(supportsLastError ? { last_error: lastErrorJson(task, reason, errorExtra) } : {})
+            last_error: lastErrorJson(task, reason, errorExtra)
           });
         } else {
-          await db.updateTaskById(task.id, { next_send_at: nextRetryTime.toISOString(), retry_count: task.retry_count + 1 });
+          await updateTaskWithLastError(task.id, {
+            next_send_at: nextRetryTime.toISOString(),
+            retry_count: task.retry_count + 1,
+            last_error: lastErrorJson(task, reason, errorExtra)
+          });
         }
         results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count + 1, nextRetryAt: nextRetryTime.toISOString() });
       }
@@ -804,9 +794,7 @@ async function deliverTasks(ctx, tasks) {
         await updateAndRelease(task.id, {
           ...(recurring ? { next_send_at: nextSendAt, retry_count: 0 } : { status: 'failed' }),
           ...(encrypted ? { encrypted_payload: encrypted } : {}),
-          ...(supportsLastError
-            ? { last_error: lastErrorJson(task, 'stale', recurring ? { skippedCount, nextSendAt } : undefined) }
-            : {})
+          last_error: lastErrorJson(task, 'stale', recurring ? { skippedCount, nextSendAt } : undefined)
         });
         results.staleTasks.push({
           taskId: task.id,
@@ -853,9 +841,14 @@ async function deliverTasks(ctx, tasks) {
         recordCancelled(task, 'cancelled_mid_delivery');
         return;
       }
+      // 兜底分支：processSingleMessage 自己把整个流程包在 try/catch 里，失败
+      // 走的是下面的 sendResult 分支。走到这儿说明是它没兜住的意外异常，跟
+      // 推送服务无关，所以不带 pushStatus——那个字段只描述「推送那一步回了什
+      // 么状态码」，任何来路的 `statusCode` 都不该冒充它（404 / 410 会让任务
+      // 被判成订阅失效、永久 failed）。
       await handleDeliveryFailure(
         task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
-        { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: error.statusCode }
+        { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: null }
       );
       return;
     }
@@ -886,18 +879,22 @@ async function deliverTasks(ctx, tasks) {
         results.deletedOnceOffTasks++;
       } else {
         // 以这条任务原本的触发时刻为基准往后推（推进到未来第一个名义时刻）。
-        // 这次成功了，把上一轮失败留下的记录一并清掉：有 last_error 列的写
-        // null；没有那一列的适配器，失败原因只落在密文 payload 里，得把它重
-        // 新加密一份剔掉——不清的话，用户重新登记订阅、之后天天正常送达，
-        // GET /message 里还挂着那次 410。
+        // 这次成功了，把上一轮失败留下的记录两处一起清掉：行上的 last_error 列
+        // 写 null，密文 payload 里那份重新加密一遍剔掉。不清的话，用户重新登记
+        // 订阅、之后天天正常送达，GET /message 里还挂着那次 410——投影读哪一份
+        // 取决于适配器有没有这一列，所以两份都得清。
+        //
+        // payload 那一份只在真有 lastError 时才重写（正常投递不会每次都重新加
+        // 密整份正文），而且重写前会确认行上的密文还是手里这一份，见
+        // encryptPayloadWithoutLastError。
         const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
-        const clearedPayload = (!supportsLastError && decryptedPayload && decryptedPayload.lastError)
-          ? await encryptPayloadWithoutLastError(decryptedPayload, userKey)
+        const clearedPayload = (decryptedPayload && decryptedPayload.lastError)
+          ? await encryptPayloadWithoutLastError(task, decryptedPayload, userKey)
           : null;
         const updated = await updateAndRelease(task.id, {
           next_send_at: nextSendAt,
           retry_count: 0,
-          ...(supportsLastError ? { last_error: null } : {}),
+          last_error: null,
           ...(clearedPayload ? { encrypted_payload: clearedPayload } : {})
         });
         if (rowVanished(updated)) {

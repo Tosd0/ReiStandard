@@ -154,11 +154,9 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
     assert.match(message, /redacted/);
   });
 
-  it('handler 抛出的异常也收成 500（它自己的错误边界之外还有几步）', async () => {
-    // handler 内部对请求处理有 try/catch，但边界之外还有几步（读 method、
-    // 鉴权）。这里用一个「读 method 就炸」的请求对象把那一段逼出来。
-    const worker = createCloudflareWorker(() => ({ vapid, fetch: makeRouter().fetch }));
-    const hostile = {
+  /** 「读 method 就炸」的请求对象——把 handler 错误边界之外那一段逼出来。 */
+  function hostileRequest() {
+    return {
       url: 'https://worker.example.com/instant',
       get method() {
         throw new TypeError('runtime lost the request method');
@@ -167,15 +165,39 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
         get: (name) => (String(name).toLowerCase() === 'origin' ? ORIGIN : ''),
       },
     };
+  }
 
-    const res = await worker.fetch(hostile, {});
+  it('handler 抛出的异常也收成 500（它自己的错误边界之外还有几步）', async () => {
+    // handler 内部对请求处理有 try/catch，但边界之外还有几步（读 method、鉴权）。
+    const worker = createCloudflareWorker(() => ({ vapid, fetch: makeRouter().fetch }));
+
+    const res = await worker.fetch(hostileRequest(), {});
 
     assert.equal(res.status, 500);
-    assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN);
+    // 没配 cors 的部署本来就是 '*'，这条 500 跟正常响应用同一套头。
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
     const body = await res.json();
     assert.equal(body.error.code, 'INTERNAL_ERROR');
     assert.equal(body.error.cause.stage, 'request');
     assert.equal(body.error.cause.name, 'TypeError');
+  });
+
+  it('请求阶段的 500 走部署自己的 CORS 白名单，不回显来访 Origin', async () => {
+    // 回归守卫：handler 已经建起来了 = 白名单是已知的。这条兜底 500 要是照
+    // 「降级」那样回显来访 Origin，任意第三方页面都能跨域读到它和它的 cause。
+    const worker = createCloudflareWorker(() => ({
+      vapid,
+      fetch: makeRouter().fetch,
+      cors: { allowOrigin: ORIGIN },
+    }));
+    // 白名单之外的来访者。
+    const outsider = hostileRequest();
+    outsider.headers = { get: (name) => (String(name).toLowerCase() === 'origin' ? 'https://evil.example' : '') };
+
+    const res = await worker.fetch(outsider, {});
+
+    assert.equal(res.status, 500);
+    assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN, '白名单里的那个，不是来访的那个');
   });
 });
 
@@ -289,6 +311,82 @@ describe('toNodeHandler 流式转发', () => {
       assert.equal(await waitFor(() => state.canceled), true, '客户端走了，上游流必须被 cancel');
       assert.equal(state.upstreamFinished, false);
     } finally {
+      gate.resolve();
+      await server.close();
+    }
+  });
+
+  // pipeline 无论因为什么失败都会先把 res 销毁，所以「res 被销毁了」根本分不出
+  // 是客户端走了还是服务端自己炸了。拿它当判据的话，SSE 流中途炸掉会被一并当成
+  // 「客户端走了」——连接就那么断了，一行痕迹都没有，运维只能从客户端那句
+  // `TypeError: network error` 反推。
+  it('服务端自己的流错误留下能归因的日志，不当成客户端断开吞掉', { timeout: 15000 }, async () => {
+    const brokenSse = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(ENCODER.encode(': keepalive\n\n'));
+          setTimeout(() => controller.error(new Error('SSE producer exploded')), 20);
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+    const server = await startServer(toNodeHandler(brokenSse));
+
+    const originalError = console.error;
+    const lines = [];
+    console.error = (...args) => { lines.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    try {
+      const res = await fetch(server.url, {
+        method: 'POST',
+        body: '{}',
+        signal: AbortSignal.timeout(3000),
+      });
+      const reader = res.body.getReader();
+      await reader.read();
+      // 流被服务端掐断：客户端这一侧读到的是一个失败的连接，不是正常收尾。
+      await assert.rejects(async () => {
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) return;
+        }
+      }, '半截流不该看起来像正常读完了');
+
+      assert.equal(
+        await waitFor(() => lines.some((line) => line.includes('SSE producer exploded'))),
+        true,
+        `服务端的流错误必须留下痕迹：${JSON.stringify(lines)}`,
+      );
+    } finally {
+      console.error = originalError;
+      await server.close();
+    }
+  });
+
+  it('客户端提前断开不写错误日志（那是正常收场，不是故障）', { timeout: 15000 }, async () => {
+    const gate = deferred();
+    const state = { upstreamFinished: false, canceled: false };
+    const server = await startServer(toNodeHandler(makeGatedSseHandler(gate, state)));
+
+    const originalError = console.error;
+    const lines = [];
+    console.error = (...args) => { lines.push(args.map(String).join(' ')); };
+    try {
+      const controller = new AbortController();
+      const res = await fetch(server.url, {
+        method: 'POST',
+        body: '{}',
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(3000)]),
+      });
+      const reader = res.body.getReader();
+      await reader.read();
+      controller.abort();
+
+      assert.equal(await waitFor(() => state.canceled), true);
+      // 用户随手关掉页面是家常便饭，不能每次都往日志里写一条「请求处理失败」。
+      await new Promise((r) => setTimeout(r, 50));
+      assert.deepEqual(lines, [], `客户端走了不该记成故障：${JSON.stringify(lines)}`);
+    } finally {
+      console.error = originalError;
       gate.resolve();
       await server.close();
     }

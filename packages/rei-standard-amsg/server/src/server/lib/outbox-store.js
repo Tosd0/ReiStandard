@@ -68,3 +68,29 @@ export async function markPushesDelivered({ db, userId, messageIds }) {
     console.warn('[amsg-server] outbox 标记 delivered 失败（已忽略）:', error && error.message);
   }
 }
+
+/**
+ * 把这一批还没发出去的行从 outbox 里撤掉。
+ *
+ * 用在任务投递到一半被取消 / 顶替的时候。整批 push 是发送前就落进 outbox 的
+ * （那是补收的事实来源），取消只拦住了 Web Push 这一路；不撤掉这些行的话，
+ * 客户端下一次 `GET /outbox` 照样把剩下的拉回去——用户看到的就是「取消接口回
+ * 了成功，消息还是来了」。
+ *
+ * 已经推出去的那几条不在此列（调用方只传没发出去的 id）：推给设备的撤不回来，
+ * 行留着让客户端照常 ack。
+ *
+ * @param {Object} args
+ * @param {Object} args.db
+ * @param {string} args.userId
+ * @param {string[]} args.messageIds
+ */
+export async function discardPushesFromOutbox({ db, userId, messageIds }) {
+  if (!db || typeof db.discardOutboxMessages !== 'function') return;
+  if (!messageIds || messageIds.length === 0) return;
+  try {
+    await db.discardOutboxMessages(userId, messageIds);
+  } catch (error) {
+    console.warn('[amsg-server] outbox 撤回未发出的行失败（已忽略）:', error && error.message);
+  }
+}

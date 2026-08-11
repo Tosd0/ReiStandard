@@ -157,6 +157,10 @@
  *   (user_id, message_id) 冲突时更新未 ack 的行、不动已 ack 的。
  * @property {(userId: string, messageIds: string[], deliveredAt: number) => Promise<number>} [markOutboxDelivered]
  *   （可选；单用户/D1）把发出去的段标 delivered_at。
+ * @property {(userId: string, messageIds: string[]) => Promise<number>} [discardOutboxMessages]
+ *   （可选；单用户/D1）把还没发出去的行删掉。任务投递到一半被取消 / 顶替时，
+ *   剩下那几条 push 已经落了行却不会再发，不撤掉的话客户端会从 `GET /outbox`
+ *   把它们补收回去。不实现 → 取消只挡住 Web Push 这一路。
  * @property {(userId: string, sinceId: number, limit: number) => Promise<Array<Object>>} [listUnackedOutbox]
  *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
@@ -164,9 +168,10 @@
  * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]
  *   （可选；单用户/D1）outbox 例行清理（runScheduledTick 每跳顺手调）。
  *
- *   outbox 五个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
+ *   outbox 这几个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
  *   发送链路静默跳过落行；缺读取侧的（list / ack），`GET /outbox` 与
- *   `POST /outbox/ack` 返回 501。内置只有 D1 实现（与 client_state 同待遇）。
+ *   `POST /outbox/ack` 返回 501；缺 discard，取消只挡住 Web Push。内置只有 D1
+ *   实现（与 client_state 同待遇）。
  */
 
 export {};

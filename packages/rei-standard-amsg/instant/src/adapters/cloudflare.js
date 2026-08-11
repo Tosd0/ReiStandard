@@ -41,7 +41,7 @@
  *   #   AMSG_CLIENT_TOKEN   # optional
  */
 
-import { createInstantHandler, CORS_ALLOW_HEADERS } from '../index.js';
+import { createInstantHandler, buildCorsHeaders, CORS_ALLOW_HEADERS } from '../index.js';
 
 /**
  * @typedef {Object} ErrorCause
@@ -52,6 +52,16 @@ import { createInstantHandler, CORS_ALLOW_HEADERS } from '../index.js';
  * @property {string} message - 脱敏后的错误消息
  * @property {string} [code] - 错误自带的 `code` 字符串（有才带）
  */
+
+/**
+ * 「短前缀 + 长随机串」形态的 key（`sk-…` / `xai-…` / `sk-ant-api03-…`）。
+ *
+ * 尾巴要有连续 16 个以上的字母数字才算数。模型 ID 长得很像这个形状
+ * （`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`），但它是一串被连
+ * 字符切开的短词，凑不出这么长的一段随机串。规则与 @rei-standard/amsg-shared
+ * 的 `redactCredentials` 一致，改一处要几处一起改。
+ */
+const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
 
 /**
  * 把错误消息压成能随响应体回给调用方的一行。
@@ -65,7 +75,7 @@ import { createInstantHandler, CORS_ALLOW_HEADERS } from '../index.js';
 function sanitizeErrorSummary(reason) {
   let s = String(reason ?? '').replace(/\s+/g, ' ').trim();
   s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(/\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g, '[redacted]');
+  s = s.replace(CREDENTIAL_LIKE_TOKEN, '[redacted]');
   s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
   if (s.length > 500) s = `${s.slice(0, 497)}…`;
   return s;
@@ -171,13 +181,18 @@ function internalErrorResponse(cors, cause) {
  */
 export function createCloudflareWorker(optionsBuilder) {
   let handler = null;
+  // 建 handler 时顺手记下这个部署配的 CORS：handler 建起来之后，「允许哪些
+  // origin」就是已知的了，请求阶段的兜底 500 得用这一份，不能再走降级回显。
+  let corsHeaders = null;
   return {
     async fetch(request, env, ctx) {
       const requestOrigin = originOf(request);
 
       if (!handler) {
         try {
-          handler = createInstantHandler(optionsBuilder(env || {}));
+          const options = optionsBuilder(env || {});
+          handler = createInstantHandler(options);
+          corsHeaders = buildCorsHeaders(options && options.cors);
         } catch (error) {
           console.error('[amsg-instant] createCloudflareWorker: 构建 handler 失败:', error && error.message);
           const cause = summarizeErrorCause(error, 'config');
@@ -194,14 +209,15 @@ export function createCloudflareWorker(optionsBuilder) {
       // handler 内部对请求处理有自己的错误边界，但边界之外还有几步（读 method、
       // 鉴权）；那里抛出来的异常同样是「跨域前端只看到 Failed to fetch」。这层
       // 兜底把它也收成同一种可读的 500。
+      //
+      // 用的是这个部署自己那套 CORS 头，跟 handler 正常回的响应一致：配置已经
+      // 建起来了，白名单是已知的，没有理由在这里放宽。降级回显只属于上面那条
+      // 「配置都没建起来」的路。
       try {
         return await handler(request, ctx);
       } catch (error) {
         console.error('[amsg-instant] createCloudflareWorker: 请求处理失败:', error && error.message);
-        return internalErrorResponse(
-          degradedCorsHeaders(requestOrigin),
-          summarizeErrorCause(error, 'request')
-        );
+        return internalErrorResponse(corsHeaders, summarizeErrorCause(error, 'request'));
       }
     }
   };

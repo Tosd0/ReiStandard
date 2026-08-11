@@ -90,7 +90,13 @@ export function toNodeHandler(fetchHandler, options = {}) {
       const fetchResponse = await fetchHandler(fetchRequest, resolveNodeRuntime(options, req, res));
       await writeFetchResponseToNode(fetchResponse, res);
     } catch (err) {
-      // 连接已经收尾（客户端走了 / 响应写完了）就没有能报错的地方了。
+      // 能走到这里的都是服务端自己的故障——客户端提前断开在
+      // writeFetchResponseToNode 里就当成正常收场了。先留一行能归因的日志再说：
+      // SSE 中途炸掉时响应头早就发出去了，状态码这条路已经用不上，不记日志的话
+      // 这次失败就彻底没痕迹，运维只能从客户端那句 `TypeError: network error`
+      // 反推。
+      console.error('[amsg-instant] toNodeHandler: 请求处理失败:', err);
+      // 连接已经收尾（响应写完了 / 流已经被销毁）就没有能报错的地方了。
       if (res.writableEnded || res.destroyed) return;
       if (res.headersSent) {
         // 字节已经在路上（多半是 SSE 流中途炸的）：200 + 半截流已经发出去，
@@ -169,14 +175,16 @@ function readBody(req) {
  *
  * 断开时 `res` 先 close，pipeline 判定为 premature close 并把两端销毁；socket
  * 已经没了，再往上抛只会让外层去写一个没人读的 500。
+ *
+ * 只认错误码，不看 `res` 的状态：pipeline 无论因为什么失败都会先把目的端销毁，
+ * 所以到这一步 `res.destroyed` 恒为 true、`writableFinished` 恒为 false，拿它
+ * 当判据的话，服务端自己抛的流错误（LLM 流中途炸、推送扇出失败）会被一并算成
+ * 「客户端走了」而无声吞掉——日志没有、500 没有、连接就那么断了。
  */
-function isClientDisconnect(err, res) {
+function isClientDisconnect(err) {
   const code = err && err.code;
-  if (code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED'
-    || code === 'EPIPE' || code === 'ECONNRESET') {
-    return true;
-  }
-  return !!(res && (res.destroyed || res.writableEnded) && !res.writableFinished);
+  return code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED'
+    || code === 'EPIPE' || code === 'ECONNRESET';
 }
 
 /**
@@ -212,7 +220,7 @@ async function writeFetchResponseToNode(response, res) {
   try {
     await pipeline(Readable.fromWeb(response.body), res);
   } catch (err) {
-    if (isClientDisconnect(err, res)) return;
+    if (isClientDisconnect(err)) return;
     throw err;
   }
 }

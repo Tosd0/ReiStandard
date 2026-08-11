@@ -90,8 +90,15 @@ export function projectTask(row, decryptedPayload, options = {}) {
   };
 }
 
-/** 这一行到底带没带 last_error 列。自定义适配器的行可能压根没有这个键，所以
- *  用「有没有这个属性」判断，而不是判空——NULL 是有意义的值（没有失败记录）。 */
+/**
+ * 这一行到底带没带 last_error 列。自定义适配器的行可能压根没有这个键，所以用
+ * 「有没有这个属性」判断，而不是判空——NULL 是有意义的值（没有失败记录）。
+ *
+ * 与之配套的是写入侧的规矩：run-tick 一律往这一列写，存储不认才退掉这个字段
+ * （见 lib/run-tick.js 的 updateTaskWithLastError）。反过来「只有某类适配器才
+ * 写」的话，就会出现「投影认这一列权威、可没人往里写」——失败原因落在密文
+ * payload 里，`lastError` 却永远读成 null。
+ */
 function hasRowLastError(row) {
   return !!row && Object.prototype.hasOwnProperty.call(row, 'last_error');
 }

@@ -897,6 +897,28 @@ export class D1Adapter {
   }
 
   /**
+   * 把这一批还没发出去的行删掉（任务投递到一半被取消 / 顶替时用）。
+   *
+   * 只删 delivered_at 仍为 NULL 的行：已经推给设备的那几条撤不回来，行留着让
+   * 客户端照常 ack。已 ack 的行更不动。
+   *
+   * @param {string} userId
+   * @param {string[]} messageIds
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async discardOutboxMessages(userId, messageIds) {
+    if (!messageIds || messageIds.length === 0) return 0;
+    return this._runInClauseWrite(
+      (placeholders) =>
+        `DELETE FROM message_outbox
+         WHERE user_id = ? AND delivered_at IS NULL AND acked_at IS NULL
+           AND message_id IN (${placeholders})`,
+      [userId],
+      messageIds
+    );
+  }
+
+  /**
    * 未 ack 的行（id 升序，游标翻页）。payload 仍是密文，解密在 handler。
    *
    * @param {string} userId

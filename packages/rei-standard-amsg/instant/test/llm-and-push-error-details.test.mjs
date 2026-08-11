@@ -91,6 +91,63 @@ describe('纯 Push 模式下 LLM 失败的错误细节', () => {
     assert.equal(errorEvent.providerCode, 'invalid_api_key');
   });
 
+  // 脱敏是必要的（上游报错常把 Key 原样抄回来），但「模型名写错」正是这套错误
+  // 细节要解决的头号场景——把模型名当 Key 遮掉，报错就只剩「有个东西不存在」。
+  it('模型名写错时，上游原话里的模型名不被脱敏吃掉；Key 照旧遮住', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: rejectingLlm({
+        status: 404,
+        statusText: 'Not Found',
+        body: JSON.stringify({
+          error: {
+            message: 'The model `gpt-4o-mini-2024-07-18` does not exist or you do not have access to it.',
+            code: 'model_not_found',
+          },
+        }),
+      }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(buildHandlerRequest({
+      body: makeValidPayload({ primaryModel: 'gpt-4o-mini-2024-07-18' }),
+    }));
+    const body = await res.json();
+
+    assert.equal(body.error.providerCode, 'model_not_found');
+    assert.match(
+      body.error.message,
+      /gpt-4o-mini-2024-07-18/,
+      `到底是哪个模型名写错了得看得见：${body.error.message}`,
+    );
+  });
+
+  it('上游把 API Key 原样抄回来时照旧遮掉', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: rejectingLlm({
+        status: 401,
+        statusText: 'Unauthorized',
+        body: JSON.stringify({
+          error: {
+            message: 'Incorrect API key provided: sk-proj-AbCdEf0123456789GhIjKlMn.',
+            code: 'invalid_api_key',
+          },
+        }),
+      }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(buildHandlerRequest({ body: makeValidPayload() }));
+    const body = await res.json();
+
+    assert.ok(
+      !body.error.message.includes('sk-proj-AbCdEf0123456789GhIjKlMn'),
+      `凭据不能原样回给调用方：${body.error.message}`,
+    );
+    assert.match(body.error.message, /redacted/);
+  });
+
   it('hook 路径（agentic loop）：LlmCallError 一样带上这些字段', async () => {
     const router = createFetchRouter({
       pushEndpoint: subKit.subscription.endpoint,

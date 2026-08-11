@@ -1328,6 +1328,59 @@ describe('scheduleTask（fire 里给自己排后续任务）', () => {
     }
     assert.match(caught.message, /AGENTIC_SCHEDULE_UNSUPPORTED/);
   });
+
+  // HTTP 那两个入口都过这道闸门，hook 建任务也得过：不然大 payload 会一路走到
+  // 落库那步，撞上存储的单行上限抛一句看不出所以然的错。
+  test('任务内容超出上限 → 当场打回，一行都不落库', async () => {
+    const { d1, adapter } = await freshAdapter();
+    let caught = null;
+    await fireWith(adapter, {
+      onFire: async (ctx) => {
+        try {
+          await ctx.scheduleTask({
+            firstSendTime: IN_90MIN,
+            metadata: { blob: 'x'.repeat(2 * 1024 * 1024) },
+          });
+        } catch (error) {
+          caught = error;
+        }
+      },
+    });
+    assert.ok(caught, '超限的任务不该悄悄建成功');
+    assert.match(caught.message, /TASK_PAYLOAD_TOO_LARGE/);
+    assert.equal(caught.code, 'TASK_PAYLOAD_TOO_LARGE');
+    assert.equal(caught.permanent, true, '内容太大重试也好不了');
+    assert.equal(await countTasks(d1), 0);
+  });
+
+  // 大小闸门跟其余参数护栏（contactName / uuid / tzId / …）待遇一致：正文超限
+  // 也是「这次调用的参数不合法」，不该烧掉一次建任务额度。烧掉的话，hook 捕获
+  // 之后换份小 metadata 重排时，会莫名其妙撞上「单次 fire 最多建 N 条」。
+  test('正文超限不占建任务额度：换份小的还能照排', async () => {
+    const { d1, adapter } = await freshAdapter();
+    const seen = [];
+
+    const result = await fireWith(adapter, {
+      maxScheduledTasksPerFire: 2,
+      onFire: async (ctx) => {
+        try {
+          await ctx.scheduleTask({
+            firstSendTime: IN_90MIN,
+            metadata: { blob: 'x'.repeat(2 * 1024 * 1024) },
+          });
+        } catch (error) {
+          seen.push(error.code);
+        }
+        // 额度还剩满满两条。
+        seen.push((await ctx.scheduleTask({ firstSendTime: IN_2MIN })).created);
+        seen.push((await ctx.scheduleTask({ firstSendTime: IN_90MIN })).created);
+      },
+    });
+
+    assert.equal(result.success, true, `重排两条合法任务不该失败：${result.error}`);
+    assert.deepEqual(seen, ['TASK_PAYLOAD_TOO_LARGE', true, true]);
+    assert.equal(await countTasks(d1), 2);
+  });
 });
 
 describe('fire 级 scratch', () => {

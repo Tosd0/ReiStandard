@@ -24,6 +24,11 @@
  *    blob body — that's the client's job.
  *  - Multipart is different: it is a transparent transport fallback.
  *    Apps see only the restored original payload.
+ *  - When a multipart id cannot be completed, `MULTIPART_EXPIRED` carries a
+ *    `reason` telling the app which way it failed — waited past the TTL, or
+ *    gave up on the spot (bad envelope, chunks disagreeing, over the size
+ *    limit, unrestorable, storage broken, multipart turned off locally).
+ *    See `MULTIPART_FAILURE_REASON` for the values.
  *
  * Usage (inside your sw.js):
  *   import { installReiSW, REI_SW_EVENT, REI_SW_MESSAGE_TYPE } from '@rei-standard/amsg-sw';
@@ -59,6 +64,7 @@ import {
   DEFAULT_MULTIPART_TTL_MS,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  MULTIPART_FAILURE_REASON,
   REI_AMSG_POSTMESSAGE_TYPE,
   REI_SW_EVENT,
   REI_SW_MESSAGE_TYPE,
@@ -102,6 +108,7 @@ const dedupeDbCache = new Map();
 // 既有导出名不变。页面侧代码建议直接从 shared import 这些常量——从本包
 // import 会执行 SW 模块的顶层状态，在窗口环境里并不合适。
 export {
+  MULTIPART_FAILURE_REASON,
   REI_AMSG_POSTMESSAGE_TYPE,
   REI_SW_EVENT,
   REI_SW_MESSAGE_TYPE,
@@ -198,7 +205,17 @@ async function handlePushPayload(sw, payload, ctx) {
   await maybeCleanupMultipart(sw, ctx);
 
   if (isMultipartPush(payload)) {
-    if (!ctx.multipart.enabled) return;
+    if (!ctx.multipart.enabled) {
+      // 本地关掉了 multipart，发送端却还在发分片：这条消息在这里就到头了。
+      // 出个声，别让页面拿着 id 一直等。
+      await rejectMultipartChunk(
+        sw,
+        payload,
+        MULTIPART_FAILURE_REASON.DISABLED,
+        'multipart reassembly is disabled by options'
+      );
+      return;
+    }
     const restoredPayload = await acceptMultipartChunkSafely(sw, payload, ctx.multipart);
     if (!restoredPayload) return;
     return handlePushPayload(sw, restoredPayload, ctx);
@@ -1017,14 +1034,53 @@ async function acceptMultipartChunkSafely(sw, payload, options) {
       originalMessageKind: typeof meta.originalMessageKind === 'string'
         ? meta.originalMessageKind
         : null,
-    });
+    }, MULTIPART_FAILURE_REASON.STORAGE_FAILED);
     return null;
   }
 }
 
+/**
+ * 分片还没进重组管线就被拒时的统一出口：信封不合规、或本地把 multipart 关了。
+ * 这类分片一片都不会落库，pending 记录无从谈起，TTL 清扫也就永远扫不到——所以
+ * 归因日志和给页面的 MULTIPART_EXPIRED 只能在这里发。
+ *
+ * `id` 都读不出来时只留日志：没有 id 的事件页面也对不上号。
+ *
+ * @param {ServiceWorkerGlobalScope} sw
+ * @param {any}    payload - 原始的 `_multipart` push payload。
+ * @param {string} reason  - {@link MULTIPART_FAILURE_REASON} 之一。
+ * @param {string} detail  - 写进日志的具体原因。
+ */
+async function rejectMultipartChunk(sw, payload, reason, detail) {
+  const meta = payload && typeof payload.multipart === 'object' && payload.multipart
+    ? payload.multipart
+    : {};
+  console.error(
+    `[rei-standard-amsg-sw] multipart chunk rejected (${reason}):`,
+    detail,
+    { id: meta.id, index: meta.index, total: meta.total }
+  );
+  if (typeof meta.id !== 'string' || !meta.id) return;
+  await dispatchMultipartExpired(sw, {
+    id: meta.id,
+    total: Number.isInteger(meta.total) ? meta.total : null,
+    originalMessageKind: typeof meta.originalMessageKind === 'string'
+      ? meta.originalMessageKind
+      : null,
+  }, reason);
+}
+
 async function acceptMultipartChunk(sw, payload, options) {
   const normalized = normalizeMultipartChunk(payload, options);
-  if (!normalized) return null;
+  if (normalized.invalid) {
+    await rejectMultipartChunk(
+      sw,
+      payload,
+      MULTIPART_FAILURE_REASON.INVALID_CHUNK,
+      normalized.invalid
+    );
+    return null;
+  }
 
   const previous = multipartLocks.get(normalized.id) || Promise.resolve();
   const current = previous
@@ -1043,21 +1099,14 @@ async function acceptMultipartChunk(sw, payload, options) {
 
 async function acceptMultipartChunkInternal(sw, normalized, options) {
   // State machine:
-  // 1. Validate the transport envelope and reject expired chunks before storage.
-  // 2. Drop already-completed multipart ids using the short-lived done marker.
-  // 3. Expire any stale pending record for this id before accepting a new one.
-  // 4. Store only new chunk indexes, track total received bytes, and wait.
-  // 5. Once all indexes are present, restore original JSON and mark done.
-  if (normalized.expiresAt <= Date.now()) {
-    await dispatchMultipartExpired(sw, {
-      id: normalized.id,
-      chunks: {},
-      total: normalized.total,
-      originalMessageKind: normalized.originalMessageKind,
-    });
-    return null;
-  }
-
+  // 1. Drop chunks for multipart ids that are already settled — finished, or
+  //    given up on — using the short-lived done marker.
+  // 2. Expire any stale pending record for this id before accepting a new one.
+  // 3. Store only new chunk indexes, track total received bytes, and wait.
+  // 4. Once all indexes are present, restore original JSON and mark done.
+  //
+  // 没有「到达即过期」这一步：重组窗口是从本地收到第一片起算的（见
+  // normalizeMultipartChunk），刚算出来的 expiresAt 不可能已经过去。
   const done = await readMultipartDone(normalized.id);
   if (done && done.expiresAt > Date.now()) return null;
   if (done) await deleteMultipartDone(normalized.id);
@@ -1084,8 +1133,18 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
       };
 
   if (base.total !== normalized.total || base.encoding !== normalized.encoding) {
-    await deleteMultipartPending(normalized.id);
-    await deleteMultipartChunks(normalized.id, base.total);
+    // 同一个 id 的分片对 total / encoding 各说各话：已收的部分拼不回去，
+    // 这条 id 到此为止。
+    console.error(
+      '[rei-standard-amsg-sw] multipart chunks disagree on total/encoding; giving up on this multipart id:',
+      {
+        id: normalized.id,
+        pending: { total: base.total, encoding: base.encoding },
+        incoming: { total: normalized.total, encoding: normalized.encoding },
+      }
+    );
+    await settleMultipartId(base, Math.max(base.total, normalized.total), options);
+    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.CHUNK_CONFLICT);
     return null;
   }
 
@@ -1098,8 +1157,17 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
     normalized.chunkBytes.byteLength;
 
   if (base.receivedBytes > options.maxTotalBytes) {
-    await deleteMultipartPending(normalized.id);
-    await deleteMultipartChunks(normalized.id, base.total);
+    // 累计字节已经超过上限，再收也不会变小，剩下的分片没必要等。
+    console.error(
+      '[rei-standard-amsg-sw] multipart payload exceeds maxTotalBytes; giving up on this multipart id:',
+      {
+        id: normalized.id,
+        receivedBytes: base.receivedBytes,
+        maxTotalBytes: options.maxTotalBytes,
+      }
+    );
+    await settleMultipartId(base, base.total, options);
+    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED);
     return null;
   }
 
@@ -1115,39 +1183,94 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
     return null;
   }
 
-  await deleteMultipartPending(base.id);
   let restored;
   try {
     restored = await restoreMultipartPayload(base, options);
-  } catch (_error) {
-    await deleteMultipartChunks(base.id, base.total);
+  } catch (error) {
+    // 分片都到齐了，却拼不回原 payload（缺片 / 超限 / JSON 解不开）。
+    console.error(
+      '[rei-standard-amsg-sw] multipart restore failed; giving up on this multipart id:',
+      error
+    );
+    await settleMultipartId(base, base.total, options);
+    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.RESTORE_FAILED);
     return null;
   }
-  await deleteMultipartChunks(base.id, base.total);
-  // Keep the done marker longer than the pending TTL so push-service
-  // redelivery cannot trigger a second business event after completion.
-  const doneTtlMs = Math.max(base.ttlMs * 2, base.ttlMs + 1);
-  await writeMultipartDone({
-    id: base.id,
-    expiresAt: Date.now() + doneTtlMs,
-  });
+
+  // 到这里 payload 已经完整地拿在手里了，下面是收尾。收尾失败只影响后续去重和
+  // 存储占用，这条消息本身照常往下走。
+  try {
+    await settleMultipartId(base, base.total, options);
+  } catch (error) {
+    console.error(
+      '[rei-standard-amsg-sw] multipart cleanup after a completed restore failed:',
+      error
+    );
+  }
   return restored;
 }
 
+/**
+ * 这个 multipart id 到此为止：先写 done 墓碑，再清掉 pending 记录和已收的分片。
+ * 收齐还原了、和中途放弃了（分片对不上、超限、拼不回来），走的是同一套收尾。
+ *
+ * 墓碑必须先写，而且失败路径也要写：
+ *   - 不写的话「放弃」不粘。同一个 id 的下一片会发现 pending 和 done 都是空
+ *     的，于是重开一份 pending 从零累计——推送服务对前几片做几次常规重投，就
+ *     能把整份重新凑齐还原出来，maxTotalBytes 这道闸门等于没有。
+ *   - 排在删 pending 之前，是为了让 TTL 清扫认得它。清理途中万一出错、pending
+ *     记录留了下来，清扫扫到它时会看见墓碑，知道这个 id 已经有结论了，不再重
+ *     复广播一次 MULTIPART_EXPIRED——对一条已经还原、已经渲染出来的消息来说，
+ *     那是条彻头彻尾的假消息。
+ *
+ * 墓碑比重组窗口活得久（两倍），推送服务重投旧分片时也不会再触发一次业务事件。
+ *
+ * @param {{ id: string, ttlMs?: number }} record
+ * @param {number} total - 要清掉的分片数（冲突时取两边的较大值，别漏删）
+ * @param {{ ttlMs: number }} options
+ */
+async function settleMultipartId(record, total, options) {
+  const ttlMs = positiveIntegerOrDefault(record.ttlMs, options.ttlMs);
+  await writeMultipartDone({
+    id: record.id,
+    expiresAt: Date.now() + Math.max(ttlMs * 2, ttlMs + 1),
+  });
+  await deleteMultipartPending(record.id);
+  await deleteMultipartChunks(record.id, total);
+}
+
+/**
+ * 解析一片 multipart 信封。合规时返回归一化后的分片；不合规时返回
+ * `{ invalid: <原因> }`，原因是给日志看的一句话，调用方据此走拒收出口
+ * （见 rejectMultipartChunk）。
+ */
 function normalizeMultipartChunk(payload, options) {
   const meta = payload.multipart;
-  if (!meta || typeof meta !== 'object') return null;
-  if (meta.version !== MULTIPART_VERSION || meta.encoding !== MULTIPART_ENCODING) return null;
-  if (typeof meta.id !== 'string' || !meta.id) return null;
-  if (!Number.isInteger(meta.index) || !Number.isInteger(meta.total)) return null;
-  if (meta.total <= 0 || meta.total > options.maxChunks) return null;
-  if (meta.index <= 0 || meta.index > meta.total) return null;
+  if (!meta || typeof meta !== 'object') return { invalid: 'missing multipart envelope' };
+  if (meta.version !== MULTIPART_VERSION) {
+    return { invalid: `unsupported version ${JSON.stringify(meta.version)} (expected ${MULTIPART_VERSION})` };
+  }
+  if (meta.encoding !== MULTIPART_ENCODING) {
+    return { invalid: `unsupported encoding ${JSON.stringify(meta.encoding)} (expected ${MULTIPART_ENCODING})` };
+  }
+  if (typeof meta.id !== 'string' || !meta.id) return { invalid: 'missing multipart id' };
+  if (!Number.isInteger(meta.index) || !Number.isInteger(meta.total)) {
+    return { invalid: 'index and total must be integers' };
+  }
+  if (meta.total <= 0 || meta.total > options.maxChunks) {
+    return { invalid: `total ${meta.total} out of range (maxChunks=${options.maxChunks})` };
+  }
+  if (meta.index <= 0 || meta.index > meta.total) {
+    return { invalid: `index ${meta.index} out of range (total=${meta.total})` };
+  }
 
   let chunkBytes;
   try {
     chunkBytes = base64UrlToBytes(payload.chunk);
-  } catch (_error) {
-    return null;
+  } catch (error) {
+    return {
+      invalid: `chunk is not valid base64url: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 
   const now = Date.now();
@@ -1156,7 +1279,17 @@ function normalizeMultipartChunk(payload, options) {
     options.ttlMs
   );
   const createdAt = Number.isFinite(meta.createdAt) ? Number(meta.createdAt) : now;
-  const expiresAt = createdAt + ttlMs;
+  // 重组窗口从**本地收到第一片**算起，不从发送端的 createdAt 算。
+  //
+  // ttlMs 说的是「攒着半截分片等剩下的能等多久」，而分片是一起发出来的、也会
+  // 一起送到——中间隔了多久跟这个窗口没关系。按 createdAt 算的话，一条离线时
+  // 段排出去的定时消息（Web Push 传输层 TTL 是四周）只要晚到超过窗口长度，
+  // 每一片都会在到达的那一刻被判过期，思考过程永远拼不回来；发送端和设备的
+  // 时钟差一分钟也是同样的下场。
+  //
+  // 同一个 id 的后续分片沿用第一片建下的 pending 记录（见 base），窗口不会被
+  // 每片续一次。
+  const expiresAt = now + ttlMs;
 
   return {
     id: meta.id,
@@ -1208,12 +1341,26 @@ async function maybeCleanupMultipart(sw, ctx) {
   }
 }
 
+/**
+ * 这个 id 已经有结论了吗（收齐还原了，或中途放弃了）。
+ *
+ * TTL 清扫扫到一条过期的 pending 记录时先问一句：收尾的第一步就是写 done 墓碑
+ * （见 settleMultipartId），墓碑还在就说明这条 pending 是收尾没清干净的残留，
+ * 而不是「没收齐」——那条消息可能早就还原并渲染出来了，再广播一次
+ * MULTIPART_EXPIRED 等于告诉用户一条他已经读过的消息没收到。
+ */
+async function multipartIdAlreadySettled(id, now) {
+  const done = await readMultipartDone(id);
+  return !!done && done.expiresAt > now;
+}
+
 async function cleanupMultipartStores(sw, now) {
   if (!hasIndexedDB()) {
     for (const [id, record] of memoryMultipartPending.entries()) {
       if (record.expiresAt <= now) {
         memoryMultipartPending.delete(id);
         await deleteMultipartChunks(id, record.total);
+        if (await multipartIdAlreadySettled(id, now)) continue;
         await dispatchMultipartExpired(sw, record);
       }
     }
@@ -1236,6 +1383,7 @@ async function cleanupMultipartStores(sw, now) {
   for (const record of pendingExpired) {
     await deleteStoreRecord(REI_SW_MULTIPART_STORE, record.id);
     await deleteMultipartChunks(record.id, record.total);
+    if (await multipartIdAlreadySettled(record.id, now)) continue;
     await dispatchMultipartExpired(sw, record);
   }
 
@@ -1258,7 +1406,11 @@ async function cleanupMultipartStores(sw, now) {
   }
 }
 
-async function dispatchMultipartExpired(sw, record) {
+/**
+ * 告诉所有窗口：这个 multipart id 别再等了。`reason` 说明是哪条路走到这一步的
+ * （取值见 {@link MULTIPART_FAILURE_REASON}），不传就是 TTL 到期没收齐。
+ */
+async function dispatchMultipartExpired(sw, record, reason = MULTIPART_FAILURE_REASON.TTL_EXPIRED) {
   await dispatchPushToClients(sw, REI_SW_EVENT.MULTIPART_EXPIRED, {
     id: record.id,
     received: typeof record.receivedCount === 'number'
@@ -1266,6 +1418,7 @@ async function dispatchMultipartExpired(sw, record) {
       : 0,
     total: record.total,
     originalMessageKind: record.originalMessageKind,
+    reason,
   });
 }
 
@@ -1411,16 +1564,20 @@ async function flushQueuedRequests(sw) {
  * 后必须留下痕迹：页面这边最常见的触发是 token 轮换（还拿着旧 token → 401）、
  * X-User-Id 不合法（400）、payload 超限（413）、路由改名（404），排的定时消息
  * 就此消失，事后连查都没得查。所以这里同时给两个出口：一条能归因的
- * console.error，和一条广播给所有窗口的 QUEUE_RESULT——页面在全局
- * `navigator.serviceWorker` message 里按 `dropped` / `status` 机读判断，不用
- * 去正则匹配人话。
+ * console.error，和一条广播给所有窗口的 `REI_QUEUE_DROPPED`——页面在全局
+ * `navigator.serviceWorker` message 里按 `status` 机读判断，不用去正则匹配人话。
+ *
+ * 用的是独立的 message type，不是入队回执那个 `REI_QUEUE_RESULT`：这条是广播，
+ * 可能由后台 `sync` 冲刷触发、说的也可能是另一条八竿子打不着的旧请求。共用一个
+ * type 的话，页面等自己那条入队回执时会先收到这一条、当成自己的结果处理，明明
+ * 入队成功却报「排队失败」。
  *
  * 广播里只带 url / method：headers 有鉴权信息、body 是用户内容，都不该被广播
  * 到每个窗口。
  */
 async function reportDroppedRequest(sw, queuedRequest, outcome) {
   const report = {
-    type: REI_SW_MESSAGE_TYPE.QUEUE_RESULT,
+    type: REI_SW_MESSAGE_TYPE.QUEUE_DROPPED,
     ok: false,
     queueId: queuedRequest.id,
     dropped: true,

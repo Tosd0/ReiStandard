@@ -55,6 +55,7 @@ globalThis.indexedDB = {
 const { installReiSW, REI_SW_EVENT } = await import('../src/index.js');
 
 const QUEUE_RESULT = 'REI_QUEUE_RESULT';
+const QUEUE_DROPPED = 'REI_QUEUE_DROPPED';
 const ENQUEUE_REQUEST = 'REI_ENQUEUE_REQUEST';
 const FLUSH_QUEUE = 'REI_FLUSH_QUEUE';
 const DELIVER = 'REI_AMSG_DELIVER';
@@ -191,8 +192,11 @@ test('queue: a 4xx-rejected request is reported instead of vanishing', async () 
   assert.equal(ack.status, 401, '下游按状态码机读判断，不靠正则匹配人话');
 
   // 2）页面侧还有一条广播能收到（没用 MessageChannel 的调用方也能看见）。
+  //    它用的是独立的 QUEUE_DROPPED，不跟点对点的入队回执抢同一个 type——
+  //    共用的话，页面等自己那条 ack 时会先收到这条广播、当成自己的结果。
   assert.equal(postedMessages.length, 1);
-  assert.equal(postedMessages[0].type, QUEUE_RESULT);
+  assert.equal(postedMessages[0].type, QUEUE_DROPPED);
+  assert.notEqual(postedMessages[0].type, QUEUE_RESULT, '广播不能和入队回执撞 type');
   assert.equal(postedMessages[0].ok, false);
   assert.equal(postedMessages[0].dropped, true);
   assert.equal(postedMessages[0].status, 401);

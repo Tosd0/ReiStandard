@@ -377,6 +377,16 @@ function clampCode(code) {
 }
 
 /**
+ * 「短前缀 + 长随机串」形态的 key（`sk-…` / `xai-…` / `sk-ant-api03-…`）。
+ *
+ * 尾巴要有连续 16 个以上的字母数字才算数。模型 ID 长得很像这个形状
+ * （`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`），但它是一串被连
+ * 字符切开的短词，凑不出这么长的一段随机串——上游那句「你写的这个模型不存在」
+ * 里最关键的就是模型名，遮掉它报错就只剩「有个东西不存在」。
+ */
+const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
+
+/**
  * 遮掉长得像凭据的串。
  *
  * 规则与 amsg-server 的 `sanitizeErrorSummary` 对齐（同一批正则、同一个判断
@@ -394,7 +404,7 @@ function redactCredentials(text) {
   let s = text;
   // Bearer 头与常见「前缀-长随机串」形态的 key。
   s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(/\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g, '[redacted]');
+  s = s.replace(CREDENTIAL_LIKE_TOKEN, '[redacted]');
   // 光长随机串（base64 / JWT 片段）也不放行。
   s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
   return s;

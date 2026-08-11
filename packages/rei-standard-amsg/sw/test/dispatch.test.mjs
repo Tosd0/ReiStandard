@@ -901,7 +901,8 @@ test('generic multipart missing chunks do not dispatch and expire observably', a
     id: 'mp_sw_expire',
     received: 1,
     total: parts.length,
-    originalMessageKind: 'reasoning'
+    originalMessageKind: 'reasoning',
+    reason: 'ttl-expired'
   });
 });
 

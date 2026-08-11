@@ -119,7 +119,9 @@ import {
   resolveLlmCredential as resolveLlmCredentialFromStore,
   supportsLlmCredentialsStore,
 } from './llm-credentials-store.js';
-import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
+import { appendPushesToOutbox, discardPushesFromOutbox, markPushesDelivered } from './outbox-store.js';
+import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, tagPushStatusCode } from './errors.js';
+import { validateTaskPayloadSize } from './validation.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -233,8 +235,11 @@ function normalizeBeforeFireResult(result) {
       toolChoice: result.toolChoice,
     };
   }
-  throw new TypeError(
-    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
+  throw markPermanent(
+    new TypeError(
+      'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
+    ),
+    'AGENTIC_BAD_BEFORE_FIRE'
   );
 }
 
@@ -275,7 +280,10 @@ function firstPositiveNumber(values, fallback) {
 export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
   if (typeof hooks.onLLMOutput !== 'function') {
-    throw new Error('AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds');
+    throw new DeploymentConfigError(
+      'AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds',
+      { code: 'AGENTIC_CONFIG_ERROR' }
+    );
   }
 
   // Injectable seams for tests only (fake clock / no real 1500ms pacing).
@@ -426,20 +434,6 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw new TypeError('scheduleTask: uuid 必须是非空字符串');
     }
 
-    // ---- 额度 ----
-    if (scheduledTaskCount >= maxScheduledTasksPerFire) {
-      throw new RangeError(
-        `scheduleTask: 单次 fire 最多建 ${maxScheduledTasksPerFire} 条任务` +
-        `（factory 配置 maxScheduledTasksPerFire 可调），这是第 ${scheduledTaskCount + 1} 条`
-      );
-    }
-    // readState 在适配器不支持时降级成空数组；建任务不一样，静默成功会让宿主
-    // 以为后续那条已经排上了，其实谁也不会触发它。
-    if (!ctx.db || typeof ctx.db.createTask !== 'function') {
-      throw new Error('AGENTIC_SCHEDULE_UNSUPPORTED: 当前数据库适配器不支持建任务（缺 createTask）');
-    }
-    scheduledTaskCount++;
-
     // 字段构成与 POST /schedule-message 落库的那份保持一致，只是走库内部、不经 HTTP。
     const fullTaskData = {
       contactName,
@@ -484,7 +478,40 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       metadata,
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
+    // 与 POST /schedule-message 同一道闸门：任务内容太大在这里就说清楚，别等
+    // 落库时撞上存储的单行上限、抛一句看不出所以然的错。hook 往 metadata 里塞
+    // 一坨大对象是最容易撞上的。
+    //
+    // 位置排在额度之前，跟其余参数护栏（contactName / uuid / tzId / …）一致：
+    // 正文超限也是「这次调用的参数不合法」，不该烧掉一次建任务额度——hook 捕获
+    // 之后换份小 metadata 重排时，会莫名其妙撞上「单次 fire 最多建 N 条」。
+    const serializedTaskData = JSON.stringify(fullTaskData);
+    const sizeError = validateTaskPayloadSize(serializedTaskData);
+    if (sizeError) {
+      throw markPermanent(
+        new RangeError(`${sizeError.code}: ${sizeError.message}`),
+        sizeError.code
+      );
+    }
+
+    // ---- 额度 ----
+    if (scheduledTaskCount >= maxScheduledTasksPerFire) {
+      throw new RangeError(
+        `scheduleTask: 单次 fire 最多建 ${maxScheduledTasksPerFire} 条任务` +
+        `（factory 配置 maxScheduledTasksPerFire 可调），这是第 ${scheduledTaskCount + 1} 条`
+      );
+    }
+    // readState 在适配器不支持时降级成空数组；建任务不一样，静默成功会让宿主
+    // 以为后续那条已经排上了，其实谁也不会触发它。
+    if (!ctx.db || typeof ctx.db.createTask !== 'function') {
+      throw new DeploymentConfigError(
+        'AGENTIC_SCHEDULE_UNSUPPORTED: 当前数据库适配器不支持建任务（缺 createTask）',
+        { code: 'AGENTIC_SCHEDULE_UNSUPPORTED' }
+      );
+    }
+    scheduledTaskCount++;
+
+    const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
     let created;
     try {
@@ -511,7 +538,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw error;
     }
     if (!created) {
-      throw new Error('AGENTIC_SCHEDULE_FAILED: createTask 没有返回新建的任务行');
+      throw new NonRetryableError(
+        'AGENTIC_SCHEDULE_FAILED: createTask 没有返回新建的任务行',
+        { code: 'AGENTIC_SCHEDULE_FAILED' }
+      );
     }
     return {
       created: true,
@@ -548,7 +578,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       );
     }
     if (!ctx.db || typeof ctx.db.deleteTaskByUuid !== 'function') {
-      throw new Error('AGENTIC_CANCEL_UNSUPPORTED: 当前数据库适配器不支持删任务（缺 deleteTaskByUuid）');
+      throw new DeploymentConfigError(
+        'AGENTIC_CANCEL_UNSUPPORTED: 当前数据库适配器不支持删任务（缺 deleteTaskByUuid）',
+        { code: 'AGENTIC_CANCEL_UNSUPPORTED' }
+      );
     }
     const cancelled = await ctx.db.deleteTaskByUuid(uuid, task.user_id);
     return { cancelled: !!cancelled };
@@ -588,7 +621,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       );
     }
     if (!ctx.db || typeof ctx.db.getTaskByUuid !== 'function' || typeof ctx.db.updateTaskByUuid !== 'function') {
-      throw new Error('AGENTIC_RENEW_UNSUPPORTED: 当前数据库适配器不支持改任务（缺 getTaskByUuid / updateTaskByUuid）');
+      throw new DeploymentConfigError(
+        'AGENTIC_RENEW_UNSUPPORTED: 当前数据库适配器不支持改任务（缺 getTaskByUuid / updateTaskByUuid）',
+        { code: 'AGENTIC_RENEW_UNSUPPORTED' }
+      );
     }
     const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
     if (!row) return { renewed: false, reason: 'not_found' };
@@ -796,7 +832,13 @@ async function runFireChain({
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
-    assertValidDecision(decision, { inlineToolCalls: true });
+    try {
+      assertValidDecision(decision, { inlineToolCalls: true });
+    } catch (error) {
+      // 决策形状不合契约：宿主的分类器返回了库不认的东西，重试必然同败。
+      // 标成确定性失败之前保住它原本的 TypeError 身份（宿主可能按类型分流）。
+      throw markPermanent(error, 'AGENTIC_BAD_DECISION');
+    }
 
     if (decision.decision === 'continue') {
       messages = decision.nextHistory.slice();
@@ -829,10 +871,16 @@ async function runFireChain({
     // 'tool-request' — execute right here in the worker.
     const toolCalls = extractToolCallsFromDecision(decision);
     if (toolCalls.length === 0) {
-      throw new Error('AGENTIC_EMPTY_TOOL_REQUEST: tool-request decision carried no toolCalls (neither decision.toolCalls nor pushPayloads[].toolCalls)');
+      throw new NonRetryableError(
+        'AGENTIC_EMPTY_TOOL_REQUEST: tool-request decision carried no toolCalls (neither decision.toolCalls nor pushPayloads[].toolCalls)',
+        { code: 'AGENTIC_EMPTY_TOOL_REQUEST' }
+      );
     }
     if (typeof hooks.executeToolCalls !== 'function') {
-      throw new Error('AGENTIC_CONFIG_ERROR: onLLMOutput returned tool-request but hooks.executeToolCalls is not configured');
+      throw new DeploymentConfigError(
+        'AGENTIC_CONFIG_ERROR: onLLMOutput returned tool-request but hooks.executeToolCalls is not configured',
+        { code: 'AGENTIC_CONFIG_ERROR' }
+      );
     }
     if (iteration === maxToolIterations - 1) {
       // No LLM round left to consume the results — executing tools now
@@ -879,7 +927,10 @@ async function runFireChain({
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 
-  throw new Error(`AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`);
+  throw new NonRetryableError(
+    `AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`,
+    { code: 'AGENTIC_LOOP_EXCEEDED' }
+  );
 }
 
 /**
@@ -1012,6 +1063,8 @@ async function sendHookPushPayloads({
   progress.total = total;
   const afterSendBase = { task, total, scratch, readState, writeState, usage: progress.usage };
   const sentIds = [];
+  /** 定稿后的整批 push（发送前就落进 outbox 的那一份）。取消收尾要按它撤行。 */
+  const finalized = [];
   try {
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
@@ -1029,7 +1082,6 @@ async function sendHookPushPayloads({
     // 先定稿整批（补 id / index / 任务身份），再发送——发送前整批落进
     // message_outbox（客户端补收的事实来源，best-effort，见 lib/outbox-store.js），
     // 落的必须是发送时的同一份内容。
-    const finalized = [];
     for (let i = 0; i < total; i++) {
       const push = { ...pushPayloads[i] };
       if (typeof push.messageId !== 'string' || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
@@ -1043,7 +1095,13 @@ async function sendHookPushPayloads({
     await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
 
     for (let i = 0; i < total; i++) {
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(finalized[i]));
+      try {
+        await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(finalized[i]));
+      } catch (error) {
+        // 标一下「这是发 push 那一步抛的」，processSingleMessage 的失败结果里
+        // 才认它的 statusCode 当推送状态码（见 lib/errors.js）。
+        throw tagPushStatusCode(error);
+      }
       sentCount++;
       progress.sentCount = sentCount;
       sentIds.push(finalized[i].messageId);
@@ -1053,6 +1111,18 @@ async function sendHookPushPayloads({
     // 部分失败：已发出的段在 outbox 里标 delivered（没标的正是要补收的），
     // 再让宿主知道已经发出去了几段——先通知，再把错误往上抛。
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
+    if (isTaskCancelledError(error)) {
+      // 投递到一半任务被取消 / 顶替：剩下这几条不会再发了，行也别留着——留着
+      // 客户端会从 GET /outbox 把它们补收回去（见 lib/outbox-store.js）。
+      const delivered = new Set(sentIds);
+      await discardPushesFromOutbox({
+        db: ctx.db,
+        userId: task.user_id,
+        messageIds: finalized
+          .map(push => push.messageId)
+          .filter(messageId => !delivered.has(messageId)),
+      });
+    }
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });
     throw error;
   }

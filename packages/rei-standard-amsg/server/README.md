@@ -226,7 +226,7 @@ ctx / metadata / push 上）。
 
 ## 更新任务时能改哪些字段
 
-`PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `maxTokens` / `temperature` / `splitPattern`、凭据三件套 `apiUrl` / `apiKey` / `primaryModel`，以及凭据引用 `credRefs`。
+`PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `messageSubtype` / `maxTokens` / `temperature` / `splitPattern` / `llmExtraBody`、凭据三件套 `apiUrl` / `apiKey` / `primaryModel`，以及凭据引用 `credRefs`。
 
 - `contactName` 必须是非空字符串（口径与排程时一致），空串 / `null` / 非字符串一律 `400`。用户给角色改了名之后，之前排的任务推送出来的通知标题（「来自 <contactName>」）靠它跟着改。
 - `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。
@@ -234,6 +234,9 @@ ctx / metadata / push 上）。
 - 凭据三件套传 `null` 同样只是忽略：清掉任何一个，任务到点就发不出去。
 - `credRefs` 是整体替换（语义同 `metadata`），同样做存在性检查；与内联三件套在同一个请求里混着传返回 `400`。给存量内联任务补 `credRefs` 时不动已存的三件套——那份留作 fire 时表行缺失的兜底。
 - `pushSubscription` 不收（`400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`），它是用户级的一份，走 `PUT /push-subscription`。
+- `userMessage` 给了就必须是字符串（口径与排程时一致）：它到点要过正则切分，别的类型收进来只会在投递时炸。
+- `messageSubtype` / `llmExtraBody` 显式传 `null` 是「改回默认」（分别是投递时的 `'chat'` 和「不透传额外参数」），不会被当成「不改」吞掉。
+- 响应里的 `updatedFields` 只列真正落进这次更新的字段。请求里带了但没被应用的键——这个接口不接受的、拼错的、传了 `null` 走「不改」语义的——不会出现在里面。
 
 ## 推送自带任务身份
 
@@ -337,9 +340,22 @@ const result = await ctx.scheduleTask({
 | 单次 fire 的建任务条数 | 默认 **2 条**，factory 配置 `maxScheduledTasksPerFire` 可调（`0` = 不许自排） | `RangeError` | 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键 |
 | `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid, task }` | fire 失败会整条重跑，宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等 |
 | `tzId` | 可用的 IANA 时区 id，或 `null` | `TypeError` | 认不出来的时区会让循环推进悄悄退回 UTC，用户设的钟点从此对不上 |
-| 数据库适配器没有 `createTask` | — | 抛 `AGENTIC_SCHEDULE_UNSUPPORTED` | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
+| 任务内容大小 | 与 `POST /schedule-message` 同一道闸门 | 抛 `RangeError`（`code: 'TASK_PAYLOAD_TOO_LARGE'`） | 往 `metadata` 里塞一坨大对象会顶穿存储的单行上限，不拦的话到落库那步才炸，报错看不出所以然 |
+| 数据库适配器没有 `createTask` | — | 抛 `DeploymentConfigError`（`code: 'AGENTIC_SCHEDULE_UNSUPPORTED'`） | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。
+
+### hook 契约违约算确定性失败
+
+宿主 hook 返回了库不认的东西（`onBeforeFire` 的返回形状、`onLLMOutput` 的决策标签）、或者轮数用尽也没等到 `finish`——这些错误带 `permanent: true` 和一个稳定的 `code`（`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_EMPTY_TOOL_REQUEST` / `AGENTIC_LOOP_EXCEEDED` / `AGENTIC_SCHEDULE_FAILED` / `TASK_PAYLOAD_TOO_LARGE`），投递侧据此跳过退避阶梯：一次性任务直接标 `failed`，循环任务作废本次 occurrence。重试也是同一个结果，而每重试一轮都要把 `onBeforeFire` 和一整轮 LLM 重跑一遍。
+
+### 部署配错了算可重试
+
+部署缺了必要的能力——没配 `onLLMOutput` / `executeToolCalls`，或者自定义适配器没有 `createTask` / `deleteTaskByUuid` / `getTaskByUuid` / `upsertClientState`——抛的是 `DeploymentConfigError`：带同样的 `code`（`AGENTIC_CONFIG_ERROR` / `AGENTIC_SCHEDULE_UNSUPPORTED` / `AGENTIC_CANCEL_UNSUPPORTED` / `AGENTIC_RENEW_UNSUPPORTED` / `AGENTIC_STATE_WRITE_UNSUPPORTED`），但**不带** `permanent`，走的是普通的退避阶梯。
+
+因为坏的不是这条任务，是这个部署：同一个坏部署下每条到点的任务都会撞同一个错，判终态等于把那段时间里每一条一次性任务都永久标 `failed`，配置改好重新部署也捞不回来（行已不在 `pending`，`PUT /update-message` 回 409）。留在阶梯上的话，配置一修好，下一跳就正常发出去。VAPID 配错回的 400 / 401 / 403 是同一个道理，见下面的推送失败分级。
+
+`AGENTIC_TOTAL_TIMEOUT`（整条 fire 链超出 `totalTimeoutMs`）也走退避重试：这一轮慢不代表下一轮也慢。
 
 `GET /capabilities` 的 features 里有 `agentic-schedule-task`，前端可以据此判断部署的 worker 认不认这条链路。
 

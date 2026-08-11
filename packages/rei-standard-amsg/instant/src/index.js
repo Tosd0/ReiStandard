@@ -876,7 +876,7 @@ async function readRequestBodyText(request) {
  * @param {{ allowOrigin?: string } | undefined} cors
  * @returns {Record<string, string>}
  */
-function buildCorsHeaders(cors) {
+export function buildCorsHeaders(cors) {
   const allowOrigin = (cors && typeof cors.allowOrigin === 'string' && cors.allowOrigin.trim())
     ? cors.allowOrigin.trim()
     : '*';

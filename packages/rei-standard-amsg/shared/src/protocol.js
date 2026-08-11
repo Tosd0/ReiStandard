@@ -61,13 +61,48 @@ export const REI_SW_EVENT = Object.freeze({
 });
 
 /**
+ * `MULTIPART_EXPIRED` 事件上带的 `reason`：这条 multipart id 是怎么废的。
+ * 页面靠它区分「等到 TTL 也没收齐」和「当场就判废了」——两种都别再等，但后
+ * 者通常意味着发送端或链路有问题，值得报上去。
+ */
+export const MULTIPART_FAILURE_REASON = Object.freeze({
+  /** TTL 到期仍未收齐，或收到的分片本身已经过期。 */
+  TTL_EXPIRED: 'ttl-expired',
+  /** 分片信封不合规：version / encoding 对不上、index 越界、chunk 不是合法 base64url。 */
+  INVALID_CHUNK: 'invalid-chunk',
+  /** 同一个 id 的分片报了不一样的 total / encoding，已收的部分拼不回去。 */
+  CHUNK_CONFLICT: 'chunk-conflict',
+  /** 累计字节数超过 maxTotalBytes。 */
+  SIZE_LIMIT_EXCEEDED: 'size-limit-exceeded',
+  /** 收齐了但拼不回原 payload（缺片、超限、JSON 解不开）。 */
+  RESTORE_FAILED: 'restore-failed',
+  /** 分片仓库（IndexedDB）读写失败。 */
+  STORAGE_FAILED: 'storage-failed',
+  /** 接收端把 multipart 关了（`multipart.enabled === false`），分片没法重组。 */
+  DISABLED: 'disabled'
+});
+
+/**
  * 页面 → SW 方向的 message type（离线队列与业务投递管线）。
  */
 export const REI_SW_MESSAGE_TYPE = Object.freeze({
   ENQUEUE_REQUEST: 'REI_ENQUEUE_REQUEST',
   DELIVER: 'REI_AMSG_DELIVER',
   FLUSH_QUEUE: 'REI_FLUSH_QUEUE',
-  QUEUE_RESULT: 'REI_QUEUE_RESULT'
+  /**
+   * 入队的点对点回执：谁发的 ENQUEUE_REQUEST 就回给谁一条，一次一条。
+   * 没转 MessagePort 过来时会落到全局的 `navigator.serviceWorker` message
+   * 监听器上。
+   */
+  QUEUE_RESULT: 'REI_QUEUE_RESULT',
+  /**
+   * 队列请求被永久拒绝、即将从队列里删掉时广播给所有窗口的一条。
+   *
+   * 跟 QUEUE_RESULT 分开是因为两者的收信人不是一回事：这条是广播，可能来自后台
+   * `sync` 冲刷、说的也可能是另一条八竿子打不着的旧请求。共用一个 type 的话，
+   * 页面等自己那条入队回执时会先收到这一条、当成自己的结果处理。
+   */
+  QUEUE_DROPPED: 'REI_QUEUE_DROPPED'
 });
 
 export const REI_AMSG_DELIVER_MESSAGE_TYPE = REI_SW_MESSAGE_TYPE.DELIVER;

@@ -715,11 +715,21 @@ export {
   DEFAULT_MULTIPART_TTL_MS,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  MULTIPART_FAILURE_REASON,
   REI_AMSG_POSTMESSAGE_TYPE,
   REI_SW_EVENT,
   REI_SW_MESSAGE_TYPE,
   REI_AMSG_DELIVER_MESSAGE_TYPE,
 } from './protocol.js';
+
+// multipart transport 的发送端切片构造：装不下单条 push 的 payload 切成
+// 若干 `_multipart` 分片，sw 收齐后还原。instant 与 server 两个发送端共用
+// 这一份，切出来的分片形状由上面那批线协议常量约束。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  buildMultipartPushPayloads,
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+} from './multipart.js';
 
 /**
  * True when `value` parses as an absolute URL.

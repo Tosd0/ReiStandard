@@ -20,7 +20,7 @@
 | `REI_SW_EVENT.REASONING_RECEIVED`    | `'rei-amsg-reasoning-received'`    | `payload.messageKind === 'reasoning'` |
 | `REI_SW_EVENT.TOOL_REQUEST_RECEIVED` | `'rei-amsg-tool-request-received'` | `payload.messageKind === 'tool_request'` |
 | `REI_SW_EVENT.ERROR_RECEIVED`        | `'rei-amsg-error-received'`        | `payload.messageKind === 'error'` |
-| `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片 TTL 到期仍未收齐 |
+| `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片拼不起来（`payload.reason` 说明是哪种） |
 | `REI_SW_EVENT.UNKNOWN_RECEIVED`      | `'rei-amsg-unknown-received'`      | 缺 `messageKind`（2.0.x 老 payload / blob envelope） |
 
 ### 客户端订阅示例
@@ -268,15 +268,32 @@ installReiSW(self, {
 });
 ```
 
-TTL 到期仍未收齐时，SW 会清理 pending 并广播：
+一条 multipart 拼不起来时（等到 TTL 也没收齐，或者当场就判废了），SW 会清理
+pending 并广播：
 
 ```js
 {
   type: 'REI_AMSG_PUSH',
   event: 'rei-amsg-multipart-expired',
-  payload: { id, received, total, originalMessageKind }
+  payload: { id, received, total, originalMessageKind, reason }
 }
 ```
+
+`reason` 说明是哪条路走到这一步的，取值从 `MULTIPART_FAILURE_REASON` 里来
+（和其他常量一样，页面侧请从 `@rei-standard/amsg-shared` import）：
+
+| 取值 | 什么情况 |
+|------|---------|
+| `'ttl-expired'`         | TTL 到期仍未收齐，或收到的分片本身已经过期 |
+| `'invalid-chunk'`       | 分片信封不合规：version / encoding 对不上、index 越界、chunk 不是合法 base64url |
+| `'chunk-conflict'`      | 同一个 id 的分片报了不一样的 total / encoding，已收的部分拼不回去 |
+| `'size-limit-exceeded'` | 累计字节数超过 `multipart.maxTotalBytes` |
+| `'restore-failed'`      | 收齐了但拼不回原 payload |
+| `'storage-failed'`      | 分片仓库（IndexedDB）读写失败 |
+| `'disabled'`            | 本地把 multipart 关了（`multipart.enabled === false`），分片没法重组 |
+
+`'ttl-expired'` 之外的几种通常意味着发送端或链路有问题，值得报上去。同一条
+信息也会打进 `console.error`。
 
 业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知。
 
@@ -373,7 +390,10 @@ export async function enqueueRequestToSW(requestPayload) {
 
 - `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到 outbox，并立即尝试发送
 - `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送
-- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果（`ok` / `error` / `queueId`）
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果（`ok` / `error` / `queueId`）。点对点，一次入队一条
+- `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
+
+`QUEUE_DROPPED` 单独占一个 type，是因为它跟 `QUEUE_RESULT` 的收信人不是一回事：它是广播，可能来自后台 `sync` 冲刷、说的也可能是另一条早就排在队列里的旧请求。页面等自己那条入队回执时，不会被它打岔。
 
 `request` 结构示例：
 
@@ -418,6 +438,7 @@ export async function enqueueRequestToSW(requestPayload) {
 - `ENQUEUE_REQUEST`
 - `FLUSH_QUEUE`
 - `QUEUE_RESULT`
+- `QUEUE_DROPPED`
 
 ## 模块格式与类型（ESM/CJS/Types）
 

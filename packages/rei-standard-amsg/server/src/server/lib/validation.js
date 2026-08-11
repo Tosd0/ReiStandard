@@ -180,13 +180,26 @@ const taskPayloadEncoder = new TextEncoder();
  * @returns {{ code: string, message: string, details: { bytes: number, maxBytes: number } } | null}
  */
 export function validateTaskPayloadSize(serializedPayload) {
-  const bytes = taskPayloadEncoder.encode(serializedPayload).length;
+  const bytes = taskPayloadByteLength(serializedPayload);
   if (bytes <= MAX_TASK_PAYLOAD_BYTES) return null;
   return {
     code: 'TASK_PAYLOAD_TOO_LARGE',
     message: `任务内容 ${bytes} 字节，超过 ${MAX_TASK_PAYLOAD_BYTES} 字节上限`,
     details: { bytes, maxBytes: MAX_TASK_PAYLOAD_BYTES }
   };
+}
+
+/**
+ * 任务正文的 UTF-8 字节数（与 {@link validateTaskPayloadSize} 同一把尺子）。
+ *
+ * `PUT /update-message` 拿它跟改动前的正文比大小：上限是后加的，比它更早建出来
+ * 的大任务不该因此连排期都改不了，只要这次改动没把它变得更大就放行。
+ *
+ * @param {string} serializedPayload
+ * @returns {number}
+ */
+export function taskPayloadByteLength(serializedPayload) {
+  return taskPayloadEncoder.encode(serializedPayload).length;
 }
 
 /**
@@ -272,6 +285,18 @@ export function validateScheduleMessagePayload(payload) {
     (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0)
   ) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['maxTokens'] } };
+  }
+
+  // userMessage 给了就必须是字符串。正文最终要过 splitMessageIntoSentences 的
+  // 正则切分，传个数字进来这一步收得下、到点投递时才炸在 `chunk.split` 上——
+  // 那时早已离开 HTTP 请求，用户只看到一条任务莫名其妙失败，还要连着重试三轮
+  // 同样地失败。
+  if (
+    payload.userMessage !== undefined &&
+    payload.userMessage !== null &&
+    typeof payload.userMessage !== 'string'
+  ) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['userMessage (must be a string)'] } };
   }
 
   if (payload.messageType === 'fixed') {

@@ -167,6 +167,44 @@ describe('任务正文大小上限', () => {
     );
   });
 
+  // 上限是后加的，比它更早建出来的大任务本来跑得好好的。一律按合并后的大小拒
+  // 的话，那条任务连把 nextSendAt 往后挪一小时都做不到，只能删掉重建。
+  test('上限生效前建出来的大任务：不把它变大的改动照常放行', async () => {
+    const { worker, env, calls } = await freshWorker();
+    const adapter = createD1Adapter(env.DB);
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+
+    // 绕开 HTTP 直接落库，模拟「上限生效之前建的那条」。
+    const oversized = {
+      contactName: 'Rei',
+      messageType: 'fixed',
+      userMessage: 'a'.repeat(MAX_TASK_PAYLOAD_BYTES + 5000),
+      recurrenceType: 'none',
+      firstSendTime: '2999-01-01T00:00:00.000Z',
+    };
+    await adapter.createTask({
+      user_id: USER,
+      uuid: 'legacy-oversized',
+      encrypted_payload: await encryptForStorage(JSON.stringify(oversized), userKey),
+      next_send_at: '2999-01-01T00:00:00.000Z',
+      message_type: 'fixed',
+    });
+    calls.length = 0;
+
+    // 只挪排期，正文一个字节没动。
+    const moved = await update(worker, env, 'legacy-oversized', {
+      nextSendAt: '2999-06-01T00:00:00.000Z',
+    });
+    assert.equal(moved.status, 200, '这次改动没把它变大，不该被上限拦下');
+
+    // 再往上加就该拦了：这次改动确实把它变得更大。
+    const grown = await update(worker, env, 'legacy-oversized', {
+      userMessage: 'a'.repeat(MAX_TASK_PAYLOAD_BYTES + 20000),
+    });
+    assert.equal(grown.status, 400);
+    assert.equal((await grown.json()).error.code, 'TASK_PAYLOAD_TOO_LARGE');
+  });
+
   // 上限本身是从 D1 的 2,000,000 字节反推的：明文加密后走 hex 会翻倍，还要给
   // 行里其他列、以及 run-tick 投递失败时补写的 lastError 留出余量。把这个换算
   // 钉在这里——上限被调大到「密文塞不下」的那一刻，这条会红。
