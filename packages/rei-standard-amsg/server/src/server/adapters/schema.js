@@ -161,3 +161,23 @@ export const UPDATABLE_COLUMNS = new Set([
   'next_send_at', 'lease_until', 'retry_after', 'serialize_group',
   'status', 'retry_count', 'last_error', 'created_at', 'updated_at'
 ]);
+
+/**
+ * 任务行的 SELECT 列集，同样是三个适配器共用一份（列名不分方言，加列只改这
+ * 里）。分成两份，是因为两条链路要的东西本来就不一样：
+ *
+ *   - `TASK_DELIVERY_COLUMNS`：投递链路读的行（`getPendingTasks` /
+ *     `getTaskByUuidOnly`）。除了发消息本身要用的字段，还必须带 `retry_after`
+ *     —— run-tick 的退避守卫就是拿这一列判断「这条还在等重试，现在别跑」，列
+ *     不在行里，守卫读到的永远是 undefined，等于没有守卫。
+ *   - `TASK_DETAIL_COLUMNS`：读接口返回的行（`getTaskByUuid` / `listTasks`），
+ *     多了 `last_error` 和两个时间戳，不带 `lease_until` 这类内部调度列。
+ *
+ * 收进来之前每个适配器各写各的 SELECT 列表，加列时漏掉其中一个不会有任何报
+ * 错，只会在那种部署上静默少一列。
+ */
+export const TASK_DELIVERY_COLUMNS =
+  'id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count';
+
+export const TASK_DETAIL_COLUMNS =
+  'id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at';

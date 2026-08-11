@@ -11,6 +11,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PgAdapter } from '../src/server/adapters/pg.js';
 import { NeonAdapter } from '../src/server/adapters/neon.js';
+import { createD1Adapter } from '../src/server/adapters/d1.js';
+import { createSpyD1 } from './helpers/sqlite-d1.mjs';
 
 /** 把 SQL 压成单行，断言时不用管缩进。 */
 const flat = (text) => text.replace(/\s+/g, ' ').trim();
@@ -20,6 +22,13 @@ function setClauseOf(text) {
   const match = flat(text).match(/\bSET\b(.*?)\bWHERE\b/i);
   assert.ok(match, `语句里没找到 SET ... WHERE：${text}`);
   return match[1];
+}
+
+/** SELECT 出来的列，按出现顺序。 */
+function selectedColumns(text) {
+  const match = flat(text).match(/^SELECT\s+(.+?)\s+FROM scheduled_messages\b/i);
+  assert.ok(match, `不是一条 scheduled_messages 的 SELECT：${text}`);
+  return match[1].split(',').map((column) => column.trim());
 }
 
 /**
@@ -174,3 +183,105 @@ for (const backend of BACKENDS) {
     }
   });
 }
+
+// ── 任务行的列集：三个适配器必须一致 ──────────────────────────────────────
+//
+// 取任务行的四个方法分两条链路，各要一套列：投递链路（getTaskByUuidOnly /
+// getPendingTasks）和读接口（getTaskByUuid / listTasks）。以前三个适配器各写
+// 各的 SELECT 列表，加列时漏掉其中一个不会有任何报错——pg / neon 的
+// getTaskByUuidOnly 就这么漏了 retry_after，run-tick 的退避守卫在这两种部署上
+// 整个失效（读到的永远是 undefined），还在等重试的任务被 runTask 当场再跑一
+// 遍。现在列集收在 adapters/schema.js 里共用，这组测试盯住它别再散开。
+
+/** COUNT 查询得有行返回，否则 listTasks 会在读 count 时抛错。 */
+const countAwareRows = (text) => (/COUNT\(\*\)/i.test(text) ? [{ count: '0' }] : []);
+
+/**
+ * 四个取任务行的方法各 SELECT 了哪些列。
+ *
+ * @param {Object} adapter
+ * @param {() => string} lastSql - 取刚发出去的那条 SQL
+ */
+async function taskSelectColumns(adapter, lastSql) {
+  const columnsAfter = async (run) => {
+    await run();
+    return selectedColumns(lastSql());
+  };
+  return {
+    getTaskByUuidOnly: await columnsAfter(() => adapter.getTaskByUuidOnly('uuid-1')),
+    getPendingTasks: await columnsAfter(() => adapter.getPendingTasks(50)),
+    getTaskByUuid: await columnsAfter(() => adapter.getTaskByUuid('uuid-1', 'user-1')),
+    listTasks: await columnsAfter(() => adapter.listTasks('user-1', {}))
+  };
+}
+
+async function d1TaskSelectColumns() {
+  const { db, calls } = createSpyD1();
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+  return taskSelectColumns(adapter, () => calls.at(-1).sql);
+}
+
+test('投递链路和读接口各自的列集，三个适配器逐字一致', async () => {
+  const pg = recordingPg(countAwareRows);
+  const neon = recordingNeon(countAwareRows);
+
+  const byBackend = {
+    pg: await taskSelectColumns(pg.adapter, () => pg.calls.at(-1).text),
+    neon: await taskSelectColumns(neon.adapter, () => neon.calls.at(-1).text),
+    d1: await d1TaskSelectColumns()
+  };
+
+  for (const [name, columns] of Object.entries(byBackend)) {
+    assert.deepEqual(
+      columns.getTaskByUuidOnly, columns.getPendingTasks,
+      `${name}: 投递链路的两个方法要给出同一套列（runTask 和 cron 走同一条投递链）`
+    );
+    assert.deepEqual(
+      columns.getTaskByUuid, columns.listTasks,
+      `${name}: 读接口的两个方法要给出同一套列`
+    );
+  }
+
+  assert.deepEqual(byBackend.pg, byBackend.d1, 'pg 的任务行列集要跟 D1 一致');
+  assert.deepEqual(byBackend.neon, byBackend.d1, 'neon 的任务行列集要跟 D1 一致');
+
+  // 光「三边一致」还不够：三个适配器一起丢掉 retry_after 的话一致性照样成立，
+  // 退避守卫却全线失效。这一列单独钉死。
+  for (const [name, columns] of Object.entries(byBackend)) {
+    assert.ok(
+      columns.getTaskByUuidOnly.includes('retry_after'),
+      `${name}: 投递链路的行必须带 retry_after，run-tick 的退避守卫读它`
+    );
+  }
+});
+
+// ── 连接池的空闲连接出错 ────────────────────────────────────────────────
+//
+// pg-pool 在空闲连接出错时 emit('error')（见 node_modules/pg-pool 的
+// makeIdleListener）。Pool 是 EventEmitter，没人监听时这一下会直接抛出来，在
+// 真实进程里就是未捕获异常——整个 Node 进程退出，日志里只剩一句栈全在 pg 内部
+// 的 `Connection terminated unexpectedly`，看不出跟本库有关系。
+test('pg: 池子里的空闲连接出错时不炸进程，只留一条认得出出处的日志', async () => {
+  const adapter = new PgAdapter('postgres://user:pass@127.0.0.1:5432/db');
+  // pg-pool 建池是懒的（连接留到第一次查询），这里不会真的去连库。
+  const pool = adapter._getPool();
+
+  const logged = [];
+  const originalError = console.error;
+  console.error = (...args) => logged.push(args.map((arg) => String(arg)).join(' '));
+  try {
+    assert.doesNotThrow(
+      () => pool.emit('error', new Error('Connection terminated unexpectedly'), {}),
+      '没挂 error 监听的话，这一下就是进程级未捕获异常'
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /\[amsg-server pg\]/, '日志要认得出是谁的池子');
+  assert.match(logged[0], /Connection terminated unexpectedly/, '日志要带上原始错误');
+
+  await pool.end();
+});

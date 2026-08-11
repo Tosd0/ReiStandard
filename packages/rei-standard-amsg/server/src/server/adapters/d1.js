@@ -18,8 +18,9 @@ import {
   MESSAGE_OUTBOX_TABLE_SQL,
   MESSAGE_OUTBOX_INDEX_SQL
 } from './schema.sqlite.js';
-// 列名不分方言：三个适配器共用 schema.js 里的这一份白名单，加列只改一处。
-import { UPDATABLE_COLUMNS } from './schema.js';
+// 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
+// schema.js 里的这一份，加列只改一处。
+import { UPDATABLE_COLUMNS, TASK_DELIVERY_COLUMNS, TASK_DETAIL_COLUMNS } from './schema.js';
 
 /**
  * 「key 以 prefix 开头」的字典序上界：`key >= prefix AND key < prefixRangeEnd(prefix)`。
@@ -329,7 +330,7 @@ export class D1Adapter {
 
   async getTaskByUuid(uuid, userId) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = ? AND user_id = ? AND status = 'pending'
        LIMIT 1`
@@ -338,7 +339,7 @@ export class D1Adapter {
 
   async getTaskByUuidOnly(uuid) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = ? AND status = 'pending'
        LIMIT 1`
@@ -422,7 +423,7 @@ export class D1Adapter {
   async getPendingTasks(limit = 50) {
     const now = this._now();
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= ?
          AND (lease_until IS NULL OR lease_until <= ?)
@@ -537,7 +538,7 @@ export class D1Adapter {
     const total = Number(countRow.count) || 0;
 
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC

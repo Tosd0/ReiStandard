@@ -15,8 +15,16 @@
  * @property {string}  next_send_at
  * @property {string}  status
  * @property {number}  retry_count
- * @property {string}  created_at
- * @property {string}  updated_at
+ * @property {string}  [created_at]
+ * @property {string}  [updated_at]
+ * @property {string|null} [retry_after]
+ *   退避时刻。投递链路读的行（getPendingTasks / getTaskByUuidOnly）必须带上
+ *   它，读接口返回的行（getTaskByUuid / listTasks）不带。
+ * @property {string|null} [last_error]
+ *   上一次投递失败的脱敏摘要（JSON 串）。读接口返回的行才带。
+ *
+ * 两条链路各要一套列，内置适配器统一从 adapters/schema.js 的
+ * `TASK_DELIVERY_COLUMNS` / `TASK_DETAIL_COLUMNS` 取，三种方言共用一份。
  */
 
 /**
@@ -53,6 +61,9 @@
  *   Fetch a single pending task by uuid + user_id.
  * @property {(uuid: string) => Promise<TaskRow|null>} getTaskByUuidOnly
  *   Fetch a single pending task by uuid only (used by instant processing).
+ *   返回的行要和 `getPendingTasks` 是同一套列（`TASK_DELIVERY_COLUMNS`）：
+ *   `runTask` 拿这一行走同一条投递链，少了 `retry_after`，退避守卫读到的永远
+ *   是 undefined，还在等重试的任务会被当场再跑一遍。
  * @property {(uuid: string) => Promise<{ status: string }|null>} [getTaskStatusByUuidOnly]
  *   （可选）这条 uuid 现在是什么状态——不限用户，也不限状态。`runTask` 用它
  *   把「这条已经跑完进终态了」和「压根没这条」分开回报；不实现时两种都归
