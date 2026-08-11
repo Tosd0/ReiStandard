@@ -22,6 +22,10 @@
  *     lifecycle. If your host exposes one, pass it through the optional
  *     adapter options so `createInstantHandler` can protect the main
  *     LLM → split → push pipeline.
+ *   - 响应是边产边写的（instant 的默认传输是 SSE）。中间件如果自己缓冲响应，
+ *     流式就会被它压回非流式：`compression` 默认会把 `text/event-stream` 一起
+ *     压，压缩缓冲区攒够才吐字节。这条路由上把它关掉即可
+ *     （`compression({ filter: (req) => req.path !== '/instant' })`）。
  */
 
 /**
@@ -49,6 +53,24 @@ async function ensureWebCryptoPolyfill() {
 }
 
 /**
+ * Lazy `node:stream` helpers, same reasoning as the crypto polyfill above:
+ * `adapters/vercel.js` re-exports `toNodeHandler` for the Node runtime, so a
+ * static `import 'node:stream'` here would end up inside the Edge bundle too
+ * (ESM imports evaluate eagerly) and break a runtime that has no such module.
+ */
+let _streamHelpers = null;
+async function loadStreamHelpers() {
+  if (!_streamHelpers) {
+    const [{ Readable }, { pipeline }] = await Promise.all([
+      import('node:stream'),
+      import('node:stream/promises'),
+    ]);
+    _streamHelpers = { Readable, pipeline };
+  }
+  return _streamHelpers;
+}
+
+/**
  * @typedef {Object} NodeAdapterOptions
  * @property {(work: Promise<unknown>) => void} [waitUntil]
  * @property {{ waitUntil?: (work: Promise<unknown>) => void }} [runtime]
@@ -68,10 +90,17 @@ export function toNodeHandler(fetchHandler, options = {}) {
       const fetchResponse = await fetchHandler(fetchRequest, resolveNodeRuntime(options, req, res));
       await writeFetchResponseToNode(fetchResponse, res);
     } catch (err) {
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      // 连接已经收尾（客户端走了 / 响应写完了）就没有能报错的地方了。
+      if (res.writableEnded || res.destroyed) return;
+      if (res.headersSent) {
+        // 字节已经在路上（多半是 SSE 流中途炸的）：200 + 半截流已经发出去，
+        // 再追加一个 JSON 信封只是往流里塞垃圾。直接断掉，让调用方看到一个
+        // 明确失败的连接——而不是一条看起来正常收尾、其实少了后半截的流。
+        res.destroy(err);
+        return;
       }
+      res.statusCode = 500;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(
         JSON.stringify({
           success: false,
@@ -135,13 +164,57 @@ function readBody(req) {
   });
 }
 
+/**
+ * 客户端提前断开是正常收场，不是服务端故障。
+ *
+ * 断开时 `res` 先 close，pipeline 判定为 premature close 并把两端销毁；socket
+ * 已经没了，再往上抛只会让外层去写一个没人读的 500。
+ */
+function isClientDisconnect(err, res) {
+  const code = err && err.code;
+  if (code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED'
+    || code === 'EPIPE' || code === 'ECONNRESET') {
+    return true;
+  }
+  return !!(res && (res.destroyed || res.writableEnded) && !res.writableFinished);
+}
+
+/**
+ * 把 Fetch Response 写到 Node 的 `res` 上——边收边写，不整体缓冲。
+ *
+ * instant 的默认传输是 SSE：响应体是一个「LLM 边跑边吐、全部推送发完才关」的
+ * ReadableStream。先 `arrayBuffer()` 读完再写的话，传输层就静默退化成非流式——
+ * 客户端要等整轮跑完才收到第一个字节，keepalive 心跳全被压在缓冲里（它本来就是
+ * 为了防连接闲置被掐才存在的），中间隔着 nginx 之类的反代还会直接
+ * proxy_read_timeout 判 504；而响应头写的仍然是 `text/event-stream`，从外面
+ * 完全看不出已经不流式了。
+ *
+ * 用 `Readable.fromWeb` + `pipeline` 而不是手写 reader 循环：背压、错误传播、
+ * 两端销毁都交给 stream 机制。客户端提前断开时 pipeline 会销毁源 Readable，
+ * 销毁会 cancel 上游那个 ReadableStream —— instant 的 SSE 分支收到 cancel 就停
+ * keepalive 定时器、把剩下的消息切到 Web Push 兜底，不会留下一个没人读的流。
+ *
+ * 非流式的 JSON 响应走同一条路：字节一样，只是改由 chunked 传输编码发出。
+ */
 async function writeFetchResponseToNode(response, res) {
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
     res.setHeader(name, value);
   });
-  const body = await response.arrayBuffer();
-  res.end(Buffer.from(body));
+
+  // 204 / 304 这类没有 body 的响应，`response.body` 是 null。
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
+  const { Readable, pipeline } = await loadStreamHelpers();
+  try {
+    await pipeline(Readable.fromWeb(response.body), res);
+  } catch (err) {
+    if (isClientDisconnect(err, res)) return;
+    throw err;
+  }
 }
 
 export default { toNodeHandler };

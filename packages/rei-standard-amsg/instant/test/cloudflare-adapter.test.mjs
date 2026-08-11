@@ -1,6 +1,6 @@
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 
 import { createInstantHandler } from '../src/index.js';
 import { createCloudflareWorker } from '../src/adapters/cloudflare.js';
@@ -252,19 +252,25 @@ function makeNodeRequestResponse(body) {
   };
   req.socket = {};
 
+  // 响应侧是个真 Writable：适配器现在把响应体流式 pipe 过来（见
+  // adapter-failure-modes.test.mjs），只认 setHeader/end 的假对象接不住。
   const chunks = [];
-  const res = {
-    statusCode: 200,
-    headersSent: false,
-    headers: {},
-    setHeader(name, value) {
-      this.headers[String(name).toLowerCase()] = String(value);
+  const res = new Writable({
+    write(chunk, _enc, cb) {
+      chunks.push(Buffer.from(chunk));
+      cb();
     },
-    end(chunk) {
-      if (chunk) chunks.push(Buffer.from(chunk));
-      this.headersSent = true;
-    },
+  });
+  res.statusCode = 200;
+  res.headers = {};
+  res.setHeader = function setHeader(name, value) {
+    this.headers[String(name).toLowerCase()] = String(value);
   };
+  Object.defineProperty(res, 'headersSent', {
+    get() {
+      return this.writableEnded || chunks.length > 0;
+    },
+  });
 
   return {
     req,
