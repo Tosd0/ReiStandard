@@ -9,7 +9,12 @@ import {
   encryptPayload,
   encryptForStorage,
 } from '../src/server/lib/encryption.js';
-import { seedPushSubscription, TEST_PUSH_SUBSCRIPTION } from './helpers/push-subscription.mjs';
+import {
+  encryptTestSubscription,
+  seedPushSubscription,
+  TEST_PUSH_SUBSCRIPTION,
+} from './helpers/push-subscription.mjs';
+import { loadPushSubscription } from '../src/server/lib/push-subscription-store.js';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -137,6 +142,114 @@ describe('PUT/GET/DELETE /push-subscription', () => {
       method: 'PUT', headers: ENC_HEADERS, body: await encBody({ subscription: SUB }),
     }), env);
     assert.equal(put.status, 401);
+  });
+});
+
+describe('GET /push-subscription 分得开「读不到库」和「解不开密文」', () => {
+  /** 让订阅这一行读不出来（表没建、读超时），其余方法照常走真适配器。 */
+  function readThrows(adapter, error) {
+    return new Proxy(adapter, {
+      get(target, prop) {
+        if (prop === 'getPushSubscription') return async () => { throw error; };
+        const value = target[prop];
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+
+  /** console.error / console.warn 静音跑一段（库照常记日志，测试输出别被刷屏）。 */
+  async function quiet(fn) {
+    const origError = console.error;
+    const origWarn = console.warn;
+    const lines = [];
+    console.error = (...args) => { lines.push(args.join(' ')); };
+    console.warn = (...args) => { lines.push(args.join(' ')); };
+    try {
+      return { result: await fn(), lines };
+    } finally {
+      console.error = origError;
+      console.warn = origWarn;
+    }
+  }
+
+  function getSubscription(worker, env) {
+    return worker.fetch(
+      new Request('https://w.dev/push-subscription', { method: 'GET', headers: { 'X-User-Id': USER } }), env
+    );
+  }
+
+  test('读库失败 → 503 PUSH_SUBSCRIPTION_LOOKUP_FAILED，不谎报「没登记」', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    await seedPushSubscription(adapter, USER, MASTER_KEY, SUB);
+
+    const db = readThrows(adapter, new Error('D1_ERROR: no such table: push_subscriptions'));
+    const worker = makeWorker(d1, { db });
+    const { result: res, lines } = await quiet(() => getSubscription(worker, { DB: d1 }));
+
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error.code, 'PUSH_SUBSCRIPTION_LOOKUP_FAILED');
+    // 真因得留在日志里，不能只剩一句「没登记」。
+    assert.ok(lines.some((line) => line.includes('no such table')), '应记下读库失败的原因');
+  });
+
+  test('同一次读库故障，GET 与 POST /schedule-message 说法一致', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+
+    const db = readThrows(adapter, new Error('D1 storage operation exceeded timeout'));
+    const worker = makeWorker(d1, { db });
+    const env = { DB: d1 };
+
+    const { result } = await quiet(async () => {
+      const get = await getSubscription(worker, env);
+      const post = await worker.fetch(new Request('https://w.dev/schedule-message', {
+        method: 'POST',
+        headers: ENC_HEADERS,
+        body: await encBody({
+          contactName: 'Rei',
+          messageType: 'fixed',
+          userMessage: 'hi',
+          firstSendTime: '2999-01-01T00:00:00.000Z',
+          recurrenceType: 'none',
+        }),
+      }), env);
+      return { get: { status: get.status, body: await get.json() }, post: { status: post.status, body: await post.json() } };
+    });
+
+    assert.equal(result.get.status, result.post.status);
+    assert.equal(result.get.body.error.code, result.post.body.error.code);
+  });
+
+  test('密文解不开仍然降级成「没登记」，但日志里留得下原因', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter(d1);
+    await adapter.initSchema();
+    // masterKey 轮换过：行还在，密文用旧 key 加的，现在解不开了。
+    await adapter.upsertPushSubscription(
+      USER,
+      await encryptTestSubscription(USER, 'b'.repeat(64), SUB),
+      Date.now()
+    );
+
+    const worker = makeWorker(d1);
+    const { result: res, lines } = await quiet(() => getSubscription(worker, { DB: d1 }));
+
+    assert.equal(res.status, 200);
+    // 客户端此时唯一有意义的动作就是重新 PUT 一份，所以这条路照旧降级。
+    assert.deepEqual((await res.json()).data, { exists: false, updatedAt: null, endpoint: null });
+    assert.ok(lines.some((line) => line.includes('解密失败')), '降级要留一行可归因的日志');
+  });
+
+  test('投递链路上读库失败照旧抛出去，不被当成「没登记」', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const db = readThrows(adapter, new Error('D1_ERROR: no such table: push_subscriptions'));
+
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    await assert.rejects(() => loadPushSubscription({ db, userId: USER, userKey }), /no such table/);
   });
 });
 

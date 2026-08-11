@@ -25,8 +25,8 @@
 import { deriveUserEncryptionKey, decryptPayload } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import {
+  decodePushSubscriptionRow,
   isPushSubscriptionShape,
-  loadPushSubscription,
   savePushSubscription,
   supportsPushSubscriptionStore,
 } from '../lib/push-subscription-store.js';
@@ -109,12 +109,27 @@ export function createPushSubscriptionHandler(ctx) {
     if (!supportsPushSubscriptionStore(db)) return UNSUPPORTED;
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
+
+    // 读库和解密分两步收：查询本身失败是基础设施问题（表没建、读超时），按可
+    // 重试的 503 报出去，别伪装成「没登记」把客户端引去走一遍多余的重订阅流
+    // 程——code 与 POST /schedule-message 的同一种失败保持一致，同一次故障两
+    // 个端点说的是同一件事。
+    let row;
+    try {
+      row = await db.getPushSubscription(userId);
+    } catch (error) {
+      console.error('[amsg-server] push-subscription 查询失败:', error && error.message);
+      return err(503, 'PUSH_SUBSCRIPTION_LOOKUP_FAILED', '推送订阅读取失败，请稍后重试');
+    }
+
     let stored = null;
     try {
-      stored = await loadPushSubscription({ db, userId, userKey });
-    } catch (_error) {
-      // 密文解不开（换过 masterKey 之类）就当没登记过：客户端会重新 PUT 一份，
-      // 那正是这种情况下唯一有意义的动作。
+      stored = await decodePushSubscriptionRow(row, userKey);
+    } catch (error) {
+      // 行在、密文解不开（换过 masterKey 之类）就当没登记过：客户端会重新 PUT
+      // 一份，那正是这种情况下唯一有意义的动作。降级留一行日志，别让「明明有
+      // 一行却报没登记」在服务端不留痕迹。
+      console.warn('[amsg-server] push-subscription 行解密失败（按未登记处理）:', error && error.message);
       stored = null;
     }
     return {
