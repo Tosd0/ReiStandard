@@ -95,6 +95,31 @@ export const STALE_AFTER_MS = 60 * 60 * 1000;
 // （见 guardWebpushWithLease）：发送方要靠它把「取消」和「发失败」分开处置。
 
 /** 推送服务回的状态码；拿不到（不是推送失败，或宿主的 webpush 实现没带）→ null。 */
+/**
+ * `last_error` 列的探测结果：写得进去的适配器 / 写不进去的适配器。
+ *
+ * 记在适配器实例上（不是模块级布尔），同一个进程里并排跑好几个库、或者宿主中
+ * 途换适配器时才不会互相串。探一次就记住，之后每次写只花一个来回。
+ */
+const adaptersWithLastErrorColumn = new WeakSet();
+const adaptersWithoutLastErrorColumn = new WeakSet();
+
+/** 已经就「行里没有 retry_after」告过警的适配器，每个只说一次。 */
+const adaptersWarnedAboutRetryAfter = new WeakSet();
+
+/**
+ * @param {Object} db
+ */
+function warnMissingRetryAfterColumn(db) {
+  if (!db || adaptersWarnedAboutRetryAfter.has(db)) return;
+  adaptersWarnedAboutRetryAfter.add(db);
+  console.warn(
+    '[amsg-server] 适配器返回的任务行里没有 retry_after，退避守卫失效：'
+    + '还在退避里的任务会被立刻重跑。投递路径的行要带上这一列，'
+    + '见 adapters/interface.js 的 TASK_DELIVERY_COLUMNS。'
+  );
+}
+
 function toPushStatus(value) {
   return Number.isInteger(value) ? value : null;
 }
@@ -268,6 +293,13 @@ export async function runTask(ctx, uuid) {
   if (Number.isFinite(dueMs) && dueMs > Date.now()) {
     return { ran: false, reason: 'not_due', nextSendAt: task.next_send_at };
   }
+  // 「这一列是 NULL」和「这一列压根没读出来」是两回事，但两者的 Date.parse 都
+  // 是 NaN，守卫一样不触发——后者会让一条还在退避里的任务被立刻重跑一遍。投递
+  // 路径的行要求带上 retry_after（见 adapters/interface.js 的
+  // TASK_DELIVERY_COLUMNS），带没带得看适配器有没有照办，所以缺了就说一声。
+  if (!Object.prototype.hasOwnProperty.call(task, 'retry_after')) {
+    warnMissingRetryAfterColumn(ctx.db);
+  }
   const retryAfterMs = task.retry_after ? Date.parse(task.retry_after) : NaN;
   if (Number.isFinite(retryAfterMs) && retryAfterMs > Date.now()) {
     return { ran: false, reason: 'retry_pending', retryAfter: task.retry_after };
@@ -348,7 +380,7 @@ async function deliverTasks(ctx, tasks) {
    * lost；同理，只有明确的 false 才算行没了，什么都不返回的自定义适配器照旧。
    */
   function startLeaseHeartbeat(task) {
-    const lease = { lost: false, stop: () => {} };
+    const lease = { lost: false, released: false, stop: () => {} };
     if (!heartbeatEnabled) return lease;
     let stopped = false;
     let timer = null;
@@ -361,7 +393,14 @@ async function deliverTasks(ctx, tasks) {
         console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
       }
       if (renewed === false) {
-        // 行已经不归这次投递管了，续也没得续，别再敲库。
+        // 续不上有两种可能，`false` 本身分不出来：
+        //   - 这次投递已经收尾了（收尾写库会把 lease_until 置空、成功的一次性
+        //     任务干脆把行删掉），租约是我们自己放的手；
+        //   - 行真的被取消或顶替了。
+        // 前者要安静收场：收尾之后宿主 hook 还可能 await 一阵子（onStaleSkip
+        // 之类），这期间飞在路上的心跳会照样落地，报成「任务被取消」的话，运维
+        // 就会在 tick 日志里看到一条正常送达的消息带着取消告警。
+        if (stopped || lease.released) return;
         lease.lost = true;
         console.warn(`[amsg-server] 任务 ${task.id} 的租约已失效（行被取消或顶替），剩余推送将中止`);
         return;
@@ -381,8 +420,23 @@ async function deliverTasks(ctx, tasks) {
     return lease;
   }
 
-  // last_error 一律往行上写，能不能写得进去交给存储说了算（写不进去的库由
-  // updateTaskWithLastError 退掉这个字段重写一次）。
+  /** 正在跑的任务 → 它的租约对象。收尾写库时要靠它标记「租约是我们自己放的」。 */
+  const activeLeases = new Map();
+
+  /**
+   * 标记这条任务的租约已经由本次投递主动放掉。
+   *
+   * 之后 renewTaskLease 当然续不上，但那不是「行被取消」——见 startLeaseHeartbeat
+   * 里对 `false` 的处理。
+   *
+   * @param {number|string} taskId
+   */
+  function markLeaseReleased(taskId) {
+    const lease = activeLeases.get(taskId);
+    if (lease) lease.released = true;
+  }
+
+  // last_error 一律往行上写，写不写得进去现场探一次（见 updateTaskWithLastError）。
   //
   // 不能拿「实现了 claimTask 吗」当判据：投影那边只看行上带不带 last_error 这
   // 个键，而 claimTask 是可选的——跟着包内 schema 建表、却没实现 claimTask 的
@@ -394,20 +448,45 @@ async function deliverTasks(ctx, tasks) {
   // 败原因一起读出来。
 
   /**
-   * updateTaskById 的包一层：升级后还没重跑 /init-tenant 的库缺 last_error
-   * 列时，退掉这个字段重写一次——状态推进（标 failed / 推进排期 / 放租约）
-   * 不能被一条锦上添花的记录挡住。
+   * updateTaskById 的包一层：状态推进（标 failed / 推进排期 / 放租约）和
+   * last_error 这条记录分开对待——前者是状态机，后者是锦上添花，后者写不进去
+   * 不能把前者挡住。
+   *
+   * 第一次遇到一个适配器时分两笔写：状态字段先落地，last_error 单独补一笔。补
+   * 得上就记住这个库有这一列，之后合成一笔写；补不上（升级后没重跑
+   * /init-tenant 的库、自建的 DbAdapter）也记住，之后不再带这个字段。
+   *
+   * 不按错误措辞猜「是不是缺列」：自建适配器拒绝未知字段时说什么全凭它自己，
+   * 猜不中就是状态永远推不动——retry_count 不涨、next_send_at 不动，任务被每
+   * 一跳 cron 重新捞起来，LLM 每次重跑一遍还每次都计费。
    */
   async function updateTaskWithLastError(taskId, fields) {
-    try {
-      return await db.updateTaskById(taskId, fields);
-    } catch (error) {
-      if (Object.prototype.hasOwnProperty.call(fields, 'last_error') && /last_error/i.test(error.message || '')) {
-        const { last_error: _omit, ...rest } = fields;
-        return db.updateTaskById(taskId, rest);
-      }
-      throw error;
+    // 这一写会把租约放掉的话，先在本地标一下：之后心跳续不上租约是我们自己放
+    // 的手，不是行被取消或顶替（见 markLeaseReleased）。
+    if (fields.lease_until === null) markLeaseReleased(taskId);
+
+    if (!Object.prototype.hasOwnProperty.call(fields, 'last_error')) {
+      return db.updateTaskById(taskId, fields);
     }
+    const { last_error: lastError, ...stateFields } = fields;
+    if (adaptersWithLastErrorColumn.has(db)) return db.updateTaskById(taskId, fields);
+    if (adaptersWithoutLastErrorColumn.has(db)) return db.updateTaskById(taskId, stateFields);
+
+    // 这个适配器还没探过。状态字段先单独落地——它写不进去就是真出错了，原样抛
+    // 出去按既有路径处理；last_error 单独补一笔，成败只决定「以后还带不带它」。
+    const result = await db.updateTaskById(taskId, stateFields);
+    try {
+      await db.updateTaskById(taskId, { last_error: lastError });
+      adaptersWithLastErrorColumn.add(db);
+    } catch (error) {
+      adaptersWithoutLastErrorColumn.add(db);
+      console.warn(
+        '[amsg-server] 适配器写不了 last_error 列，后续写入不再带它'
+        + '（失败原因仍记在 payload 的 lastError 里）:',
+        error && error.message
+      );
+    }
+    return result;
   }
 
   /**
@@ -500,11 +579,36 @@ async function deliverTasks(ctx, tasks) {
   }
 
   /**
+   * 行上的密文还是占位时手里这一份吗？
+   *
+   * 每一次重写 `encrypted_payload` 之前都要问一遍。手里这份 payload 是占位时
+   * 的快照，而一次投递可能跑几十秒——其间用户 `PUT /update-message` 改过这条
+   * 任务的话，把快照原样写回去就等于把那次修改静默回滚了（更新走的是按 id 匹
+   * 配的写，没有条件判断拦着；没实现 claimTask 的适配器也没有租约拦着）。
+   *
+   * 读不到就当它可能变过：留一条过时的 lastError，比吞掉用户刚保存的改动强。
+   *
+   * @param {Object} task - 数据库行（占位时那一份）
+   * @returns {Promise<boolean>}
+   */
+  async function payloadStillFresh(task) {
+    if (typeof db.getTaskByUuid !== 'function' || !task.uuid) return true;
+    try {
+      const current = await db.getTaskByUuid(task.uuid, task.user_id);
+      return Boolean(current) && current.encrypted_payload === task.encrypted_payload;
+    } catch (_readError) {
+      return false;
+    }
+  }
+
+  /**
    * 把这次的错误记进 payload 的 lastError（best-effort）。
    *
    * 行上的 last_error 列才是投影读的权威那一份（每次失败刷新、成功清空），密
    * 文里这一份是给没有那一列的适配器兜底的——投影读不到列时才会回退到它，见
    * lib/task-projection.js。加密不了就算了，记录失败不该拖垮状态推进。
+   *
+   * 这一份要重写整个 `encrypted_payload`，所以同样先过 payloadStillFresh。
    *
    * @param {Object} task
    * @param {Object} decryptedPayload
@@ -514,6 +618,7 @@ async function deliverTasks(ctx, tasks) {
    */
   async function encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, extra) {
     if (!decryptedPayload || !userKey) return null;
+    if (!(await payloadStillFresh(task))) return null;
     try {
       return await encryptForStorage(JSON.stringify({
         ...decryptedPayload,
@@ -536,11 +641,8 @@ async function deliverTasks(ctx, tasks) {
    * 的适配器兜底的；但两份都得清干净——同一个部署换个适配器、或者投影从不同的
    * 列集读行，剩下的那一份就会翻出来当成「最近一次失败」。
    *
-   * 手里这份 payload 是占位时的快照，而一次投递可能跑几十秒——其间用户
-   * `PUT /update-message` 改过这条任务的话，把快照原样写回去就等于把那次修改
-   * 静默回滚了（这条路上的适配器没实现 claimTask，也就没有租约拦着）。所以写
-   * 之前先确认行上的密文还是同一份，变了就不清了：留一条过时的 lastError，比
-   * 吞掉用户刚保存的改动强，而且下一次成功投递会自己把它清掉。
+   * 同样先过 payloadStillFresh：清不掉最多留一条过时的 lastError，下一次成功
+   * 投递会自己把它清掉。
    *
    * @param {Object} task - 数据库行（占位时那一份）
    * @param {Object} decryptedPayload
@@ -549,15 +651,7 @@ async function deliverTasks(ctx, tasks) {
    */
   async function encryptPayloadWithoutLastError(task, decryptedPayload, userKey) {
     if (!decryptedPayload || !userKey) return null;
-    if (typeof db.getTaskByUuid === 'function' && task.uuid) {
-      try {
-        const current = await db.getTaskByUuid(task.uuid, task.user_id);
-        if (!current || current.encrypted_payload !== task.encrypted_payload) return null;
-      } catch (_readError) {
-        // 读不到就当它可能变过，别赌。
-        return null;
-      }
-    }
+    if (!(await payloadStillFresh(task))) return null;
     try {
       const { lastError: _cleared, ...rest } = decryptedPayload;
       return await encryptForStorage(JSON.stringify(rest), userKey);
@@ -729,10 +823,12 @@ async function deliverTasks(ctx, tasks) {
     // 占位成功，投递期间滚动续租（见 startLeaseHeartbeat）。收尾必须停心跳，
     // 不管下面哪条路径退出——finally 兜住。
     const lease = startLeaseHeartbeat(task);
+    activeLeases.set(task.id, lease);
     try {
       await deliverClaimedTask(task, decrypted, lease);
     } finally {
       lease.stop();
+      activeLeases.delete(task.id);
     }
   }
 
@@ -872,6 +968,8 @@ async function deliverTasks(ctx, tasks) {
       // 间隔盖不住的那段窗口）。消息确实发出去了，但这一跳不能记成功——记成功
       // 的话，「取消接口回了 200、消息照样送达」在 summary 里一点痕迹都没有。
       if (recurrenceType === 'none') {
+        // 行删掉之后租约当然也续不上了，跟收尾写库一样先标一下（见 markLeaseReleased）。
+        markLeaseReleased(task.id);
         if (rowVanished(await db.deleteTaskById(task.id))) {
           recordCancelled(task, 'cancelled_after_delivery');
           return;

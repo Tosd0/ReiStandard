@@ -28,6 +28,7 @@ import {
   buildReasoningPush,
   readReasoningContent,
   stripReasoningTags,
+  DEFAULT_MULTIPART_CHUNK_BYTES,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
 } from '@rei-standard/amsg-shared';
@@ -38,7 +39,7 @@ import { callLlm } from './llm.js';
 import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
-import { appendPushesToOutbox, discardPushesFromOutbox, markPushesDelivered } from './outbox-store.js';
+import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
 import {
   buildErrorExtra,
   isNonRetryableError,
@@ -46,7 +47,7 @@ import {
   isTaskCancelledError,
   readPushStatusCode,
   sanitizeErrorSummary,
-  tagPushStatusCode,
+  sendTaggedPush,
 } from './errors.js';
 
 const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
@@ -123,43 +124,84 @@ function splitMessageIntoSentences(messageContent, splitPattern = null) {
  * @param {ProcessorContext} ctx
  * @param {Object} pushSubscription
  * @param {Object} reasoningPush
- * @returns {Promise<boolean>} 送出去了没有。false = 这条没发成，正文继续发。
+ * @returns {Promise<{ shipped: boolean, error?: string }>} shipped=false 时
+ *   error 是这条没发成的原因，正文继续发。
  */
 async function deliverReasoningPush(ctx, pushSubscription, reasoningPush) {
+  const multipart = resolveMultipartOptions(ctx);
   try {
     const serialized = JSON.stringify(reasoningPush);
     const { bytes, withinLimit } = measurePushPayload(serialized);
 
     if (withinLimit) {
-      await ctx.webpush.sendNotification(pushSubscription, serialized);
-      return true;
+      await sendTaggedPush(ctx.webpush, pushSubscription, serialized);
+      return { shipped: true };
     }
 
-    // 分片也有量级上限，接收端按同一组默认值收——超了就别发，发出去也是被
-    // sw 按 maxTotalBytes / maxChunks 拒收。
-    if (bytes > DEFAULT_MULTIPART_MAX_TOTAL_BYTES) {
-      throw new Error(`思考过程 ${bytes} 字节，超过分片传输的 ${DEFAULT_MULTIPART_MAX_TOTAL_BYTES} 字节上限`);
+    // 分片也有量级上限，超了就别发，发出去也是被 sw 拒收。判据要跟接收端那份
+    // 对齐——宿主把 installReiSW 的 multipart 收窄了，这里不知道的话，切出来
+    // 的分片到了那边一片都拼不回来（见 resolveMultipartOptions）。
+    if (bytes > multipart.maxTotalBytes) {
+      throw new Error(`思考过程 ${bytes} 字节，超过分片传输的 ${multipart.maxTotalBytes} 字节上限`);
     }
     const parts = buildMultipartPushPayloads(reasoningPush, {
       serializedPayload: serialized,
-      ttlMs: REASONING_MULTIPART_TTL_MS,
+      maxChunkBytes: multipart.maxChunkBytes,
+      ttlMs: multipart.ttlMs,
     });
-    if (parts.length > DEFAULT_MULTIPART_MAX_CHUNKS) {
-      throw new Error(`思考过程要切 ${parts.length} 片，超过分片传输的 ${DEFAULT_MULTIPART_MAX_CHUNKS} 片上限`);
+    if (parts.length > multipart.maxChunks) {
+      throw new Error(`思考过程要切 ${parts.length} 片，超过分片传输的 ${multipart.maxChunks} 片上限`);
     }
 
-    for (const part of parts) {
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(part));
+    for (let i = 0; i < parts.length; i++) {
+      await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(parts[i]));
+      // 分片跟正文的段一样按节奏发：一口气推几十条，推送服务会限流，而这里的
+      // 失败只会让整条思考过程收不齐。
+      if (i < parts.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+      }
     }
-    return true;
+    return { shipped: true };
 
   } catch (error) {
-    console.warn(
-      '[amsg-server] 思考过程未送达（正文照常发送）:',
-      sanitizeErrorSummary(error && error.message)
-    );
-    return false;
+    // 取消不是「思考过程没发成」，是整条任务的中止信号（见 run-tick 的
+    // guardWebpushWithLease）。吞掉它的话，日志会说「正文照常发送」，而实际上
+    // 下一条 push 就会把整条任务中止掉——正好把真相说反了。
+    if (isTaskCancelledError(error)) throw error;
+    const reason = sanitizeErrorSummary(error && error.message);
+    console.warn('[amsg-server] 思考过程未送达（正文照常发送）:', reason);
+    return { shipped: false, error: reason };
   }
+}
+
+/**
+ * 分片参数：默认跟 shared 那组默认值走，宿主可以用 `ctx.multipart` 收窄，跟它
+ * 给 `installReiSW` 的那份对齐。
+ *
+ * 接收端的限额是宿主可配的，发送端不跟着走的话，切出来的分片会在到达时被逐片
+ * 拒收——一条也拼不回来，而发送端这边两道门槛全都过了，看不出任何异常。
+ *
+ * @param {ProcessorContext} ctx
+ */
+function resolveMultipartOptions(ctx) {
+  const configured = (ctx && ctx.multipart && typeof ctx.multipart === 'object') ? ctx.multipart : {};
+  return {
+    maxChunkBytes: positiveIntegerOr(configured.maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES),
+    maxChunks: positiveIntegerOr(configured.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS),
+    maxTotalBytes: positiveIntegerOr(configured.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES),
+    ttlMs: positiveIntegerOr(configured.ttlMs, REASONING_MULTIPART_TTL_MS),
+  };
+}
+
+/**
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function positiveIntegerOr(value, fallback) {
+  return Number.isInteger(value) && /** @type {number} */ (value) > 0
+    ? /** @type {number} */ (value)
+    : fallback;
 }
 
 /**
@@ -347,25 +389,25 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
 
     const sentIds = [];
     let cancelledMidBurst = false;
+    // 思考过程是附赠内容，发不出去不算这条任务失败——但也不能一声不吭：调用方
+    // 拿它决定要不要重发 / 要不要提示用户思考过程这次没到。
+    let reasoningError;
     try {
       // 思考过程先发，且只影响它自己：发不出去（超限、推送服务拒收……）就跳
       // 过，正文一条不少地照发。它排在最前面又和正文共用一个循环的话，一次
       // 失败会把整条消息一起带走。
       if (reasoningPush) {
-        const reasoningShipped = await deliverReasoningPush(ctx, pushSubscription, reasoningPush);
-        if (reasoningShipped) {
+        const reasoning = await deliverReasoningPush(ctx, pushSubscription, reasoningPush);
+        if (reasoning.shipped) {
           sentIds.push(reasoningPush.messageId);
           await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+        } else {
+          reasoningError = reasoning.error;
         }
       }
 
       for (let i = 0; i < contentPushes.length; i++) {
-        try {
-          await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPushes[i]));
-        } catch (error) {
-          // 标一下「这是发 push 那一步抛的」，下面的 catch 才认它的 statusCode。
-          throw tagPushStatusCode(error);
-        }
+        await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(contentPushes[i]));
         sentIds.push(contentPushes[i].messageId);
         if (i < contentPushes.length - 1) {
           await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
@@ -383,18 +425,17 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         // 这几条不撤掉的话，客户端下一次 GET /outbox 会照样把它们拉回去——用户
         // 看到的就是「取消接口回了成功，消息还是来了」。
         // 投递失败不走这里：那种情况下这些行正是要留着补收的。
-        const delivered = new Set(sentIds);
-        await discardPushesFromOutbox({
-          db: ctx.db,
-          userId: task.user_id,
-          messageIds: pushesToSend
-            .map(push => push.messageId)
-            .filter(messageId => !delivered.has(messageId)),
+        await discardUndeliveredPushes({
+          db: ctx.db, userId: task.user_id, pushes: pushesToSend, sentIds,
         });
       }
     }
 
-    return { success: true, messagesSent: messages.length };
+    return {
+      success: true,
+      messagesSent: messages.length,
+      ...(reasoningError ? { reasoningError } : {}),
+    };
 
   } catch (error) {
     // errorCode 透传底层错误的稳定 `code`（如 PUSH_SUBSCRIPTION_MISSING），
@@ -402,8 +443,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // NonRetryableError 的透传（见 lib/errors.js），语义相同、来源更宽。
     // pushStatusCode 是推送服务回的 HTTP 状态码：410 / 404 说明这条订阅已经
     // 没了，run-tick 据此判终态——不传出来的话，那个事实只剩错误消息里的一句
-    // 人话，谁想用都得去正则匹配。只认发 push 那一步标过的错误（见
-    // lib/errors.js 的 tagPushStatusCode），别改成直接读 `error.statusCode`：
+    // 人话，谁想用都得去正则匹配。只认发 push 那一步标过的错误（发 push 一律
+    // 走 lib/errors.js 的 sendTaggedPush），别改成直接读 `error.statusCode`：
     // 这个 catch 收的是整个函数的异常，LLM 调用、fire-time hook、解密都在里
     // 面，那些错误上的 `statusCode` 不是推送状态码。
     return {

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
+import { installFakeIndexedDB, FakeDOMException } from './helpers/fake-indexeddb.mjs';
+import { buildMultipartPayloads } from './helpers/multipart-wire.mjs';
 
 // 先装可控 IndexedDB 再 import SDK（`node --test` 每个文件独立进程，不会串到
 // 别的套件里）。离线队列这条路无论如何都要 IndexedDB，没有 fallback。
@@ -15,13 +16,6 @@ const QUEUE_DB_NAME = 'rei-sw';
 // dbName 却没有 delivery-dedupe 这个 store 时就是这个形状。
 const brokenDbNames = new Set();
 const realIndexedDB = globalThis.indexedDB;
-
-class FakeDOMException extends Error {
-  constructor(message, name) {
-    super(message);
-    this.name = name;
-  }
-}
 
 function brokenConnection(storeName) {
   return {
@@ -319,6 +313,67 @@ test('push: a duplicate whose repair notification is rejected must not hang the 
   );
 });
 
+test('deliver: 通知弹不出来时，回执带 notificationError（首投）', async () => {
+  const { sw, state, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    dedupe: { dbName: `dedupe_notify_reject_${Date.now()}`, cleanupIntervalMs: 0 },
+  });
+
+  state.rejectNotifications = true;
+  let replies;
+  await captureErrors(async () => {
+    replies = await triggerMessage({
+      type: DELIVER,
+      source: 'sse',
+      requestId: 'req-notify-reject',
+      payload: { messageKind: 'content', messageId: 'msg_notify_reject', message: 'ack me' },
+    });
+  });
+
+  // 收下了也分发了，所以 ok 保持 true——但把 DELIVER 当备份通道用的发送端要靠
+  // 这个字段知道用户压根没看见这条消息，是该回退还是重试。
+  assert.equal(replies[0].ok, true, '分发成功了，不该报成投递失败');
+  assert.equal(replies[0].requestId, 'req-notify-reject');
+  assert.equal(
+    replies[0].notificationError, 'notification permission revoked',
+    `通知没弹出来得如实报给发送端：${JSON.stringify(replies[0])}`,
+  );
+});
+
+test('deliver: 重复包补通知被拒时，回执一样带 notificationError', async () => {
+  const { sw, state, triggerPush, triggerMessage } = createSwMock();
+  installReiSW(sw, {
+    dedupe: { dbName: `dedupe_notify_reject_dup_${Date.now()}`, cleanupIntervalMs: 0 },
+  });
+
+  const messageId = 'msg_notify_reject_dup';
+  // 首包按策略不弹通知，记录上留下 notificationShown: false。
+  await triggerPush({
+    messageKind: 'content', messageId, message: 'first', notification: { show: false },
+  });
+
+  // backup 走 DELIVER 到达，本该补一条通知，但这次 showNotification 被拒。
+  state.rejectNotifications = true;
+  let replies;
+  await captureErrors(async () => {
+    replies = await triggerMessage({
+      type: DELIVER,
+      source: 'sse',
+      requestId: 'req-notify-reject-dup',
+      payload: {
+        messageKind: 'content', messageId, message: 'first', notification: { show: 'always' },
+      },
+    });
+  });
+
+  assert.equal(replies[0].ok, true);
+  assert.equal(replies[0].duplicate, true);
+  assert.equal(
+    replies[0].notificationError, 'notification permission revoked',
+    `补通知没弹成得如实报给发送端：${JSON.stringify(replies[0])}`,
+  );
+});
+
 // --- push：分片存储坏掉要「放弃这条 multipart」，不是挂掉整条 push ----------
 
 test('push: a broken multipart store gives up on the id instead of hanging the push', async () => {
@@ -351,7 +406,7 @@ test('push: a broken multipart store gives up on the id instead of hanging the p
   }
 
   assert.ok(
-    lines.some((line) => line.includes('multipart chunk storage failed')),
+    lines.some((line) => line.includes('multipart chunk rejected (storage-failed)')),
     `失败要留下能归因的日志：${JSON.stringify(lines)}`,
   );
   assert.equal(notifications.length, 0, '手里只有半条消息，绝不能拿去弹通知');
@@ -362,27 +417,3 @@ test('push: a broken multipart store gives up on the id instead of hanging the p
   assert.equal(expired[0].payload.id, 'mp_broken_store');
   assert.equal(expired[0].payload.total, parts.length);
 });
-
-function buildMultipartPayloads(payload, { id, maxChunkBytes = 80, ttlMs = 60_000 }) {
-  const bytes = new TextEncoder().encode(JSON.stringify(payload));
-  const total = Math.ceil(bytes.byteLength / maxChunkBytes);
-  const createdAt = Date.now();
-  return Array.from({ length: total }, (_, index) => {
-    const start = index * maxChunkBytes;
-    const chunk = bytes.subarray(start, Math.min(start + maxChunkBytes, bytes.byteLength));
-    return {
-      messageKind: '_multipart',
-      multipart: {
-        version: 1,
-        id,
-        index: index + 1,
-        total,
-        encoding: 'json-utf8-base64url',
-        originalMessageKind: typeof payload.messageKind === 'string' ? payload.messageKind : null,
-        createdAt,
-        ttlMs,
-      },
-      chunk: Buffer.from(chunk).toString('base64url'),
-    };
-  });
-}

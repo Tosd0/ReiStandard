@@ -85,7 +85,7 @@ export async function markPushesDelivered({ db, userId, messageIds }) {
  * @param {string} args.userId
  * @param {string[]} args.messageIds
  */
-export async function discardPushesFromOutbox({ db, userId, messageIds }) {
+async function discardPushesFromOutbox({ db, userId, messageIds }) {
   if (!db || typeof db.discardOutboxMessages !== 'function') return;
   if (!messageIds || messageIds.length === 0) return;
   try {
@@ -93,4 +93,31 @@ export async function discardPushesFromOutbox({ db, userId, messageIds }) {
   } catch (error) {
     console.warn('[amsg-server] outbox 撤回未发出的行失败（已忽略）:', error && error.message);
   }
+}
+
+/**
+ * 把这一批 push 里「没发出去的那些」从 outbox 撤掉。
+ *
+ * 取消撞上投递时用：整批 push 在开发之前就落进了 outbox，取消只拦住了 Web
+ * Push 这一路，剩下的行不撤掉，客户端下一次 GET /outbox 会照样把它们拉回去
+ * ——用户看到的就是「取消接口回了成功，消息还是来了」。
+ *
+ * 「哪些算没发出去」这条判据收在这里：投递侧只要把整批 push 和已发出的
+ * messageId 交过来就行。
+ *
+ * @param {Object} args
+ * @param {Object} args.db
+ * @param {string} args.userId
+ * @param {Array<{ messageId: string }>} args.pushes - 落进 outbox 的整批 push
+ * @param {string[]} args.sentIds - 已经发出去的 messageId
+ */
+export async function discardUndeliveredPushes({ db, userId, pushes, sentIds }) {
+  const delivered = new Set(sentIds);
+  await discardPushesFromOutbox({
+    db,
+    userId,
+    messageIds: (pushes || [])
+      .map(push => push.messageId)
+      .filter(messageId => !delivered.has(messageId)),
+  });
 }

@@ -119,8 +119,8 @@ import {
   resolveLlmCredential as resolveLlmCredentialFromStore,
   supportsLlmCredentialsStore,
 } from './llm-credentials-store.js';
-import { appendPushesToOutbox, discardPushesFromOutbox, markPushesDelivered } from './outbox-store.js';
-import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, tagPushStatusCode } from './errors.js';
+import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, sendTaggedPush } from './errors.js';
 import { validateTaskPayloadSize } from './validation.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
@@ -871,9 +871,12 @@ async function runFireChain({
     // 'tool-request' — execute right here in the worker.
     const toolCalls = extractToolCallsFromDecision(decision);
     if (toolCalls.length === 0) {
-      throw new NonRetryableError(
+      // 留在退避阶梯里：这一轮模型没吐出能解析的 tool_calls，是这次生成的结果，
+      // 不是部署配置错了。判成终态的话，一次性任务第一次掷歪就永久 failed，而
+      // 且行离开 pending 之后连 PUT 都救不回来（409 TASK_ALREADY_COMPLETED）。
+      throw taggedRetryableError(
         'AGENTIC_EMPTY_TOOL_REQUEST: tool-request decision carried no toolCalls (neither decision.toolCalls nor pushPayloads[].toolCalls)',
-        { code: 'AGENTIC_EMPTY_TOOL_REQUEST' }
+        'AGENTIC_EMPTY_TOOL_REQUEST'
       );
     }
     if (typeof hooks.executeToolCalls !== 'function') {
@@ -927,10 +930,28 @@ async function runFireChain({
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 
-  throw new NonRetryableError(
+  // 同样留在退避阶梯里：把回合数用光是模型这一轮的走向，隔两分钟重掷一次通常
+  // 就正常收尾了。
+  throw taggedRetryableError(
     `AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`,
-    { code: 'AGENTIC_LOOP_EXCEEDED' }
+    'AGENTIC_LOOP_EXCEEDED'
   );
+}
+
+/**
+ * 带 `code` 的普通错误——会走 run-tick 的重试阶梯。
+ *
+ * 跟 {@link NonRetryableError} 的分界线：错误只跟「这一次生成掷出了什么」有关
+ * 就用这个（重掷一次多半就好了），跟部署配置 / 宿主 hook 契约有关才用那个。
+ *
+ * @param {string} message
+ * @param {string} code
+ * @returns {Error}
+ */
+function taggedRetryableError(message, code) {
+  const error = new Error(message);
+  /** @type {any} */ (error).code = code;
+  return error;
 }
 
 /**
@@ -1095,13 +1116,7 @@ async function sendHookPushPayloads({
     await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
 
     for (let i = 0; i < total; i++) {
-      try {
-        await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(finalized[i]));
-      } catch (error) {
-        // 标一下「这是发 push 那一步抛的」，processSingleMessage 的失败结果里
-        // 才认它的 statusCode 当推送状态码（见 lib/errors.js）。
-        throw tagPushStatusCode(error);
-      }
+      await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(finalized[i]));
       sentCount++;
       progress.sentCount = sentCount;
       sentIds.push(finalized[i].messageId);
@@ -1114,13 +1129,8 @@ async function sendHookPushPayloads({
     if (isTaskCancelledError(error)) {
       // 投递到一半任务被取消 / 顶替：剩下这几条不会再发了，行也别留着——留着
       // 客户端会从 GET /outbox 把它们补收回去（见 lib/outbox-store.js）。
-      const delivered = new Set(sentIds);
-      await discardPushesFromOutbox({
-        db: ctx.db,
-        userId: task.user_id,
-        messageIds: finalized
-          .map(push => push.messageId)
-          .filter(messageId => !delivered.has(messageId)),
+      await discardUndeliveredPushes({
+        db: ctx.db, userId: task.user_id, pushes: finalized, sentIds,
       });
     }
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });

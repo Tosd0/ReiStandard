@@ -100,6 +100,15 @@ const memoryMultipartPending = new Map();
 const memoryMultipartDone = new Map();
 const memoryMultipartChunks = new Map();
 const multipartLocks = new Map();
+/**
+ * 已经报过「这条 multipart 收不了」的 id → 这条记录自己的过期时刻。
+ *
+ * 一条消息的分片是一起发出来的，被拒收时（信封不合规、本地关掉了 multipart、
+ * 分片仓库坏掉）每一片都会各走一次拒收出口，页面就会为同一条消息收到几十条
+ * 一模一样的 MULTIPART_EXPIRED。这些分片一片都不落库，写不了 done 墓碑，所以
+ * 记在内存里：同一条消息的分片只隔几秒就到齐，SW 睡了重启最多让它多报一次。
+ */
+const rejectedMultipartIds = new Map();
 const dedupeDbCache = new Map();
 
 // SW ↔ 页面 postMessage 常量（REI_AMSG_POSTMESSAGE_TYPE / REI_SW_EVENT /
@@ -227,6 +236,9 @@ async function handlePushPayload(sw, payload, ctx) {
     claim.duplicateNotification = duplicateNotification;
     await notifyDuplicate(payload, claim, ctx);
     const result = { ...claim, duplicateNotification };
+    if (duplicateNotification && duplicateNotification.error !== undefined) {
+      result.notificationError = duplicateNotification.error;
+    }
     // The first delivery claims this key and runs business once. If that
     // business failed, the failure is persisted on the dedupe record — and a
     // duplicate (sender retry, or the other transport's backup) is the only
@@ -266,6 +278,12 @@ async function handlePushPayload(sw, payload, ctx) {
     // hit `notificationStatePending` and skip the repair path.
     await updateDedupeNotificationState(claim, ctx, intermediateResult);
   });
+  const notificationError = dispatchResult && dispatchResult.notification
+    ? dispatchResult.notification.error
+    : undefined;
+  if (notificationError !== undefined) {
+    claim.notificationError = notificationError;
+  }
   const businessError = dispatchResult ? dispatchResult.businessError : undefined;
   if (businessError !== undefined) {
     claim.businessError = businessError;
@@ -303,6 +321,12 @@ async function handleDeliverMessage(sw, event, message, ctx) {
     // 知道这次没有去重保护——同一条消息的另一路 backup 可能会再投一次。
     if (result.dedupeError !== undefined) {
       ack.dedupeError = result.dedupeError;
+    }
+    // 通知没弹出来（权限被撤 / 配额 / OS 错误）。payload 收下了也分发了，所以
+    // `ok` 保持 true；但把 DELIVER 当备份通道用的发送端要靠这个字段判断这条
+    // 消息用户到底看没看见。
+    if (result.notificationError !== undefined) {
+      ack.notificationError = result.notificationError;
     }
     respondToSender(event, ack);
   } catch (error) {
@@ -348,6 +372,9 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
         .then(
           () => { notificationState.shown = true; },
           (error) => {
+            // 记下来（不只是打日志）：DELIVER 的回执要能说出「收下了，但没弹
+            // 出来」，跟 businessError 同一个口径。
+            notificationState.error = errorToMessage(error);
             console.error('[rei-standard-amsg-sw] showNotification rejected:', error);
           }
         )
@@ -877,9 +904,11 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
     await sw.registration.showNotification(notification.title, notification.options);
   } catch (error) {
     // 补通知被拒（权限被撤 / 配额 / OS 错误）不能把整条 duplicate 处理带走：
-    // 首投路径 dispatchBusinessPayload 已经是这么处理的，这里对齐。
+    // 首投路径 dispatchBusinessPayload 也是这么处理的。但失败要如实带回去——
+    // 发送端把 REI_AMSG_DELIVER 当备份通道用时，靠回执上的 notificationError
+    // 才知道这条消息压根没弹出来，是该回退还是重试。
     console.error('[rei-standard-amsg-sw] duplicate showNotification rejected:', error);
-    return { shown: false, reason: 'show-failed' };
+    return { shown: false, reason: 'show-failed', error: errorToMessage(error) };
   }
 
   try {
@@ -1021,20 +1050,7 @@ async function acceptMultipartChunkSafely(sw, payload, options) {
   try {
     return await acceptMultipartChunk(sw, payload, options);
   } catch (error) {
-    console.error(
-      '[rei-standard-amsg-sw] multipart chunk storage failed; giving up on this multipart id:',
-      error
-    );
-    const meta = payload && typeof payload.multipart === 'object' && payload.multipart
-      ? payload.multipart
-      : {};
-    await dispatchMultipartExpired(sw, {
-      id: meta.id,
-      total: meta.total,
-      originalMessageKind: typeof meta.originalMessageKind === 'string'
-        ? meta.originalMessageKind
-        : null,
-    }, MULTIPART_FAILURE_REASON.STORAGE_FAILED);
+    await rejectMultipartChunk(sw, payload, MULTIPART_FAILURE_REASON.STORAGE_FAILED, error);
     return null;
   }
 }
@@ -1055,12 +1071,27 @@ async function rejectMultipartChunk(sw, payload, reason, detail) {
   const meta = payload && typeof payload.multipart === 'object' && payload.multipart
     ? payload.multipart
     : {};
+  if (typeof meta.id !== 'string' || !meta.id) {
+    console.error(
+      `[rei-standard-amsg-sw] multipart chunk rejected (${reason}):`,
+      detail,
+      { id: meta.id, index: meta.index, total: meta.total }
+    );
+    return;
+  }
+
+  const now = Date.now();
+  pruneRejectedMultipartIds(now);
+  // 同一个 id 只报一次：日志和给页面的事件都是「这条消息收不了」，剩下的分片
+  // 再说一遍不带新信息，却会让页面弹出几十个一样的提示。
+  if (rejectedMultipartIds.has(meta.id)) return;
+  rejectedMultipartIds.set(meta.id, now + REJECTED_MULTIPART_ID_TTL_MS);
+
   console.error(
     `[rei-standard-amsg-sw] multipart chunk rejected (${reason}):`,
     detail,
     { id: meta.id, index: meta.index, total: meta.total }
   );
-  if (typeof meta.id !== 'string' || !meta.id) return;
   await dispatchMultipartExpired(sw, {
     id: meta.id,
     total: Number.isInteger(meta.total) ? meta.total : null,
@@ -1068,6 +1099,21 @@ async function rejectMultipartChunk(sw, payload, reason, detail) {
       ? meta.originalMessageKind
       : null,
   }, reason);
+}
+
+/** 拒收记录留多久。比重组窗口长一截，够盖住同一条消息的所有分片和推送服务的重投。 */
+const REJECTED_MULTIPART_ID_TTL_MS = DEFAULT_MULTIPART_TTL_MS * 2;
+
+/**
+ * 清掉过期的拒收记录。这个表只在拒收路径上长，长度就是「最近几分钟收不了的
+ * multipart 条数」，顺手扫一遍比挂个定时器省事。
+ *
+ * @param {number} now
+ */
+function pruneRejectedMultipartIds(now) {
+  for (const [id, expiresAt] of rejectedMultipartIds) {
+    if (expiresAt <= now) rejectedMultipartIds.delete(id);
+  }
 }
 
 async function acceptMultipartChunk(sw, payload, options) {
@@ -1114,23 +1160,29 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
   const now = Date.now();
   const existing = await readMultipartPending(normalized.id);
   if (existing && existing.expiresAt <= now) {
-    await deleteMultipartPending(existing.id);
+    // 窗口从本地收到第一片起算，走到这里说明剩下的分片迟到得超过了整个 ttlMs。
+    // 这条 id 到此为止：连同已落库的分片一起清掉、补一条 done 墓碑，后面迟到的
+    // 分片静默丢弃。只删 pending 不删分片的话，新窗口的计数从 0 重来，而旧分片
+    // 会被「这一片已经有了」挡在门外，这条 id 就再也收不齐了。
+    console.error(
+      '[rei-standard-amsg-sw] multipart reassembly window elapsed; giving up on this multipart id:',
+      { id: existing.id, total: existing.total, receivedCount: existing.receivedCount }
+    );
+    await settleMultipartId(existing, existing.total, options);
     await dispatchMultipartExpired(sw, existing);
+    return null;
   }
 
-  const base = existing && existing.expiresAt > now
-    ? existing
-    : {
-        id: normalized.id,
-        createdAt: normalized.createdAt,
-        expiresAt: normalized.expiresAt,
-        ttlMs: normalized.ttlMs,
-        total: normalized.total,
-        originalMessageKind: normalized.originalMessageKind,
-        encoding: normalized.encoding,
-        receivedCount: 0,
-        receivedBytes: 0,
-      };
+  const base = existing || {
+    id: normalized.id,
+    expiresAt: normalized.expiresAt,
+    ttlMs: normalized.ttlMs,
+    total: normalized.total,
+    originalMessageKind: normalized.originalMessageKind,
+    encoding: normalized.encoding,
+    receivedCount: 0,
+    receivedBytes: 0,
+  };
 
   if (base.total !== normalized.total || base.encoding !== normalized.encoding) {
     // 同一个 id 的分片对 total / encoding 各说各话：已收的部分拼不回去，
@@ -1278,7 +1330,6 @@ function normalizeMultipartChunk(payload, options) {
     positiveIntegerOrDefault(meta.ttlMs, options.ttlMs),
     options.ttlMs
   );
-  const createdAt = Number.isFinite(meta.createdAt) ? Number(meta.createdAt) : now;
   // 重组窗口从**本地收到第一片**算起，不从发送端的 createdAt 算。
   //
   // ttlMs 说的是「攒着半截分片等剩下的能等多久」，而分片是一起发出来的、也会
@@ -1293,7 +1344,6 @@ function normalizeMultipartChunk(payload, options) {
 
   return {
     id: meta.id,
-    createdAt,
     expiresAt,
     ttlMs,
     total: meta.total,

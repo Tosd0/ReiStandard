@@ -1489,3 +1489,132 @@ test('成功收尾清 lastError：不覆盖投递期间用户改过的正文', a
   const payload = await decryptPayloadOf(row);
   assert.equal(payload.userMessage, '用户刚改的正文。', '投递收尾不能把用户刚保存的改动写回旧值');
 });
+
+// 投递跑到一半失败，而用户在这几十秒里 PUT 改了任务。失败收尾要往 payload 里
+// 记 lastError，但它写的是领取时的快照——原样写回去，那次修改就被静默回滚了。
+// 成功收尾那条路早就有这个守卫，失败这条路走得更勤，一样得有。
+test('失败收尾记 lastError：不覆盖投递期间用户改过的正文', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'concurrent-put-on-failure',
+    recurrenceType: 'daily',
+    nextSendAt: recentDue(),
+    payload: { userMessage: '旧的正文。' }
+  });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+
+  const webpush = {
+    async sendNotification() {
+      markSending();
+      await gate;
+      throw new Error('push failed');
+    }
+  };
+
+  const tick = runScheduledTick({
+    db: withoutClaimTask(adapter), masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 0
+  });
+  await sending;
+
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const updated = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei',
+    messageType: 'fixed',
+    userMessage: '用户刚改的正文。',
+    recurrenceType: 'daily'
+  }), userKey);
+  assert.ok(await adapter.updateTaskByUuid('concurrent-put-on-failure', USER, updated, { retry_count: 0 }));
+  openGate();
+
+  await tick;
+
+  const row = await findTaskAnyStatus(adapter, 'concurrent-put-on-failure');
+  const payload = await decryptPayloadOf(row);
+  assert.equal(payload.userMessage, '用户刚改的正文。', '失败收尾也不能把用户刚保存的改动写回旧值');
+  // 行上那一列照常记得下失败原因，跟密文那份互不影响。
+  assert.ok(row.last_error, '失败原因该记在行上');
+});
+
+// 自建适配器可能既没有 last_error 列、拒绝未知字段时又只回一句自己的话。状态
+// 推进不能被这条锦上添花的记录挡住——挡住的话 retry_count 不涨、next_send_at
+// 不动，这条任务会被每一跳 cron 重新捞起来，LLM 每次重跑一遍还每次都计费。
+test('适配器拒收 last_error 且措辞对不上关键词：状态照样推进', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'opaque-adapter', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const rejected = [];
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') return undefined;
+      if (prop === 'updateTaskById') {
+        return async (taskId, fields) => {
+          if (Object.prototype.hasOwnProperty.call(fields, 'last_error')) {
+            rejected.push(fields);
+            throw new Error('unsupported update field');
+          }
+          return target.updateTaskById(taskId, fields);
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const webpush = { async sendNotification() { throw new Error('push failed'); } };
+  const res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.failedCount, 1);
+  assert.notEqual(
+    res.details.failedTasks[0].status, 'retry_update_failed',
+    `写库不该整笔失败：${JSON.stringify(res.details.failedTasks[0])}`,
+  );
+  assert.ok(rejected.length >= 1, '得先真的试过写这一列，才谈得上退而求其次');
+
+  const row = await adapter.getTaskByUuidOnly('opaque-adapter');
+  assert.equal(row.retry_count, 1, '重试计数必须往前走，不然这条任务永远卡在原地');
+  assert.notEqual(row.next_send_at, null);
+  // 这一列写不进去就不写了，但重试排期已经落库——下一跳按退避走，不是立刻重跑。
+  assert.ok(Date.parse(row.next_send_at) > Date.now(), '退避要真的排出去');
+});
+
+// 收尾写库会把 lease_until 置空，之后心跳当然续不上租约——那是我们自己放的
+// 手。报成「行被取消或顶替」的话，运维会在 tick 日志里看到一条正常送达的消息
+// 带着取消告警，而这个分支存在的意义正是让取消看得见。
+test('正常收尾不会被心跳误报成「任务被取消」', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'clean-finish', recurrenceType: 'daily', nextSendAt: recentDue() });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+
+  let res;
+  try {
+    // 心跳每 1ms 敲一次：收尾之后、processTask 停表之前，必然有几次落在中间。
+    // onStaleSkip 之类的宿主 hook 会把这段窗口拉得更长，这里用 afterSend 模拟。
+    res = await runScheduledTick({
+      db: adapter,
+      masterKey: MASTER_KEY,
+      vapid: VAPID,
+      webpush: fakeWebpush(),
+      leaseHeartbeatMs: 1,
+      onAfterSend: async () => { await new Promise((resolve) => { setTimeout(resolve, 30); }); }
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(res.successCount, 1, '这条消息是正常送达的');
+  assert.equal(res.details.cancelledTasks.length, 0);
+  assert.equal(
+    warnings.filter((line) => line.includes('租约已失效')).length, 0,
+    `正常收尾不该报租约失效：${JSON.stringify(warnings)}`,
+  );
+});

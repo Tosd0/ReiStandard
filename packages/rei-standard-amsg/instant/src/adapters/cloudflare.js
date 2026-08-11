@@ -41,7 +41,8 @@
  *   #   AMSG_CLIENT_TOKEN   # optional
  */
 
-import { createInstantHandler, buildCorsHeaders, CORS_ALLOW_HEADERS } from '../index.js';
+import { redactCredentials } from '@rei-standard/amsg-shared';
+import { createInstantHandler, buildCorsHeaders } from '../index.js';
 
 /**
  * @typedef {Object} ErrorCause
@@ -53,15 +54,8 @@ import { createInstantHandler, buildCorsHeaders, CORS_ALLOW_HEADERS } from '../i
  * @property {string} [code] - 错误自带的 `code` 字符串（有才带）
  */
 
-/**
- * 「短前缀 + 长随机串」形态的 key（`sk-…` / `xai-…` / `sk-ant-api03-…`）。
- *
- * 尾巴要有连续 16 个以上的字母数字才算数。模型 ID 长得很像这个形状
- * （`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`），但它是一串被连
- * 字符切开的短词，凑不出这么长的一段随机串。规则与 @rei-standard/amsg-shared
- * 的 `redactCredentials` 一致，改一处要几处一起改。
- */
-const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
+/** 回给调用方的错误摘要最长留这么多字符。 */
+const ERROR_SUMMARY_MAX_CHARS = 500;
 
 /**
  * 把错误消息压成能随响应体回给调用方的一行。
@@ -69,16 +63,18 @@ const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
  * 错误消息偶尔会回显请求细节（上游 API 的报错带 URL、header 片段），所以长得
  * 像凭据的串一律遮掉，再截断——这条响应是跨域前端能直接读到的。
  *
+ * 遮什么、怎么遮由 @rei-standard/amsg-shared 的 `redactCredentials` 说了算，
+ * 这里只负责压平空白和截断。
+ *
  * @param {unknown} reason
  * @returns {string}
  */
 function sanitizeErrorSummary(reason) {
-  let s = String(reason ?? '').replace(/\s+/g, ' ').trim();
-  s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(CREDENTIAL_LIKE_TOKEN, '[redacted]');
-  s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
-  if (s.length > 500) s = `${s.slice(0, 497)}…`;
-  return s;
+  const flattened = String(reason ?? '').replace(/\s+/g, ' ').trim();
+  const safe = redactCredentials(flattened);
+  return safe.length > ERROR_SUMMARY_MAX_CHARS
+    ? `${safe.slice(0, ERROR_SUMMARY_MAX_CHARS - 3)}…`
+    : safe;
 }
 
 /**
@@ -123,11 +119,8 @@ function summarizeErrorCause(error, stage) {
 function degradedCorsHeaders(requestOrigin) {
   if (!requestOrigin) return null;
   return {
-    'Access-Control-Allow-Origin': requestOrigin,
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
+    ...buildCorsHeaders({ allowOrigin: requestOrigin }),
     'Access-Control-Max-Age': '0',
-    'Vary': 'Origin',
   };
 }
 

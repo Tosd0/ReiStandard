@@ -10,6 +10,18 @@ import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../
 import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize, taskPayloadByteLength } from '../lib/validation.js';
 import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs } from '../lib/llm-credentials-store.js';
 
+/**
+ * 行级列名 → 对应的请求字段名。
+ *
+ * 正文字段改的是密文那一份（走 appliedPatch，键名就是请求字段名），行级字段改
+ * 的是列（走 extraFields，键名是列名）。回执里的 `updatedFields` 报的是请求字
+ * 段名，所以行级那一侧要翻译一下。
+ *
+ * 这里没有的列是本接口自己写的（重置 retry_count / 放掉 retry_after），不来自
+ * 请求，自然也不该出现在 `updatedFields` 里。
+ */
+const REQUEST_FIELD_BY_COLUMN = { next_send_at: 'nextSendAt' };
+
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
     const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
@@ -276,7 +288,7 @@ export function createUpdateMessageHandler(ctx) {
     const serializedUpdatedData = JSON.stringify(updatedData);
     const sizeError = validateTaskPayloadSize(serializedUpdatedData);
     if (sizeError
-        && taskPayloadByteLength(serializedUpdatedData) > taskPayloadByteLength(JSON.stringify(existingData))) {
+        && sizeError.details.bytes > taskPayloadByteLength(JSON.stringify(existingData))) {
       return { status: 400, body: { success: false, error: sizeError } };
     }
 
@@ -292,6 +304,7 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.nextSendAt ? { next_send_at: updates.nextSendAt } : {})
     };
 
+
     const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
 
     if (!result) {
@@ -301,9 +314,16 @@ export function createUpdateMessageHandler(ctx) {
     // 只报真正生效的字段。请求里带了但没被应用的键（这个接口不接受的、拼错
     // 的、或者传了 null 走 truthy spread 被忽略的），照单报成「改了」会让调用
     // 方以为生效了，其实库里一个字节没动。
-    const appliedFieldNames = new Set(Object.keys(appliedPatch));
-    if (updates.nextSendAt) appliedFieldNames.add('nextSendAt');
-    const updatedFields = Object.keys(updates).filter(name => appliedFieldNames.has(name));
+    //
+    // 两个来源都算：正文字段进 appliedPatch（密文那一份），行级字段进
+    // extraFields（列那一份）。只数 appliedPatch、再给行级字段一个个补特例的
+    // 话，下一个行级可更新字段会悄无声息地从 updatedFields 里漏掉——那正是这
+    // 个字段要消灭的那种谎报。
+    const applied = new Set([
+      ...Object.keys(appliedPatch),
+      ...Object.keys(extraFields).map(column => REQUEST_FIELD_BY_COLUMN[column]),
+    ]);
+    const updatedFields = Object.keys(updates).filter(name => applied.has(name));
 
     return {
       status: 200,

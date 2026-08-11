@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { buildMultipartPayloads } from './helpers/multipart-wire.mjs';
 
 import {
   installReiSW,
@@ -112,34 +113,6 @@ const COMMON = Object.freeze({
   sessionId: 'sess_test_0',
   timestamp: '2026-05-19T00:00:00.000Z'
 });
-
-function buildMultipartPayloads(payload, {
-  id = `mp_test_${Math.random().toString(16).slice(2)}`,
-  maxChunkBytes = 80,
-  ttlMs = 60_000,
-  createdAt = Date.now(),
-} = {}) {
-  const bytes = new TextEncoder().encode(JSON.stringify(payload));
-  const total = Math.ceil(bytes.byteLength / maxChunkBytes);
-  return Array.from({ length: total }, (_, index) => {
-    const start = index * maxChunkBytes;
-    const chunk = bytes.subarray(start, Math.min(start + maxChunkBytes, bytes.byteLength));
-    return {
-      messageKind: '_multipart',
-      multipart: {
-        version: 1,
-        id,
-        index: index + 1,
-        total,
-        encoding: 'json-utf8-base64url',
-        originalMessageKind: typeof payload.messageKind === 'string' ? payload.messageKind : null,
-        createdAt,
-        ttlMs,
-      },
-      chunk: Buffer.from(chunk).toString('base64url'),
-    };
-  });
-}
 
 test('dedupe: WebPush duplicate messageId only dispatches once', async () => {
   const businessPayloads = [];

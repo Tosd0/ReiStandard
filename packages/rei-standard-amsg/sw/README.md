@@ -150,7 +150,8 @@ const registration = await navigator.serviceWorker.ready;
 const channel = new MessageChannel();
 
 channel.port1.onmessage = (event) => {
-  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string, businessError?: string }
+  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string,
+  //        businessError?: string, dedupeError?: string, notificationError?: string }
   // 失败：{ ok: false, error: string, key?: string, requestId?: string }
 };
 
@@ -178,6 +179,11 @@ channel.port1.onmessage = (event) => {
 ```
 
 这样设计是为了向后兼容：`ok` 的含义保持不变，原本只看 `ok` 的调用方不受影响；需要严格区分「传输成功」和「业务落库成功」的调用方读 `businessError` 即可。webpush `push` 路径没有 ack，业务回调失败只会在 SW 内部 `console.error`，不会让投递 promise reject。
+
+同一套口径下还有两个可选字段，`ok` 一样保持 `true`：
+
+- `notificationError`：通知没弹出来（权限被撤、系统配额、OS 错误）。payload 收下了也分发了，但用户没被提醒——把 `deliver()` 当备份通道用的发送端靠它判断是回退还是重试。首投和重复包补通知两条路都带。
+- `dedupeError`：去重仓库读写失败，这条 payload 是绕过去重直接投递的。分发本身成功了，但这次没有去重保护，同一条消息的另一路 backup 可能会再投一次。
 
 `businessError` 会持久化到 dedupe 记录上，并且是 duplicate 自愈的开关：记录上带着 `businessError` 时，之后**同 key 的重复包**（发送方重试、或另一条 transport 的 backup）到达会重跑一次 `onBusinessPayload`——重跑成功就清掉记录上的 `businessError`（本次 ack 不带该字段，之后的重复包恢复纯去重），重跑仍失败则用新的失败信息更新记录、照旧在 ack 上报。业务成功过的记录不受影响：重复包永不重跑业务，只按当前 `notification.show` 策略决定要不要补通知。
 
@@ -294,6 +300,14 @@ pending 并广播：
 
 `'ttl-expired'` 之外的几种通常意味着发送端或链路有问题，值得报上去。同一条
 信息也会打进 `console.error`。
+
+一条 multipart 消息只会报一次收不了。分片是一起发出来的，逐片报的话页面会为
+同一条消息收到几十条一模一样的事件。
+
+重组窗口从**本地收到第一片**起算（长度取发送端标的 `ttlMs` 与本地
+`multipart.ttlMs` 里更紧的那个）。窗口过完之后才到的分片，会连同这条 id 已落
+库的分片一起清掉，之后同 id 的分片静默丢弃——留着旧分片的话，新窗口的计数从零
+重来，而旧分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。
 
 业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知。
 

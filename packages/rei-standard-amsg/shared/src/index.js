@@ -688,10 +688,14 @@ export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js'
 // 响应 + trim），instant 的 callLlmRaw 与 server 的 callLlm 共用这一份，
 // 两侧差异（stream 字段 / tools 转发 / timeoutMs）走 options 参数化。
 // 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+// `redactCredentials` 是这套里唯一一份脱敏规则：server 的
+// `sanitizeErrorSummary`（落库的 last_error 列）与 instant 的 cloudflare
+// 适配器（跨域 502 响应体）都调它，各自只负责后面的截断长度。
 export {
   callLlm,
   buildLlmRequestBody,
   normalizeAiApiUrl,
+  redactCredentials,
 } from './llm-call.js';
 
 // Web Push 加密栈（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID），

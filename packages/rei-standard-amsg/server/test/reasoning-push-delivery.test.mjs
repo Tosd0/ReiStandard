@@ -263,3 +263,59 @@ describe('pushStatusCode 的来源', () => {
     );
   });
 });
+
+describe('ReasoningPush 的取消信号与限额对齐', () => {
+  // 取消不是「思考过程没发成」，是整条任务的中止信号。吞掉它的话，日志会说
+  // 「正文照常发送」，而实际上下一条 push 就把整条任务中止掉了——正好说反。
+  it('分片发到一半任务被取消：信号往上抛，不被当成思考过程发失败', async () => {
+    const task = await createEncryptedTask(LLM_TASK_PAYLOAD);
+    const restore = stubLlm('正文。', 'x'.repeat(MAX_PUSH_PAYLOAD_BYTES * 2));
+
+    let calls = 0;
+    const ctx = createContext(async () => {
+      calls++;
+      if (calls === 2) {
+        const error = new Error('任务在投递期间被取消或顶替');
+        error.code = 'TASK_CANCELLED';
+        throw error;
+      }
+    });
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, false, '取消要如实报成没送达');
+      assert.equal(result.errorCode, 'TASK_CANCELLED');
+    } finally {
+      restore();
+    }
+  });
+
+  // 接收端的限额是宿主可配的（installReiSW 的 multipart）。发送端不跟着走的
+  // 话，切出来的分片到了那边会被逐片拒收，一条也拼不回来——而发送端这边两道
+  // 门槛全都过了，看不出任何异常。
+  it('宿主收窄 multipart 限额时，发送端跟着收窄（宁可不发也不发一堆收不了的）', async () => {
+    const task = await createEncryptedTask(LLM_TASK_PAYLOAD);
+    const restore = stubLlm('正文。', 'x'.repeat(MAX_PUSH_PAYLOAD_BYTES * 4));
+
+    const sent = [];
+    const ctx = {
+      ...createContext(async (_sub, payload) => { sent.push(JSON.parse(payload)); }),
+      // 接收端只肯收 2 片，这段思考过程远不止 2 片。
+      multipart: { maxChunks: 2 },
+    };
+
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true, '思考过程发不出去不影响正文');
+      assert.ok(result.reasoningError, `发不出去要说出原因：${JSON.stringify(result)}`);
+      assert.match(result.reasoningError, /2 片上限/);
+      assert.equal(
+        sent.filter((push) => push.messageKind === '_multipart').length, 0,
+        '既然对面收不了，一片都不该发出去',
+      );
+      assert.ok(sent.some((push) => push.messageKind === 'content'), '正文照发');
+    } finally {
+      restore();
+    }
+  });
+});

@@ -213,7 +213,10 @@ describe('fire-time hook 的契约违约', () => {
     assert.equal(result.errorCode, 'AGENTIC_BAD_DECISION');
   });
 
-  it('轮数用尽也没等到 finish → 确定性失败（每重试一轮就是一整个循环）', async () => {
+  // 把回合数用光跟「慢一次」是同一类事：结果取决于这一轮模型掷出了什么，隔两
+  // 分钟重掷一次多半就正常收尾了。判终态的话，一次性任务第一次掷歪就永久
+  // failed，而且行离开 pending 之后连 PUT 都救不回来（409）。
+  it('轮数用尽也没等到 finish：仍是可重试的，掷歪一次不等于永远掷歪', async () => {
     const result = await fireWith(
       {
         onBeforeFire: async () => [{ role: 'user', content: 'U' }],
@@ -223,8 +226,28 @@ describe('fire-time hook 的契约违约', () => {
     );
 
     assert.equal(result.success, false);
-    assert.equal(result.permanent, true);
+    assert.notEqual(result.permanent, true);
     assert.equal(result.errorCode, 'AGENTIC_LOOP_EXCEEDED');
+  });
+
+  // 模型这一轮吐了 tool-request 却没给出能解析的 tool_calls——同样是掷出来的
+  // 结果，不是部署配置错了。
+  it('tool-request 里一个 toolCall 都没有：仍是可重试的', async () => {
+    const result = await fireWith(
+      {
+        onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+        // 决策形状本身合法，只是这一轮没吐出任何能解析的 tool_calls。
+        onLLMOutput: async () => ({
+          decision: 'tool-request',
+          pushPayloads: [{ messageKind: 'tool_request' }]
+        })
+      },
+      { maxToolIterations: 2 }
+    );
+
+    assert.equal(result.success, false);
+    assert.notEqual(result.permanent, true);
+    assert.equal(result.errorCode, 'AGENTIC_EMPTY_TOOL_REQUEST');
   });
 
   it('整体超时仍是可重试的：慢一次不等于永远慢', async () => {

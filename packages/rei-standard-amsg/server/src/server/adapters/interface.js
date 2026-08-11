@@ -145,6 +145,12 @@
  *   （可选）投递期间的租约续期（runScheduledTick 的心跳）。只在行仍是
  *   pending 且 lease_until 非空时生效——收尾放掉租约之后，迟到的心跳不会把
  *   它复活。不实现 → 心跳自动关闭，退回一次性长租约（claimLeaseMs）。
+ *
+ *   返回值现在还是「这条任务是不是被取消/顶替了」的信号：明确返回 `false`
+ *   会中止这次投递剩下的推送（行已经不在了，再发就是「取消接口回了成功，
+ *   消息照样送达」）。所以匹配不到行时必须返回 `false`，不能返回 undefined
+ *   ——什么都不返回等于关掉这条信号，取消撞上投递时又会照发。抛错不算行没
+ *   了，只当作这次没续上，下个心跳再试。
  * @property {(uuid: string, userId: string) => Promise<{ status: string, last_error: string|null }|null>} [getTaskStatusInfo]
  *   （可选）状态 + last_error 列（脱敏失败摘要的 JSON 串）。GET /message 用
  *   它把「为什么失败」透给已失败的行；不实现时退回 getTaskStatus（409 里就

@@ -16,7 +16,9 @@
 
 现在它们都带 `permanent: true` 和一个稳定的 `code`：
 
-`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_EMPTY_TOOL_REQUEST` / `AGENTIC_LOOP_EXCEEDED` / `AGENTIC_SCHEDULE_FAILED`
+`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_SCHEDULE_FAILED`
+
+「这一轮模型掷出了什么」决定的两种结果不在此列，它们带 `code` 但不带 `permanent`，照常走退避阶梯：`AGENTIC_LOOP_EXCEEDED`（回合数用光也没等到 finish/skip-push 决策）与 `AGENTIC_EMPTY_TOOL_REQUEST`（tool-request 决策里一个能解析的 toolCall 都没有）。隔两分钟重掷一次多半就正常收尾了；判成终态的话，一次性任务第一次掷歪就永久 `failed`，而且行离开 `pending` 之后连 `PUT /update-message` 都救不回来（409）。
 
 错误消息和类型都没变（决策校验抛的仍是 `TypeError`，`scheduleTask` 的参数护栏仍是 `TypeError` / `RangeError`），按消息文本或类型分流的宿主代码不受影响。
 

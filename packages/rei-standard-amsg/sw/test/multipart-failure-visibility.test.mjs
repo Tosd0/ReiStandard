@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
+import { installFakeIndexedDB, FakeDOMException } from './helpers/fake-indexeddb.mjs';
+import { buildChunksFromText, buildMultipartPayloads } from './helpers/multipart-wire.mjs';
 
 // 先装可控 IndexedDB 再 import SDK（`node --test` 每个文件一个进程，不会串到别的
 // 套件里）。这里要的不只是「有个库能用」，还要能在重组成功之后精准打断收尾那一步。
@@ -10,15 +11,17 @@ const fake = installFakeIndexedDB();
 const QUEUE_DB_NAME = 'rei-sw';
 const MULTIPART_DONE_STORE = 'multipart-done';
 const MULTIPART_PENDING_STORE = 'multipart-pending';
+const MULTIPART_CHUNK_STORE = 'multipart-chunk';
+
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/** 某个仓库里现在攒了多少行。用来盯「放弃一条 id 之后有没有留下孤儿分片」。 */
+function storeSize(connection, storeName) {
+  const data = connection && connection._meta && connection._meta.stores.get(storeName);
+  return data ? data.records.size : 0;
+}
 
 const { installReiSW, REI_SW_EVENT } = await import('../src/index.js');
-
-class FakeDOMException extends Error {
-  constructor(message, name) {
-    super(message);
-    this.name = name;
-  }
-}
 
 function createSwMock() {
   const listeners = new Map();
@@ -66,39 +69,6 @@ async function captureErrors(run) {
     console.error = original;
   }
 }
-
-/** 把任意字节切成 multipart 分片信封。text 不是 JSON 时用来造「拼得回、解不开」。 */
-function buildChunksFromText(text, { id, maxChunkBytes = 80, ttlMs = 60_000, originalMessageKind = null }) {
-  const bytes = new TextEncoder().encode(text);
-  const total = Math.ceil(bytes.byteLength / maxChunkBytes);
-  const createdAt = Date.now();
-  return Array.from({ length: total }, (_, index) => {
-    const start = index * maxChunkBytes;
-    const chunk = bytes.subarray(start, Math.min(start + maxChunkBytes, bytes.byteLength));
-    return {
-      messageKind: '_multipart',
-      multipart: {
-        version: 1,
-        id,
-        index: index + 1,
-        total,
-        encoding: 'json-utf8-base64url',
-        originalMessageKind,
-        createdAt,
-        ttlMs,
-      },
-      chunk: Buffer.from(chunk).toString('base64url'),
-    };
-  });
-}
-
-function buildMultipartPayloads(payload, options) {
-  return buildChunksFromText(JSON.stringify(payload), {
-    originalMessageKind: typeof payload.messageKind === 'string' ? payload.messageKind : null,
-    ...options,
-  });
-}
-
 /** 从广播里挑出 MULTIPART_EXPIRED。 */
 function expiredEvents(postedMessages) {
   return postedMessages
@@ -171,7 +141,68 @@ test('multipart: chunks arriving while multipart is disabled are reported', asyn
   assert.equal(expired[0].reason, 'disabled');
 });
 
+test('multipart: 一条收不了的消息只报一次，不按片数刷屏', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  const business = install(sw, { enabled: false });
+
+  const original = { messageKind: 'content', messageId: 'msg_mp_flood', message: 'x'.repeat(600) };
+  const parts = buildMultipartPayloads(original, { id: 'mp_disabled_flood', maxChunkBytes: 40 });
+  assert.ok(parts.length >= 5, `要多片才量得出刷屏：${parts.length}`);
+
+  await captureErrors(async () => {
+    for (const part of parts) await triggerPush(part);
+  });
+
+  assert.equal(notifications.length, 0);
+  assert.equal(business.length, 0);
+
+  const expired = expiredEvents(postedMessages);
+  assert.equal(
+    expired.length, 1,
+    `${parts.length} 片属于同一条消息，页面只该收到一次「收不了」，实际 ${expired.length} 次`,
+  );
+  assert.equal(expired[0].id, 'mp_disabled_flood');
+  assert.equal(expired[0].reason, 'disabled');
+});
+
 // --- 进了管线但收不齐 --------------------------------------------------------
+
+test('multipart: 重组窗口过完就整条放弃 —— 已落库的分片一起清掉', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  // 清扫按默认节流（15 分钟）走：迟到分片撞上的是重组那一步的过期判断，不是清扫。
+  const business = install(sw, { cleanupIntervalMs: 15 * 60_000 });
+
+  const original = { messageKind: 'content', messageId: 'msg_mp_window', message: 'x'.repeat(400) };
+  const parts = buildMultipartPayloads(original, {
+    id: 'mp_window_elapsed',
+    maxChunkBytes: 40,
+    ttlMs: 20,
+  });
+  assert.ok(parts.length >= 4, `要多片才排得出「先到几片、剩下的迟到」：${parts.length}`);
+
+  await captureErrors(async () => {
+    await triggerPush(parts[0]);
+    await triggerPush(parts[1]);
+    // 设备睡了一觉，剩下的分片迟到得超过了整个重组窗口。
+    await sleep(40);
+    for (const part of parts.slice(2)) await triggerPush(part);
+    // 推送服务把早到的那几片重投一遍。
+    await triggerPush(parts[0]);
+  });
+
+  assert.equal(notifications.length, 0, '手里只有半条消息，绝不能拿去弹通知');
+  assert.equal(business.length, 0);
+
+  const expired = expiredEvents(postedMessages);
+  assert.equal(expired.length, 1, `一条消息只该报一次收不了，实际 ${expired.length} 次`);
+  assert.equal(expired[0].id, 'mp_window_elapsed');
+
+  // 早到那两片必须跟着一起清掉：只删 pending 的话，新窗口计数从 0 重来，而旧
+  // 分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  assert.equal(storeSize(conn, MULTIPART_CHUNK_STORE), 0, '放弃这条 id 之后不该留下孤儿分片');
+  assert.equal(storeSize(conn, MULTIPART_PENDING_STORE), 0, 'pending 也该清干净');
+});
 
 test('multipart: chunks that disagree on total give up on the id observably', async () => {
   const { sw, notifications, postedMessages, triggerPush } = createSwMock();

@@ -21,7 +21,11 @@
  * happens *after* the call) is always in place before the callback runs.
  */
 
-class FakeDOMException extends Error {
+/**
+ * IndexedDB 抛的错带 `name`（`NotFoundError` / `QuotaExceededError` 之类），
+ * SW 那边就是按 name 分类的。测试要注入这类故障，就得抛同一个形状。
+ */
+export class FakeDOMException extends Error {
   constructor(message, name) {
     super(message);
     this.name = name;

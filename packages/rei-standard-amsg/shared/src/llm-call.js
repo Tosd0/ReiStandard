@@ -22,6 +22,8 @@
  * completePrompt 模式，而不是把空数组原样发给上游。
  */
 
+import { concatBytes, utf8Decode } from './webcrypto-utils.js';
+
 // 上游错误说明能留多长。provider 的报错偶尔会把请求内容整段回显（内容审核类
 // 的报错尤其爱这么干），而这段文本最终会落进 server 的 last_error 明文列、也
 // 会随 instant 的 502 原样回给调用方。够看清原因就行，正文不必全留。
@@ -32,6 +34,12 @@ const UPSTREAM_ERROR_DETAIL_MAX_CHARS = 300;
 // provider 错误码的长度上限。code 是标识符不是人话，但也别让一个来路不明的超长
 // 串撑大错误消息（与 server 记 last_error.errorCode 时的口径一致）。
 const UPSTREAM_ERROR_CODE_MAX_CHARS = 64;
+
+// 读上游错误响应体最多读这么多字节，读够就断开。错误信封
+//（`{"error":{"message":…}}`）永远在最前面，而中转出问题时能把整个请求体回显
+// 回来——任务正文上限接近 1MB，一次网关故障把一批任务同时打挂时，这些只为留
+// 300 字符而读进来的整段文本会一起压在 Worker 的内存上限上。
+const UPSTREAM_ERROR_BODY_MAX_BYTES = 16 * 1024;
 
 /**
  * Call an OpenAI-compatible API.
@@ -320,7 +328,7 @@ function buildUpstreamError(summary, status, detail) {
 async function readUpstreamErrorDetail(response) {
   let raw;
   try {
-    raw = typeof response.text === 'function' ? await response.text() : '';
+    raw = await readBoundedBody(response);
   } catch {
     return { message: '', code: '' };
   }
@@ -355,6 +363,42 @@ async function readUpstreamErrorDetail(response) {
 }
 
 /**
+ * 读上游错误响应体的开头一段（最多 {@link UPSTREAM_ERROR_BODY_MAX_BYTES}
+ * 字节），读够就把流断开。
+ *
+ * 能拿到 `response.body` 就边读边数字节；拿不到（调用方喂的是只实现了
+ * `text()` 的假响应）退回整段读。
+ *
+ * @param {Response} response
+ * @returns {Promise<string>}
+ */
+async function readBoundedBody(response) {
+  const body = response && response.body;
+  if (!body || typeof body.getReader !== 'function') {
+    return typeof response.text === 'function' ? await response.text() : '';
+  }
+
+  const reader = body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (bytes < UPSTREAM_ERROR_BODY_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.length) continue;
+      chunks.push(value);
+      bytes += value.length;
+    }
+  } finally {
+    // 读完了再 cancel 是空操作；连接早断了则抛在这里——那跟这次要报的 HTTP
+    // 失败无关，不能让它盖掉。
+    try { await reader.cancel(); } catch { /* 读 body 的二次失败不外传 */ }
+  }
+
+  return utf8Decode(concatBytes(...chunks));
+}
+
+/**
  * 把上游说明压成能安全外传的一行：压平空白 → 遮凭据 → 截断。
  *
  * @param {unknown} text
@@ -379,32 +423,47 @@ function clampCode(code) {
 /**
  * 「短前缀 + 长随机串」形态的 key（`sk-…` / `xai-…` / `sk-ant-api03-…`）。
  *
- * 尾巴要有连续 16 个以上的字母数字才算数。模型 ID 长得很像这个形状
- * （`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`），但它是一串被连
- * 字符切开的短词，凑不出这么长的一段随机串——上游那句「你写的这个模型不存在」
- * 里最关键的就是模型名，遮掉它报错就只剩「有个东西不存在」。
+ * 尾巴按整段算长度，不要求它以字母数字收尾：真实 Key 的随机段里经常夹着 `-`
+ * 和 `_`（`sk-9aBcDeFgHiJkLmNo_PqRsTu`），按「结尾必须是一长串字母数字」去卡
+ * 的话，这类 Key 只会被遮掉前半截。
  */
-const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
+const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g;
+
+/**
+ * 模型 ID 的形状：全小写字母数字，被 `-` / `.` 切成一串短段，每段不超过 12 个
+ * 字符（`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`）。这类串同时
+ * 也落在 {@link CREDENTIAL_LIKE_TOKEN} 的形状里，命中这里的原样保留——上游那
+ * 句「你写的这个模型不存在」里最关键的就是模型名，遮掉之后报错只剩「有个东西
+ * 不存在」。
+ *
+ * Key 只要带大写字母、带下划线，或者有任何一段超过 12 个字符，就落不进这个形
+ * 状，照常遮掉。
+ */
+const MODEL_ID_LIKE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]{1,12})+$/;
+
+/** 超过这个长度就不再当模型名看待：再长的短段串更可能是 Key，一律遮掉。 */
+const MODEL_ID_MAX_CHARS = 64;
 
 /**
  * 遮掉长得像凭据的串。
  *
- * 规则与 amsg-server 的 `sanitizeErrorSummary` 对齐（同一批正则、同一个判断
- * 标准）。那份在 server 包里，shared 是它的上游，反过来 import 不成立，所以
- * 这里留一份同规则的实现——改脱敏规则时两边一起改。
+ * 脱敏规则只有这一处：amsg-server 的 `sanitizeErrorSummary`（落库的
+ * `last_error` 列）和 amsg-instant 的 cloudflare 适配器（跨域 502 响应体）都
+ * 调这一份，各自只负责后面的截断长度。
  *
- * 这一层必须自己遮一遍，不能全指望下游：server 那份只覆盖落库的 last_error，
- * amsg-instant 的 502 响应体不经过它；而上游报错里最常见的凭据回显恰好是
+ * 这一层必须自己遮一遍，不能全指望下游：上游报错里最常见的凭据回显恰好是
  * 「Incorrect API key provided: sk-…」这种把 Key 原样抄回来的写法。
  *
  * @param {string} text
  * @returns {string}
  */
-function redactCredentials(text) {
+export function redactCredentials(text) {
   let s = text;
   // Bearer 头与常见「前缀-长随机串」形态的 key。
   s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(CREDENTIAL_LIKE_TOKEN, '[redacted]');
+  s = s.replace(CREDENTIAL_LIKE_TOKEN, (token) => (
+    token.length <= MODEL_ID_MAX_CHARS && MODEL_ID_LIKE.test(token) ? token : '[redacted]'
+  ));
   // 光长随机串（base64 / JWT 片段）也不放行。
   s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
   return s;

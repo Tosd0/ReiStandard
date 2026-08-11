@@ -37,3 +37,7 @@ VAPID 配错回的 **400 / 401 / 403** 维持原样，仍走重试梯子：那�
 ```
 
 心跳没开的部署（适配器没实现 `renewTaskLease`，或 `leaseHeartbeatMs` 设成 0）拿不到中途的信号，但收尾写库那一步仍会认出来，记成 `cancelled_after_delivery`。
+
+取消检查挂在 `ctx.webpush` 上的方式：拿宿主对象当原型建一个影子对象，只盖住 `sendNotification`。宿主按常见写法传 `webpush: Object.freeze({ sendNotification })` 时，这条路照样能用。
+
+心跳只把「行真的没了」当取消信号。收尾写库会把 `lease_until` 置空、成功的一次性任务干脆把行删掉，之后续租当然也匹配不到行——那是本次投递自己放的手，不记成取消。收尾之后宿主 hook 还可能 await 一阵子（`onStaleSkip` 之类），这期间飞在路上的心跳会照样落地。

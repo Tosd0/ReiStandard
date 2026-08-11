@@ -2,6 +2,8 @@
  * 错误类型：宿主 hook 与库内部共用的失败语义标注。
  */
 
+import { redactCredentials } from '@rei-standard/amsg-shared';
+
 /**
  * 确定性失败——重试必然同败，别再排退避阶梯。
  *
@@ -129,7 +131,7 @@ export function isTaskCancelledError(error) {
  * 设备吗」会变成 false，客户端多半会把用户引去重新登记，而重新登记只是把同一
  * 条死订阅再写一遍。这件事靠 last_error 里的 pushStatus 说给下游听。
  */
-export const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
+const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
 
 /**
  * 「这条内容装不下」：本地大小护栏在加密前就抛 PUSH_PAYLOAD_TOO_LARGE
@@ -144,10 +146,10 @@ export const TERMINAL_PUSH_STATUSES = new Set([404, 410]);
  * 条一次性任务都永久标 failed，配置修好也回不来了。这类失败留在退避阶梯里，
  * 原因靠 last_error 里的 errorCode / pushStatus 说清楚。
  */
-export const PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
+const PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
 
 /** 重试也好不了的错误码：订阅压根没登记、适配器不支持订阅存储、payload 超限。 */
-export const PERMANENT_ERROR_CODES = new Set([
+const PERMANENT_ERROR_CODES = new Set([
   'PUSH_SUBSCRIPTION_MISSING',
   'PUSH_SUBSCRIPTION_STORE_UNSUPPORTED',
   'PUSH_PAYLOAD_TOO_LARGE',
@@ -189,17 +191,40 @@ const pushStatusCodes = new WeakMap();
 
 /**
  * 标记「这个错误是发 push 那一步抛出来的」，把它的 `statusCode` 记成推送服务
- * 回的状态码。原样返回传入的错误，方便 `throw tagPushStatusCode(error)`。
+ * 回的状态码。原样返回传入的错误。
+ *
+ * 模块私有：外面一律走 {@link sendTaggedPush}，不要各自 try/catch 手动标。
  *
  * @template T
  * @param {T} error
  * @returns {T}
  */
-export function tagPushStatusCode(error) {
+function tagPushStatusCode(error) {
   if (error && typeof error === 'object' && Number.isInteger(/** @type {any} */ (error).statusCode)) {
     pushStatusCodes.set(/** @type {object} */ (error), /** @type {any} */ (error).statusCode);
   }
   return error;
+}
+
+/**
+ * 发一条 push，失败时自动标上「这是发 push 那一步抛的」。
+ *
+ * 发 push 的地方一律走这里，别各自写 `try { send } catch { throw
+ * tagPushStatusCode(e) }`：漏标一处，那条路上的 410 就读不出状态码，一条早就
+ * 失效的订阅会被当成普通失败，在退避阶梯上把 LLM 重跑三轮。忘了标是没有任何
+ * 提示的。
+ *
+ * @param {{ sendNotification: (subscription: any, payload: string) => Promise<any> }} webpush
+ * @param {any} subscription
+ * @param {string} payloadJson
+ * @returns {Promise<any>}
+ */
+export async function sendTaggedPush(webpush, subscription, payloadJson) {
+  try {
+    return await webpush.sendNotification(subscription, payloadJson);
+  } catch (error) {
+    throw tagPushStatusCode(error);
+  }
 }
 
 /**
@@ -238,38 +263,28 @@ export function buildErrorExtra(errorCode, pushStatus) {
   return Object.keys(extra).length > 0 ? extra : undefined;
 }
 
-/**
- * 「短前缀 + 长随机串」形态的 key（`sk-…` / `xai-…` / `sk-ant-api03-…`）。
- *
- * 尾巴要有连续 16 个以上的字母数字才算数。模型 ID 长得很像这个形状
- * （`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`），但它是一串被连
- * 字符切开的短词，凑不出这么长的一段随机串——上游那句「你写的这个模型不存在」
- * 里最关键的就是模型名，遮掉它 last_error 里就只剩「有个东西不存在」。
- *
- * 与 @rei-standard/amsg-shared 的 `redactCredentials` 是同一条规则，改一处要
- * 两处一起改。
- */
-const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]*[A-Za-z0-9]{16,}/g;
+/** 落库的 last_error 摘要最长留这么多字符。 */
+const ERROR_SUMMARY_MAX_CHARS = 500;
 
 /**
  * 把错误原因脱敏成能明文落库（任务行 last_error 列）的摘要。
  *
  * 任务内容一律密文落库，last_error 是唯一一列明文的「为什么没发出去」——
  * 错误消息偶尔会回显请求细节（上游 API 的报错带 URL、header 片段），所以
- * 长得像凭据的 token 一律遮掉，再截断到 500 字符。
+ * 长得像凭据的 token 一律遮掉，再截断。
+ *
+ * 遮什么、怎么遮由 @rei-standard/amsg-shared 的 `redactCredentials` 说了算，
+ * 这里只负责压平空白和截断。
  *
  * @param {unknown} reason
  * @returns {string}
  */
 export function sanitizeErrorSummary(reason) {
-  let s = String(reason ?? '').replace(/\s+/g, ' ').trim();
-  // Bearer 头与常见「前缀-长随机串」形态的 key。
-  s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(CREDENTIAL_LIKE_TOKEN, '[redacted]');
-  // 光长随机串（base64 / JWT 片段）也不放行。
-  s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
-  if (s.length > 500) s = `${s.slice(0, 497)}…`;
-  return s;
+  const flattened = String(reason ?? '').replace(/\s+/g, ' ').trim();
+  const safe = redactCredentials(flattened);
+  return safe.length > ERROR_SUMMARY_MAX_CHARS
+    ? `${safe.slice(0, ERROR_SUMMARY_MAX_CHARS - 3)}…`
+    : safe;
 }
 
 /**

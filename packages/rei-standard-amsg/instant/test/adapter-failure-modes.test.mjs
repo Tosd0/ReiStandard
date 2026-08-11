@@ -392,6 +392,47 @@ describe('toNodeHandler 流式转发', () => {
     }
   });
 
+  // pipeline 把「客户端走了」和「服务端的流中途死了」收敛成同一个
+  // ERR_STREAM_PREMATURE_CLOSE，从错误上分不出是谁先走的。分不出就不硬猜，但
+  // 也不能一声不吭：全静默的话，服务端自己的流死掉时这里一个字都没有，运维只
+  // 能从客户端那句 `TypeError: network error` 反推。
+  it('流没写完就结束时留一行 warn（不记成 error，免得关页面刷屏）', { timeout: 15000 }, async () => {
+    const gate = deferred();
+    const state = { upstreamFinished: false, canceled: false };
+    const server = await startServer(toNodeHandler(makeGatedSseHandler(gate, state)));
+
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    const warnings = [];
+    const errors = [];
+    console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+    console.error = (...args) => { errors.push(args.map(String).join(' ')); };
+    try {
+      const controller = new AbortController();
+      const res = await fetch(server.url, {
+        method: 'POST',
+        body: '{}',
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(3000)]),
+      });
+      const reader = res.body.getReader();
+      await reader.read();
+      controller.abort();
+
+      assert.equal(await waitFor(() => state.canceled), true);
+      assert.equal(
+        await waitFor(() => warnings.some((line) => line.includes('响应流提前结束'))),
+        true,
+        `流没写完就结束了，总得留一行：${JSON.stringify(warnings)}`,
+      );
+      assert.deepEqual(errors, [], `分不出是谁先走的，就不该记成故障：${JSON.stringify(errors)}`);
+    } finally {
+      console.warn = originalWarn;
+      console.error = originalError;
+      gate.resolve();
+      await server.close();
+    }
+  });
+
   it('JSON 模式（Accept: application/json）不受影响', async () => {
     const router = makeRouter();
     const handler = createInstantHandler({ vapid, fetch: router.fetch });
