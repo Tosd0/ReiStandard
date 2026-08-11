@@ -199,12 +199,12 @@ async function handlePushPayload(sw, payload, ctx) {
 
   if (isMultipartPush(payload)) {
     if (!ctx.multipart.enabled) return;
-    const restoredPayload = await acceptMultipartChunk(sw, payload, ctx.multipart);
+    const restoredPayload = await acceptMultipartChunkSafely(sw, payload, ctx.multipart);
     if (!restoredPayload) return;
     return handlePushPayload(sw, restoredPayload, ctx);
   }
 
-  const claim = await claimDedupe(payload, ctx);
+  const claim = await claimDedupeSafely(payload, ctx);
   if (claim.duplicate) {
     const duplicateNotification = await maybeShowDuplicateNotification(sw, payload, claim, ctx);
     claim.duplicateNotification = duplicateNotification;
@@ -280,6 +280,12 @@ async function handleDeliverMessage(sw, event, message, ctx) {
     // `ok`, so existing callers keep working and stricter callers can react.
     if (result.businessError !== undefined) {
       ack.businessError = result.businessError;
+    }
+    // 去重仓库坏掉时这条 payload 是「绕过去重直接投递」的（见
+    // claimDedupeSafely）。分发本身成功了，所以 `ok` 保持 true，但发送端得
+    // 知道这次没有去重保护——同一条消息的另一路 backup 可能会再投一次。
+    if (result.dedupeError !== undefined) {
+      ack.dedupeError = result.dedupeError;
     }
     respondToSender(event, ack);
   } catch (error) {
@@ -444,16 +450,29 @@ function shouldRenderNotification(payload, clientList) {
  * @returns {Promise<void>}
  */
 async function dispatchPushToClients(sw, eventName, payload, preFetchedClientList = null) {
+  return broadcastToClients(sw, {
+    type: REI_AMSG_POSTMESSAGE_TYPE,
+    event: eventName,
+    payload
+  }, preFetchedClientList);
+}
+
+/**
+ * 把一条信封广播给所有窗口客户端。单个 client 的 postMessage 失败不影响其他
+ * 窗口，拿不到 client 列表也只是没人收到——这个 helper 永远 resolve，可以直
+ * 接扔给 `event.waitUntil`。
+ *
+ * @param {ServiceWorkerGlobalScope} sw
+ * @param {Record<string, unknown>}  envelope
+ * @param {Array<Client>|null} [preFetchedClientList]
+ * @returns {Promise<void>}
+ */
+async function broadcastToClients(sw, envelope, preFetchedClientList = null) {
   try {
     const clientList = preFetchedClientList || await sw.clients.matchAll({
       type: 'window',
       includeUncontrolled: true
     });
-    const envelope = {
-      type: REI_AMSG_POSTMESSAGE_TYPE,
-      event: eventName,
-      payload
-    };
     for (const client of clientList) {
       try {
         client.postMessage(envelope);
@@ -462,8 +481,9 @@ async function dispatchPushToClients(sw, eventName, payload, preFetchedClientLis
       }
     }
   } catch (_matchError) {
-    // No window clients available, or the matchAll call rejected.
-    // Either way, fail silently — notification rendering still wins.
+    // No window clients available, or the matchAll call rejected. Either
+    // way, a broadcast is a courtesy to the page — it must never be the
+    // thing that fails its caller.
   }
 }
 
@@ -604,6 +624,34 @@ function positiveIntegerOrDefault(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+/**
+ * 去重是「防重复弹」的优化，不是投递的前置条件，所以它坏掉时应该多弹一条，
+ * 而不是一条都不弹。claimDedupe 全程压在 IndexedDB 上（占坑 add、过期记录
+ * 的 delete + 二次 add），设备存储写满、存储压力下连接被强关重开失败、宿主
+ * 占了同名 dbName 却没有这个 store，都会让它抛错——裸 await 会把整条 push
+ * 一起带走：通知不弹、页面收不到 postMessage、onBusinessPayload 不跑，只在
+ * SW 控制台留一条 unhandled rejection。而订阅是按 `userVisibleOnly: true`
+ * 建的，静默吞掉一条 push 的代价见 README 的通知策略一节。
+ *
+ * 因此这里整段兜住，失败时降级成「当作首次投递照常分发」，并把失败原因记在
+ * claim 上：后续的记录写回据此跳过（store 已经坏了，再写只会刷屏），DELIVER
+ * ack 也据此如实告诉发送端这条没走去重、可能重复。
+ */
+async function claimDedupeSafely(payload, ctx) {
+  try {
+    return await claimDedupe(payload, ctx);
+  } catch (error) {
+    console.error(
+      '[rei-standard-amsg-sw] dedupe claim failed; delivering as a first delivery:',
+      error
+    );
+    const key = ctx.dedupe && ctx.dedupe.enabled !== false
+      ? resolveDedupeKey(payload, ctx.dedupe)
+      : undefined;
+    return { duplicate: false, key, dedupeError: errorToMessage(error) };
+  }
+}
+
 async function claimDedupe(payload, ctx) {
   if (!ctx.dedupe || ctx.dedupe.enabled === false) {
     return { duplicate: false, key: undefined };
@@ -647,6 +695,9 @@ async function claimDedupe(payload, ctx) {
 
 async function updateDedupeNotificationState(claim, ctx, dispatchResult) {
   if (!claim || claim.duplicate || !claim.key || !ctx.dedupe || ctx.dedupe.enabled === false) return;
+  // 占坑那一步就失败过（claimDedupeSafely 降级过来的），没有可更新的记录，
+  // 再往坏掉的 store 里写只会多刷一条 error。
+  if (claim.dedupeError !== undefined) return;
   if (!dispatchResult || !dispatchResult.notification) return;
 
   const notification = dispatchResult.notification;
@@ -673,6 +724,8 @@ async function updateDedupeNotificationState(claim, ctx, dispatchResult) {
 async function updateDedupeBusinessState(claim, ctx, businessError) {
   if (businessError === undefined) return;
   if (!claim || claim.duplicate || !claim.key || !ctx.dedupe || ctx.dedupe.enabled === false) return;
+  // 同 updateDedupeNotificationState：没占上坑就没有记录可以挂失败信息。
+  if (claim.dedupeError !== undefined) return;
 
   try {
     // Attach only to the very record we claimed. While our business callback
@@ -803,20 +856,33 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
     defaultBody: ctx.defaultBody,
   });
 
-  await sw.registration.showNotification(notification.title, notification.options);
+  try {
+    await sw.registration.showNotification(notification.title, notification.options);
+  } catch (error) {
+    // 补通知被拒（权限被撤 / 配额 / OS 错误）不能把整条 duplicate 处理带走：
+    // 首投路径 dispatchBusinessPayload 已经是这么处理的，这里对齐。
+    console.error('[rei-standard-amsg-sw] duplicate showNotification rejected:', error);
+    return { shown: false, reason: 'show-failed' };
+  }
 
-  // Merge onto the LATEST record, not the pre-await `existing` snapshot:
-  // while we awaited showNotification, the first delivery may have persisted
-  // a `businessError` (or other fields) onto this key. Overwriting from the
-  // stale snapshot would erase it and break the DELIVER ack contract.
-  const latest = await readDedupeRecord(ctx.dedupe, claim.key);
-  const base = latest || existing;
-  const next = {
-    ...base,
-    notificationShown: true,
-    notificationStatePending: false,
-  };
-  await putDedupeRecord(ctx.dedupe, next);
+  try {
+    // Merge onto the LATEST record, not the pre-await `existing` snapshot:
+    // while we awaited showNotification, the first delivery may have persisted
+    // a `businessError` (or other fields) onto this key. Overwriting from the
+    // stale snapshot would erase it and break the DELIVER ack contract.
+    const latest = await readDedupeRecord(ctx.dedupe, claim.key);
+    const base = latest || existing;
+    const next = {
+      ...base,
+      notificationShown: true,
+      notificationStatePending: false,
+    };
+    await putDedupeRecord(ctx.dedupe, next);
+  } catch (error) {
+    // 通知已经弹了，记不上账最多让下一条重复包再弹一次——比把整条 push
+    // 挂掉强。
+    console.error('[rei-standard-amsg-sw] duplicate notification state update failed:', error);
+  }
 
   return { shown: true, reason: 'shown-from-duplicate' };
 }
@@ -924,6 +990,36 @@ function isMultipartPush(payload) {
     payload.multipart &&
     typeof payload.multipart === 'object' &&
     typeof payload.chunk === 'string';
+}
+
+/**
+ * 分片重组同样全程压在 IndexedDB 上（done 标记、pending 记录、chunk 本体），
+ * 存储出错时一样不能让整条 push 挂掉。但这条路的「降级」不能照搬普通 push 的
+ * 「当作首次投递照常分发」——手里只有一个分片，拿去弹通知就是把半条乱码推给
+ * 用户。所以降级成「这个 multipart id 收不齐了」：丢掉这片、留一条能归因的
+ * 日志，并按既有的 MULTIPART_EXPIRED 事件告诉页面别再等下去（TTL 清扫要靠
+ * pending 记录才触发，而写 pending 正是刚刚失败的那一步，等不到）。
+ */
+async function acceptMultipartChunkSafely(sw, payload, options) {
+  try {
+    return await acceptMultipartChunk(sw, payload, options);
+  } catch (error) {
+    console.error(
+      '[rei-standard-amsg-sw] multipart chunk storage failed; giving up on this multipart id:',
+      error
+    );
+    const meta = payload && typeof payload.multipart === 'object' && payload.multipart
+      ? payload.multipart
+      : {};
+    await dispatchMultipartExpired(sw, {
+      id: meta.id,
+      total: meta.total,
+      originalMessageKind: typeof meta.originalMessageKind === 'string'
+        ? meta.originalMessageKind
+        : null,
+    });
+    return null;
+  }
 }
 
 async function acceptMultipartChunk(sw, payload, options) {
@@ -1181,13 +1277,24 @@ async function enqueueAndFlush(sw, event, requestPayload) {
     const queueId = await addQueuedRequest(request);
 
     await registerFlushSync(sw);
-    await flushQueuedRequests(sw);
+    const outcomes = await flushQueuedRequests(sw);
 
-    respondToSender(event, {
+    // `ok: true` 只表示「已入队」，不表示「已发出去」——立即冲刷可能刚好把
+    // 这条发成功了、也可能被服务端 4xx 永久拒掉（记录随即被删，不会再发）。
+    // 老调用方只看 `ok`，行为不变；要分辨这三种结局的读下面这几个机读字段。
+    const outcome = outcomes.get(queueId);
+    const ack = {
       type: REI_SW_MESSAGE_TYPE.QUEUE_RESULT,
       ok: true,
-      queueId
-    });
+      queueId,
+      delivered: Boolean(outcome && outcome.delivered)
+    };
+    if (outcome && outcome.dropped) {
+      ack.dropped = true;
+      ack.status = outcome.status;
+      ack.error = outcome.error;
+    }
+    respondToSender(event, ack);
   } catch (error) {
     respondToSender(event, {
       type: REI_SW_MESSAGE_TYPE.QUEUE_RESULT,
@@ -1258,21 +1365,81 @@ function normalizeRequestBody(bodyInput) {
   }
 }
 
+/**
+ * 冲刷 outbox，并把每条记录这一轮的结局报回给调用方。
+ *
+ * @param {ServiceWorkerGlobalScope} sw
+ * @returns {Promise<Map<unknown, { delivered: boolean, dropped?: true, status?: number, error?: string }>>}
+ *   key 是入队时拿到的 queueId。没出现在 map 里的记录 = 这一轮没轮到它，还在
+ *   队列里等下次。
+ */
 async function flushQueuedRequests(sw) {
   const queuedRequests = await listQueuedRequests();
+  const outcomes = new Map();
 
   for (const queuedRequest of queuedRequests) {
-    const canDelete = await trySendQueuedRequest(queuedRequest);
+    const outcome = await trySendQueuedRequest(queuedRequest);
 
-    if (!canDelete) {
+    if (outcome.state === 'retry') {
       await registerFlushSync(sw);
-      return;
+      return outcomes;
     }
 
     await removeQueuedRequest(queuedRequest.id);
+
+    if (outcome.state === 'dropped') {
+      outcomes.set(queuedRequest.id, {
+        delivered: false,
+        dropped: true,
+        status: outcome.status,
+        error: outcome.error
+      });
+      await reportDroppedRequest(sw, queuedRequest, outcome);
+      continue;
+    }
+
+    outcomes.set(queuedRequest.id, { delivered: true });
   }
+
+  return outcomes;
 }
 
+/**
+ * 一条队列请求被永久拒绝、即将从队列里删掉时的失败出口。
+ *
+ * 删记录这件事本身是有意的重试策略（4xx 重试多少次都是同一个结果），但删掉之
+ * 后必须留下痕迹：页面这边最常见的触发是 token 轮换（还拿着旧 token → 401）、
+ * X-User-Id 不合法（400）、payload 超限（413）、路由改名（404），排的定时消息
+ * 就此消失，事后连查都没得查。所以这里同时给两个出口：一条能归因的
+ * console.error，和一条广播给所有窗口的 QUEUE_RESULT——页面在全局
+ * `navigator.serviceWorker` message 里按 `dropped` / `status` 机读判断，不用
+ * 去正则匹配人话。
+ *
+ * 广播里只带 url / method：headers 有鉴权信息、body 是用户内容，都不该被广播
+ * 到每个窗口。
+ */
+async function reportDroppedRequest(sw, queuedRequest, outcome) {
+  const report = {
+    type: REI_SW_MESSAGE_TYPE.QUEUE_RESULT,
+    ok: false,
+    queueId: queuedRequest.id,
+    dropped: true,
+    status: outcome.status,
+    error: outcome.error,
+    request: { url: queuedRequest.url, method: queuedRequest.method }
+  };
+
+  console.error('[rei-standard-amsg-sw] queued request dropped and will not be retried:', report);
+  await broadcastToClients(sw, report);
+}
+
+/**
+ * 发一条队列请求，返回这次的结局：
+ *  - `sent`    发出去了，服务端收下了，可以从队列删掉；
+ *  - `dropped` 被 4xx 永久拒绝，删掉不再重试，但要报出去（见
+ *              reportDroppedRequest）；
+ *  - `retry`   网络错误或 5xx，留在队列里等下一次 sync。
+ */
 async function trySendQueuedRequest(queuedRequest) {
   try {
     const response = await fetch(queuedRequest.url, {
@@ -1281,14 +1448,20 @@ async function trySendQueuedRequest(queuedRequest) {
       body: queuedRequest.body
     });
 
+    if (response.ok) return { state: 'sent' };
+
     // 4xx is usually a permanent issue for this payload, so do not retry forever.
-    if (response.ok || (response.status >= 400 && response.status < 500)) {
-      return true;
+    if (response.status >= 400 && response.status < 500) {
+      return {
+        state: 'dropped',
+        status: response.status,
+        error: `[rei-standard-amsg-sw] request rejected with HTTP ${response.status}`
+      };
     }
 
-    return false;
+    return { state: 'retry' };
   } catch (_error) {
-    return false;
+    return { state: 'retry' };
   }
 }
 
