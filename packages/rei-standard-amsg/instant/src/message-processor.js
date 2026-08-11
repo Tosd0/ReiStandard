@@ -200,6 +200,34 @@ async function callLlmRaw(payload, fetchImpl, requireContent) {
 }
 
 /**
+ * Carry the machine-readable annotations `callLlm` puts on its error over
+ * to the error instant re-throws.
+ *
+ * 两条路径都得把 LLM 失败重造成带 `LLM_CALL_FAILED` 的错误（legacy 路径手搓、
+ * hook 路径用 LlmCallError），重造时不搬这两个字段的话，接入方手里就只剩一句
+ * 人话——判「是 Key 失效、余额不够，还是上下文超长」只能拿正则去猜。
+ *
+ * `llmStatus` 是上游回的 HTTP 状态码，`providerCode` 是 provider 自己的错误码。
+ * 两个都只在上游确实答复了时才有，网络直接炸 / 超时的时候不会出现，接入方据此
+ * 也能分清「上游拒了」和「根本没连上」。
+ *
+ * 名字刻意不用 `statusCode`：本包里那个字段是推送服务回的状态码（见
+ * `sendPushesSequentially`），两条上游共用一个名字会让 502 里的数字说不清是
+ * 谁回的。
+ *
+ * @template {Error} T
+ * @param {T} error - 重造出来的错误
+ * @param {unknown} cause - callLlm 抛出来的原始错误
+ * @returns {T}
+ */
+function carryLlmErrorDetails(error, cause) {
+  const raw = /** @type {{ llmStatus?: unknown, providerCode?: unknown }} */ (cause || {});
+  if (Number.isInteger(raw.llmStatus)) error.llmStatus = raw.llmStatus;
+  if (typeof raw.providerCode === 'string' && raw.providerCode) error.providerCode = raw.providerCode;
+  return error;
+}
+
+/**
  * Process one instant request. Dispatches between two **independent**
  * paths based on whether the caller provided an `onLLMOutput` hook:
  *
@@ -278,8 +306,9 @@ async function runLegacyInstant(payload, ctx) {
     messageContent = content.trim();
     onEvent({ type: 'llm_done', sessionId });
   } catch (err) {
-    const error = new Error(err?.message || 'LLM call failed');
+    const error = new Error(err?.message || 'LLM call failed', { cause: err });
     error.code = 'LLM_CALL_FAILED';
+    carryLlmErrorDetails(error, err);
     throw error;
   }
 
@@ -440,7 +469,10 @@ async function runAgenticLoop(payload, ctx) {
       llmResponse = response;
     } catch (err) {
       onEvent({ type: 'llm_call_failed', sessionId, iteration, cause: err });
-      throw new LlmCallError(err?.message || 'LLM call failed', { cause: err });
+      throw carryLlmErrorDetails(
+        new LlmCallError(err?.message || 'LLM call failed', { cause: err }),
+        err
+      );
     }
     onEvent({ type: 'llm_done', sessionId, iteration });
 
