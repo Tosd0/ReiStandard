@@ -13,6 +13,11 @@
  * @param {string} [config.serverToken]  - optional shared secret (X-Client-Token)
  * @param {{ email?: string, publicKey?: string, privateKey?: string }} [config.vapid]
  * @param {{ sendNotification: function }} [config.webpush] - web-push-compatible sender
+ * @param {{ maxChunkBytes?: number, maxChunks?: number, maxTotalBytes?: number, ttlMs?: number }} [config.multipart]
+ *   分片传输的限额，跟传给 `installReiSW` 的那一份保持一致（同名同键，原样传过来
+ *   即可）。一条 push 装不下的思考过程要切片发，切多大、最多几片、重组窗口多长由
+ *   接收端说了算——发送端不知道这份配置的话，切出来的分片到了那边会被逐片拒收，
+ *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
  * @param {Object} [config.hooks] - optional fire-time hooks (see lib/agentic-fire.js):
  *   { onBeforeFire, onLLMOutput, executeToolCalls }. When omitted, AI tasks
  *   replay the schedule-time frozen prompt (legacy behavior, unchanged).
@@ -71,6 +76,9 @@ export function createSingleUserServer(config) {
       privateKey: vapid.privateKey || ''
     },
     webpush: config.webpush || null,
+    // 分片传输的限额（与 installReiSW 的 multipart 同一份）。instant 消息也走
+    // 这个 ctx 发，所以它要跟着 handlers 一起进来。
+    multipart: config.multipart || null,
     tenantManager,
     // Fire-time hooks (optional): the in-server instant path fires through
     // processMessagesByUuid with this ctx, so instant-type tasks can take

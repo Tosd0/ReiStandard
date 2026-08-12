@@ -329,6 +329,17 @@ curl -X POST https://instant.example.com/instant \
 
 **`/blob/:key` 端点的 error envelope 不同** —— 它走 plain `{ error: 'invalid_key' | 'blob_not_found_or_expired' | 'blob_store_not_configured' | 'blob_read_failed' }`，因为这条路径是给 SW 直 fetch 用的、跟主 SDK 的 wrap envelope 不在一条契约上。
 
+### 失败来自 LLM 时的机读标注
+
+`LLM_CALL_FAILED` 这类失败额外带两个字段，客户端靠它们分流「Key 失效，要去改配置」和「上游一时抽风，等会儿再说」，不用回去正则匹配 `message` 那句人话（那句是给用户看的，措辞随时会变）：
+
+| 字段 | 是什么 |
+|---|---|
+| `llmStatus` | 上游 LLM 回的 HTTP 状态码（`401` / `429` / `400`…） |
+| `providerCode` | provider 自己的错误码（`invalid_api_key` / `context_length_exceeded` / `RESOURCE_EXHAUSTED`…） |
+
+三条路上带的是同一组：JSON 信封里挂在 `error` 对象上，SSE 的 `event: error` 和掉线兜底的 Web Push 挂在 `ErrorPush` 顶层，`onEvent` 的 `type: 'error'` 事件也带。上游没答复（网络层就断了）时两个字段都不出现。
+
 ## 推送 payload 字段（SW 端契约）
 
 字段形状与 `amsg-server` scheduled / instant 路径一致，`@rei-standard/amsg-sw` 零修改可用，通过 `source` 区分来源。

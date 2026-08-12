@@ -107,6 +107,11 @@ const multipartLocks = new Map();
  * 分片仓库坏掉）每一片都会各走一次拒收出口，页面就会为同一条消息收到几十条
  * 一模一样的 MULTIPART_EXPIRED。这些分片一片都不落库，写不了 done 墓碑，所以
  * 记在内存里：同一条消息的分片只隔几秒就到齐，SW 睡了重启最多让它多报一次。
+ *
+ * 这张表同时就是这条结论的墓碑：报过之后，这个 id 的分片不再进重组管线、TTL
+ * 清扫也不再为它广播第二次（见 multipartIdAlreadyRejected）。墓碑记在内存而不
+ * 是 IndexedDB，是因为走到拒收出口的路里就有一条是「IndexedDB 刚刚出错」——那
+ * 时候再去写一条 done 记录，多半也是白写。
  */
 const rejectedMultipartIds = new Map();
 const dedupeDbCache = new Map();
@@ -220,6 +225,7 @@ async function handlePushPayload(sw, payload, ctx) {
       await rejectMultipartChunk(
         sw,
         payload,
+        ctx.multipart,
         MULTIPART_FAILURE_REASON.DISABLED,
         'multipart reassembly is disabled by options'
       );
@@ -1045,29 +1051,48 @@ function isMultipartPush(payload) {
  * 用户。所以降级成「这个 multipart id 收不齐了」：丢掉这片、留一条能归因的
  * 日志，并按既有的 MULTIPART_EXPIRED 事件告诉页面别再等下去（TTL 清扫要靠
  * pending 记录才触发，而写 pending 正是刚刚失败的那一步，等不到）。
+ *
+ * 存储出错往往只是一阵子的事（连接被强关、配额一时不够），所以这句话尤其得说
+ * 到做到：这条 id 会随即记进内存墓碑，后面的分片和推送服务的重投都不再收。不
+ * 记的话，剩下的分片照样能把这条消息拼齐投出来，页面却已经挂上了「这条收不
+ * 到」——一条读得到的消息旁边永远挂着失败横幅，而且再也没有事件能撤掉它。
  */
 async function acceptMultipartChunkSafely(sw, payload, options) {
   try {
     return await acceptMultipartChunk(sw, payload, options);
   } catch (error) {
-    await rejectMultipartChunk(sw, payload, MULTIPART_FAILURE_REASON.STORAGE_FAILED, error);
+    await rejectMultipartChunk(
+      sw,
+      payload,
+      options,
+      MULTIPART_FAILURE_REASON.STORAGE_FAILED,
+      error
+    );
     return null;
   }
 }
 
 /**
- * 分片还没进重组管线就被拒时的统一出口：信封不合规、或本地把 multipart 关了。
- * 这类分片一片都不会落库，pending 记录无从谈起，TTL 清扫也就永远扫不到——所以
- * 归因日志和给页面的 MULTIPART_EXPIRED 只能在这里发。
+ * 「这条 multipart 收不了」的统一出口：信封不合规、本地把 multipart 关了、分片
+ * 仓库出错。这三条都是当场下的结论，跟「等到 TTL 也没收齐」不是一回事。
+ *
+ * 归因日志和给页面的 MULTIPART_EXPIRED 只能在这里发：这几条路上写不了 done 墓
+ * 碑（存储出错那次，坏的正是 IndexedDB），pending 记录也不一定有，TTL 清扫未必
+ * 扫得到这个 id。
+ *
+ * 结论在这里就得钉死——报过之后这个 id 记进 {@link rejectedMultipartIds}，同 id
+ * 的分片一律不再收。只广播不钉死的话，剩下的分片会把这条消息照常拼齐投递出去，
+ * 页面那边的「收不到」却撤不掉了。
  *
  * `id` 都读不出来时只留日志：没有 id 的事件页面也对不上号。
  *
  * @param {ServiceWorkerGlobalScope} sw
  * @param {any}    payload - 原始的 `_multipart` push payload。
+ * @param {{ ttlMs: number }} options - 归一化后的 multipart 配置，用来算墓碑活多久。
  * @param {string} reason  - {@link MULTIPART_FAILURE_REASON} 之一。
  * @param {string} detail  - 写进日志的具体原因。
  */
-async function rejectMultipartChunk(sw, payload, reason, detail) {
+async function rejectMultipartChunk(sw, payload, options, reason, detail) {
   const meta = payload && typeof payload.multipart === 'object' && payload.multipart
     ? payload.multipart
     : {};
@@ -1084,8 +1109,8 @@ async function rejectMultipartChunk(sw, payload, reason, detail) {
   pruneRejectedMultipartIds(now);
   // 同一个 id 只报一次：日志和给页面的事件都是「这条消息收不了」，剩下的分片
   // 再说一遍不带新信息，却会让页面弹出几十个一样的提示。
-  if (rejectedMultipartIds.has(meta.id)) return;
-  rejectedMultipartIds.set(meta.id, now + REJECTED_MULTIPART_ID_TTL_MS);
+  if (multipartIdAlreadyRejected(meta.id, now)) return;
+  rejectedMultipartIds.set(meta.id, now + rejectedMultipartIdTtlMs(options));
 
   console.error(
     `[rei-standard-amsg-sw] multipart chunk rejected (${reason}):`,
@@ -1101,8 +1126,33 @@ async function rejectMultipartChunk(sw, payload, reason, detail) {
   }, reason);
 }
 
-/** 拒收记录留多久。比重组窗口长一截，够盖住同一条消息的所有分片和推送服务的重投。 */
-const REJECTED_MULTIPART_ID_TTL_MS = DEFAULT_MULTIPART_TTL_MS * 2;
+/**
+ * 拒收记录留多久：这条 id 的重组窗口翻一倍，够盖住同一条消息的所有分片和推送
+ * 服务的重投。
+ *
+ * 跟着配置走而不是写死一个常数：记录一过期，同 id 的分片就又能从零开始攒，所以
+ * 它至少得比重组窗口活得久。把 `multipart.ttlMs` 调长的接入方，写死 60 秒的话
+ * 中间那段空当里迟到的分片会重新拼起一条已经报过收不到的消息。
+ *
+ * @param {{ ttlMs?: number }} options
+ */
+function rejectedMultipartIdTtlMs(options) {
+  return positiveIntegerOrDefault(options && options.ttlMs, DEFAULT_MULTIPART_TTL_MS) * 2;
+}
+
+/**
+ * 这个 id 是不是已经报过「收不了」了。顺手把自己这条过期记录清掉。
+ *
+ * @param {string} id
+ * @param {number} [now]
+ */
+function multipartIdAlreadyRejected(id, now = Date.now()) {
+  const expiresAt = rejectedMultipartIds.get(id);
+  if (expiresAt === undefined) return false;
+  if (expiresAt > now) return true;
+  rejectedMultipartIds.delete(id);
+  return false;
+}
 
 /**
  * 清掉过期的拒收记录。这个表只在拒收路径上长，长度就是「最近几分钟收不了的
@@ -1122,6 +1172,7 @@ async function acceptMultipartChunk(sw, payload, options) {
     await rejectMultipartChunk(
       sw,
       payload,
+      options,
       MULTIPART_FAILURE_REASON.INVALID_CHUNK,
       normalized.invalid
     );
@@ -1145,6 +1196,7 @@ async function acceptMultipartChunk(sw, payload, options) {
 
 async function acceptMultipartChunkInternal(sw, normalized, options) {
   // State machine:
+  // 0. Drop chunks for ids we already told the page were unreceivable.
   // 1. Drop chunks for multipart ids that are already settled — finished, or
   //    given up on — using the short-lived done marker.
   // 2. Expire any stale pending record for this id before accepting a new one.
@@ -1153,6 +1205,13 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
   //
   // 没有「到达即过期」这一步：重组窗口是从本地收到第一片起算的（见
   // normalizeMultipartChunk），刚算出来的 expiresAt 不可能已经过去。
+
+  // 已经报过「这条收不了」的 id 不再收片。这一步排在所有 IndexedDB 之前：报这
+  // 句话的路里有一条正是「IndexedDB 刚刚出错」，那时候写不了 done 墓碑，结论只
+  // 在内存里（见 rejectedMultipartIds）。继续收下去的话，剩下的分片加上推送服务
+  // 对失败那片的重投能把这条消息照常拼齐投出来，页面却已经挂上了「收不到」。
+  if (multipartIdAlreadyRejected(normalized.id)) return null;
+
   const done = await readMultipartDone(normalized.id);
   if (done && done.expiresAt > Date.now()) return null;
   if (done) await deleteMultipartDone(normalized.id);
@@ -1392,14 +1451,18 @@ async function maybeCleanupMultipart(sw, ctx) {
 }
 
 /**
- * 这个 id 已经有结论了吗（收齐还原了，或中途放弃了）。
+ * 这个 id 已经有结论了吗（收齐还原了、中途放弃了，或者当场就判废并报给页面了）。
  *
  * TTL 清扫扫到一条过期的 pending 记录时先问一句：收尾的第一步就是写 done 墓碑
  * （见 settleMultipartId），墓碑还在就说明这条 pending 是收尾没清干净的残留，
  * 而不是「没收齐」——那条消息可能早就还原并渲染出来了，再广播一次
  * MULTIPART_EXPIRED 等于告诉用户一条他已经读过的消息没收到。
+ *
+ * 当场判废那条路（见 rejectMultipartChunk）的结论只记在内存里，一样算数：页面
+ * 早就收到过一次「这条收不了」，清扫再补一次只是同一句话说两遍。
  */
 async function multipartIdAlreadySettled(id, now) {
+  if (multipartIdAlreadyRejected(id, now)) return true;
   const done = await readMultipartDone(id);
   return !!done && done.expiresAt > now;
 }

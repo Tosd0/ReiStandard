@@ -57,6 +57,11 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @typedef {Object} ReiServerConfig
  * @property {VapidConfig} [vapid]   - VAPID keys for Web Push.
  * @property {TenantServerConfig} tenant - Tenant config & auth settings.
+ * @property {{ maxChunkBytes?: number, maxChunks?: number, maxTotalBytes?: number, ttlMs?: number }} [multipart]
+ *   分片传输的限额，跟传给 `installReiSW` 的那一份保持一致（同名同键，原样传过来
+ *   即可）。一条 push 装不下的思考过程要切片发，切多大、最多几片、重组窗口多长由
+ *   接收端说了算——发送端不知道这份配置的话，切出来的分片到了那边会被逐片拒收，
+ *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
  */
 
 /**
@@ -130,6 +135,10 @@ export async function createReiServer(config) {
       privateKey: vapid.privateKey || ''
     },
     webpush: webpushModule,
+    // 分片传输的限额（与 installReiSW 的 multipart 同一份）。instant 消息在
+    // schedule-message 里就地投递、定时消息走 send-notifications 的 tick，两条路
+    // 都从这个 ctx 展开，所以配一次两边都认。
+    multipart: config.multipart || null,
     tenant: {
       initSecret
     },

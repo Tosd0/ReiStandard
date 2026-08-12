@@ -739,14 +739,19 @@ test('循环任务发送后写库失败不标 sent：推进到下个周期继续
   const dueAt = recentDue();
   await seed(adapter, { uuid: 'daily-hiccup', recurrenceType: 'daily', nextSendAt: dueAt });
 
-  // 发送后的第一笔写库（推进排期）抛错一次，之后恢复正常。
+  // 发送后的写库（推进排期）失败，之后恢复正常。
+  //
+  // 抛两笔而不是一笔：推进排期这一步顺手把上一轮的 last_error 清成 null，这两样
+  // 是合成一笔写的，写不进去还会退回去只写状态字段再来一次（见 run-tick 的
+  // updateTaskWithLastError）。只抛第一笔的话退回的那笔就成了，压根到不了「发送
+  // 后写库失败」这条路。
   let updateCalls = 0;
   const db = new Proxy(adapter, {
     get(target, prop) {
       if (prop === 'updateTaskById') {
         return async (...args) => {
           updateCalls++;
-          if (updateCalls === 1) throw new Error('d1 hiccup');
+          if (updateCalls <= 2) throw new Error('d1 hiccup');
           return target.updateTaskById(...args);
         };
       }
@@ -1013,8 +1018,8 @@ test('410 的失败记录带 pushStatus: 410，reason 仍是那句人话摘要',
   assert.equal(rowLastError.pushStatus, 410);
   assert.match(rowLastError.reason, /Web Push delivery failed: 410 Gone/);
 
-  // 投影优先读 payload 里那份 lastError，所以两处都得有——只写行上那一列的
-  // 话，GET /messages 交出去的记录里 pushStatus 会凭空消失。
+  // 两处都得有：投影读行上那一列，而没有这一列的适配器读的是密文 payload 里
+  // 这一份——少写哪一边，那类部署的 GET /messages 里 pushStatus 就凭空消失。
   const payload = await decryptPayloadOf(row);
   assert.equal(payload.lastError.pushStatus, 410);
   assert.equal(payload.lastError.reason, rowLastError.reason);

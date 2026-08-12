@@ -291,7 +291,10 @@ export function sanitizeErrorSummary(reason) {
  * @typedef {Object} ErrorCause
  * @property {'config'|'request'|'tick'} stage - 在哪一段炸的
  * @property {string} name - 错误类型（`error.name`，认不出来时是 'Error'）
- * @property {string} message - 脱敏后的错误消息
+ * @property {string} [message] - 脱敏后的错误消息。降级 500（配置都没建起来那条
+ *   路）回给跨域调用方时不带这个字段——那条路的 CORS 头是回显来访 Origin 的，任
+ *   意第三方页面都能读，而构建期异常原文里常有 binding 名、内网域名、环境变量
+ *   名。同源 / 无 Origin 的请求照旧带全文，`wrangler tail` 里也一直有。
  * @property {string} [code] - 错误自带的 `code` 字符串（有才带）
  */
 

@@ -101,7 +101,36 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
     assert.equal(body.error.code, 'INTERNAL_ERROR');
     assert.equal(body.error.cause.stage, 'config');
     assert.equal(body.error.cause.name, 'TypeError');
-    assert.match(body.error.cause.message, /Cannot read properties of undefined/);
+  });
+
+  // 这条路的 CORS 头是回显来访 Origin 猜出来的，任意第三方页面 fetch 一下就能
+  // 读到响应体；而构建期异常的原文就是部署信息本身（binding 名、内网域名、环境
+  // 变量名）。排障线索留在服务端日志和同源请求里，见下一条。
+  it('跨域读到的 cause 不带异常原文，只有 stage / 异常类名这类标注', async () => {
+    const worker = createCloudflareWorker(() => {
+      throw new TypeError("Cannot read properties of undefined (reading 'get') at env.INTERNAL_KV");
+    });
+
+    const res = await worker.fetch(request('POST'), {});
+    const { cause } = (await res.json()).error;
+
+    assert.equal(cause.stage, 'config');
+    assert.equal(cause.name, 'TypeError');
+    assert.equal('message' in cause, false, `异常原文不该跨域回出去：${JSON.stringify(cause)}`);
+    assert.ok(
+      !JSON.stringify(cause).includes('INTERNAL_KV'),
+      `信封任何一处都不该有构建期异常的原文：${JSON.stringify(cause)}`,
+    );
+  });
+
+  it('Origin 就是 Worker 自己域名时（同源页面）照旧给全文', async () => {
+    const worker = createCloudflareWorker(missingBinding);
+
+    // 同源页面读到的本来就是自己部署的东西，没有额外暴露面。
+    const res = await worker.fetch(request('POST', { origin: 'https://worker.example.com' }), {});
+
+    assert.equal(res.status, 500);
+    assert.match((await res.json()).error.cause.message, /Cannot read properties of undefined/);
   });
 
   it('OPTIONS 预检回 204 —— 预检挂掉的话那条真正的 POST 根本发不出去', async () => {
@@ -121,7 +150,10 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
 
     assert.equal(res.status, 500);
     assert.equal(res.headers.get('access-control-allow-origin'), null);
-    assert.equal((await res.json()).error.cause.stage, 'config');
+    const { cause } = (await res.json()).error;
+    assert.equal(cause.stage, 'config');
+    // 部署方 `curl` 一下就该看到真因，不用回去翻 `wrangler tail`。
+    assert.match(cause.message, /Cannot read properties of undefined/);
   });
 
   it('构建失败不被记住：binding 补上之后下一个请求就正常了', async () => {
@@ -142,12 +174,14 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
     assert.equal((await res.json()).success, true);
   });
 
-  it('cause.message 里长得像凭据的串会被遮掉（这条响应跨域前端能直接读到）', async () => {
+  it('给出全文的那条路上，长得像凭据的串照样遮掉', async () => {
+    // 无 Origin / 同源才带 message，凭据脱敏是这条路上的第二道闸：机器之间的调
+    // 用日志、终端回滚记录也不该留下能直接拿去用的 Key。
     const worker = createCloudflareWorker(() => {
       throw new Error('upstream rejected Bearer sk-live-0123456789abcdefghijklmnop');
     });
 
-    const res = await worker.fetch(request('POST'), {});
+    const res = await worker.fetch(request('POST', { origin: '' }), {});
 
     const { message } = (await res.json()).error.cause;
     assert.ok(!message.includes('0123456789abcdefghijklmnop'), `凭据没遮住: ${message}`);
@@ -198,6 +232,77 @@ describe('createCloudflareWorker 构建失败的降级路径', () => {
 
     assert.equal(res.status, 500);
     assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN, '白名单里的那个，不是来访的那个');
+  });
+});
+
+// ─── 1b. 降级信封的形状 ─────────────────────────────────────────────────
+//
+// 这套降级行为在 amsg-server 的
+// server/src/server/cloudflare/single-user-worker.js 里有对称的一份：两个包刻意
+// 各留一份、不互相 import（instant 会把 blob-store 和一整排 adapter 拖进去，破
+// 坏 server「D1-only、不开 nodejs_compat 也能打包」的目标）。没有测试钉着的话，
+// 两边会慢慢漂成两种信封，接入方照其中一份写的判断换个部署就不灵。
+//
+// 下面把 instant 这份逐字段钉死；改这里记得对着那个文件一起改。已知且故意的差
+// 别只有一处：跨域读到的 cause 在 instant 这边不带 message。
+
+describe('降级 500 的信封形状（与 amsg-server 那份保持一致）', () => {
+  function req(method, origin = ORIGIN) {
+    return new Request('https://worker.example.com/instant', {
+      method,
+      headers: { 'content-type': 'application/json', origin },
+      body: method === 'POST' ? '{}' : undefined,
+    });
+  }
+
+  it('跨域 POST：信封字段与 CORS 头逐个对上', async () => {
+    const worker = createCloudflareWorker(() => { throw new TypeError('binding 没了'); });
+
+    const res = await worker.fetch(req('POST'), {});
+
+    assert.equal(res.status, 500);
+    assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN);
+    assert.equal(res.headers.get('access-control-max-age'), '0');
+    assert.equal(res.headers.get('vary'), 'Origin');
+    assert.match(res.headers.get('access-control-allow-methods') || '', /POST/);
+    assert.match(res.headers.get('access-control-allow-headers') || '', /Content-Type/);
+
+    const body = await res.json();
+    assert.deepEqual(Object.keys(body).sort(), ['error', 'success']);
+    assert.equal(body.success, false);
+    assert.deepEqual(Object.keys(body.error).sort(), ['cause', 'code', 'message']);
+    // 这两句是老调用方的判据，一直是固定的那两个字符串。
+    assert.equal(body.error.code, 'INTERNAL_ERROR');
+    assert.equal(body.error.message, '服务器内部错误');
+    assert.deepEqual(Object.keys(body.error.cause).sort(), ['name', 'stage']);
+    assert.equal(body.error.cause.stage, 'config');
+  });
+
+  it('异常自带 code 时跟着一起出去（仍然不带原文）', async () => {
+    const worker = createCloudflareWorker(() => {
+      const error = new Error('缺了个模块');
+      error.code = 'ERR_MODULE_NOT_FOUND';
+      throw error;
+    });
+
+    const res = await worker.fetch(req('POST'), {});
+    const { cause } = (await res.json()).error;
+
+    assert.deepEqual(Object.keys(cause).sort(), ['code', 'name', 'stage']);
+    assert.equal(cause.code, 'ERR_MODULE_NOT_FOUND');
+  });
+
+  it('预检回 204、空体，CORS 头与那条 500 是同一套', async () => {
+    const worker = createCloudflareWorker(() => { throw new TypeError('binding 没了'); });
+
+    const res = await worker.fetch(req('OPTIONS'), {});
+
+    assert.equal(res.status, 204);
+    assert.equal(await res.text(), '');
+    assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN);
+    assert.equal(res.headers.get('access-control-max-age'), '0');
+    assert.equal(res.headers.get('vary'), 'Origin');
   });
 });
 

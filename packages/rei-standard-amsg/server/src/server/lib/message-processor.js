@@ -31,6 +31,7 @@ import {
   DEFAULT_MULTIPART_CHUNK_BYTES,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  DEFAULT_MULTIPART_TTL_MS,
 } from '@rei-standard/amsg-shared';
 import { measurePushPayload } from './webpush-webcrypto.js';
 
@@ -57,11 +58,17 @@ const DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
 // Kept equal to amsg-instant's SLEEP_BETWEEN_MESSAGES_MS default.
 const SLEEP_BETWEEN_MESSAGES_MS = 1500;
 
-// 思考过程切片时给分片标的重组窗口。sw 那边按 min(这个值, 它自己的
-// multipart.ttlMs) 取，两边谁更紧听谁的。定时消息是设备离线也要送到的
-// （传输层 TTL 四周），所以发送端这边不再额外收窄——窗口开多大由 sw 的
-// multipart.ttlMs 说了算。
-const REASONING_MULTIPART_TTL_MS = 2_419_200_000; // 4 weeks
+// 一整批分片能占用的重组窗口比例。
+//
+// 接收端的重组窗口（「攒着半截分片等剩下的能等多久」）从**它收到第一片**起算，
+// 而窗口里还要装上每一片自己的网络耗时、推送服务的排队——这些发送端量不到。所以
+// 只按窗口的一半来排发送节奏，别掐着边缘发。
+const MULTIPART_WINDOW_USAGE = 0.5;
+
+// 分片之间的最小间隔。分片本身不弹通知（要收齐还原了才走派发），间隔的意义只是
+// 别把推送服务一口气打到限流，所以片数多时收紧是安全的；收紧到这个下限还塞不进
+// 窗口，就说明这批分片怎么发都拼不回来，发之前直接拒绝。
+const MIN_SLEEP_BETWEEN_CHUNKS_MS = 50;
 
 /**
  * Split a single chunk by one regex; on no-match return [chunk] so a later
@@ -153,12 +160,22 @@ async function deliverReasoningPush(ctx, pushSubscription, reasoningPush) {
       throw new Error(`思考过程要切 ${parts.length} 片，超过分片传输的 ${multipart.maxChunks} 片上限`);
     }
 
+    // 整批分片必须在接收端的重组窗口内发完（见 resolveChunkIntervalMs）。塞不进
+    // 去就一片都不发：发一半的下场是接收端窗口一到就写死墓碑、迟到的分片被静默
+    // 丢弃，用户那边整条思考过程凭空消失，而这边每一片都发成功、看不出任何异常。
+    const intervalMs = resolveChunkIntervalMs(parts.length, multipart.ttlMs);
+    if (intervalMs === null) {
+      throw new Error(
+        `思考过程要切 ${parts.length} 片，${multipart.ttlMs} 毫秒的分片重组窗口内发不完`
+      );
+    }
+
     for (let i = 0; i < parts.length; i++) {
       await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(parts[i]));
       // 分片跟正文的段一样按节奏发：一口气推几十条，推送服务会限流，而这里的
       // 失败只会让整条思考过程收不齐。
       if (i < parts.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+        await sleepFor(ctx, intervalMs);
       }
     }
     return { shipped: true };
@@ -175,11 +192,57 @@ async function deliverReasoningPush(ctx, pushSubscription, reasoningPush) {
 }
 
 /**
+ * 一批分片之间该隔多久发一条。
+ *
+ * 接收端的重组窗口是「收到第一片之后，攒着半截等剩下的能等多久」，窗口一到就写
+ * 死墓碑：之后到的分片被静默丢掉，推送服务重投也救不回来。窗口从它收到第一片起
+ * 算，所以整批分片的**发送跨度**必须落在窗口里——片数一多，固定
+ * SLEEP_BETWEEN_MESSAGES_MS 的节奏（1.5 秒一片）几十片就把窗口用光了。
+ *
+ * 片少时保持原来的 1.5 秒不变；片多时按片数把间隔压到刚好装得下（不低于
+ * MIN_SLEEP_BETWEEN_CHUNKS_MS）。压到下限还装不下 → null，调用方发之前就拒绝。
+ *
+ * @param {number} chunkCount
+ * @param {number} windowMs - 声明给这批分片的重组窗口（= 接收端实际会用的那个值，
+ *   见 resolveMultipartOptions 的 ttlMs）
+ * @returns {number|null} 每片之间的间隔毫秒；null = 这批分片怎么发都装不进窗口
+ */
+function resolveChunkIntervalMs(chunkCount, windowMs) {
+  if (chunkCount <= 1) return 0;
+  const budgetMs = Math.floor(windowMs * MULTIPART_WINDOW_USAGE);
+  const evenlySpaced = Math.floor(budgetMs / (chunkCount - 1));
+  if (evenlySpaced < MIN_SLEEP_BETWEEN_CHUNKS_MS) return null;
+  return Math.min(SLEEP_BETWEEN_MESSAGES_MS, evenlySpaced);
+}
+
+/**
+ * 发送节奏用的等待。
+ *
+ * `ctx._pushSleep` 是给测试留的注入口——「整批分片在重组窗口内发完」这类断言真
+ * 等几十秒不现实。宿主不配它，走真的 setTimeout（与 agentic 循环的
+ * `ctx._agenticSleep` 同一个路数）。
+ *
+ * @param {ProcessorContext} ctx
+ * @param {number} ms
+ */
+function sleepFor(ctx, ms) {
+  if (!(ms > 0)) return Promise.resolve();
+  if (ctx && typeof ctx._pushSleep === 'function') return ctx._pushSleep(ms);
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
  * 分片参数：默认跟 shared 那组默认值走，宿主可以用 `ctx.multipart` 收窄，跟它
  * 给 `installReiSW` 的那份对齐。
  *
  * 接收端的限额是宿主可配的，发送端不跟着走的话，切出来的分片会在到达时被逐片
  * 拒收——一条也拼不回来，而发送端这边两道门槛全都过了，看不出任何异常。
+ *
+ * ttlMs 的默认值就是接收端的默认重组窗口。声明得比它大没有意义：接收端算的是
+ * `min(分片上写的 ttlMs, 它自己的 multipart.ttlMs)`，发送端写多大都会被夹回它那
+ * 一份。所以这里当作「接收端实际会用的窗口」来排发送节奏（见
+ * resolveChunkIntervalMs）——宿主把 installReiSW 的窗口调宽了、又把同样的值传给
+ * 这里，节奏才会跟着放宽。
  *
  * @param {ProcessorContext} ctx
  */
@@ -189,7 +252,7 @@ function resolveMultipartOptions(ctx) {
     maxChunkBytes: positiveIntegerOr(configured.maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES),
     maxChunks: positiveIntegerOr(configured.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS),
     maxTotalBytes: positiveIntegerOr(configured.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES),
-    ttlMs: positiveIntegerOr(configured.ttlMs, REASONING_MULTIPART_TTL_MS),
+    ttlMs: positiveIntegerOr(configured.ttlMs, DEFAULT_MULTIPART_TTL_MS),
   };
 }
 
@@ -209,6 +272,9 @@ function positiveIntegerOr(value, fallback) {
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
  * @property {Object}  vapid             - { email, publicKey, privateKey }
  * @property {import('../adapters/interface.js').DbAdapter} db
+ * @property {{ maxChunkBytes?: number, maxChunks?: number, maxTotalBytes?: number, ttlMs?: number }} [multipart]
+ *   分片传输的限额，宿主传给 `installReiSW` 的那一份原样传过来即可（见
+ *   resolveMultipartOptions）。不传 = 两边都用默认值。
  */
 
 /**
@@ -400,7 +466,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         const reasoning = await deliverReasoningPush(ctx, pushSubscription, reasoningPush);
         if (reasoning.shipped) {
           sentIds.push(reasoningPush.messageId);
-          await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+          await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS);
         } else {
           reasoningError = reasoning.error;
         }
@@ -410,7 +476,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(contentPushes[i]));
         sentIds.push(contentPushes[i].messageId);
         if (i < contentPushes.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS));
+          await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS);
         }
       }
     } catch (error) {
@@ -466,7 +532,10 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
  * @param {number} [maxRetries=2]
  * @param {string} [userId]
  * @param {string} [providedMasterKey]
- * @returns {Promise<{ success: boolean, messagesSent?: number, retriesUsed?: number, error?: Object }>}
+ * @returns {Promise<{ success: boolean, messagesSent?: number, retriesUsed?: number, reasoningError?: string, error?: Object }>}
+ *   `reasoningError` 只在正文都发出去了、思考过程那一条没发成时出现（思考过程是
+ *   附赠内容，它发不出去不算这条消息失败）。调用方拿它提示用户这次没有思考过程，
+ *   不带这个字段就是整轮都送到了。
  */
 export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, providedMasterKey) {
   let retryCount = 0;
@@ -576,7 +645,15 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       };
     }
 
-    return { success: true, messagesSent: result.messagesSent, retriesUsed: retryCount };
+    // 思考过程没发成时把原因一路带出去：正文确实发到了，所以这轮仍是成功，但
+    // 「这次没有思考过程」得让调用方看得见——丢在这里的话，那条 push 就是静悄悄
+    // 消失了，而 reasoningError 存在的意义正是提供这份可见性。
+    return {
+      success: true,
+      messagesSent: result.messagesSent,
+      retriesUsed: retryCount,
+      ...(result.reasoningError ? { reasoningError: result.reasoningError } : {}),
+    };
   }
 }
 

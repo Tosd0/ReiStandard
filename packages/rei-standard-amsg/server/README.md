@@ -142,6 +142,40 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 用比 64 字符更长的 uuid（`scheduleTask` 允许传任意字符串）就自己再多留一点。
 
+### 装不下就切片：`multipart`
+
+思考过程（reasoning）常常一条 push 装不下。装不下时服务端会把它切成分片逐条发，Service Worker 收齐后还原成原样再走正常派发。切多大一片、最多切几片、收齐前能等多久，都是接收端说了算——所以给 `installReiSW` 传了什么，就把同一份原样传给服务端：
+
+```js
+const multipart = { maxChunkBytes: 1800, maxChunks: 128, maxTotalBytes: 256_000, ttlMs: 60_000 };
+
+installReiSW({ multipart });                                    // 页面
+createReiServer({ tenant: { … }, multipart });                  // 多租户
+createSingleUserServer({ db, masterKey, multipart });           // 单用户
+createSingleUserCloudflareWorker((env) => ({ …, multipart }));  // CF Worker（cron 与 runTask 都认）
+```
+
+| 键 | 默认值 | 说明 |
+| --- | --- | --- |
+| `maxChunkBytes` | `1800` | 每片装多少字节原文 |
+| `maxChunks` | `128` | 一条消息最多切几片，超了就不发 |
+| `maxTotalBytes` | `256000` | 整条消息的原文上限，超了就不发 |
+| `ttlMs` | `60000` | 接收端收到第一片之后，等齐剩下分片能等多久 |
+
+不配 = 两边都用默认值。发送节奏也按 `ttlMs` 排：片数多时自动收紧每片之间的间隔，保证整批分片在这个窗口内发完；收紧到下限还装不下就一片都不发。
+
+两边对不上的下场值得记一下：页面把 `maxChunks` 收窄到 32、服务端还按 128 切的话，分片到了接收端会被逐片拒收；节奏排得比窗口长的话，迟到的分片会被当过期丢掉。两种都是「页面上这条思考过程直接没有」，而服务端那边每一片都发成功、看不出任何异常。
+
+### 思考过程没送到时的可见性
+
+思考过程是正文之外的附赠内容：它没发出去不影响正文，任务照样算成功。这件事有三处看得见——
+
+- 定时任务的 tick 汇总多一个 `details.reasoningSkippedTasks`：`[{ taskId, reason }]`。这些任务同时计在 `successCount` 里。
+- instant 消息（`POST /schedule-message`）的成功响应带 `reasoningError`（字符串，只在思考过程没送到时出现）。
+- 服务端日志各打一行：一行说原因，一行说是哪条任务。
+
+刻意不写进 `last_error`：那一列说的是「上一次没发出去的原因」，一条正文已经送达的消息挂着它，客户端会当成这次投递失败了。
+
 ## 推送订阅（用户级）
 
 推送订阅一个用户存一份，任务行不携带它，到点投递时现读。用户清了站点数据、重装了 PWA、或者推送服务轮换了 endpoint 之后，覆盖这一份就够了——所有已排的任务，包括角色在 fire 里给自己排的、客户端根本不知道存在的那些，下次触发读到的都是新订阅。
@@ -237,6 +271,14 @@ ctx / metadata / push 上）。
 - `userMessage` 给了就必须是字符串（口径与排程时一致）：它到点要过正则切分，别的类型收进来只会在投递时炸。
 - `messageSubtype` / `llmExtraBody` 显式传 `null` 是「改回默认」（分别是投递时的 `'chat'` 和「不透传额外参数」），不会被当成「不改」吞掉。
 - 响应里的 `updatedFields` 只列真正落进这次更新的字段。请求里带了但没被应用的键——这个接口不接受的、拼错的、传了 `null` 走「不改」语义的——不会出现在里面。
+
+## 取消 / 顶替时，没发出去的那几段也会撤掉
+
+适配器实现了 outbox 那组方法（内置 D1 有）时，每条 push 在发出去之前会先落一行 `message_outbox`，客户端离线或推送服务抽风时靠 `GET /outbox` 补收。这就带来一个收尾问题：一条任务投递到一半失败过的话，没发出去的那几段还留在 outbox 里等补收，光删任务行它们不会跟着走。
+
+所以 `DELETE /cancel-message` 和 `POST /schedule-message` 的 `supersedesUuid` 顶替，都会顺手把该任务名下还没发出去的行撤掉。已经推到设备上的分段不动——取消的意思是「别再发后面的」，不是「把用户已经收到的从收件箱里抹掉」，那几条留着让客户端照常 ack。
+
+清理是 best-effort：适配器没实现 outbox、或者清理本身出错，都不影响取消 / 顶替的成功返回（任务行已经删掉了）。
 
 ## 推送自带任务身份
 
@@ -347,7 +389,9 @@ const result = await ctx.scheduleTask({
 
 ### hook 契约违约算确定性失败
 
-宿主 hook 返回了库不认的东西（`onBeforeFire` 的返回形状、`onLLMOutput` 的决策标签）、或者轮数用尽也没等到 `finish`——这些错误带 `permanent: true` 和一个稳定的 `code`（`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_EMPTY_TOOL_REQUEST` / `AGENTIC_LOOP_EXCEEDED` / `AGENTIC_SCHEDULE_FAILED` / `TASK_PAYLOAD_TOO_LARGE`），投递侧据此跳过退避阶梯：一次性任务直接标 `failed`，循环任务作废本次 occurrence。重试也是同一个结果，而每重试一轮都要把 `onBeforeFire` 和一整轮 LLM 重跑一遍。
+宿主 hook 返回了库不认的东西（`onBeforeFire` 的返回形状、`onLLMOutput` 的决策标签），或者建后续任务时 `createTask` 没把行交回来——这些错误带 `permanent: true` 和一个稳定的 `code`（`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_SCHEDULE_FAILED` / `TASK_PAYLOAD_TOO_LARGE`），投递侧据此跳过退避阶梯：一次性任务直接标 `failed`，循环任务作废本次 occurrence。重试也是同一个结果，而每重试一轮都要把 `onBeforeFire` 和一整轮 LLM 重跑一遍。
+
+分界线是「谁写错了」：契约由宿主代码定死，重掷一次还是同一个形状；而模型这一轮掷出了什么则是每轮都可能不同的。所以「tool-request 决策里没有能解析的 `toolCalls`」（`AGENTIC_EMPTY_TOOL_REQUEST`）和「轮数用尽也没等到 `finish` / `skip-push`」（`AGENTIC_LOOP_EXCEEDED`）带 `code` 但不带 `permanent`，留在退避阶梯上——隔两分钟重掷一次多半就正常收尾了，判终态的话一次性任务第一次掷歪就永久 `failed`，行离开 `pending` 之后连 `PUT /update-message` 都救不回来（回 409）。
 
 ### 部署配错了算可重试
 
@@ -536,10 +580,12 @@ const result = await runTask(ctx, uuid);
 |---|---|
 | `stage` | 在哪一段炸的：`config` = 构建配置时（少了 binding、环境变量丢了），`request` = 路由或处理器抛错 |
 | `name` | 错误类型（`error.name`，认不出来时是 `Error`） |
-| `message` | 错误消息，长得像凭据的串已遮掉、超长截断到 500 字符 |
+| `message` | 错误消息，长得像凭据的串已遮掉、超长截断到 500 字符。`stage: 'config'` 的响应回给跨域调用方时没有这个字段，见下 |
 | `code` | 错误自带的 `code` 字符串，有才带 |
 
 只带错误类型和消息文本：密钥、用户数据、任务正文都不在 `error.message` 上，也不往这里放。
+
+`stage: 'config'` 那条路多一层收敛：配置都没建起来时这个部署允许哪些 origin 无从得知，响应头只能回显来访 Origin，于是任意第三方页面一个 `fetch` 就能读到这条响应。而构建期异常的原文往往就是部署信息本身（`env.DB is undefined` 报的是 binding 名）。所以跨域读到的那份 `cause` 只有 `stage` / `name` / `code`，`message` 不出去；同源请求和不带 `Origin` 的调用（`curl`、服务端之间调用）照旧拿全文，`wrangler tail` 里也一直有。配置一修好，响应立刻回到部署自己那套 CORS，`stage: 'request'` 的 500 不受这层影响。
 
 cron 那条路上没有调用方能读到响应，所以另开两个出口：
 

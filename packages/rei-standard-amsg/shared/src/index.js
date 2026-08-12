@@ -220,11 +220,19 @@ export const PUSH_SOURCE = Object.freeze({
  * string; `iteration` is the agentic-loop iteration number when
  * relevant (0 / absent otherwise).
  *
+ * `llmStatus` / `providerCode` 是失败来自 LLM 调用时的机读标注：上游回的 HTTP
+ * 状态码，以及 provider 自己的错误码（`invalid_api_key` /
+ * `context_length_exceeded` 之类）。客户端靠它们分流「Key 失效要去改配置」和
+ * 「上游一时抽风等会儿再说」，不用回去正则匹配 `message` 那句人话——那句是给
+ * 用户看的，措辞随时会变。失败跟 LLM 无关时两个都不出现。
+ *
  * @typedef {AmsgPushCommon & {
  *   messageKind: 'error',
  *   code:    string,
  *   message: string,
  *   iteration?: number,
+ *   llmStatus?: number,
+ *   providerCode?: string,
  * }} ErrorPush
  */
 
@@ -498,6 +506,8 @@ function validateNotificationArg(kind, value) {
  * @param {string}      [args.messageSubtype]
  * @param {Object}      [args.metadata]
  * @param {NotificationDirective} [args.notification]
+ * @param {number}      [args.llmStatus]     - 上游 LLM 回的 HTTP 状态码（见 ErrorPush）
+ * @param {string}      [args.providerCode]  - provider 自己的错误码（见 ErrorPush）
  * @returns {ErrorPush}
  */
 export function buildErrorPush(args) {
@@ -526,6 +536,8 @@ export function buildErrorPush(args) {
   if (args.messageSubtype !== undefined) push.messageSubtype = args.messageSubtype;
   if (args.metadata !== undefined) push.metadata = args.metadata;
   if (args.notification !== undefined) push.notification = args.notification;
+  if (args.llmStatus !== undefined) push.llmStatus = args.llmStatus;
+  if (args.providerCode !== undefined) push.providerCode = args.providerCode;
   return push;
 }
 

@@ -121,3 +121,63 @@ export async function discardUndeliveredPushes({ db, userId, pushes, sentIds }) 
       .filter(messageId => !delivered.has(messageId)),
   });
 }
+
+// 按任务清 outbox 时的扫描参数。适配器只提供「按用户翻页列未 ack 行」这一种
+// 读法，所以得翻一遍挑出属于这条任务的行；页大小与 GET /outbox 同量级。行数上
+// 限是防呆——outbox 只留最近四周的推送（tick 顺手清），正常远到不了。
+const OUTBOX_SCAN_PAGE_SIZE = 100;
+const OUTBOX_SCAN_MAX_ROWS = 5000;
+
+/**
+ * 把某条任务名下「还没发出去的」行从 outbox 撤掉。
+ *
+ * 用在取消 / 顶替只碰了任务行的那两条路上（`DELETE /message` 与
+ * `supersedesUuid`）：任务此前投递到一半失败过的话，没发出去的那几段还躺在
+ * outbox 里等重试，任务行删掉它们也不会跟着走。不撤的话客户端下一次
+ * `GET /outbox` 照样把它们补收回去——用户看到的就是「取消接口回了成功，消息还
+ * 是来了」。
+ *
+ * 判据与 discardUndeliveredPushes 一致：只撤 delivered_at 为 null 的行。已经推
+ * 给设备的那几条撤不回来，行留着让客户端照常 ack——取消的意思是「别再发后面
+ * 的」，不是「把已经收到的从收件箱里抹掉」。
+ *
+ * 同样是 best-effort：适配器缺读/删任一侧就静默跳过，出错只记日志。取消 / 顶
+ * 替本身已经生效了，不该因为账本没清干净被翻成失败。
+ *
+ * @param {Object} args
+ * @param {Object} args.db
+ * @param {string} args.userId
+ * @param {string} args.taskUuid - 被取消 / 被顶替的任务 uuid
+ */
+export async function discardUndeliveredPushesForTask({ db, userId, taskUuid }) {
+  if (!db || typeof db.listUnackedOutbox !== 'function' || typeof db.discardOutboxMessages !== 'function') return;
+  if (!taskUuid) return;
+
+  const messageIds = [];
+  try {
+    let cursor = 0;
+    let scanned = 0;
+    while (scanned < OUTBOX_SCAN_MAX_ROWS) {
+      const rows = await db.listUnackedOutbox(userId, cursor, OUTBOX_SCAN_PAGE_SIZE);
+      if (!rows || rows.length === 0) break;
+      scanned += rows.length;
+      let nextCursor = cursor;
+      for (const row of rows) {
+        if (row.id > nextCursor) nextCursor = row.id;
+        if (row.task_uuid !== taskUuid) continue;
+        // 已经推出去的那几条不动（见上）。
+        if (row.delivered_at != null) continue;
+        messageIds.push(row.message_id);
+      }
+      // 游标没往前走说明适配器没按 `id > sinceId` 翻页，再翻就是死循环。
+      if (nextCursor <= cursor) break;
+      cursor = nextCursor;
+      if (rows.length < OUTBOX_SCAN_PAGE_SIZE) break;
+    }
+  } catch (error) {
+    console.warn('[amsg-server] outbox 查未投递的行失败（已忽略）:', error && error.message);
+    return;
+  }
+
+  await discardPushesFromOutbox({ db, userId, messageIds });
+}

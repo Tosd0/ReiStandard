@@ -8,6 +8,7 @@ import {
   createFetchRouter,
   buildHandlerRequest,
   makeLlmResponse,
+  consumeSse,
 } from './helpers.mjs';
 
 // ─── 失败信封里的上游状态码 ─────────────────────────────────────────────
@@ -196,6 +197,72 @@ describe('纯 Push 模式下 LLM 失败的错误细节', () => {
     assert.equal(body.error.code, 'LLM_CALL_FAILED');
     assert.equal(body.error.llmStatus, undefined);
     assert.equal(body.error.providerCode, undefined);
+  });
+});
+
+// SSE 是默认传输方式（不带 `Accept: application/json` 就走它），浏览器客户端拿
+// 到的是 `event: error` 而不是 JSON 信封。字段只挂在信封那条路上的话，同一次
+// Key 失效换个传输方式就只剩一句人话，客户端又得回去正则匹配。
+describe('SSE 模式下 LLM 失败的错误细节', () => {
+  it('error 事件带上 llmStatus / providerCode，和 JSON 信封同一组', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: rejectingLlm({ status: 401, statusText: 'Unauthorized', body: OPENAI_401_BODY }),
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(buildHandlerRequest({ body: makeValidPayload(), mode: 'sse' }));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/event-stream/);
+
+    const { errors } = await consumeSse(res);
+    assert.equal(errors.length, 1, '这一次失败该有且只有一条 error 事件');
+    const [diag] = errors;
+    assert.equal(diag.messageKind, 'error');
+    assert.equal(diag.code, 'LLM_CALL_FAILED');
+    assert.equal(diag.llmStatus, 401);
+    assert.equal(diag.providerCode, 'invalid_api_key');
+    assert.match(diag.message, /Incorrect API key provided/);
+    // LLM 那一步失败时不该冒出推送侧的字段，两条上游别串台。
+    assert.equal(diag.pushStatus, undefined);
+  });
+
+  it('两条传输路径带的字段一样（同一次失败，换个 Accept 头）', async () => {
+    const makeHandler = () => createInstantHandler({
+      vapid,
+      fetch: createFetchRouter({
+        pushEndpoint: subKit.subscription.endpoint,
+        llm: rejectingLlm({ status: 401, statusText: 'Unauthorized', body: OPENAI_401_BODY }),
+      }).fetch,
+    });
+
+    const envelope = (await (await makeHandler()(
+      buildHandlerRequest({ body: makeValidPayload() })
+    )).json()).error;
+    const { errors } = await consumeSse(await makeHandler()(
+      buildHandlerRequest({ body: makeValidPayload(), mode: 'sse' })
+    ));
+
+    const machineReadable = ({ code, llmStatus, providerCode, pushStatus }) => (
+      { code, llmStatus, providerCode, pushStatus }
+    );
+    assert.deepEqual(machineReadable(errors[0]), machineReadable(envelope));
+  });
+
+  it('上游根本没答复时 SSE 也不硬造字段', async () => {
+    const router = createFetchRouter({
+      pushEndpoint: subKit.subscription.endpoint,
+      llm: async () => { throw new Error('connect ECONNREFUSED'); },
+    });
+    const handler = createInstantHandler({ vapid, fetch: router.fetch });
+
+    const res = await handler(buildHandlerRequest({ body: makeValidPayload(), mode: 'sse' }));
+    const { errors } = await consumeSse(res);
+
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].code, 'LLM_CALL_FAILED');
+    assert.equal(errors[0].llmStatus, undefined);
+    assert.equal(errors[0].providerCode, undefined);
   });
 });
 

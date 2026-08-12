@@ -13,6 +13,7 @@ import { validateScheduleMessagePayload, validateTaskPayloadSize } from '../lib/
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
+import { discardUndeliveredPushesForTask } from '../lib/outbox-store.js';
 
 export function createScheduleMessageHandler(ctx) {
   async function POST(headers, body) {
@@ -270,6 +271,14 @@ export function createScheduleMessageHandler(ctx) {
       return { status: 500, body: { success: false, error: { code: 'TASK_CREATE_FAILED', message: '创建任务失败' } } };
     }
 
+    // 被顶替的旧任务跟走 DELETE /message 取消是一回事：任务行删了，它此前投递
+    // 到一半失败留下的那几段还在 message_outbox 里等补收，不撤掉的话客户端下次
+    // GET /outbox 会把被顶替的那条重新拉回去。已经推到设备上的分段不动。
+    // best-effort，清不干净也不影响这次顶替（旧行已经删掉了）。
+    if (superseded) {
+      await discardUndeliveredPushesForTask({ db, userId, taskUuid: supersedesUuid });
+    }
+
     // In-server instant path — rationale documented above the VAPID pre-check.
     // Instant type: send immediately
     if (payload.messageType === 'instant') {
@@ -295,6 +304,9 @@ export function createScheduleMessageHandler(ctx) {
               sentAt: new Date().toISOString(),
               status: 'sent',
               retriesUsed: sendResult.retriesUsed || 0,
+              // 思考过程那条 push 没发出去的原因（有才带上）。正文照发，所以
+              // 这次调用仍是成功的；调用方拿它决定要不要提示 / 重发。
+              ...(sendResult.reasoningError ? { reasoningError: sendResult.reasoningError } : {}),
               ...(supersedesUuid ? { superseded } : {})
             }
           }

@@ -327,8 +327,9 @@ function buildUpstreamError(summary, status, detail) {
  */
 async function readUpstreamErrorDetail(response) {
   let raw;
+  let truncated = false;
   try {
-    raw = await readBoundedBody(response);
+    ({ text: raw, truncated } = await readBoundedBody(response));
   } catch {
     return { message: '', code: '' };
   }
@@ -338,6 +339,17 @@ async function readUpstreamErrorDetail(response) {
   try {
     body = JSON.parse(raw);
   } catch {
+    // 被 UPSTREAM_ERROR_BODY_MAX_BYTES 切断的 JSON：前缀不可能 parse 得过，而
+    // 「中转把整个请求原样回显」恰恰是那个上限唯一要挡的场景。这时退回原文的话，
+    // detail 会变成 300 字符的裸 JSON（里面还是被回显的 prompt），上游真正那句
+    // 话和 code 全丢，所以先从残缺前缀里把字段捞出来。
+    if (truncated && looksLikeJson(raw)) {
+      const salvaged = salvageJsonStringFields(raw);
+      return {
+        message: clampDetail(salvaged.message || TRUNCATED_BODY_NOTE),
+        code: clampCode(salvaged.code),
+      };
+    }
     // 不是 JSON（HTML 错误页、纯文本）——原文就是唯一的线索。
     return { message: clampDetail(raw), code: '' };
   }
@@ -369,13 +381,18 @@ async function readUpstreamErrorDetail(response) {
  * 能拿到 `response.body` 就边读边数字节；拿不到（调用方喂的是只实现了
  * `text()` 的假响应）退回整段读。
  *
+ * `truncated` 告诉调用方「这段文本是被上限切出来的前缀」，好让 JSON 解析失败
+ * 时知道该走容错提取而不是把前缀当原文外传。正好读满上限的完整响应体也会被算
+ * 成 truncated，但那种情况下 JSON 本来就 parse 得过，这个标记不起作用。
+ *
  * @param {Response} response
- * @returns {Promise<string>}
+ * @returns {Promise<{ text: string, truncated: boolean }>}
  */
 async function readBoundedBody(response) {
   const body = response && response.body;
   if (!body || typeof body.getReader !== 'function') {
-    return typeof response.text === 'function' ? await response.text() : '';
+    const text = typeof response.text === 'function' ? await response.text() : '';
+    return { text, truncated: false };
   }
 
   const reader = body.getReader();
@@ -395,7 +412,55 @@ async function readBoundedBody(response) {
     try { await reader.cancel(); } catch { /* 读 body 的二次失败不外传 */ }
   }
 
-  return utf8Decode(concatBytes(...chunks));
+  return {
+    text: utf8Decode(concatBytes(...chunks)),
+    truncated: bytes >= UPSTREAM_ERROR_BODY_MAX_BYTES,
+  };
+}
+
+/** 截断的 JSON 前缀里一个字段都没捞到时说的话。总比一段裸 JSON 强。 */
+const TRUNCATED_BODY_NOTE = 'upstream error body was truncated before any readable message';
+
+/**
+ * 从残缺的 JSON 前缀里扫字符串字段：`"message": "…"` 这种形状，值里的转义
+ *（`\"` / `\\`）跟着一起吃掉，免得在半个转义序列上断开。值本身要是被截断了
+ *（没有收尾的引号）就匹配不上，那种半截话不如不要。
+ */
+const JSON_STRING_FIELD = /"(message|detail|code|status|type)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+
+/** @param {string} raw */
+function looksLikeJson(raw) {
+  return /^\s*[{[]/.test(raw);
+}
+
+/**
+ * @param {string} raw 残缺的 JSON 前缀
+ * @returns {{ message: string, code: string }} 捞不到的字段是空串
+ */
+function salvageJsonStringFields(raw) {
+  /** @type {Record<string, string>} */
+  const found = {};
+  for (const match of raw.matchAll(JSON_STRING_FIELD)) {
+    // 同名字段只认第一个：错误信封在最前面，后面重复出现的多半来自被回显的请求。
+    if (found[match[1]] === undefined) found[match[1]] = unescapeJsonString(match[2]);
+  }
+  return {
+    message: firstNonEmptyString(found.message, found.detail),
+    code: firstNonEmptyString(found.code, found.status, found.type),
+  };
+}
+
+/**
+ * @param {string} value JSON 字符串字面量的内容（不含两侧引号）
+ * @returns {string}
+ */
+function unescapeJsonString(value) {
+  try {
+    return JSON.parse(`"${value}"`);
+  } catch {
+    // 转义序列本身不合法时原样返回：拿到这句话比转义准确更要紧。
+    return value;
+  }
 }
 
 /**
@@ -429,20 +494,70 @@ function clampCode(code) {
  */
 const CREDENTIAL_LIKE_TOKEN = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g;
 
+/** 光长随机串（base64 / JWT 片段）：没有前缀也照遮。 */
+const LONG_OPAQUE_RUN = /[A-Za-z0-9+/_.-]{48,}/g;
+
 /**
  * 模型 ID 的形状：全小写字母数字，被 `-` / `.` 切成一串短段，每段不超过 12 个
  * 字符（`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`）。这类串同时
- * 也落在 {@link CREDENTIAL_LIKE_TOKEN} 的形状里，命中这里的原样保留——上游那
- * 句「你写的这个模型不存在」里最关键的就是模型名，遮掉之后报错只剩「有个东西
+ * 也落在 {@link CREDENTIAL_LIKE_TOKEN} 的形状里，脱敏时得先把它们认出来——上游
+ * 那句「你写的这个模型不存在」里最关键的就是模型名，遮掉之后报错只剩「有个东西
  * 不存在」。
  *
  * Key 只要带大写字母、带下划线，或者有任何一段超过 12 个字符，就落不进这个形
- * 状，照常遮掉。
+ * 状，照常遮掉。光靠这个形状还不够，见 {@link looksLikeModelId}。
  */
 const MODEL_ID_LIKE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]{1,12})+$/;
 
 /** 超过这个长度就不再当模型名看待：再长的短段串更可能是 Key，一律遮掉。 */
 const MODEL_ID_MAX_CHARS = 64;
+
+/**
+ * 公认的凭据前缀：跟在它后面的东西不管长什么形状都不是模型名。自建中转
+ *（one-api / new-api / LiteLLM 这类）发的 Key 常常是全小写、按短横线分段的，
+ * 大形状跟模型 ID 一模一样，先靠前缀把它们摘出来。
+ */
+const CREDENTIAL_PREFIX_SEGMENTS = new Set([
+  'sk', 'pk', 'ak', 'api', 'apikey', 'key', 'token', 'secret',
+  'auth', 'bearer', 'session', 'sess', 'pat', 'xai', 'gsk',
+]);
+
+/** uuid（8-4-4-4-12 hex）。中转爱直接拿它当 Key 发，模型名不会长这样。 */
+const UUID_SHAPE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/;
+
+/** 一段里字母块和数字块来回切了几次。段已经由 {@link MODEL_ID_LIKE} 保证是 `[a-z0-9]+`。 */
+function alternationCount(segment) {
+  return (segment.match(/[a-z]+|[0-9]+/g) || []).length;
+}
+
+/**
+ * 这个 token 是不是「只可能是模型名」。
+ *
+ * 光看 {@link MODEL_ID_LIKE} 的形状会把 Key 一起放行：中转发的
+ * `sk-550e8400-e29b-41d4-a716-446655440000`、`key-1a2b3c4d5e6f-7a8b9c0d1e2f`
+ * 全小写、每段都不超过 12 个字符，跟模型 ID 完全同形。所以形状之外还要过三道：
+ *
+ *   - 公认的凭据前缀后面接什么都不豁免；
+ *   - uuid 形状永远不是模型名；
+ *   - 出现「随机段」（字母数字来回切三次以上）就不是模型名。`mixtral-8x7b`
+ *     里的版本段也来回切，但真实模型名里这种段最多一个、而且很短，Key 的随机
+ *     段则是成串的长 hex。
+ *
+ * @param {string} token
+ * @returns {boolean}
+ */
+function looksLikeModelId(token) {
+  if (token.length > MODEL_ID_MAX_CHARS) return false;
+  if (!MODEL_ID_LIKE.test(token)) return false;
+  if (UUID_SHAPE.test(token)) return false;
+
+  const segments = token.split(/[.-]/);
+  if (CREDENTIAL_PREFIX_SEGMENTS.has(segments[0])) return false;
+
+  const randomLooking = segments.filter((segment) => alternationCount(segment) >= 3);
+  if (randomLooking.length === 0) return true;
+  return randomLooking.length === 1 && randomLooking[0].length <= 5;
+}
 
 /**
  * 遮掉长得像凭据的串。
@@ -461,11 +576,15 @@ export function redactCredentials(text) {
   let s = text;
   // Bearer 头与常见「前缀-长随机串」形态的 key。
   s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]');
-  s = s.replace(CREDENTIAL_LIKE_TOKEN, (token) => (
-    token.length <= MODEL_ID_MAX_CHARS && MODEL_ID_LIKE.test(token) ? token : '[redacted]'
-  ));
-  // 光长随机串（base64 / JWT 片段）也不放行。
-  s = s.replace(/[A-Za-z0-9+/_.-]{48,}/g, '[redacted]');
+  s = s.replace(CREDENTIAL_LIKE_TOKEN, (token) => (looksLikeModelId(token) ? token : '[redacted]'));
+  // 长随机串这条也要认模型名，否则 48~64 字符的模型 ID
+  //（`deepseek-ai.deepseek-v3-0324-thinking-preview-latest`）会在上一条放行之后
+  // 被这里二次吞掉，「你写的这个模型不存在」又变回「有个东西不存在」。
+  // 两端的分隔符先剥掉再判：句尾的 `.` 也在这条规则的字符集里，会跟着一起匹进来。
+  s = s.replace(LONG_OPAQUE_RUN, (run) => {
+    const token = run.replace(/^[._+/-]+/, '').replace(/[._+/-]+$/, '');
+    return looksLikeModelId(token) ? run : '[redacted]';
+  });
   return s;
 }
 

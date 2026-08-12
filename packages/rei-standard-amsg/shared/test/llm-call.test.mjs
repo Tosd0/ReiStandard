@@ -33,6 +33,36 @@ function upstream({ status = 400, statusText = 'Bad Request', body = '', textThr
   });
 }
 
+/**
+ * 一个把响应体按流分块给出来的假上游。callLlm 只读前 16KB 就断开——中转把整个
+ * 请求原样回显时，读到的就是一段被切坏的 JSON 前缀。
+ */
+function streamingUpstream({ status = 400, statusText = 'Bad Request', body = '' } = {}) {
+  return async () => ({
+    ok: false,
+    status,
+    statusText,
+    body: {
+      getReader() {
+        const bytes = new TextEncoder().encode(body);
+        let offset = 0;
+        return {
+          async read() {
+            if (offset >= bytes.length) return { done: true, value: undefined };
+            const chunk = bytes.subarray(offset, offset + 4096);
+            offset += chunk.length;
+            return { done: false, value: chunk };
+          },
+          async cancel() {},
+        };
+      },
+    },
+  });
+}
+
+/** 一段够长的回显正文，保证响应体被 16KB 上限切断。 */
+const ECHOED_PROMPT = 'echoed prompt text '.repeat(2000);
+
 async function callAndCatch(fetchImpl, payload = makePayload()) {
   try {
     await callLlm(payload, { fetch: fetchImpl });
@@ -144,6 +174,63 @@ test('callLlm: 响应体不是 JSON 时，原文当说明', async () => {
   assert.equal(error.llmStatus, 502);
   assert.equal(error.providerCode, undefined);
   assert.match(error.message, /nginx\/1\.24\.0/);
+});
+
+// ─── 上游 JSON 被 16KB 上限切断 ──────────────────────────────────────────
+// 中转出问题时会把整个请求原样回显回来，响应体轻松超过 16KB。切出来的前缀不是
+// 合法 JSON，硬 parse 必挂——不能因此就把这段裸 JSON 当作「上游说了什么」。
+
+test('callLlm: 响应体被截断时，说明取上游那句话而不是裸 JSON 前缀', async () => {
+  const body = JSON.stringify({
+    error: {
+      message: 'This model is not available in your region.',
+      // 回显的请求正文把 code 顶到了 16KB 之外。
+      echoed_request: ECHOED_PROMPT,
+      code: 'model_not_available',
+    },
+  });
+  const error = await callAndCatch(streamingUpstream({ status: 403, statusText: 'Forbidden', body }));
+
+  assert.match(error.message, /This model is not available in your region/);
+  assert.ok(!error.message.includes('{'), `说明里不该出现裸 JSON：${error.message}`);
+  assert.ok(!error.message.includes('echoed prompt text'), `说明里不该出现被回显的正文：${error.message}`);
+  assert.equal(error.llmStatus, 403);
+  // code 落在截断点之后，拿不到就别硬凑。
+  assert.equal(error.providerCode, undefined);
+});
+
+test('callLlm: 响应体被截断时，截断点之前的 code 照样能拿到', async () => {
+  const body = JSON.stringify({
+    error: {
+      code: 'context_length_exceeded',
+      message: "This model's maximum context length is 8192 tokens.",
+      echoed_request: ECHOED_PROMPT,
+    },
+  });
+  const error = await callAndCatch(streamingUpstream({ status: 400, body }));
+
+  assert.equal(error.providerCode, 'context_length_exceeded');
+  assert.match(error.message, /maximum context length is 8192 tokens/);
+  assert.ok(!error.message.includes('{'), `说明里不该出现裸 JSON：${error.message}`);
+});
+
+test('callLlm: 截断的 JSON 里一个字段都捞不到时，也不外传裸 JSON', async () => {
+  const body = JSON.stringify({ echoed_request: ECHOED_PROMPT });
+  const error = await callAndCatch(streamingUpstream({ status: 502, statusText: 'Bad Gateway', body }));
+
+  assert.ok(!error.message.includes('echoed prompt text'), `说明里不该出现被回显的正文：${error.message}`);
+  assert.ok(!error.message.includes('{'), `说明里不该出现裸 JSON：${error.message}`);
+  assert.match(error.message, /truncated/);
+  assert.equal(error.llmStatus, 502);
+});
+
+test('callLlm: 流式响应体没超上限时，按普通 JSON 解析', async () => {
+  const body = JSON.stringify({ error: { message: 'Overloaded', type: 'overloaded_error' } });
+  const error = await callAndCatch(streamingUpstream({ status: 429, statusText: 'Too Many Requests', body }));
+
+  assert.match(error.message, /Overloaded/);
+  assert.equal(error.providerCode, 'overloaded_error');
+  assert.equal(error.llmStatus, 429);
 });
 
 test('callLlm: 上游把 Key 抄回来时会遮掉', async () => {

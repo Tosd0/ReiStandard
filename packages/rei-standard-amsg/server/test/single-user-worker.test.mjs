@@ -240,6 +240,56 @@ test('CORS: a config build failure answers the preflight and returns a readable 
   assert.equal(sameOrigin.headers.get('Access-Control-Allow-Origin'), null);
 });
 
+// 回归守卫：降级 500 的 CORS 头是回显来访 Origin 猜出来的，任意第三方页面一个
+// fetch 就能读到整个响应体。构建期异常的原文就是部署信息本身（binding 名、内网
+// 域名、环境变量名），所以跨域那份 cause 不能带 message。
+// 与之配对的 instant 那份见 amsg-instant 的 test/adapter-failure-modes.test.mjs。
+test('降级 500：跨域读到的 cause 不带异常原文，同源 / 无 Origin 照旧给全文', async () => {
+  const worker = createSingleUserCloudflareWorker(() => {
+    throw new TypeError("Cannot read properties of undefined (reading 'prepare') — env.REI_D1_BINDING");
+  });
+  const origErr = console.error;
+  console.error = () => {};
+  let crossOrigin, sameOrigin, noOrigin;
+  try {
+    crossOrigin = await worker.fetch(
+      new Request('https://w.dev/messages?status=all', {
+        method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://evil.example.com' }
+      }),
+      {}
+    );
+    sameOrigin = await worker.fetch(
+      new Request('https://w.dev/messages?status=all', {
+        method: 'GET', headers: { 'X-User-Id': USER, Origin: 'https://w.dev' }
+      }),
+      {}
+    );
+    noOrigin = await worker.fetch(
+      new Request('https://w.dev/messages?status=all', { method: 'GET', headers: { 'X-User-Id': USER } }),
+      {}
+    );
+  } finally {
+    console.error = origErr;
+  }
+
+  const crossCause = (await crossOrigin.json()).error.cause;
+  assert.equal(crossOrigin.headers.get('Access-Control-Allow-Origin'), 'https://evil.example.com');
+  assert.equal(crossCause.stage, 'config');
+  assert.equal(crossCause.name, 'TypeError');
+  assert.equal(crossCause.message, undefined, '跨域页面读得到这条响应，异常原文不能出去');
+  assert.ok(
+    !JSON.stringify(crossCause).includes('REI_D1_BINDING'),
+    'binding 名不能出现在跨域读得到的任何字段里'
+  );
+
+  // 同源页面和 curl 读到的本来就是自己的东西，多给细节没有额外暴露面——部署方
+  // 排障靠的就是这条（另一处是 wrangler tail）。
+  for (const [label, res] of [['同源', sameOrigin], ['无 Origin', noOrigin]]) {
+    const cause = (await res.json()).error.cause;
+    assert.match(cause.message, /REI_D1_BINDING/, `${label}调用方该拿到全文`);
+  }
+});
+
 // Regression guard (design spec §7): with serverToken set, EVERY exposed HTTP
 // endpoint must require X-Client-Token. Today all handlers funnel through the
 // same resolveTenant, but this pins it down so a future handler that forgets

@@ -10,8 +10,9 @@
 
 现在这条路径：
 
-- 预检回 204，其余请求回一条能读的 500：`{ success: false, error: { code: 'INTERNAL_ERROR', message, cause } }`，`cause` 是机读的 `{ stage, name, message }`（`stage` = `'config'` 构建配置时炸的 / `'request'` handler 抛出来的），长得像凭据的串会先遮掉；
-- CORS 头**回显来访的 `Origin`，不退化成 `*`**：配置都没建起来，这个部署允许哪些站点无从得知；这条路上放出去的只有一个固定的错误信封，没有数据也不带凭据，配置一修好所有响应立刻回到 handler 自己那套 CORS；
+- 预检回 204，其余请求回一条能读的 500：`{ success: false, error: { code: 'INTERNAL_ERROR', message, cause } }`，`cause` 是机读的 `{ stage, name, message?, code? }`（`stage` = `'config'` 构建配置时炸的 / `'request'` handler 抛出来的），长得像凭据的串会先遮掉；
+- CORS 头**回显来访的 `Origin`，不退化成 `*`**：配置都没建起来，这个部署允许哪些站点无从得知；配置一修好所有响应立刻回到 handler 自己那套 CORS；
+- 回显 Origin 意味着任意第三方页面都能读到这条响应，所以构建失败那条路上跨域读到的 `cause` 只有 `stage` / `name` / `code`，不带 `message`——构建期异常的原文往往就是部署信息本身（`env.BLOB_KV is undefined` 报的是 binding 名，配置校验的报错里可能有内网域名、环境变量名）。同源请求和不带 `Origin` 的调用（`curl`、服务端之间调用）照旧拿全文；
 - `Access-Control-Max-Age: 0`，故障期间答的那次预检不会留在浏览器缓存里；
 - 同源调用（请求没有 `Origin` 头）依然一个 CORS 头都不加；
 - 构建失败不被记住，下一个请求照常重试：binding 补上之后不用重新部署也能自己恢复。

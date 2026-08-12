@@ -168,7 +168,10 @@
  *   剩下那几条 push 已经落了行却不会再发，不撤掉的话客户端会从 `GET /outbox`
  *   把它们补收回去。不实现 → 取消只挡住 Web Push 这一路。
  * @property {(userId: string, sinceId: number, limit: number) => Promise<Array<Object>>} [listUnackedOutbox]
- *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。
+ *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。行上要带
+ *   `task_uuid` 和 `delivered_at`：`DELETE /message` 和 supersedesUuid 顶替这两
+ *   条路靠翻这份名单找出该任务名下还没发出去的行（没有按 task_uuid 查的读法），
+ *   缺任一字段就挑不出来，那两条路上的 outbox 清理会静默跳过。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
  *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
  * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]
@@ -176,8 +179,8 @@
  *
  *   outbox 这几个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
  *   发送链路静默跳过落行；缺读取侧的（list / ack），`GET /outbox` 与
- *   `POST /outbox/ack` 返回 501；缺 discard，取消只挡住 Web Push。内置只有 D1
- *   实现（与 client_state 同待遇）。
+ *   `POST /outbox/ack` 返回 501；缺 discard（或取消那条路上缺 list），取消只挡
+ *   住 Web Push。内置只有 D1 实现（与 client_state 同待遇）。
  */
 
 export {};

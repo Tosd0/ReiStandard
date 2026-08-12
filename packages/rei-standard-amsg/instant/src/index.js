@@ -553,15 +553,21 @@ export function createInstantHandler(options) {
               // same logical failure. Other errors (LlmCallError,
               // unexpected) had no in-loop diagnostic and DO need one.
               if (!(err instanceof HookError)) {
+                const code = err?.code || 'INTERNAL_ERROR';
                 const diag = buildErrorPush({
                   messageType: MESSAGE_TYPE.INSTANT,
                   source: PUSH_SOURCE.INSTANT,
                   messageId: `msg_${randomUUID()}_error`,
                   sessionId,
-                  code: err?.code || 'INTERNAL_ERROR',
+                  code,
                   message: err?.message || '内部错误',
                   timestamp: new Date().toISOString(),
                 });
+                // 机读标注跟 JSON 信封同一个来源（describeUpstreamFailure），不
+                // 在这儿再抄一份：SSE 是默认传输方式，字段只挂在信封那条路上的
+                // 话，浏览器客户端遇到 Key 失效只能回去正则匹配人话消息。这份
+                // diag 掉线时会原样走 Web Push 兜底，字段跟着一起到。
+                Object.assign(diag, describeUpstreamFailure(err, code));
                 await safeEnqueue('error', diag, (pushErr) => {
                   onEvent({ type: 'sse_error_fallback_failed', sessionId, cause: pushErr });
                 });
@@ -698,8 +704,11 @@ function resolvePositiveInt(value, fallback, fieldName) {
 }
 
 /**
- * 失败信封里的机读标注：上游回的 HTTP 状态码，以及 LLM 那边 provider 自己的
- * 错误码。
+ * 失败时的机读标注：上游回的 HTTP 状态码，以及 LLM 那边 provider 自己的错误码。
+ *
+ * 三个出口共用这一份：纯推送模式的 JSON 信封、宿主拿去做日志 / 告警的 onEvent
+ * error 事件、SSE 的 `event: error`。各写各的话，同一次失败换个传输方式字段就少
+ * 几个——SSE 还是默认传输方式。
  *
  * 名字按上游分开写，不合成一个 `status`：合起来既跟响应自身的 502 撞名字，读
  * 日志时也分不清那个数字是谁回的。`pushStatus` 与 amsg-server 记进 lastError

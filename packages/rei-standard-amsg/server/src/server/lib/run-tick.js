@@ -32,7 +32,11 @@
  * 信号，所以收到之后剩下的推送一条都不发，这一跳把它记进 details.cancelledTasks，
  * 既不算成功也不算失败。
  *
- * @param {Object} ctx - { db, masterKey, vapid, webpush, claimLeaseMs?, leaseHeartbeatMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
+ * @param {Object} ctx - { db, masterKey, vapid, webpush, multipart?, claimLeaseMs?, leaseHeartbeatMs?, staleAfterMs?, serializeBy?, onStaleSkip? }
+ *   ctx.multipart?：分片传输的限额 { maxChunkBytes, maxChunks, maxTotalBytes,
+ *   ttlMs }，宿主传给 `installReiSW` 的那一份原样传过来。整份 ctx 会展开给
+ *   processSingleMessage，发送端据此切片、排发送节奏（见 lib/message-processor.js
+ *   的 resolveMultipartOptions）。不传 = 两边都用默认值。
  *   ctx.serializeBy?.(task)：可选的分组串行。返回一个分组标识（同一个角色、
  *   同一份台账……宿主自己定义），同一分组的任务同时只放行一条；返回 null /
  *   空串 / 不配这个函数 = 这条任务不参与串行，行为与以前完全一致。参数是与
@@ -96,13 +100,35 @@ export const STALE_AFTER_MS = 60 * 60 * 1000;
 
 /** 推送服务回的状态码；拿不到（不是推送失败，或宿主的 webpush 实现没带）→ null。 */
 /**
- * `last_error` 列的探测结果：写得进去的适配器 / 写不进去的适配器。
+ * 认定「这个适配器写不了 `last_error` 列」的适配器（之后的写不再带这个字段）。
  *
- * 记在适配器实例上（不是模块级布尔），同一个进程里并排跑好几个库、或者宿主中
- * 途换适配器时才不会互相串。探一次就记住，之后每次写只花一个来回。
+ * 记在适配器实例上（不是模块级布尔），同一个进程里并排跑好几个库、或者宿主中途
+ * 换适配器时才不会互相串。正面结果不用记：默认就是把 last_error 和状态字段合成
+ * 一笔写，写得进去就什么都不用做。
  */
-const adaptersWithLastErrorColumn = new WeakSet();
 const adaptersWithoutLastErrorColumn = new WeakSet();
+
+/**
+ * 「这个适配器可能没有 last_error 列」的嫌疑计数（适配器 → 次数）。
+ *
+ * 判据是「带这个字段的写挂了，退回去只写状态字段的同一笔却成了」——不靠错误措辞
+ * 猜（自建适配器拒绝未知字段时说什么全凭它自己）。但这个判据一次观察还不够：连
+ * 接重置、语句超时、D1 的 `Network connection lost` 这类瞬时错误恰好落在前一笔上
+ * 时，长得跟「没这一列」一模一样。而认定的后果是永久的（长驻 Node 部署里适配器
+ * 活到进程结束），一次瞬时错误就再也不写 last_error，之后每个失败任务的
+ * `GET /message` 都只剩 lastError: null。所以要连续两次撞上同一个形状才认定；中
+ * 间只要有一笔带 last_error 的写成功了，嫌疑就清零。
+ */
+const lastErrorColumnSuspicions = new WeakMap();
+
+/**
+ * 「带 last_error 的写没成功」这条运维提示已经说过了。
+ *
+ * 刻意不用 WeakSet 按适配器记：Cloudflare 部署每个请求都 `new D1Adapter(env.DB)`，
+ * 按适配器记等于每跳一条，cron 一分钟一跳，日志会被刷满。挂在模块上就是 isolate
+ * 内说一次——它要传达的信息（去把表结构补上）说一次就够。
+ */
+let warnedAboutMissingLastErrorColumn = false;
 
 /** 已经就「行里没有 retry_after」告过警的适配器，每个只说一次。 */
 const adaptersWarnedAboutRetryAfter = new WeakSet();
@@ -117,6 +143,27 @@ function warnMissingRetryAfterColumn(db) {
     '[amsg-server] 适配器返回的任务行里没有 retry_after，退避守卫失效：'
     + '还在退避里的任务会被立刻重跑。投递路径的行要带上这一列，'
     + '见 adapters/interface.js 的 TASK_DELIVERY_COLUMNS。'
+  );
+}
+
+/**
+ * 「带 last_error 的写没成功」的告警（isolate 内只说一次，见
+ * warnedAboutMissingLastErrorColumn）。
+ *
+ * 第一次撞上就说，不等到坐实——Cloudflare 部署每个请求都新建适配器，坐实要看同一
+ * 个适配器上的连续两次，那边永远等不到，运维也就永远看不到这条提示。反过来说，
+ * 一次瞬时错误也会让它说一句：所以措辞把两种可能都写出来，别只说「缺列」。
+ *
+ * @param {unknown} error - 带 last_error 的那笔写报的错（原文照录，别自己转述）
+ */
+function warnMissingLastErrorColumn(error) {
+  if (warnedAboutMissingLastErrorColumn) return;
+  warnedAboutMissingLastErrorColumn = true;
+  console.warn(
+    '[amsg-server] 带 last_error 的写没成功，已退回只写状态字段'
+    + '（失败原因仍记在 payload 的 lastError 里）。库升级后没重跑过 /init-tenant 的话，'
+    + '补一次表结构就能恢复；只是偶发的话不用管:',
+    error && /** @type {{ message?: unknown }} */ (error).message
   );
 }
 
@@ -341,6 +388,7 @@ async function deliverTasks(ctx, tasks) {
     updatedRecurringTasks: 0,
     staleTasks: [],
     cancelledTasks: [],
+    reasoningSkippedTasks: [],
     failedTasks: []
   };
 
@@ -436,7 +484,7 @@ async function deliverTasks(ctx, tasks) {
     if (lease) lease.released = true;
   }
 
-  // last_error 一律往行上写，写不写得进去现场探一次（见 updateTaskWithLastError）。
+  // last_error 一律往行上写，写不进去再退回去（见 updateTaskWithLastError）。
   //
   // 不能拿「实现了 claimTask 吗」当判据：投影那边只看行上带不带 last_error 这
   // 个键，而 claimTask 是可选的——跟着包内 schema 建表、却没实现 claimTask 的
@@ -452,9 +500,16 @@ async function deliverTasks(ctx, tasks) {
    * last_error 这条记录分开对待——前者是状态机，后者是锦上添花，后者写不进去
    * 不能把前者挡住。
    *
-   * 第一次遇到一个适配器时分两笔写：状态字段先落地，last_error 单独补一笔。补
-   * 得上就记住这个库有这一列，之后合成一笔写；补不上（升级后没重跑
-   * /init-tenant 的库、自建的 DbAdapter）也记住，之后不再带这个字段。
+   * 默认就是合成一笔写（状态字段 + last_error）：库有这一列时永远只花一个来回，
+   * 不用先探一次——探测结果只能记在适配器实例上，而 Cloudflare 部署每个请求都新
+   * 建一个 D1Adapter，探一次记一次等于永远在探。
+   *
+   * 这一笔挂了，退回去只写状态字段再来一次：
+   *   - 退回的这笔成了 → 问题就出在 last_error 这个字段上（`updateTaskById` 是
+   *     单条 UPDATE，字段不认时整条不生效，所以退回重写是安全的，写的又都是绝对
+   *     值、重放一次没有副作用）。记一次嫌疑，连续两次才认定这个库没有这一列。
+   *   - 退回的这笔也挂了 → 是库真出问题了，跟哪个字段无关。原样抛出去按既有路径
+   *     处理，什么都不缓存。
    *
    * 不按错误措辞猜「是不是缺列」：自建适配器拒绝未知字段时说什么全凭它自己，
    * 猜不中就是状态永远推不动——retry_count 不涨、next_send_at 不动，任务被每
@@ -468,23 +523,31 @@ async function deliverTasks(ctx, tasks) {
     if (!Object.prototype.hasOwnProperty.call(fields, 'last_error')) {
       return db.updateTaskById(taskId, fields);
     }
-    const { last_error: lastError, ...stateFields } = fields;
-    if (adaptersWithLastErrorColumn.has(db)) return db.updateTaskById(taskId, fields);
+    const { last_error: _lastError, ...stateFields } = fields;
     if (adaptersWithoutLastErrorColumn.has(db)) return db.updateTaskById(taskId, stateFields);
 
-    // 这个适配器还没探过。状态字段先单独落地——它写不进去就是真出错了，原样抛
-    // 出去按既有路径处理；last_error 单独补一笔，成败只决定「以后还带不带它」。
-    const result = await db.updateTaskById(taskId, stateFields);
+    let combinedError;
     try {
-      await db.updateTaskById(taskId, { last_error: lastError });
-      adaptersWithLastErrorColumn.add(db);
+      const result = await db.updateTaskById(taskId, fields);
+      // 写进去了 = 这一列在。之前那次失败是瞬时的，嫌疑清零。
+      lastErrorColumnSuspicions.delete(db);
+      return result;
     } catch (error) {
+      combinedError = error;
+    }
+
+    // 退回只写状态字段。这一笔再挂就是库真出问题了，原样抛给调用方（既有路径会
+    // 把它记成 retry_update_failed / stale_update_failed），一个字都不缓存。
+    const result = await db.updateTaskById(taskId, stateFields);
+
+    // 告警第一次就说（见 warnMissingLastErrorColumn），认定要等第二次。
+    warnMissingLastErrorColumn(combinedError);
+    const suspicions = (lastErrorColumnSuspicions.get(db) || 0) + 1;
+    if (suspicions >= 2) {
       adaptersWithoutLastErrorColumn.add(db);
-      console.warn(
-        '[amsg-server] 适配器写不了 last_error 列，后续写入不再带它'
-        + '（失败原因仍记在 payload 的 lastError 里）:',
-        error && error.message
-      );
+      lastErrorColumnSuspicions.delete(db);
+    } else {
+      lastErrorColumnSuspicions.set(db, suspicions);
     }
     return result;
   }
@@ -963,6 +1026,19 @@ async function deliverTasks(ctx, tasks) {
       return;
     }
 
+    // 正文送到了，只有那条思考过程没发出去（超限、被推送服务拒收……）。这条任务
+    // 仍然是成功的——思考过程是正文之外的附赠内容，把它算成失败会让接入方跑去查
+    // 投递链路，还会给一条已经送达的消息排重试。但也不能一声不吭：不记在这里的
+    // 话，这条被丢掉的 push 在 tick 汇总、日志、调用方响应里全都看不见。
+    // 同理不写进 last_error：那一列说的是「上一次没发出去的原因」，一条正常送达
+    // 的消息挂着它，客户端会当成这次投递失败了。
+    if (sendResult.reasoningError) {
+      results.reasoningSkippedTasks.push({ taskId: task.id, reason: sendResult.reasoningError });
+      console.warn(
+        `[amsg-server] 任务 ${task.id} 的正文已送达，思考过程没发出去: ${sendResult.reasoningError}`
+      );
+    }
+
     try {
       // 收尾写库匹配不到行 = 推送都发完了才发现这条已经被取消或顶替（心跳的
       // 间隔盖不住的那段窗口）。消息确实发出去了，但这一跳不能记成功——记成功
@@ -1067,6 +1143,9 @@ async function deliverTasks(ctx, tasks) {
       // 之前被拦下；`cancelled_after_delivery` = 推送已经发完，收尾写库才发现
       // 行没了。两种都不计入 successCount / failedCount。
       cancelledTasks: results.cancelledTasks,
+      // 正文送到了、只有思考过程没发出去的任务（{ taskId, reason }）。这些任务
+      // 照常计入 successCount——列在这里只是让「这次没有思考过程」看得见。
+      reasoningSkippedTasks: results.reasoningSkippedTasks,
       failedTasks: results.failedTasks
     }
   };

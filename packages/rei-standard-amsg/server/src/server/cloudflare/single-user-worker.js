@@ -54,6 +54,10 @@
  * `serializeBy`；一次 fire 无论什么结局都想收到回执，就配 `onFireSettled`。
  * 两个都不配时行为与以前完全一致。
  *
+ * 页面那边给 `installReiSW` 传了 `multipart`（分片重组的限额）的话，同一份原样
+ * 传进这里的 config：一条 push 装不下的思考过程要切片发，切多大、最多几片、重组
+ * 窗口多长由接收端说了算，发送端不知道就会发出一批对面收不了的分片。
+ *
  * 工厂的第二个参数是 worker 级选项，目前只有一个 `onError`——fetch / cron 任
  * 何一段出错都调它一次。它故意放在 buildConfig 外面：buildConfig 自己抛错
  * （少个 binding、环境变量丢了）时，配置里的东西一个都读不到，而那恰恰是最
@@ -129,6 +133,17 @@ function corsHeadersFor(cors, requestOrigin) {
   return headers;
 }
 
+// ─── 降级路径（配置没建起来时的 500）───────────────────────────────────────
+//
+// 这一段——degradedCorsHeaders、internalErrorResponse、config 与 request 两个阶
+// 段的切分、OPTIONS 必须回 204 的例外、Max-Age: 0、跨域那份 cause 不带 message
+// ——和 amsg-instant 的 instant/src/adapters/cloudflare.js 是同一套行为，两个包
+// 各留一份、不互相 import：instant 会把 blob-store 和一整排 adapter 拖进去，破
+// 坏这个包「D1-only、不开 nodejs_compat 也能打包」的目标。
+//
+// 改这边的信封形状（状态码、error.code/message、cause 的字段、CORS 头）记得同
+// 步改那边，反之亦然。
+
 /**
  * CORS headers for the degraded path: buildConfig itself threw, so the
  * deployment's configured policy is unknowable — yet the error response still
@@ -137,17 +152,61 @@ function corsHeadersFor(cors, requestOrigin) {
  * reads exactly like the worker being down).
  *
  * The fallback echoes the caller's Origin — never '*' — and is used ONLY on this
- * path. What it exposes is a fixed error envelope with no data and no
- * credentials, so a stranger's page learns nothing beyond "this worker is
- * failing"; the moment the config builds again, every response goes back to
- * cfg.cors, so a CORS-less (same-origin) deployment does not become an open one.
- * maxAge 0 keeps a preflight answered during the outage out of the browser cache.
+ * path. What it exposes is a fixed error envelope plus a couple of annotations
+ * that carry no deployment detail (which stage blew up, the exception's class
+ * name), so a stranger's page learns nothing beyond "this worker is failing, and
+ * roughly where"; the moment the config builds again, every response goes back
+ * to cfg.cors, so a CORS-less (same-origin) deployment does not become an open
+ * one. maxAge 0 keeps a preflight answered during the outage out of the browser
+ * cache.
  *
  * @param {string} requestOrigin - the request's Origin header ('' → null, i.e.
  *   a same-origin caller needs no headers, same as everywhere else)
  */
 function degradedCorsHeaders(requestOrigin) {
   return corsHeadersFor({ origin: requestOrigin, maxAge: 0 }, requestOrigin);
+}
+
+/**
+ * 这次调用是不是「自己人」：没有 Origin 头（`curl`、服务端之间调用、同源 GET），
+ * 或者 Origin 就是这个 Worker 自己的域名。
+ *
+ * 问的其实是「谁能读到这条响应」。降级路径回显来访 Origin，所以任意第三方页面一
+ * 个 `fetch` 就能读全响应体；而同源 / 无 Origin 的调用者读到的本来就是自己的东
+ * 西。哪些 origin 算自己人本该由部署配的 CORS 说了算——但降级路径存在的前提正是
+ * 那份配置没建起来，只能退到这条按请求本身就能判断的线上。
+ *
+ * @param {Request} request
+ * @param {string} requestOrigin
+ * @returns {boolean}
+ */
+function isSameOriginCall(request, requestOrigin) {
+  if (!requestOrigin) return true;
+  try {
+    return new URL(request.url).origin === requestOrigin;
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * 跨域能读到的那一份 cause：只留不含部署内容的标注（stage、异常类名、错误自带的
+ * code），异常消息原文不跟着出去。
+ *
+ * 构建期异常的原文就是部署信息本身：`env.DB is undefined` 报的是 binding 名，配
+ * 置校验的报错里可能有内网域名、环境变量名。运维要的线索留在两处：`wrangler
+ * tail`（console.error 那一行）和同源 / 无 Origin 的请求——部署方 `curl` 一下就
+ * 是全文。
+ *
+ * 请求阶段的 500 不走这里：那条响应用的是这个部署自己配的 CORS 白名单，谁读得到
+ * 是部署方批准过的。
+ *
+ * @param {import('../lib/errors.js').ErrorCause} cause
+ * @returns {import('../lib/errors.js').ErrorCause}
+ */
+function publicErrorCause(cause) {
+  const { message: _serverSideOnly, ...safe } = cause;
+  return /** @type {import('../lib/errors.js').ErrorCause} */ (safe);
 }
 
 /**
@@ -244,7 +303,11 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       // 租约心跳间隔（默认 30s；0 = 关掉心跳，退回一次性长租约）。
       leaseHeartbeatMs: cfg.leaseHeartbeatMs,
       // 补发新鲜度阈值（默认 60 分钟；见 lib/run-tick.js 的 STALE_AFTER_MS）。
-      staleAfterMs: cfg.staleAfterMs
+      staleAfterMs: cfg.staleAfterMs,
+      // 分片传输的限额 { maxChunkBytes, maxChunks, maxTotalBytes, ttlMs }：跟宿主
+      // 传给 installReiSW 的那一份保持一致。装不下一条 push 的思考过程按它切片、
+      // 按它排发送节奏（见 lib/message-processor.js）。
+      multipart: cfg.multipart
     };
   }
 
@@ -273,7 +336,12 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       // A preflight must be 2xx or the browser never sends the real request —
       // and then the readable 500 below never reaches the caller.
       if (method === 'OPTIONS' && degraded) return new Response(null, { status: 204, headers: degraded });
-      return internalErrorResponse(degraded, cause);
+      // 跨域读得到的那份不带异常原文：这条响应的 CORS 头是回显来访 Origin 猜出
+      // 来的，不是这个部署自己批准的白名单（见 publicErrorCause）。
+      return internalErrorResponse(
+        degraded,
+        isSameOriginCall(request, requestOrigin) ? cause : publicErrorCause(cause)
+      );
     }
 
     const cors = corsHeadersFor(cfg.cors, requestOrigin);
