@@ -5,10 +5,10 @@
 
 ## v2.1.0 — 按 kind 分发的客户端事件
 
-2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error`）区分内容类型。SW 在收到 push 后会做两件事：
+2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error` / `result`）区分内容类型。SW 在收到 push 后会做两件事：
 
 1. **永远** 通过 `postMessage` 把 payload 广播给所有受控窗口（包括 `includeUncontrolled: true` 的未受控窗口）。
-2. **仅当** `messageKind === 'content'` 或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
+2. **仅当** `messageKind === 'content'` / `'result'`，或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
 
 ### 新增导出 `REI_SW_EVENT`
 
@@ -20,6 +20,7 @@
 | `REI_SW_EVENT.REASONING_RECEIVED`    | `'rei-amsg-reasoning-received'`    | `payload.messageKind === 'reasoning'` |
 | `REI_SW_EVENT.TOOL_REQUEST_RECEIVED` | `'rei-amsg-tool-request-received'` | `payload.messageKind === 'tool_request'` |
 | `REI_SW_EVENT.ERROR_RECEIVED`        | `'rei-amsg-error-received'`        | `payload.messageKind === 'error'` |
+| `REI_SW_EVENT.RESULT_RECEIVED`       | `'rei-amsg-result-received'`       | `payload.messageKind === 'result'`（宿主自定义的结果） |
 | `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片拼不起来（`payload.reason` 说明是哪种） |
 | `REI_SW_EVENT.UNKNOWN_RECEIVED`      | `'rei-amsg-unknown-received'`      | 缺 `messageKind`（2.0.x 老 payload / blob envelope） |
 
@@ -37,6 +38,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
     case REI_SW_EVENT.REASONING_RECEIVED:    /* 渲染思考中 UI */ break;
     case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: /* 弹出工具执行确认 */ break;
     case REI_SW_EVENT.ERROR_RECEIVED:        /* 显示错误 toast */ break;
+    case REI_SW_EVENT.RESULT_RECEIVED:       /* 宿主自定义结果，页面自己消化 */ break;
     case REI_SW_EVENT.MULTIPART_EXPIRED:     /* 观测 transport 缺片 */ break;
     case REI_SW_EVENT.UNKNOWN_RECEIVED:      /* 2.0.x 老 payload 的兼容路径 */ break;
   }
@@ -46,7 +48,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 ### 通知显示策略 (Notification Rendering)
 
 默认情况下：
-- `content` 和老式 payload：自动弹系统通知。
+- `content`、`result` 和老式 payload：自动弹系统通知。
 - `reasoning` / `tool_request` / `error`：不弹通知，只触发 client 事件。
 
 通过 `payload.notification.show`，你可以显式覆盖这个默认行为。此字段由服务端或产生 payload 时指定：

@@ -50,6 +50,9 @@
  *   行原样（payload 是密文），所以解密出来的 metadata 单独放在 info 里；只透传
  *   metadata 这一个子字段，解密 payload 里的 apiKey / pushSubscription 等凭据
  *   不会递给 hook。
+ *   ctx.clientStateTtl?：client_state 的按命名空间过期清理，形状是
+ *   `{ 命名空间: 天数 }`。不配 = 一个都不清（默认行为不变）。见
+ *   cleanupExpiredClientState。
  * @returns {Promise<Object>} summary { totalTasks, successCount, failedCount, processedAt, executionTime, details }
  */
 
@@ -62,8 +65,10 @@ import {
 } from './errors.js';
 import { deriveUserEncryptionKey, decryptFromStorage, encryptForStorage } from './encryption.js';
 import { processSingleMessage } from './message-processor.js';
-import { buildHookTask } from './agentic-fire.js';
+import { buildHookTask, occurrenceSuffix } from './agentic-fire.js';
 import { createStateAccessors } from './state-accessors.js';
+import { planClientStateCleanup } from './client-state-store.js';
+import { createResultEmitter } from './result-emitter.js';
 import { nextFutureOccurrence, planNextOccurrence } from './recurrence.js';
 
 // 占位租期（一次性长租约的老行为）：要盖住最慢的一次投递。老链路单次 LLM
@@ -243,6 +248,8 @@ function resolveStaleAfterMs(ctx) {
  * @property {string|null} nextSendAt - 循环任务快进到的下一次触发时刻；一次性任务为 null
  * @property {(namespace: string) => Promise<Array>} readState
  * @property {(namespace: string, entries: Array) => Promise<Object>} writeState
+ * @property {(payload: Object) => Promise<{ messageId: string, pushed: boolean }>} emitResult
+ *   往客户端补一条自定义结果（落收件箱 + 推送，见 lib/result-emitter.js）。
  */
 
 function isRecurringType(recurrenceType) {
@@ -295,7 +302,41 @@ export async function runScheduledTick(ctx) {
       console.warn('[amsg-server] cleanupOutbox 失败（已忽略）:', error && error.message);
     }
   }
+  await cleanupExpiredClientState(ctx);
   return summary;
+}
+
+/**
+ * client_state 的按命名空间过期清理（宿主配了 `ctx.clientStateTtl` 才做）。
+ *
+ * 默认什么都不清：写进 client_state 的东西是宿主的数据，库不替它决定什么时候
+ * 该没。但「大内容旁路」那类用法（一条 push 塞不下的正文先写进状态、push 里
+ * 只带引用键）写的是一次性内容，客户端取走之后没人再去删，攒着只会白占库。
+ * 给这类命名空间配上天数，这里每跳顺手清一次。
+ *
+ * 配置形状是 `{ 命名空间: 天数 }`，逐个命名空间开——没写进配置的一个都不动。
+ * 判据是行的 `updated_at` 列（本来就有，不加列）：升级后老库不用改表结构，
+ * 也就没有「表没跟上 → cron 静默挂在缺的那一列上」这一说。
+ *
+ * 一个坑说在前头：`PUT /client-state` 和 `writeState()` 的条件写护栏
+ * （entry 上的 `version`）落的就是这一列。护栏值传的是自增计数器之类的小整数
+ * 时，这行的 `updated_at` 看起来就像 1970 年，第一次清理就会被扫走。要给某个
+ * 命名空间配 TTL，就让它的写入方把 `version` 传成毫秒时间戳。
+ *
+ * 全程 best-effort：清理失败只记日志——它是顺手做的库存卫生，不该把一整跳投
+ * 递带下水。
+ *
+ * @param {Object} ctx - 与 runScheduledTick 同一份 ctx
+ */
+async function cleanupExpiredClientState(ctx) {
+  if (typeof ctx.db.cleanupClientState !== 'function') return;
+  const targets = planClientStateCleanup(ctx.clientStateTtl, Date.now());
+  if (targets.length === 0) return;
+  try {
+    await ctx.db.cleanupClientState(targets);
+  } catch (error) {
+    console.warn('[amsg-server] cleanupClientState 失败（已忽略）:', error && error.message);
+  }
 }
 
 /**
@@ -936,6 +977,22 @@ async function deliverTasks(ctx, tasks) {
           userKey,
           maxStateValueBytes: ctx.maxStateValueBytes
         });
+        // 结果出口也一并给：「这一条（这几条）没响」本身就常是要送回客户端
+        // 的一条结果，宿主不用为这个场合另开一条回程（见 lib/result-emitter.js）。
+        const { emitResult } = createResultEmitter({
+          db,
+          task,
+          userKey,
+          decryptedPayload,
+          messageIdBase: task.id != null
+            ? `msg_task_${task.id}${occurrenceSuffix(task)}`
+            : `msg_stale_${task.uuid || ''}`,
+          sessionId: task.id != null
+            ? `sess_task_${task.id}${occurrenceSuffix(task)}`
+            : `sess_stale_${task.uuid || ''}`,
+          occurrenceMs,
+          webpush: ctx.webpush
+        });
 
         // 循环任务快进（fast_forwarded）与一次性任务作废（expired）的收尾
         // 完全同构：写 lastError → 写库 → 记 staleTasks → 调 onStaleSkip。
@@ -977,7 +1034,8 @@ async function deliverTasks(ctx, tasks) {
           skippedOccurrences: recurring ? plan.skippedOccurrences : [occurrenceMs],
           skippedTruncated: recurring ? plan.skippedTruncated : false,
           nextSendAt,
-          ...stateAccessors
+          ...stateAccessors,
+          emitResult
         });
       } catch (error) {
         results.failedCount++;

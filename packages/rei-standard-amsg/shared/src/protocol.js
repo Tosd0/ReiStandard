@@ -56,6 +56,8 @@ export const REI_SW_EVENT = Object.freeze({
   REASONING_RECEIVED: 'rei-amsg-reasoning-received',
   TOOL_REQUEST_RECEIVED: 'rei-amsg-tool-request-received',
   ERROR_RECEIVED: 'rei-amsg-error-received',
+  /** 宿主自定义的一条结果（`messageKind: 'result'`），不是聊天内容。 */
+  RESULT_RECEIVED: 'rei-amsg-result-received',
   MULTIPART_EXPIRED: 'rei-amsg-multipart-expired',
   UNKNOWN_RECEIVED: 'rei-amsg-unknown-received'
 });

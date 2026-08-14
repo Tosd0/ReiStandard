@@ -114,6 +114,11 @@
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
+ * @property {(targets: Array<{ namespace: string, updatedBefore: number }>) => Promise<number>} [cleanupClientState]
+ *   （可选；单用户/D1）按命名空间清掉 `updated_at` 早于 `updatedBefore`（epoch 毫秒）
+ *   的行，不限用户。宿主配了 `clientStateTtl` 时 runScheduledTick 每跳顺手调；
+ *   指令由 lib/client-state-store.js 的 `planClientStateCleanup` 算好（含大值切片
+ *   所在的保留命名空间）。不实现 → 不清理，与不配 TTL 时行为一致。
  * @property {(userId: string) => Promise<{ subscription: string, updated_at: number }|null>} [getPushSubscription]
  *   这个用户当前登记的 Web Push 订阅（`subscription` 是密文，解密在上层）。没有登记过 → null。
  *   一个用户一份：任务行不携带订阅，到点投递时读这里。

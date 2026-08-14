@@ -5,8 +5,8 @@
  *  - Three-axis `push` payload dispatch — keyed by `payload.messageKind`
  *    (see `@rei-standard/amsg-shared`). Every push is mirrored to every
  *    controlled client via `postMessage` under a per-kind event name.
- *  - Notification rendering for `messageKind: 'content'` (and legacy
- *    payloads without `messageKind`, for back-compat with 2.0.x
+ *  - Notification rendering for `messageKind: 'content'` / `'result'` (and
+ *    legacy payloads without `messageKind`, for back-compat with 2.0.x
  *    producers).
  *  - Generic `_multipart` transport reassembly. Multipart chunks are
  *    stored below the business layer and never dispatched until the
@@ -42,6 +42,7 @@
  *       case REI_SW_EVENT.REASONING_RECEIVED:    // render thinking UI
  *       case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: // prompt tool exec
  *       case REI_SW_EVENT.ERROR_RECEIVED:        // show error toast
+ *       case REI_SW_EVENT.RESULT_RECEIVED:       // 宿主自定义结果，页面自己消化
  *       case REI_SW_EVENT.MULTIPART_EXPIRED:    // observe incomplete transport
  *       case REI_SW_EVENT.UNKNOWN_RECEIVED:      // legacy 2.0.x payload
  *     }
@@ -54,6 +55,7 @@
  * @typedef {import('@rei-standard/amsg-shared').ReasoningPush} ReasoningPush
  * @typedef {import('@rei-standard/amsg-shared').ToolRequestPush} ToolRequestPush
  * @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush
+ * @typedef {import('@rei-standard/amsg-shared').ResultPush} ResultPush
  */
 
 import {
@@ -447,18 +449,23 @@ function resolveEventName(payload) {
       return REI_SW_EVENT.TOOL_REQUEST_RECEIVED;
     case MESSAGE_KIND.ERROR:
       return REI_SW_EVENT.ERROR_RECEIVED;
+    case MESSAGE_KIND.RESULT:
+      return REI_SW_EVENT.RESULT_RECEIVED;
     default:
       return REI_SW_EVENT.UNKNOWN_RECEIVED;
   }
 }
 
 /**
- * True when the payload should trigger `showNotification`. Only
- * `messageKind: 'content'` renders a notification; everything else
- * (`reasoning`, `tool_request`, `error`) is dispatched silently so
- * apps can render them in-app.
+ * True when the payload should trigger `showNotification`. Two kinds
+ * render: `content`（聊天正文）与 `result`（宿主自定义的结果——「跑完了，
+ * 回来看看」正是要弹一下的那种消息）；其余（`reasoning`、`tool_request`、
+ * `error`）静默送给页面自己渲染。
  * Legacy payloads with no `messageKind` field still render a
  * notification — that's the 2.0.x back-compat path.
+ *
+ * 想反过来（结果不弹 / 思考过程要弹）就在 payload 里带
+ * `notification: { show }`，那一路优先级更高（见 shouldRenderNotification）。
  *
  * @param {Record<string, unknown>} payload
  * @returns {boolean}
@@ -467,7 +474,7 @@ function isNotificationKind(payload) {
   if (!payload || typeof payload !== 'object') return false;
   const kind = payload.messageKind;
   if (kind === undefined || kind === null) return true;
-  return kind === MESSAGE_KIND.CONTENT;
+  return kind === MESSAGE_KIND.CONTENT || kind === MESSAGE_KIND.RESULT;
 }
 
 function shouldRenderNotification(payload, clientList) {

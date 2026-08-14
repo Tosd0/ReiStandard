@@ -210,6 +210,9 @@ export {
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
+// 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原）。自己包路由的宿主
+// 用它代替 `await request.text()`，压缩请求体就跟单用户 Worker 一样自动认。
+export { readRequestBody, DEFAULT_MAX_REQUEST_BODY_BYTES } from './lib/request.js';
 // 一条任务正文的明文字节上限（超了 POST /schedule-message、PUT /update-message
 // 回 400 TASK_PAYLOAD_TOO_LARGE）。客户端想在提交前自己预算就读这一份，别手抄
 // 第二个数——它是按 D1 的单行上限反推出来的，见 lib/validation.js。

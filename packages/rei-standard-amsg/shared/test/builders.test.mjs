@@ -9,10 +9,12 @@ import {
   buildReasoningPush,
   buildToolRequestPush,
   buildErrorPush,
+  buildResultPush,
   isContentPush,
   isReasoningPush,
   isToolRequestPush,
   isErrorPush,
+  isResultPush,
   chunkReasoningByUtf8Bytes,
 } from '../src/index.js';
 
@@ -23,10 +25,10 @@ const COMMON = Object.freeze({
   sessionId: 'sess_test_0',
 });
 
-test('MESSAGE_KIND constant enumerates all four kinds', () => {
+test('MESSAGE_KIND constant enumerates all five kinds', () => {
   assert.deepEqual(
     new Set(Object.values(MESSAGE_KIND)),
-    new Set(['content', 'reasoning', 'tool_request', 'error']),
+    new Set(['content', 'reasoning', 'tool_request', 'error', 'result']),
   );
 });
 
@@ -243,18 +245,41 @@ test('buildErrorPush replaces the legacy {type:"error"} envelope', () => {
   assert.ok(isErrorPush(push));
 });
 
+test('buildResultPush keeps the host fields it does not know about', () => {
+  const push = buildResultPush({
+    ...COMMON,
+    resultKind: 'fire-pack',
+    packId: 'pack_42',
+    entries: [{ id: 1 }, { id: 2 }],
+  });
+  assert.equal(push.messageKind, 'result');
+  assert.equal(push.resultKind, 'fire-pack');
+  // 结果的形状是宿主定的：白名单式复制会把内容删掉一半，所以这里原样保留
+  assert.equal(push.packId, 'pack_42');
+  assert.deepEqual(push.entries, [{ id: 1 }, { id: 2 }]);
+  assert.ok(push.timestamp, 'timestamp 缺席时由 builder 补上');
+  assert.ok(isResultPush(push));
+});
+
+test('buildResultPush 要求给这类结果起个名字（resultKind）', () => {
+  assert.throws(() => buildResultPush({ ...COMMON }), /resultKind/);
+  assert.throws(() => buildResultPush({ ...COMMON, resultKind: '  ' }), /resultKind/);
+});
+
 test('type guards narrow correctly across union members', () => {
   const content = buildContentPush({ ...COMMON, message: 'x' });
   const reasoning = buildReasoningPush({ ...COMMON, reasoningContent: 'y' });
   const tool = buildToolRequestPush({ ...COMMON, toolCalls: [{ id: 'a' }] });
   const error = buildErrorPush({ ...COMMON, code: 'E', message: 'm' });
+  const result = buildResultPush({ ...COMMON, resultKind: 'ledger-entry' });
 
-  for (const push of [content, reasoning, tool, error]) {
+  for (const push of [content, reasoning, tool, error, result]) {
     const matches = [
       isContentPush(push),
       isReasoningPush(push),
       isToolRequestPush(push),
       isErrorPush(push),
+      isResultPush(push),
     ].filter(Boolean).length;
     assert.equal(matches, 1, `exactly one guard should match ${push.messageKind}`);
   }

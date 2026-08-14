@@ -673,6 +673,44 @@ test('error push dispatches ERROR_RECEIVED with no notification', async () => {
   assert.equal(postedMessages[0].message.payload.code, 'HOOK_THREW');
 });
 
+test('result push dispatches RESULT_RECEIVED AND renders a notification', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  const payload = {
+    ...COMMON,
+    messageKind: 'result',
+    resultKind: 'fire-pack',
+    title: '生成完毕',
+    body: '这次整理好了 3 条'
+  };
+  await triggerPush(payload);
+
+  // 结果与聊天正文同待遇：跑完了就该弹一下叫人回来看
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, '生成完毕');
+  assert.equal(notifications[0].options.body, '这次整理好了 3 条');
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.RESULT_RECEIVED);
+  assert.equal(postedMessages[0].message.payload.resultKind, 'fire-pack');
+});
+
+test('result push with notification.show:false stays silent but still dispatches', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'result',
+    resultKind: 'ledger-entry',
+    notification: { show: false }
+  });
+
+  assert.equal(notifications.length, 0, '宿主说了别弹就别弹');
+  assert.equal(postedMessages.length, 1);
+  assert.equal(postedMessages[0].message.event, REI_SW_EVENT.RESULT_RECEIVED);
+});
+
 test('legacy payload without messageKind dispatches UNKNOWN_RECEIVED AND renders a notification (back-compat)', async () => {
   const { sw, notifications, postedMessages, triggerPush } = createSwMock();
   installReiSW(sw);

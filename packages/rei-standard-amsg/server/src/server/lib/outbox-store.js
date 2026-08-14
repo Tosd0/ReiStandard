@@ -34,22 +34,35 @@ export function supportsOutbox(db) {
 export async function appendPushesToOutbox({ db, userId, userKey, pushes }) {
   if (!supportsOutbox(db) || !pushes || pushes.length === 0) return false;
   try {
-    const now = Date.now();
-    const rows = await Promise.all(pushes.map(async (push) => ({
-      message_id: push.messageId,
-      task_uuid: push.taskUuid ?? null,
-      session_id: push.sessionId ?? null,
-      message_index: push.messageIndex ?? null,
-      total_messages: push.totalMessages ?? null,
-      payload: await encryptForStorage(JSON.stringify(push), userKey),
-      created_at: now,
-    })));
-    await db.appendOutboxMessages(userId, rows);
+    await db.appendOutboxMessages(userId, await toOutboxRows(pushes, userKey, Date.now()));
     return true;
   } catch (error) {
     console.warn('[amsg-server] outbox 落行失败（不影响投递）:', error && error.message);
     return false;
   }
+}
+
+/**
+ * 把 push 对象转成 message_outbox 的行（payload 加密）。
+ *
+ * 抽出来是给 `ctx.emitResult()` 用的：它落的行要跟推送链路落的完全同构——
+ * 列一样、加密方式一样、身份字段的取法一样，客户端补收时才不用区分是谁写的。
+ *
+ * @param {Object[]} pushes - 定稿后的 push 对象
+ * @param {CryptoKey|string} userKey
+ * @param {number} createdAt - epoch 毫秒
+ * @returns {Promise<Object[]>}
+ */
+export async function toOutboxRows(pushes, userKey, createdAt) {
+  return Promise.all(pushes.map(async (push) => ({
+    message_id: push.messageId,
+    task_uuid: push.taskUuid ?? null,
+    session_id: push.sessionId ?? null,
+    message_index: push.messageIndex ?? null,
+    total_messages: push.totalMessages ?? null,
+    payload: await encryptForStorage(JSON.stringify(push), userKey),
+    created_at: createdAt,
+  })));
 }
 
 /**

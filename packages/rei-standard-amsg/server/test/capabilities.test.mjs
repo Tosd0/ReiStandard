@@ -53,6 +53,9 @@ const EXPECTED_FEATURES = [
   'schema-self-check',
   'worker-run-task',
   'llm-credentials',
+  'gzip-request-body',
+  'client-state-ttl',
+  'emit-result',
 ];
 
 function makeWorker(extra = {}) {

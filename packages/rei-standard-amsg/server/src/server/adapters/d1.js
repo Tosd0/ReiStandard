@@ -684,6 +684,35 @@ export class D1Adapter {
   }
 
   /**
+   * 例行清理：把指定命名空间下太久没更新的条目删掉（run-tick 每跳顺手调，
+   * 宿主配了 `clientStateTtl` 才会调）。
+   *
+   * 不限用户——「这个命名空间只留最近 N 天」是命名空间级的约定，单用户部署
+   * 下也就是这一个用户的行。指令由 lib/client-state-store.js 的
+   * `planClientStateCleanup` 算好（含大值切片所在的保留命名空间），这里只负
+   * 责照着删。
+   *
+   * @param {Array<{ namespace: string, updatedBefore: number }>} targets
+   *   `updatedBefore` 是 epoch 毫秒，与 `updated_at` 列同一把尺子。
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async cleanupClientState(targets = []) {
+    if (!Array.isArray(targets) || targets.length === 0) return 0;
+    const SQL = 'DELETE FROM client_state WHERE namespace = ? AND updated_at < ?';
+    const statements = targets.map((target) =>
+      this._db.prepare(SQL).bind(target.namespace, target.updatedBefore)
+    );
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const statement of statements) results.push(await statement.run());
+    }
+    return results.reduce((sum, res) => sum + (res.meta.changes || 0), 0);
+  }
+
+  /**
    * Wipe every entry of this user.
    *
    * @param {string} userId

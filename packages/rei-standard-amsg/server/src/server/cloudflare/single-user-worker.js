@@ -58,6 +58,14 @@
  * 传进这里的 config：一条 push 装不下的思考过程要切片发，切多大、最多几片、重组
  * 窗口多长由接收端说了算，发送端不知道就会发出一批对面收不了的分片。
  *
+ * 请求体带 `Content-Encoding: gzip` 时自动解压，所有带 body 的端点都认（见
+ * lib/request.js）。客户端把大 body 压了再传能省下几倍传输量，两边都不用改
+ * 端点。解压后的字节上限默认 32MB，config 的 `maxRequestBodyBytes` 可调。
+ *
+ * client_state 默认不过期。config 里配 `clientStateTtl`（`{ 命名空间: 天数 }`）
+ * 之后，cron 每跳顺手把这些命名空间下超过天数没更新的条目清掉——放旁路大内容
+ * 的命名空间用得上，见 lib/run-tick.js。
+ *
  * 工厂的第二个参数是 worker 级选项，目前只有一个 `onError`——fetch / cron 任
  * 何一段出错都调它一次。它故意放在 buildConfig 外面：buildConfig 自己抛错
  * （少个 binding、环境变量丢了）时，配置里的东西一个都读不到，而那恰恰是最
@@ -74,6 +82,7 @@ import { createD1Adapter } from '../adapters/d1.js';
 import { runScheduledTick, runTask as runTaskWithContext } from '../lib/run-tick.js';
 import { getSchemaVersion as readSchemaVersion, ensureSchema as applySchema } from '../lib/schema-version.js';
 import { summarizeErrorCause } from '../lib/errors.js';
+import { readRequestBody } from '../lib/request.js';
 
 function headersToObject(h) {
   const out = {};
@@ -304,6 +313,9 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       leaseHeartbeatMs: cfg.leaseHeartbeatMs,
       // 补发新鲜度阈值（默认 60 分钟；见 lib/run-tick.js 的 STALE_AFTER_MS）。
       staleAfterMs: cfg.staleAfterMs,
+      // client_state 的按命名空间过期清理 `{ 命名空间: 天数 }`。不配 = 一个都
+      // 不清（见 lib/run-tick.js 的 cleanupExpiredClientState）。
+      clientStateTtl: cfg.clientStateTtl,
       // 分片传输的限额 { maxChunkBytes, maxChunks, maxTotalBytes, ttlMs }：跟宿主
       // 传给 installReiSW 的那一份保持一致。装不下一条 push 的思考过程按它切片、
       // 按它排发送节奏（见 lib/message-processor.js）。
@@ -367,13 +379,24 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       const pathname = new URL(url).pathname.replace(/\/+$/, '') || '/';
       const headers = headersToObject(request.headers);
 
+      // 带 body 的方法先把正文读出来：`Content-Encoding: gzip` 的请求体在这一
+      // 步还原（见 lib/request.js 的 readRequestBody）。放在路由之前是为了所
+      // 有端点一次全通——各端点自己判那个头的话，漏判的那个收到的就是一段乱
+      // 码，报出来是「请求体不是有效的 JSON」，跟压缩八竿子打不着。
+      let body = '';
+      if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+        const read = await readRequestBody(request, { maxBytes: cfg.maxRequestBodyBytes });
+        if (!read.ok) return jsonResponse(read.error.status, read.error.body, cors);
+        body = read.body;
+      }
+
       let result;
       if (method === 'POST' && pathname.endsWith('/init-tenant')) {
-        result = await server.handlers.init.POST(headers, await request.text());
+        result = await server.handlers.init.POST(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/get-user-key')) {
         result = await server.handlers.getUserKey.GET(url, headers);
       } else if (method === 'POST' && pathname.endsWith('/schedule-message')) {
-        result = await server.handlers.scheduleMessage.POST(headers, await request.text());
+        result = await server.handlers.scheduleMessage.POST(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/messages')) {
         result = await server.handlers.messages.GET(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/message')) {
@@ -381,7 +404,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         // 's'），两条 endsWith 判断互不吃对方的请求。
         result = await server.handlers.getMessage.GET(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/update-message')) {
-        result = await server.handlers.updateMessage.PUT(url, headers, await request.text());
+        result = await server.handlers.updateMessage.PUT(url, headers, body);
       } else if (method === 'DELETE' && pathname.endsWith('/cancel-message')) {
         result = await server.handlers.cancelMessage.DELETE(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/vapid-public-key')) {
@@ -389,7 +412,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       } else if (method === 'GET' && pathname.endsWith('/capabilities')) {
         result = await server.handlers.capabilities.GET(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/client-state')) {
-        result = await server.handlers.clientState.PUT(headers, await request.text());
+        result = await server.handlers.clientState.PUT(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/client-state')) {
@@ -397,20 +420,20 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       } else if (method === 'GET' && pathname.endsWith('/outbox')) {
         result = await server.handlers.outbox.GET(url, headers);
       } else if (method === 'POST' && pathname.endsWith('/outbox/ack')) {
-        result = await server.handlers.outbox.POST(headers, await request.text());
+        result = await server.handlers.outbox.POST(headers, body);
       } else if (method === 'PUT' && pathname.endsWith('/push-subscription')) {
-        result = await server.handlers.pushSubscription.PUT(headers, await request.text());
+        result = await server.handlers.pushSubscription.PUT(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/push-subscription')) {
         result = await server.handlers.pushSubscription.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/push-subscription')) {
         result = await server.handlers.pushSubscription.DELETE(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/llm-credentials')) {
-        result = await server.handlers.llmCredentials.PUT(headers, await request.text());
+        result = await server.handlers.llmCredentials.PUT(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/llm-credentials')) {
         result = await server.handlers.llmCredentials.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/llm-credentials')) {
         // DELETE 带加密 body（{ credIds } 或 { all: true }），与 PUT 同一套信封。
-        result = await server.handlers.llmCredentials.DELETE(url, headers, await request.text());
+        result = await server.handlers.llmCredentials.DELETE(url, headers, body);
       } else {
         result = { status: 404, body: { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } } };
       }

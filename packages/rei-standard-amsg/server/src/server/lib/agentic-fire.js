@@ -22,7 +22,8 @@
  * 记得说过、用户没收到」。载荷带 task（任务行本身）：tick 内多个任务并发
  * 投递时，hook 靠它区分回执属于哪条任务；带 scratch（与本次 fire 的
  * onBeforeFire / onLLMOutput 同一个引用），前面几个 hook 记下的东西这里直
- * 接读；带 readState / writeState，回执要落进 client_state 时不用另想办法。
+ * 接读；带 readState / writeState / emitResult，回执要落进 client_state、或者
+ * 要给客户端补一条结果时，不用另想办法。
  *
  * 收尾回执：onAfterSend 只走「有 push 要发」这条路。**只要 onBeforeFire 被
  * 调用过**，无论结局是发完、跳过（skip / skip-push）还是抛错，可选的
@@ -46,6 +47,12 @@
  * writeState，读到和写出的都是客户端 `GET/PUT /client-state` 那套数据。写口
  * 在 sessionCtx 上也给，是因为「这条内容太大、塞不进 push」往往到工具跑完、
  * 组 pushPayloads 时才知道，那时 onBeforeFire 早已返回。
+ *
+ * 自定义结果：同样这几个位置上还挂着 emitResult(payload)，把一条**不是聊天
+ * 内容**的结果送给客户端——整理好的一份数据、一条账目、后台生成的产物。它同
+ * 时落进服务端收件箱并推一条 Web Push：推送负责及时（生成完当场弹一下），
+ * 收件箱负责到达（客户端下次 `GET /outbox?since=` 一定拿得到）。客户端因此
+ * 不必为每种结果各写一套轮询。实现见 lib/result-emitter.js。
  *
  * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx、同一次 fire
  * 每轮的 sessionCtx、以及发送后的 onAfterSend 都持有同一个引用，hook 之间借
@@ -109,6 +116,7 @@ import { decryptFromStorage, encryptForStorage } from './encryption.js';
 import { isUniqueViolation } from './db-errors.js';
 import { callLlm } from './llm.js';
 import { createStateAccessors } from './state-accessors.js';
+import { createResultEmitter } from './result-emitter.js';
 import { projectTask } from './task-projection.js';
 import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
@@ -297,6 +305,31 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     userId: task.user_id,
     userKey,
     maxStateValueBytes: ctx.maxStateValueBytes,
+    now: nowFn,
+  });
+
+  // 这一次 fire 的三个身份值，整条链共用一份：sessionId 钉在（任务 id + 名义
+  // 触发时刻）上，同一 occurrence 的重试复用同一个 session、不同 occurrence 各
+  // 一个（见 occurrenceSuffix）。它是给日志和去重用的**不透明 id**，想知道是哪
+  // 条任务、哪一次触发，读 sessionCtx 上的 taskId / taskUuid / occurrenceMs，
+  // 别去拆它。messageIdBase 同理，是推送与结果两条路的 messageId 前缀——两边
+  // 各算一份的话，任务行没有 id 时（instant 那条路）两边会各掷一个随机数。
+  const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
+  const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
+  const occurrenceMs = occurrenceMsOf(task);
+
+  // 结果出口：把一条宿主自定义的结果落进收件箱并推出去（见
+  // lib/result-emitter.js）。与 readState / writeState 同待遇，fire 级和每轮的
+  // sessionCtx、以及收尾 hook 上都挂着同一个。
+  const { emitResult } = createResultEmitter({
+    db: ctx.db,
+    task,
+    userKey,
+    decryptedPayload,
+    messageIdBase,
+    sessionId,
+    occurrenceMs,
+    webpush: ctx.webpush,
     now: nowFn,
   });
 
@@ -670,6 +703,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     userId: task.user_id,
     readState,
     writeState,
+    emitResult,
     scheduleTask,
     cancelTask,
     renewTask,
@@ -689,8 +723,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-      readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+      readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
       resolveLlmCredential, fireCtx, progress,
+      sessionId, messageIdBase, occurrenceMs,
     });
     settledStatus = !outcome.handled
       ? 'not-handled'
@@ -719,6 +754,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       scratch,
       readState,
       writeState,
+      emitResult,
     });
   }
 }
@@ -732,8 +768,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
  */
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-  readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+  readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
   resolveLlmCredential, fireCtx, progress,
+  sessionId, messageIdBase, occurrenceMs,
 }) {
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
@@ -758,13 +795,6 @@ async function runFireChain({
   );
   const deadline = nowFn() + totalTimeoutMs;
 
-  // Same sessionId scheme as the legacy path: pinned to (task id + 名义触发
-  // 时刻)，同一 occurrence 的重试复用同一个 session，不同 occurrence 各一个
-  // （见 occurrenceSuffix）。这个字符串是给日志和去重用的**不透明 id**，
-  // 想知道是哪条任务、哪一次触发，读 sessionCtx 上的 taskId / taskUuid /
-  // occurrenceMs，别去拆它。
-  const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
-  const occurrenceMs = occurrenceMsOf(task);
   let messages = normalized.messages.slice();
 
   // chat 凭据进循环前解析一次（多轮共用同一份；credRefs.chat 缺席时是 null，
@@ -825,6 +855,7 @@ async function runFireChain({
       occurrenceMs,
       readState,
       writeState,
+      emitResult,
       scheduleTask,
       cancelTask,
       renewTask,
@@ -856,6 +887,7 @@ async function runFireChain({
         decryptedPayload,
         ctx,
         sessionId,
+        messageIdBase,
         occurrenceMs,
         task,
         userKey,
@@ -863,6 +895,7 @@ async function runFireChain({
         scratch,
         readState,
         writeState,
+        emitResult,
         progress,
       });
       return { handled: true, result: { success: true, messagesSent, status: 'finished', iterations: iteration + 1 } };
@@ -1070,6 +1103,7 @@ async function sendHookPushPayloads({
   decryptedPayload,
   ctx,
   sessionId,
+  messageIdBase,
   occurrenceMs,
   task,
   userKey,
@@ -1077,12 +1111,13 @@ async function sendHookPushPayloads({
   scratch,
   readState,
   writeState,
+  emitResult,
   progress,
 }) {
   const total = pushPayloads.length;
   let sentCount = 0;
   progress.total = total;
-  const afterSendBase = { task, total, scratch, readState, writeState, usage: progress.usage };
+  const afterSendBase = { task, total, scratch, readState, writeState, emitResult, usage: progress.usage };
   const sentIds = [];
   /** 定稿后的整批 push（发送前就落进 outbox 的那一份）。取消收尾要按它撤行。 */
   const finalized = [];
@@ -1098,7 +1133,6 @@ async function sendHookPushPayloads({
       userKey,
       legacyFallback: (decryptedPayload && decryptedPayload.pushSubscription) ?? null,
     });
-    const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 
     // 先定稿整批（补 id / index / 任务身份），再发送——发送前整批落进
     // message_outbox（客户端补收的事实来源，best-effort，见 lib/outbox-store.js），

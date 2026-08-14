@@ -304,6 +304,7 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 | ctx 上的口子 | 干什么 |
 |---|---|
 | `readState(ns)` / `writeState(ns, entries)` | 读写 `client_state`，和客户端 `GET/PUT /client-state` 是同一份数据 |
+| `emitResult(payload)` | 给客户端送一条**不是聊天内容**的结果（落收件箱 + 推送） |
 | `scheduleTask(options)` | 给同一个用户再建一条定时任务 |
 | `scratch` | 本次 fire 的便签对象，三个 hook 加上发送后的 `onAfterSend` 共享同一个引用，fire 结束即丢弃 |
 
@@ -323,11 +324,11 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 
 | hook | 什么时候调 | 载荷 |
 |---|---|---|
-| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, total, error, scratch, readState, writeState }` |
-| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, total, iterations, error, scratch, readState, writeState }` |
-| `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState }` |
+| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, total, error, scratch, readState, writeState, emitResult }` |
+| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, total, iterations, error, scratch, readState, writeState, emitResult }` |
+| `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
 
-三个 hook 都自带 `readState` / `writeState`，作用于当前用户的 `client_state`，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
+三个 hook 都自带 `readState` / `writeState` / `emitResult`，作用于当前用户，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
 
 `onAfterSend` 的 `scratch` 与本次 fire 的 `onBeforeFire` / `onLLMOutput` 是同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读，不用自建按任务分格的登记表。全部成功时 `error` 为 `null`；第 k 段失败时 `sentCount = k`、`error` 带原始错误，且在错误往上抛之前调用完。
 
@@ -387,6 +388,40 @@ const result = await ctx.scheduleTask({
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。
 
+### `ctx.emitResult(payload)`
+
+聊天正文之外的产出——整理好的一份数据、一条账目、后台生成的产物——用它送给客户端。
+
+```js
+const { messageId, pushed } = await ctx.emitResult({
+  resultKind: 'fire-pack',              // 必填：这类结果的名字，客户端按它分流
+  packId: 'pack_42',                    // 以下随便加，形状由你定
+  entries: [{ id: 1 }, { id: 2 }],
+  notification: { title: '整理好了', body: '点开看看' },  // 可选，见下
+});
+```
+
+一条结果走两条路，缺一不可：
+
+| 路 | 负责什么 |
+|---|---|
+| 落进 `message_outbox` | **到达**。客户端下次 `GET /outbox?since=` 一定拿得到——推送没送到、内容超过一条推送 4KB 的上限，都不会让它丢 |
+| 发一条 Web Push | **及时**。跑完当场弹一下叫人回来看，而不是等客户端下次上线 |
+
+客户端因此不必为每种结果各写一套轮询：补收机制已经在那儿了，结果跟聊天消息从同一个口子回来，靠 `messageKind === 'result'` 分开，再按 `resultKind` 分流。
+
+**通知**默认弹（结果与聊天正文同待遇，其余 push 类型是静默送给页面）。标题正文在 `notification` 里自定义，字段与 SW 那套一致（`title` / `body` / `icon` / `tag` / …）；不想弹就 `notification: { show: false }`。
+
+**返回值**里 `pushed` 是「这次推送有没有真的发出去」。`false` 只表示没能当场送达（订阅失效、推送服务抽风、payload 超过 4KB），行还在收件箱里等补收——所以这不算失败，`emitResult` 也不会因此抛错。
+
+**落行失败会抛**：收件箱是到达的保证，静默丢掉正是这个能力要修的病。适配器没有 `message_outbox`（自定义适配器）时同样抛，`code` 是 `OUTBOX_UNSUPPORTED`。
+
+**取消**与聊天分段同待遇：结果行上带 `task_uuid`，`DELETE /message` 取消、`supersedesUuid` 顶替时，这条任务名下**还没送到**的结果一起撤掉；已经推到设备上的留着让客户端照常 ack（推出去的撤不回来）。
+
+**重试**：`messageId` 缺省值掺了任务 id 与本次名义触发时刻，同一次触发重跑时第 n 条结果拿到的还是同一个 id，收件箱靠 `(user_id, message_id)` 唯一约束天然去重，不会补出第二条。想自己控制就在 payload 里传 `messageId`。
+
+`GET /capabilities` 的 features 里有 `emit-result`。
+
 ### hook 契约违约算确定性失败
 
 宿主 hook 返回了库不认的东西（`onBeforeFire` 的返回形状、`onLLMOutput` 的决策标签），或者建后续任务时 `createTask` 没把行交回来——这些错误带 `permanent: true` 和一个稳定的 `code`（`AGENTIC_BAD_BEFORE_FIRE` / `AGENTIC_BAD_DECISION` / `AGENTIC_SCHEDULE_FAILED` / `TASK_PAYLOAD_TOO_LARGE`），投递侧据此跳过退避阶梯：一次性任务直接标 `failed`，循环任务作废本次 occurrence。重试也是同一个结果，而每重试一轮都要把 `onBeforeFire` 和一整轮 LLM 重跑一遍。
@@ -427,6 +462,54 @@ const result = await ctx.scheduleTask({
   - `Authorization: Bearer <tenantToken>`
 - `send-notifications`
   - `Authorization: Bearer <cronToken>` 或 `?token=<cronToken>`
+
+## 请求体可以压缩（`Content-Encoding: gzip`）
+
+带 `Content-Encoding: gzip` 的请求体在读出来的那一步自动解压，单用户 Worker 上每个带 body 的端点都认（`POST /schedule-message`、`PUT /client-state`、`PUT /llm-credentials`……）。客户端把大 body 压了再传能省下几倍传输量，两边都不用改端点。
+
+```js
+await fetch(`${baseUrl}/client-state`, {
+  method: 'PUT',
+  headers: { ...encryptionHeaders, 'Content-Encoding': 'gzip' },
+  body: await gzip(JSON.stringify(encryptedEnvelope)),
+});
+```
+
+几条边界：
+
+| 情况 | 结果 |
+|---|---|
+| 没有这个头 | 原样读，行为与以前一字不差 |
+| 说是 gzip、字节却是明文 | 按明文处理。有些边缘网关会替你解开请求体却留着这个头，照着头再解一次只会解出乱码 |
+| `br` / `deflate` 之类 | `415 UNSUPPORTED_CONTENT_ENCODING`，不猜着解 |
+| 解压后超过上限 | `413 REQUEST_BODY_TOO_LARGE`。默认 32MB，config 的 `maxRequestBodyBytes` 可调 |
+| 声明了 gzip 但数据是坏的 | `400 INVALID_CONTENT_ENCODING` |
+
+上限只管压缩这条路：几百 KB 的压缩数据能展开成几个 GB，不设上限等于把内存交给调用方决定。不压缩的请求体不受它约束。
+
+自己包路由的宿主用 `readRequestBody(request, { maxBytes })` 代替 `await request.text()` 就能得到同样的行为，`GET /capabilities` 的 features 里有 `gzip-request-body`。
+
+## `client_state` 的过期清理（`clientStateTtl`）
+
+`client_state` 默认不过期：写进去的是宿主的数据，库不替它决定什么时候该没。
+
+但「大内容旁路」那类用法写的是一次性内容——一条 push 塞不下的正文先写进状态、push 里只带一个引用键，客户端取走之后没人再回来删它。给这类命名空间配上天数，cron 每跳顺手清一次：
+
+```js
+clientStateTtl: {
+  fire_pack: 7,        // fire_pack 下超过 7 天没更新的条目自动清掉
+  scratch_pad: 1,
+}
+```
+
+- **逐个命名空间开**，没写进配置的一个都不动。
+- 判据是行本来就有的 `updated_at` 列，不加列——升级后老库不用改表结构，也就没有「表没跟上、cron 静默挂在缺的那一列上」这一说。
+- 大值分块存储的切片行跟着根行一起走，不留读不出来的垃圾行。
+- 天数不是正数的条目会被跳过并告警一次；清理本身失败只记日志，不影响这一跳的投递。
+
+一个坑说在前头：`PUT /client-state` 和 `writeState()` 的条件写护栏（entry 上的 `version`）落的就是 `updated_at` 这一列。护栏值传的是自增计数器之类的小整数时，这行的 `updated_at` 看起来就像 1970 年，第一次清理就会被扫走。要给某个命名空间配 TTL，就让它的写入方把 `version` 传成毫秒时间戳。
+
+`GET /capabilities` 的 features 里有 `client-state-ttl`。
 
 ## 循环任务的时区（`tzId`）
 
@@ -613,6 +696,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION` — 表结构自查与补齐
 - `summarizeErrorCause` — 把异常压成响应体里 `error.cause` 那个形状（自己包一层路由、想回同样形状时用同一份）
 - `NonRetryableError` / `isNonRetryableError` — hook 侧标注「重试也好不了」的失败
+- `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES` — 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原），自己包路由时代替 `await request.text()`
 - `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
 - `createTenantToken` / `verifyTenantToken`
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
@@ -627,6 +711,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION`
 - `summarizeErrorCause` / `NonRetryableError` / `isNonRetryableError`
 - `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES`
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
 
 ## 运行环境与要求
