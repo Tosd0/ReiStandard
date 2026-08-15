@@ -1,5 +1,42 @@
 # Changelog — @rei-standard/amsg-shared
 
+## 0.4.0-next.7
+
+### Minor Changes
+
+- 80f471d: 不会弹通知的 payload 不发推送，只落收件箱
+
+  一条 payload 出门有两条腿：落进 `message_outbox`（到达的保证，客户端上线 `GET /outbox?since=` 补拉）和发一条 Web Push（及时性）。收件箱那条腿每条 payload 都走，推送这条腿只留给「到了客户端会弹通知」的那些。
+
+  | payload                                                         | 落收件箱 | 发推送 |
+  | --------------------------------------------------------------- | -------- | ------ |
+  | `content` / `result`                                            | ✅       | ✅     |
+  | `reasoning` / `tool_request` / `error`                          | ✅       | ❌     |
+  | 任意 kind + `notification: { show: false }`                     | ✅       | ❌     |
+  | 任意 kind + `notification: { show: 'always' \| 'when-hidden' }` | ✅       | ✅     |
+
+  订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈。`reasoning` / `tool_request` / `error` 在 Service Worker 那边是静默送给页面的，推过去不会有任何可见反馈，却要跟浏览器赊一次账：Firefox 对这类 push 有配额、超了退掉订阅；iOS 给新订阅几天宽限期，过后一条不弹的就吊销订阅，而且掉订阅是静默发生的，服务端只看得到后续推送返回 410。这些内容在收件箱里一个字不少，走补拉既不影响到达，也不再拿订阅去换一条根本不会显示的横幅。
+
+  想让某一条照样弹，给它带上 `notification: { show: 'always' }`——发送端和 Service Worker 读同一份判定，宿主说了要弹就照推。`show: 'when-hidden'` 也照推：它到底弹不弹要看当下有没有可见窗口，那只有 Service Worker 知道；这一档是给既有部署留的兼容值，新代码在「一定弹」和「压根不推」里挑一个。
+
+  一个例外不用配：这一批没能落进收件箱时照旧推送，那时推送是这条内容唯一的腿。收件箱是 D1 适配器的能力，多租户线的 pg / neon 还没有，那条线上所有 payload 照旧全推。跳过推送的行不标 `delivered_at`，留在收件箱里等客户端补收。
+
+  agentic 链路的 `onAfterSend` / `onFireSettled` 回执新增 `pushedCount`：这批里真的占用了推送通道的有几条。`sentCount` 含义不变（这批走完了几段），`sentCount === total` 照旧表示整批都到位了。
+
+  `@rei-standard/amsg-shared` 新增导出 `notificationIntent(payload)`：把「这条到了客户端会不会弹」算成 `'always'` / `'when-hidden'` / `'never'`。SW 和发送端读同一份，判定不会各走各的。
+
+### Patch Changes
+
+- 80f471d: 通知策略统一成「要推就一定弹，不想弹就别推」
+
+  订阅是按 `userVisibleOnly: true` 建的，收到 push 却不弹通知，各家浏览器的处理不一样。iOS 那边实测下来是宽限期机制：订阅刚建好的几天里，发多少条不弹通知的 push 都不掉订阅（跟条数无关，只跟订阅建了多久有关）；宽限期一过，一条不弹的就立刻吊销；吊销后重新订阅，判定比第一次更严，之后随时可能再掉。最难查的是这个时间差——本地订阅完立刻测一轮都正常，上线几天后用户订阅才开始成片掉，而且掉订阅是静默的，服务端只看到推送返回 410。
+
+  于是通知策略的口径收敛成一条，跟客户端跑在什么设备上无关：**要推就一定弹**（`notification.show: "always"`，嫌打扰用 `tag` 折叠加 `silent: true`；弹通知不影响页面自绘，`postMessage` 照常派发），**不想弹就别推**（内容落服务端收件箱，客户端上线 `GET /outbox?since=` 补拉）。
+
+  `"when-hidden"` 标为兼容档：应用在前台时它就是一条不弹的 push，那笔账照记（规范允许 user agent 在有可见窗口时免掉展示约束，Chrome 认这条豁免，iOS 不认）。既有部署照常工作，新代码在上面两条里挑一个。文档里的场景示例统一改用 `"always"` + `tag` 折叠 + `silent: true`。
+
+  `show` 四个档各是什么、什么时候用，收进 `@rei-standard/amsg-shared` README 的「选哪个 `show`」一张表，其余包只留一句「兼容档，新代码不选」加链接。amsg-sw README 新增「不展示通知的代价」一节收口这套取舍，shared / server / instant / client 的相关段落指过去；Service Worker 规范同步新增 §4.1.2，正文与变更历史里的通知策略建议改用同一口径。纯文档改动，运行行为不变。
+
 ## 0.4.0-next.6
 
 ### Minor Changes
