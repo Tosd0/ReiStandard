@@ -164,7 +164,7 @@
 
   payload 的正文一路取下来是空串（或只有空白字符）时，SW 现在用兜底文案填上再弹，默认 `New message`，`installReiSW(self, { defaultBody })` 可以换成自己的。只有标题、正文空白的系统通知对用户来说就是一条什么都没有的消息：锁屏上看到、未读 +1、点进去还是空的。
 
-  兜底只能是「弹一条有内容的」，不能是「干脆不弹」：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，不弹会被 Firefox 按配额退订、iOS 可能撤掉推送权限（README 的通知策略一节有完整代价说明）。
+  兜底只能是「弹一条有内容的」，不能是「干脆不弹」：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，不弹会被 Firefox 按配额退订、被 iOS 吊销订阅（README 的「不展示通知的代价」一节有完整说明）。
 
   发送方本来就不该发空正文；这层是兜底，正文非空时一个字都不动（前后空格也照原样保留）。
 
@@ -175,9 +175,9 @@
 - d47a842: 包元数据对齐：instant 的 `engines.node` 从 `>=18` 收紧到与其余包和构建目标一致的 `>=20`；instant / sw 对 `@rei-standard/amsg-shared` 的依赖区间统一为 `^0.4.0-next.1`。
 - 9f3827e: 通知显示策略文档写清 `notification.show: false` 的代价
 
-  订阅是按 `userVisibleOnly: true` 建的，那是跟浏览器约好每条 push 都会给用户可见反馈。应用在后台时收到 push 却不展示通知，Chrome 会替你弹一条通用的「此网站在后台更新了内容」，Firefox 对这类 push 有配额、超了直接退掉订阅，iOS Web Push 可能撤销推送权限——而掉订阅是静默发生的。README 的通知策略一节补上这段代价说明，并写明 `"when-hidden"` 这一档是安全的（规范允许 user agent 在有可见窗口时免掉展示约束）。
+  订阅是按 `userVisibleOnly: true` 建的，那是跟浏览器约好每条 push 都会给用户可见反馈。应用在后台时收到 push 却不展示通知，Chrome 会替你弹一条通用的「此网站在后台更新了内容」，Firefox 对这类 push 有配额、超了直接退掉订阅，iOS 会吊销订阅——而掉订阅是静默发生的。README 的通知策略一节补上这段代价说明。
 
-  「前台自绘 Toast」的场景示例从 `show: false` 换成 `show: "when-hidden"`：前台静默交给页面自绘、后台照弹系统通知，两边都不落空。
+  「前台自绘 Toast」的场景示例改用 `show: "always"` + `tag` 折叠 + `silent: true`：页面自绘照做（`postMessage` 跟弹不弹通知无关），系统通知被同 `tag` 的下一条覆盖掉，通知栏里始终只有一条。
 
 - Updated dependencies [d6bea67]
   - @rei-standard/amsg-shared@0.4.0-next.3

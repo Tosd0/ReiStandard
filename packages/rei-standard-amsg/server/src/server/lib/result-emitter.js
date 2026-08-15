@@ -23,6 +23,13 @@
  * 在宿主没表态时把 `show: 'always'` 补上——这样即使客户端的 SW 还是旧版本
  * （不认识 result 这个 kind），通知照样弹得出来。
  *
+ * 订阅是按 `userVisibleOnly: true` 建的，收到 push 却不弹通知，Firefox 按配额
+ * 退订、iOS 在订阅的宽限期过后直接吊销（见 amsg-sw README 的「不展示通知的代
+ * 价」）。所以这里只有两条路：要推就一定弹（`show: 'always'`，嫌吵配 `tag`
+ * 折叠 + `silent`），不想弹就 `show: false` ——那条不发推送、只落行，客户端
+ * 上线补拉照样拿得到。`'when-hidden'` 是给老部署留的兼容值，照推，但应用在前
+ * 台时它就是一条不弹的 push，那笔账照记。
+ *
  * 取消语义与聊天分段一致：行上写 `task_uuid`，所以 `DELETE /message` 取消、
  * `supersedesUuid` 顶替时，这条任务名下还没发出去的结果会一起撤掉（见
  * lib/outbox-store.js 的 discardUndeliveredPushesForTask）。取消恰好发生在
@@ -38,6 +45,7 @@ import {
   markPushesDelivered,
   discardUndeliveredPushes,
 } from './outbox-store.js';
+import { shouldSendPush } from './push-policy.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 
 /**
@@ -112,9 +120,14 @@ export function createResultEmitter({
     // 先落行再推送，与推送链路同序：落进去的必须是发出去的同一份内容。
     await db.appendOutboxMessages(task.user_id, await toOutboxRows([push], userKey, nowFn()));
 
+    // 宿主明说了不弹（`show: false`）就不推：推过去只会白违约一次
+    // `userVisibleOnly` 的约定，而行已经落好，客户端补收照样拿得到。行落成功
+    // 是走到这里的前提（上面那句失败会直接抛），所以不用再判 outboxed。
     let pushed;
     try {
-      pushed = await sendResultPush({ db, task, userKey, decryptedPayload, webpush, push });
+      pushed = shouldSendPush(push, { outboxed: true })
+        ? await sendResultPush({ db, task, userKey, decryptedPayload, webpush, push })
+        : false;
     } catch (error) {
       // 走到这里只有一种可能：推送前发现这条任务已经被取消 / 顶替（见
       // sendResultPush）。取消动作发生在这一行落库之前，所以它清不到这一行，

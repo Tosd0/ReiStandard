@@ -17,6 +17,7 @@ import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/singl
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { encryptTestSubscription, seedPushSubscription, withPushSubscriptionStore } from './helpers/push-subscription.mjs';
+import { withoutOutbox } from './helpers/no-outbox.mjs';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
@@ -173,7 +174,9 @@ describe('宿主配的分片限额传得到发送端', () => {
 
     const sent = [];
     const worker = createSingleUserCloudflareWorker((env) => ({
-      db: createD1Adapter(env.DB),
+      // 有收件箱时思考过程只落行、不推送（见 lib/push-policy.js），这条用例要
+      // 验的是分片限额，得站在没有收件箱的部署上——那时推送是它唯一的腿。
+      db: withoutOutbox(createD1Adapter(env.DB)),
       masterKey: TEST_MASTER_KEY,
       vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
       webpush: { async sendNotification(_sub, payload) { sent.push(JSON.parse(payload)); } },

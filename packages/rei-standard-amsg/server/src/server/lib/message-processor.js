@@ -41,6 +41,7 @@ import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTa
 import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
 import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import { shouldSendPush } from './push-policy.js';
 import {
   buildErrorExtra,
   isNonRetryableError,
@@ -451,18 +452,26 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // outbox 落的是逻辑上的那几条 push：思考过程走分片时，落进去的也是没切
     // 之前的整条——补收走的是 HTTP，没有单条体积上限。
     const pushesToSend = reasoningPush ? [reasoningPush, ...contentPushes] : contentPushes;
-    await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
+    const outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
+
+    // 到了客户端不会弹通知的那些不推，只留在 outbox 里等客户端补拉（见
+    // lib/push-policy.js）。思考过程正是这一类：SW 那边它本来就是静默送给页面
+    // 的，推过去等于白违约一次 `userVisibleOnly` 的约定，而内容在 outbox 里一
+    // 个字不少。落行没成的那批不适用——那时候推送是它唯一的腿。
+    const pushGate = { outboxed };
+    const contentToPush = contentPushes.filter(push => shouldSendPush(push, pushGate));
 
     const sentIds = [];
     let cancelledMidBurst = false;
     // 思考过程是附赠内容，发不出去不算这条任务失败——但也不能一声不吭：调用方
-    // 拿它决定要不要重发 / 要不要提示用户思考过程这次没到。
+    // 拿它决定要不要重发 / 要不要提示用户思考过程这次没到。按策略跳过的不算
+    // 「没发成」，那条路上内容还在 outbox 里，不设这个字段。
     let reasoningError;
     try {
       // 思考过程先发，且只影响它自己：发不出去（超限、推送服务拒收……）就跳
       // 过，正文一条不少地照发。它排在最前面又和正文共用一个循环的话，一次
       // 失败会把整条消息一起带走。
-      if (reasoningPush) {
+      if (reasoningPush && shouldSendPush(reasoningPush, pushGate)) {
         const reasoning = await deliverReasoningPush(ctx, pushSubscription, reasoningPush);
         if (reasoning.shipped) {
           sentIds.push(reasoningPush.messageId);
@@ -472,10 +481,10 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         }
       }
 
-      for (let i = 0; i < contentPushes.length; i++) {
-        await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(contentPushes[i]));
-        sentIds.push(contentPushes[i].messageId);
-        if (i < contentPushes.length - 1) {
+      for (let i = 0; i < contentToPush.length; i++) {
+        await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(contentToPush[i]));
+        sentIds.push(contentToPush[i].messageId);
+        if (i < contentToPush.length - 1) {
           await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS);
         }
       }

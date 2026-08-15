@@ -27,7 +27,7 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/capabilities`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /messages` 是列表，`GET /message?id=<uuid>` 是单条。单条比列表多给一个**完整的 `metadata`**：`PUT /update-message` 对 `metadata` 是整体替换，只改其中一个键就得先把完整那份读回来。列表不带整份 metadata——一页最多 100 条，每条都驮着它会把响应撑得很大。
@@ -65,6 +65,25 @@ await client.putPushSubscription(sub);
 - `POST /schedule-message` / `PUT /update-message` 都不收 `pushSubscription` 字段（带了 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）。
 - 投递时读不到订阅 → 任务按投递失败处理，原因记进 `lastError`，`GET /messages` 上看得见。
 - 表是 `push_subscriptions`（`user_id` 主键，`subscription` 密文，`updated_at` epoch 毫秒）。`POST /init-tenant` 会建，手工建表的看 `schema.sql`。
+
+## 服务端收件箱（/outbox）
+
+这是啥：每条 payload 在发出去之前先落的一行账。客户端上线拉 `GET /outbox?since=<cursor>` 取还没确认收到的，处理完 `POST /outbox/ack` 销账。
+
+**为什么必须接**：到了客户端不会弹通知的 payload——思考过程、工具请求、错误，以及带 `notification: { show: false }` 的结果——**不发推送，只落这里**。订阅是按 `userVisibleOnly: true` 建的，收到 push 却不弹通知，Firefox 按配额退订、iOS 过了订阅宽限期直接吊销，而且掉订阅是静默发生的。这些内容在收件箱里一个字不少，客户端补拉拿得回来。不接补拉的话，它们就等于没发出去过。
+
+会弹通知的那些也照样落行，所以推送没送到（离线、订阅失效、推送服务抽风）时同样从这里补回来。
+
+```js
+// 应用启动、以及页面从后台回到前台时各拉一次
+const { entries, cursor, hasMore } = await client.getOutbox({ limit: 100 });
+for (const entry of entries) await handlePush(entry.push); // entry.push 与 SW 收到的那份逐字一致
+await client.ackOutbox(entries.map((e) => e.messageId));   // 先落库成功再 ack
+```
+
+完整写法（翻页、去重、ack 顺序）见 [`@rei-standard/amsg-client` README 的「上线补一次收件箱」](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md#上线补一次收件箱)。
+
+想让某条本来不弹的照样推出去，发的时候给它带 `notification: { show: 'always' }`——发送端和 Service Worker 读同一份判定。
 
 ## 客户端状态同步（/client-state）
 
@@ -413,6 +432,8 @@ Worker 从 `@rei-standard/amsg-server/cloudflare` 导入（不是包根）。这
 ## 客户端
 
 `@rei-standard/amsg-client` 配 `baseUrl` 指向本 Worker；若设了 `AMSG_SERVER_TOKEN`，client 也要配同样的 `serverToken`。
+
+别漏了**应用启动时拉一次收件箱**（见上面的 [/outbox](#服务端收件箱outbox)）：思考过程、工具请求、错误这些不弹通知的内容只落收件箱、不发推送，不补拉就等于没有。
 
 前端和 Worker 不同源时，浏览器会对带自定义头的请求发 CORS 预检。默认是同源、不开 CORS；跨源就在 config 里加 `cors`，填你的前端域名：
 

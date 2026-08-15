@@ -12,12 +12,25 @@
 
 本规范定义 ReiStandard 主动消息 API 的服务端行为，重点覆盖：
 
-- 一体化初始化（`init-tenant`）
-- 租户鉴权（`tenantToken` / `cronToken`）
+- 两条部署线各自的初始化与鉴权（见 §1.1）
 - 端到端加密所需的关键约束
-- 多租户与单租户共用的最小化初始化流程
+- 推送 wire shape（`AmsgPush`）与到达保证（服务端收件箱）
 
 本规范适用于 `packages/rei-standard-amsg/server` 与 `examples/` 的同构实现。
+
+### 1.1 两条部署线
+
+| | 单用户线（推荐） | 多租户线 |
+|---|---|---|
+| 一个部署 | 服务一个用户 | 服务多个租户 |
+| 初始化 | `POST /init-tenant` 只建表（幂等） | `POST /init-tenant` 提交 `databaseUrl`，签发 token |
+| 鉴权 | 可选的共享密钥，客户端用 `X-Client-Token` 带上 | `tenantToken` / `cronToken`（§5） |
+| 定时触发 | 平台周期调度直接调运行时的定时入口 | HTTP `POST /send-notifications`（§5.2 / §5.3） |
+| 服务端收件箱（§6.7） | 必须实现 | 尚未实现，相关端点返回 `501` |
+
+**新实现走单用户线。** 收件箱是这套 API 的到达保证，也是「不会弹通知的 payload 不发推送」（§6.7）能成立的前提——没有它，那些 payload 只能照旧全推，每一条都在拿推送订阅冒险。
+
+第 3～5、7～8 节讲的是多租户线独有的租户模型与鉴权，第 6、9 节两条线通用；两条线各自的对接流程见 §10。
 
 ## 2. 核心变更（相对 v1）
 
@@ -40,6 +53,8 @@
 - **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0、`amsg-server` 2.4.0、`amsg-instant` 0.8.0、`amsg-sw` 2.1.0、`amsg-client` 2.3.0 协同实装。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
 
 ## 3. 角色与职责
+
+> 本节到第 5 节讲的是**多租户线**的租户模型与鉴权。单用户线一个部署只服务一个人，没有租户这一层：部署方自己配 `masterKey` 与 VAPID，鉴权是可选的共享密钥，流程见 §10.1。
 
 ### 3.1 管理员（每个部署一次）
 
@@ -155,6 +170,20 @@ export const config = {
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
 `/messages` 是列表、`/message` 是单条：列表的每条任务只投影 `metadata` 里的 `charId` / `clientTaskId`，单条则给出完整的 `metadata`。`update-message` 对 `metadata` 是整体替换，所以「只改其中一个子字段」要先用单条查询把完整的那份读回来。单条查询只返回还没发出去的任务（`pending`），已结束的返回 `409 TASK_ALREADY_COMPLETED`，与 `update-message` 同一口径。
+
+上表的 `tenantToken` / `cronToken` 是多租户线的鉴权（§5）。**单用户线**（§1.1）同样提供上表里两个 `send-notifications*` 之外的端点（它的定时投递不走 HTTP，由平台周期调度直接触发运行时的定时入口），鉴权换成可选的共享密钥；并且另有这几组：
+
+| 方法 | 路径 | 描述 |
+|---|---|---|
+| `GET` | `/api/v1/outbox` | 拉这个用户还没 ack 的服务端消息（§6.7） |
+| `POST` | `/api/v1/outbox/ack` | 销账（§6.7） |
+| `PUT` / `GET` / `DELETE` | `/api/v1/push-subscription` | 用户级 Web Push 订阅：任务行不携带订阅，到点投递时读这一份 |
+| `GET` | `/api/v1/vapid-public-key` | 本部署的 VAPID 公钥，前端建订阅时作 `applicationServerKey` |
+| `PUT` / `GET` / `DELETE` | `/api/v1/client-state` | 客户端状态的云端镜像，供 fire 时刻的 hooks 读 |
+| `PUT` / `GET` / `DELETE` | `/api/v1/llm-credentials` | 用户级 LLM 凭据，排程 payload 用 `credRefs` 引用 |
+| `GET` | `/api/v1/capabilities` | `{ serverVersion, features }`，给前端做特性探测 |
+
+字段与错误码见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)；接入顺序见 §10.1。
 
 上表是 `@rei-standard/amsg-server` 的端点。`@rei-standard/amsg-instant` 是另一套无状态 worker，自带 `/instant`（一次性即时推送）与 `/continue`（agentic-loop 工具回执续跑，仅当 handler 配了 `onLLMOutput` 时可用）两个端点，鉴权用可选的 client token，详见 [`amsg-instant` README](../packages/rei-standard-amsg/instant/README.md)。本规范正文提到 `/continue` 时即指这里。
 
@@ -350,14 +379,16 @@ LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
 
 完整字段表、builders、类型守卫与常量见 [`../packages/rei-standard-amsg/shared/README.md`](../packages/rei-standard-amsg/shared/README.md)。
 
-### 6.4 `ReasoningPush` 自动发出不变量
+### 6.4 `ReasoningPush` 自动产出不变量
 
-LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回 `choices[0].message.reasoning_content` 非空时，必须**先**发一条独立的 `ReasoningPush`，**再**发后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端可以靠 `sessionId` 把"思考中"UI 拼到真正回复上。
+LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回 `choices[0].message.reasoning_content` 非空时，必须**先**产出一条独立的 `ReasoningPush`，**再**产出后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端靠 `sessionId` 把"思考中"UI 拼到真正回复上。
+
+这里说的是**产出顺序**，不是到达顺序。`ReasoningPush` 默认不弹通知，因此有服务端收件箱的实现只把它落进收件箱、不发推送（见 §6.7）——那条线上客户端先由推送拿到正文，再由 `GET /outbox?since=` 补到思考过程。所以客户端不能拿"思考过程先到"当前提去切 UI，要靠 `sessionId` 关联，什么时候补到就什么时候补上去。
 
 具体规则：
 
 1. **触发条件**：`choices[0].message.reasoning_content` 是非空字符串。空串、`null`、`undefined` 均不触发。
-2. **顺序**：`ReasoningPush` 必须先于该 LLM 轮的任何 `ContentPush` 发出（client 端可据此切换"思考中" UI）。
+2. **顺序**：`ReasoningPush` 必须先于该 LLM 轮的任何 `ContentPush` 产出，落收件箱时也排在前面。
 3. **`sessionId` 共享**：
    - 同一 LLM 轮：`ReasoningPush` + 该轮所有 `ContentPush` 共用一个 `sessionId`。
    - Agentic loop：同一 `/instant` 请求的所有 iteration 共用一个 `sessionId`（不是每轮重新 mint）。
@@ -374,7 +405,7 @@ LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径
 - 发送失败 → HTTP `500`，`error.code = MESSAGE_SEND_FAILED`，底层处理错误放在 `error.details`（见 §9）。
 - 其余 `messageType`（`fixed` / `prompted` / `auto`）→ HTTP `201` 的调度响应，任务入库等 cron 触发。
 
-这条 in-server instant 路径要数据库，任务先落库再处理，投递不绑请求连接（客户端断开仍会跑完、可重试）。它与无状态的 `@rei-standard/amsg-instant` worker 是两条都正式支持的路径，按各自特点选用，详见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)。
+这条 in-server instant 路径要数据库，任务先落库再处理，投递不绑请求连接（客户端断开仍会跑完、可重试），发出去的内容还落进服务端收件箱（§6.7）。无状态的 `@rei-standard/amsg-instant` worker 是另一条路径：不要数据库，处理挂在响应连接上，也没有收件箱兜底；它继续维护，新接入从 in-server instant 起步。详见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)。
 
 ### 6.6 投递裁决（delivery adjudication）
 
@@ -386,6 +417,31 @@ LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径
 - SSE 这条流断开 / reject 也不等于没送达（push backup 可能已到，常见于 iOS 把后台 fetch 杀掉）。
 
 投递契约：transport 的成败只用来收紧延迟，**不用来判送达**；送达由调用方提供的一条 out-of-band「观察通道」裁决（一个等业务上「真到了」才 resolve 的 Promise）。`@rei-standard/amsg-client` 的 `deliver()` 实现了这套裁决，返回 `delivered` / `cancelled` / `timeout` / `send-failed` / `completed-unconfirmed` 五种 outcome，完整 API 见 [`amsg-client` README](../packages/rei-standard-amsg/client/README.md)。
+
+### 6.7 服务端收件箱与到达保证
+
+推送是通知通道，不是同步通道：订阅会失效、设备会离线、平台会限流，任何一条 push 都可能不到。所以实现方必须给每条 payload 留第二条腿——服务端收件箱（DoD 第 3～5 条）：
+
+- 每条 payload 在发出去**之前**先落一行（`message_outbox`：`(user_id, message_id)` 去重、密文 payload、`delivered_at` / `acked_at` 两个时间戳）。
+- 客户端上线拉 `GET /outbox?since=<cursor>` 取还没 ack 的行，处理完 `POST /outbox/ack` 销账。**先落库成功再 ack**，反序会丢消息。
+- 每条 entry 的 `push` 字段**逐字等于**推送信封本身，客户端两条路因此可以共用同一份处理逻辑，靠 `messageId` 去重。
+
+有了这条腿，「到了客户端不会弹通知的 payload」就不必占用推送通道：
+
+| payload | 落收件箱 | 发推送 |
+|---|---|---|
+| `content` / `result` | 是 | 是 |
+| `reasoning` / `tool_request` / `error` | 是 | 否 |
+| 任意 kind + `notification.show: false` | 是 | 否 |
+| 任意 kind + `notification.show: "always"` / `"when-hidden"` | 是 | 是 |
+
+理由见 [Service Worker 规范 §4.1.2 不展示通知的代价](./service-worker-specification.md#412-不展示通知的代价)：订阅按 `userVisibleOnly: true` 建，收到 push 却不弹通知就是违约——Firefox 按配额退掉订阅，iOS 过了订阅宽限期直接吊销，而且掉订阅是静默发生的，服务端只看得到后续推送返回 `410`。这些内容在收件箱里一个字不少，改走补拉既不影响到达，也不用拿订阅去换一条根本不会显示的横幅。
+
+于是产出端只有两条路，跟客户端跑在什么设备上无关：**要推就一定弹**（`show: "always"`，嫌打扰配 `tag` 折叠 + `silent`），**不想弹就别推**（落收件箱等补拉）。`"when-hidden"` 算「会弹」照推——它到底弹不弹取决于当下有没有可见窗口，只有 Service Worker 当场知道——但那是给既有部署留的兼容档，新实现在上面两条里挑一个。
+
+例外只有一个：这条 payload 没能落进收件箱（实现方没有收件箱、或这一批落行失败）。那时推送是它唯一的腿，照发——宁可违约一次，也不能让内容凭空消失。
+
+**实现现状**：`@rei-standard/amsg-server` 的单用户线（Cloudflare D1）实现了收件箱；多租户线的 pg / neon 适配器尚未实现，相关端点返回 `501`，那条线上所有 payload 照旧全推。`@rei-standard/amsg-instant` 没有数据库，同理。
 
 ## 7. 一体化初始化接口
 
@@ -520,13 +576,28 @@ Body:
 
 ## 10. 对接流程（标准）
 
-### 10.1 管理员一次性流程
+### 10.1 单用户线（推荐）
+
+部署方一次性流程：
+
+1. 建数据库并建表（执行建表 SQL，或部署后调一次幂等的 `POST /api/v1/init-tenant`）。
+2. 配置 `masterKey` 与 VAPID 三件套；要挡住公网调用就再配一个共享密钥，客户端用 `X-Client-Token` 带上。
+3. 把平台的周期调度指向运行时的定时入口（例如 Cloudflare Cron Trigger → `scheduled()`）。
+
+客户端接入四步，缺一步都不完整：
+
+1. 取用户密钥（`GET /api/v1/get-user-key`）。
+2. 订 Web Push 并登记（`PUT /api/v1/push-subscription`）：服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到。公钥从 `GET /api/v1/vapid-public-key` 拿。
+3. 发消息 / 排任务（`POST /api/v1/schedule-message`；即时消息用 `messageType: 'instant'`，见 §6.5）。
+4. **应用启动时拉一次服务端收件箱**（`GET /api/v1/outbox` → 处理 → `POST /api/v1/outbox/ack`）。不会弹通知的 payload 只落收件箱、不发推送（§6.7），少了这步它们就等于没发出去过。
+
+### 10.2 多租户线：管理员一次性流程
 
 1. 部署服务。
 2. 配置环境变量（见第 3.1 节）。
 3. 提供租户初始化入口（页面或 API 文档）。
 
-### 10.2 租户一次性流程
+### 10.3 多租户线：租户一次性流程
 
 1. 调用 `POST /api/v1/init-tenant` 提交 `databaseUrl`（必须是该 tenant 独占的数据库 URL）。
 2. 保存返回的 `tenantToken`、`cronWebhookUrl`。
@@ -535,7 +606,7 @@ Body:
    - 仅推荐模式：由 `init-tenant` 同步写入 Blob 租户调度索引。
    - 双轨兼容（主备）：两者同时配置，但需满足第 5.4 节防重入要求。
 
-### 10.3 日常调用流程
+### 10.4 多租户线：日常调用流程
 
 1. 前端调用业务端点时自动携带 `tenantToken`。
 2. 调度触发可单轨或双轨：
@@ -561,12 +632,20 @@ v2.x 后续增量（向后兼容，无需迁移）：
 
 ## 12. 实现一致性要求（DoD）
 
-实现方需满足以下条件：
+两条线通用：
 
-1. 租户初始化为一步（`init-tenant`）。
-2. 业务端点不可仅依赖 `X-User-Id` 调用成功。
-3. `tenantToken` 与 `cronToken` 权限分离。
-4. `amsg-server` 与 `amsg-instant` 在共有字段（§6.1 / §6.2）上行为字节级一致；`splitPattern` 不是 0.8.0 instant 的共有字段。`examples/` 是教学示例，可能滞后于最新 SDK 字段，不在一致性约束内。
-5. 文档明确管理员一次性与租户一次性职责。
-6. 若实现推荐调度模式，必须实现 Blob 租户调度索引，并对索引中的 `cronToken` 加密存储。
-7. 若同时启用兼容模式与推荐模式，必须实现调度防重入机制（入口互斥或任务原子领取）。
+1. 业务端点不可仅依赖 `X-User-Id` 调用成功。
+2. `amsg-server` 与 `amsg-instant` 在共有字段（§6.1 / §6.2）上行为字节级一致；`splitPattern` 不是 0.8.0 instant 的共有字段。`examples/` 是教学示例，可能滞后于最新 SDK 字段，不在一致性约束内。
+3. 实现服务端收件箱（§6.7）：每条 payload 发出去之前先落一行，提供 `outbox` 与 `outbox/ack` 两个端点，entry 的 `push` 字段逐字等于推送信封本身。
+4. 按 §6.7 的表决定发不发推送——到了客户端不会弹通知的 payload 只落收件箱。唯一的例外是这条 payload 没能落进收件箱，那时推送是它唯一的腿，照发。
+5. 跳过推送的行不标 `delivered_at`。
+
+多租户线另需满足：
+
+6. 租户初始化为一步（`init-tenant`）。
+7. `tenantToken` 与 `cronToken` 权限分离。
+8. 文档明确管理员一次性与租户一次性职责。
+9. 若实现推荐调度模式，必须实现 Blob 租户调度索引，并对索引中的 `cronToken` 加密存储。
+10. 若同时启用兼容模式与推荐模式，必须实现调度防重入机制（入口互斥或任务原子领取）。
+
+第 3 / 4 / 5 条目前只有单用户线（Cloudflare D1）满足；多租户线的 pg / neon 适配器还没实现收件箱，相关端点返回 `501`，那条线上所有 payload 照旧全推（见 §6.7 的实现现状）。

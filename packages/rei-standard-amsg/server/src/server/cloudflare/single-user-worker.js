@@ -58,6 +58,10 @@
  * 传进这里的 config：一条 push 装不下的思考过程要切片发，切多大、最多几片、重组
  * 窗口多长由接收端说了算，发送端不知道就会发出一批对面收不了的分片。
  *
+ * 到了客户端不会弹通知的那些 payload（思考过程、工具请求、错误）不发推送，只落
+ * 收件箱，等客户端上线 `GET /outbox?since=` 补拉。想让某一条照样弹，给它带
+ * `notification: { show: 'always' }`（见 lib/push-policy.js）。
+ *
  * 请求体带 `Content-Encoding: gzip` 时自动解压，所有带 body 的端点都认（见
  * lib/request.js）。客户端把大 body 压了再传能省下几倍传输量，两边都不用改
  * 端点。解压后的字节上限默认 32MB，config 的 `maxRequestBodyBytes` 可调。

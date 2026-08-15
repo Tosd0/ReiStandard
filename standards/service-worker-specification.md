@@ -22,6 +22,13 @@
 2. `@rei-standard/amsg-client`
 3. `@rei-standard/amsg-sw`
 
+浏览器这侧是四步，缺一步都不完整：
+
+1. 装 Service Worker（`installReiSW`）
+2. 订 Web Push，把订阅登记到服务端（`subscribePush` → `putPushSubscription`）
+3. 发消息 / 排任务
+4. **应用启动时拉一次服务端收件箱**（`getOutbox` → 处理 → `ackOutbox`）
+
 最小接入示例：
 
 ```javascript
@@ -44,10 +51,25 @@ const client = new ReiClient({
 });
 
 await client.init();
-await navigator.serviceWorker.register('/service-worker.js');
+
+// 1. 装 Service Worker
+const registration = await navigator.serviceWorker.register('/service-worker.js');
+
+// 2. 订 Web Push 并登记：服务端一个用户存一份，所有任务到点都读它。
+//    不登记就一条推送都收不到。
+//    公钥从 worker 自己拿（单用户线）；多租户线从你的部署配置里取。
+const vapidPublicKey = await client.getVapidPublicKey();
+const subscription = await client.subscribePush(vapidPublicKey, registration);
+await client.putPushSubscription(subscription);
+
+// 4. 应用启动时拉一次服务端收件箱：到了客户端不会弹通知的内容（思考过程、
+//    工具请求、错误）只落收件箱、不发推送，不补拉就等于没有。见 API 规范 §6.7。
+const { entries } = await client.getOutbox({ limit: 100 });
+for (const entry of entries) await handlePush(entry.push);
+await client.ackOutbox(entries.map((entry) => entry.messageId)); // 落库成功再 ack
 ```
 
-完整接入（包括离线队列、消息协议、notificationclick 处理）请看：
+完整接入（包括离线队列、消息协议、notificationclick 处理、收件箱翻页）请看：
 
 - https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md
 - https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md
@@ -435,7 +457,7 @@ function buildNotificationOptions(data) {
 
 **核心原则**:
 - **后台状态**: 用户未打开应用或切换到其他应用时，显示系统通知
-- **前台状态**: 用户正在使用应用时，建议直接在 UI 中渲染消息；若希望前台不弹系统通知，请让 payload 设置 `notification.show = "when-hidden"` 或 `false`
+- **前台状态**: 用户正在使用应用时，建议直接在 UI 中渲染消息——这跟弹不弹系统通知无关，`postMessage` 照样派发。要连系统通知都不弹，别把这条发成 push，让客户端上线补拉；理由见 [4.1.2 不展示通知的代价](#412-不展示通知的代价)
 - **渲染一致性**: 前台接收的消息应与实时收到的消息在视觉和交互上完全一致
 
 #### 实现方式
@@ -484,7 +506,8 @@ self.addEventListener('push', async event => {
           });
         });
 
-        // 如果希望前台不弹系统通知，请让 payload.notification.show = "when-hidden" 或 false
+        // 前台自绘跟弹不弹系统通知无关，这段照跑。真不想弹的内容别发成 push，
+        // 走服务端收件箱让客户端上线补拉（代价见 4.1.2）
       }
 
       // 3. 检查 messageKind 和 notification.show 判断是否要在后台弹系统通知
@@ -687,9 +710,38 @@ if ('serviceWorker' in navigator) {
 - 系统提醒和通知
 - 任何需要即时反馈的场景
 
-**不适用场景**:
-- 用户明确希望收到系统通知的场景（如重要提醒）
-- 需要在通知中心保留记录的场景
+#### 与系统通知的关系
+
+本节说的是「前台自己渲染一份」，跟弹不弹系统通知是两件独立的事：`postMessage` 一定派发，`showNotification` 按 `notification.show` 走。所以前台自绘不需要、也不应该顺手把系统通知关掉——嫌打扰用 `tag` 折叠加 `silent: true`。真把通知关掉是另一回事，代价见 [4.1.2 不展示通知的代价](#412-不展示通知的代价)。
+
+### 4.1.2 不展示通知的代价
+
+推送订阅是按 `userVisibleOnly: true` 建的——那是跟浏览器约好「每条 push 都会给用户可见反馈」。收到 push 却不弹通知就是违约，各家的处理不一样：
+
+| 浏览器 | 违约之后 |
+|--------|---------|
+| Chrome | 替你弹一条通用的「此网站在后台更新了内容」，订阅保住 |
+| Firefox | 对不展示通知的 push 有配额，超了直接把这个订阅退掉，得等用户再访问站点才恢复 |
+| iOS | 新订阅有几天宽限期，宽限期一过，一条就够，直接吊销订阅 |
+
+**iOS 的宽限期**跟直觉不太一样，实测下来是这样的：
+
+- 订阅刚建好的那几天，发多少条不弹通知的 push 都不会掉订阅——**跟条数无关，只跟订阅建了多久有关**。
+- 过了宽限期，再来一条不弹的就立刻吊销。
+- 吊销后重新订阅，判定比第一次更严，之后随时可能再掉。
+
+最难查的就是这个时间差：本地订阅完立刻测一轮，怎么试都正常；上线几天后用户的订阅开始成片掉。而且掉订阅是静默发生的——服务端只看到推送返回 `410`，用户只觉得「怎么不推了」。
+
+所以口径只有一条，跟客户端跑在什么设备上无关：**要推就一定弹，不想弹就别推。**
+
+- 要推 → `notification.show = "always"`。嫌打扰就用 `tag` 折叠（同 `tag` 的通知互相覆盖，通知栏里只留一条）加 `silent: true`（不响铃不震动），而不是不弹。弹了通知不影响页面自绘，`postMessage` 照样派发。
+- 不想弹 → 压根别把它发成 push，落服务端收件箱，等客户端上线补拉。
+
+`"when-hidden"` 卡在这两条中间：应用在前台时它就是一条不弹的 push（规范允许 user agent 在有可见窗口时免掉展示约束，Chrome 认这条豁免，iOS 不认），那笔账照记。它是给既有部署留的兼容档，新实现在上面两条里挑一个。
+
+同一笔账也记在默认行为上：`reasoning` / `tool_request` / `error` 默认不弹通知，它们每到一条就是一次不展示的 push。**所以发送端压根不该把它们发成 push**——服务端收件箱里有同样的内容，客户端上线补拉更稳（见 [API 规范 §6.7](./active-messaging-api.md#67-服务端收件箱与到达保证)）。想让某一条照样弹，给它带上 `notification: { show: "always" }`，发送端据此判定这条值得占用推送通道。
+
+更一般地说：想让后台产生的副作用到达客户端，比起发一条不弹的 push，让客户端上线时主动拉一次总是更靠得住。push 是通知通道，不适合当唯一的数据同步手段。
 
 ### 4.2 NotificationClick 事件
 
@@ -1407,7 +1459,7 @@ self.addEventListener('notificationclick', (event) => {
 **2. 页面到 SW 的统一投递协议**
 - 新增 `{ type: 'REI_AMSG_DELIVER', payload, source?, requestId? }`，让 SSE page bridge 和 Web Push 进入同一条 SW pipeline。
 - SSE 与 Web Push backup 共用同一个业务 key 时，先到者放行业务回调，后到者被 dedupe 收敛；若需要补系统通知，只补通知不重复业务。
-- 正式环境推荐搭配 `@rei-standard/amsg-instant` 固定 `sse.backupPush = "on"`：SSE 正常流式返回，同时每条 payload 也走 Web Push backup，最终由 SW dedupe 统一收敛。
+- 走 `@rei-standard/amsg-instant` 这条无数据库线时搭配它固定的 `sse.backupPush = "on"`：SSE 正常流式返回，同时每条 payload 也走 Web Push backup，最终由 SW dedupe 统一收敛。有服务端收件箱的部署用的是另一套到达保证，见 [API 规范 §6.7](./active-messaging-api.md#67-服务端收件箱与到达保证)。
 
 **3. 无声通知**
 - `notification.silent` 进入 shared 类型与 SW 渲染链路，可配合 `tag` 做折叠、低打扰通知。
@@ -1425,7 +1477,7 @@ self.addEventListener('notificationclick', (event) => {
 - 进一步提升前台应用接管消息的自由度，免除不必要的通知打扰。
 
 > **APNs / iOS Web Push 提醒**
-> 如果业务大量发送后台 push 却长期不展示可见通知，iOS Web Push 的送达可能被系统策略影响。生产环境建议对后台消息使用 `notification.show = "always"` 或 `"when-hidden"`，再配合 `tag` 折叠与 `silent: true` 降低打扰。
+> 收到 push 却不展示可见通知，在 iOS 上会掉订阅——完整口径见 [4.1.2 不展示通知的代价](#412-不展示通知的代价)：要推的一律 `notification.show = "always"`，再配合 `tag` 折叠与 `silent: true` 降低打扰；不想弹的别发成 push。
 
 **3. `onBusinessPayload` 与 Generic Multipart（SDK 功能）**
 - 统一了分片数据还原逻辑，移除了老的 `chunkIndex` 专属逻辑，改为基于 `_multipart` 进行可靠重组。

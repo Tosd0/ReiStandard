@@ -71,6 +71,7 @@ import {
   REI_SW_EVENT,
   REI_SW_MESSAGE_TYPE,
   REI_AMSG_DELIVER_MESSAGE_TYPE,
+  notificationIntent,
   base64UrlToBytes,
   concatBytes,
 } from '@rei-standard/amsg-shared';
@@ -457,39 +458,31 @@ function resolveEventName(payload) {
 }
 
 /**
- * True when the payload should trigger `showNotification`. Two kinds
- * render: `content`（聊天正文）与 `result`（宿主自定义的结果——「跑完了，
- * 回来看看」正是要弹一下的那种消息）；其余（`reasoning`、`tool_request`、
- * `error`）静默送给页面自己渲染。
- * Legacy payloads with no `messageKind` field still render a
- * notification — that's the 2.0.x back-compat path.
+ * True when the payload should trigger `showNotification`.
  *
- * 想反过来（结果不弹 / 思考过程要弹）就在 payload 里带
- * `notification: { show }`，那一路优先级更高（见 shouldRenderNotification）。
+ * 弹不弹的判定本身在 `@rei-standard/amsg-shared` 的 `notificationIntent`：
+ * `notification.show` 说了算，没说才按 `messageKind` 走默认（`content` /
+ * `result` 与缺 kind 的 2.0.x 老 payload 弹，`reasoning` / `tool_request` /
+ * `error` 不弹）。判定放在 shared 是因为发送端也要用同一份——服务端据此决定
+ * 一条 payload 值不值得占用推送通道。
+ *
+ * 这里只多做一件 shared 做不了的事：`'when-hidden'` 要看当下有没有可见窗口，
+ * 而那只有 SW 知道。
  *
  * @param {Record<string, unknown>} payload
+ * @param {Array<Client>} clientList
  * @returns {boolean}
  */
-function isNotificationKind(payload) {
-  if (!payload || typeof payload !== 'object') return false;
-  const kind = payload.messageKind;
-  if (kind === undefined || kind === null) return true;
-  return kind === MESSAGE_KIND.CONTENT || kind === MESSAGE_KIND.RESULT;
-}
-
 function shouldRenderNotification(payload, clientList) {
-  const showOpt = payload && payload.notification ? payload.notification.show : undefined;
-
-  if (showOpt === 'always') {
-    return true;
-  }
-  if (showOpt === 'when-hidden') {
-    return !clientList.some(client => client.visibilityState === 'visible');
-  }
-  if (showOpt === false) {
-    return false;
-  }
-  return isNotificationKind(payload);
+  const intent = notificationIntent(payload);
+  if (intent === 'always') return true;
+  if (intent === 'never') return false;
+  // 'when-hidden'：规范允许 user agent 在有可见窗口时免掉「必须展示通知」的
+  // 约束，Chrome 认这条豁免，iOS 不认——前台静默掉的那条 push 在 iOS 那边照
+  // 样记账，宽限期过了就吊销订阅。所以它是给老部署留的兼容档，新代码要推就发
+  // 'always' + tag 折叠，不想弹就别把它发成 push（见 README 的「不展示通知的
+  // 代价」一节）。
+  return !clientList.some(client => client.visibilityState === 'visible');
 }
 
 /**
@@ -565,7 +558,8 @@ function readPushPayload(event) {
  *
  * 兜底只能是「弹一条有内容的」，不能是「干脆不弹」：订阅是按
  * `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，不弹会被
- * Firefox 按配额退订、iOS 可能撤掉推送权限（见 README 的通知策略一节）。
+ * Firefox 按配额退订、被 iOS 在订阅的宽限期过后直接吊销（见 README 的
+ * 「不展示通知的代价」一节）。
  *
  * @param {unknown} value - 从 payload 上取到的正文
  * @param {{ defaultBody: string }} defaults
@@ -688,7 +682,7 @@ function positiveIntegerOrDefault(value, fallback) {
  * 占了同名 dbName 却没有这个 store，都会让它抛错——裸 await 会把整条 push
  * 一起带走：通知不弹、页面收不到 postMessage、onBusinessPayload 不跑，只在
  * SW 控制台留一条 unhandled rejection。而订阅是按 `userVisibleOnly: true`
- * 建的，静默吞掉一条 push 的代价见 README 的通知策略一节。
+ * 建的，静默吞掉一条 push 的代价见 README 的「不展示通知的代价」一节。
  *
  * 因此这里整段兜住，失败时降级成「当作首次投递照常分发」，并把失败原因记在
  * claim 上：后续的记录写回据此跳过（store 已经坏了，再写只会刷屏），DELIVER
