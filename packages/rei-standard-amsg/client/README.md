@@ -1,20 +1,26 @@
 # @rei-standard/amsg-client
 
-`@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应、Push 订阅，以及 **送达协调**。
+`@rei-standard/amsg-client` 是 ReiStandard 主动消息标准的浏览器端 SDK 包，负责加密请求、解密响应、Push 订阅、收件箱补拉，以及 **送达协调**。
 
-## v2.5.0 — `deliver()`：平台无关的送达 primitive
+## 先看你接的是哪条服务端线
 
-新增 `client.deliver(payload, opts)`，把"发出去"和"业务上是否真送达"分离开。它是新代码的**首选入口**。
+| 服务端 | 这份 README 里主要用到 |
+|---|---|
+| **`@rei-standard/amsg-server` 单用户线**（新接入走这条） | `scheduleMessage()` 排任务（`messageType: 'instant'` 也走它）、`putPushSubscription()` 登记订阅、**`getOutbox()` / `ackOutbox()` 上线补拉** |
+| `@rei-standard/amsg-instant`（连数据库都不要的部署，维护态） | `deliver()` / `sendInstant()` / `consumeInstantStream()` |
 
-旧的 `sendInstant()` / `consumeInstantStream()` 仍然保留可用，但被降级为**低级 transport**——只在你已经自己接好了送达校验时才用，否则会出现「HTTP 200 / SSE 不报错 ≠ 消息真送到」的陷阱（详见下方[为什么需要 `deliver()`](#为什么需要-deliver)）。
+接单用户线是四步：部署 worker → 装 Service Worker 并 `putPushSubscription()` 登记订阅 → 发消息 / 排任务 → **应用启动时拉一次收件箱**。
 
-> 与 `@rei-standard/amsg-instant` 0.9.0+ 配合最直接，但 `deliver()` 本身**不绑死任何后端 / 平台**——它接收一个普通的 `Promise<ObservedDeliveryReceipt>` 作为"观察通道"信号源，**谁都能接**（Service Worker 广播、Electron IPC、原生桥、轮询、自定义 long-poll……）。
+第四步不能省：到了客户端不会弹通知的内容（思考过程、工具请求、错误）只落收件箱、不发推送，不补拉就等于没有。写法见[上线补一次收件箱](#上线补一次收件箱)。
+
+`deliver()` 是给 instant 那条线用的送达裁决 primitive，把"发出去"和"业务上是否真送达"分开：那条线没有服务端收件箱可退，判送达只能靠一条 out-of-band 的观察通道。它本身**不绑死任何后端 / 平台**——接收一个普通的 `Promise<ObservedDeliveryReceipt>`，Service Worker 广播、Electron IPC、原生桥、轮询都能接——所以自建 worker 也用得上。`sendInstant()` / `consumeInstantStream()` 是它底下的**低级 transport**，只在你已经自己接好了送达校验时才直接用，否则会踩「HTTP 200 / SSE 不报错 ≠ 消息真送到」（见[为什么需要 `deliver()`](#为什么需要-deliver)）。
 
 ---
 
 ## 目录
 
 - [快速使用](#快速使用)
+- [上线补一次收件箱](#上线补一次收件箱)
 - [`deliver()` 标准用法](#deliver-标准用法)
 - [为什么需要 `deliver()`](#为什么需要-deliver)
 - [`DeliverOptions` 全字段](#deliveroptions-全字段)
@@ -48,26 +54,28 @@ const client = new ReiClient({
 await client.init();
 ```
 
-发送即时消息（**推荐**走 `deliver()`，下一节展开）：
+发送即时消息（单用户线：任务先落库再处理，客户端断开也跑得完，内容同时落收件箱）：
 
 ```js
-const result = await client.deliver(payload, {
-  delivery: { mode: 'observed', observed: observationPromise },
-  timeoutMs: 300_000,
+const result = await client.scheduleMessage({
+  contactName: 'Rei',
+  messageType: 'instant',
+  userMessage: '帮我看看今天的日程',
 });
-if (result.ok) {
-  // result.outcome === 'delivered' —— 真送达
-}
+// result.status === 'sent'，附 messagesSent / sentAt
 ```
 
-订 Web Push（如果你的接入方案需要走 push 通道）：
+接 `@rei-standard/amsg-instant` 那条线的话，即时消息走 `deliver()`，见[下面那节](#deliver-标准用法)。
+
+订 Web Push 并登记订阅——服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到：
 
 ```js
 await navigator.serviceWorker.register('/service-worker.js');
 const registration = await navigator.serviceWorker.ready;
-const subscription = await client.subscribePush(window.__VAPID_PUBLIC_KEY__, registration);
 
-// 订阅登记到服务端：一个用户一份，所有定时任务到点都读它。
+// 公钥从 worker 自己拿（单用户线）；多租户线从你的部署配置里取。
+const vapidPublicKey = await client.getVapidPublicKey();
+const subscription = await client.subscribePush(vapidPublicKey, registration);
 await client.putPushSubscription(subscription);
 
 await client.scheduleMessage({
@@ -78,6 +86,8 @@ await client.scheduleMessage({
   recurrenceType: 'none',
 });
 ```
+
+接 amsg-server 时还差一步：**应用启动时拉一次收件箱**（`getOutbox()` → 处理 → `ackOutbox()`），完整写法见下一节。
 
 订阅登记之后随时可以覆盖：用户清了站点数据、重装了 PWA、或者推送服务轮换了 endpoint，再调一次 `putPushSubscription()` 就全好了——已排的任务一条都不用碰。任务不再携带 `pushSubscription` 字段，`scheduleMessage` / `updateMessage` 里带了会被服务端 400 拒掉。
 
@@ -94,6 +104,46 @@ try {
   throw err;
 }
 ```
+
+---
+
+## 上线补一次收件箱
+
+服务端每条 payload 在发出去之前都会先记进收件箱。到了客户端**不会弹通知的那些**——思考过程、工具请求、错误、带 `notification: { show: false }` 的结果——只落收件箱、不发推送，不补拉就等于没有。会弹的那些也照落，推送没送到（离线、订阅失效、推送服务抽风）时同样从这里补回来。
+
+所以接入时这是必做的一步：**应用启动、以及页面从后台回到前台时，各拉一次。**
+
+```js
+async function drainOutbox(client) {
+  let since;
+  for (;;) {
+    const { entries, cursor, hasMore } = await client.getOutbox({ since, limit: 100 });
+    if (entries.length === 0) return;
+
+    // entry.push 就是推送信封本身，与 Service Worker 收到的那份逐字一致，
+    // 交给已有的推送处理逻辑即可。
+    for (const entry of entries) await handlePush(entry.push);
+
+    // 先落库成功再销账。反过来的话账已经销了、落库半途失败，这条就补不回来了。
+    await client.ackOutbox(entries.map((entry) => entry.messageId));
+
+    if (!hasMore) return;
+    since = cursor;
+  }
+}
+
+await drainOutbox(client);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') drainOutbox(client);
+});
+```
+
+几点：
+
+- **去重靠 `messageId`**。同一条消息可能推送和补拉各来一次。`installReiSW()` 的包级 dedupe 只管 Service Worker 那条路，补拉走的是 HTTP，业务侧要自己认一次 `messageId`。想两条路共用同一份落地逻辑和去重，把 `entry.push` 桥进 SW（`REI_SW_MESSAGE_TYPE.DELIVER`，见 [`@rei-standard/amsg-sw` README 的「页面 -> SW 业务投递」](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md#页面---sw-业务投递)）——代价是补拉时用户明明已经在应用里，SW 还会按 `notification.show` 给 `content` 补弹一条系统通知。
+- **ack 一定在落库之后**，见上面注释里那句。
+- **翻页**把上一页的 `cursor` 当下一页的 `since`，`limit` 取 1–100。
+- 这两个端点在单用户线（D1）上有。多租户线的 pg / neon 适配器还没有收件箱，调用会拿到 501——`getCapabilities()` 的 `features` 说的是「这份代码支持什么」，不反映部署用的哪个适配器，所以这里判 501 比判 feature 准。
 
 ---
 
@@ -510,6 +560,7 @@ try {
 
 ---
 
+
 ## 其他工具
 
 `ReiClient` 还有这些方法（与 2.4.x 相比无字节变化）：
@@ -518,14 +569,14 @@ try {
 - `updateMessage(uuid, updates)` —— 改任务字段
 - `cancelMessage(uuid)` —— 取消任务
 - `listMessages(opts)` —— 拉当前 user 的任务列表。每条任务只带 `charId` / `clientTaskId` 两个 `metadata` 子字段
-- `getMessage(uuid)` —— 单条任务（`GET /message`，amsg-server 2.6.0+ 单用户线），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
+- `getMessage(uuid)` —— 单条任务（`GET /message`，单用户线），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
 - `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装，返回的 endpoint 保证是活的（认出 Chromium 的 `permanently-removed.invalid` 占位订阅就退掉重订，最多三次；仍然拿不到就抛 `PUSH_ENDPOINT_ZOMBIE`）
 
 对接单用户 amsg-server worker 的配套方法：
 
 - `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
-- `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，amsg-server 2.7.0+ 单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
-- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，amsg-server 2.6.0+ 单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 2.7.0+ 的 worker 会自动分片存储（feature `client-state-chunking`，可用 `getCapabilities()` 探测）
+- `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
+- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
 - `getClientState(namespace)` —— 读回一个 namespace 的全部条目（走加密响应信封，方法内解密后返回明文值）
 - `clearClientState()` —— 清空该用户所有 namespace 的云端状态（如「清除云端数据」设置项）
 - `putPushSubscription(subscription, opts?)` —— 登记 / 覆盖这个用户的 Web Push 订阅（`PUT /push-subscription`）。传 `pushManager.subscribe()` 的结果（或它的 `toJSON()`）即可，方法内部会取 `toJSON`。服务端一个用户存一份，所有定时任务到点投递时都读它——包括角色在 fire 里给自己排的、客户端根本不知道存在的那些任务。`opts.updatedAt` 是 epoch 毫秒，不传由服务端取当前时刻
@@ -534,7 +585,7 @@ try {
 - `putLlmCredentials(credentials)` —— 批量登记 / 覆盖用户级 LLM 凭据（`PUT /llm-credentials`；worker 支不支持用 `getCapabilities()` 探测 features 含 `llm-credentials`，别判版本号）。credentials 为 `[{ credId, value: { apiUrl, apiKey, primaryModel } }]`；`credId` 由客户端起名（约定 `char:<charId>/<purpose>`、`global/<purpose>`）。登记后排程 payload 用 `credRefs: { chat: credId }` 引用它，任务到点现读——换 Key 覆盖对应行就够，所有引用它的任务（含角色自排的）自动跟随
 - `listLlmCredentials()` —— 云端凭据对账清单 `{ credentials: [{ credId, updatedAt }] }`，凭据本体永远不回传
 - `deleteLlmCredentials(opts)` —— 删凭据：`{ credIds: [...] }` 删指定那几行（如角色删除时清它名下的），`{ all: true }` 全删（「清空云端数据」）。删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，重新登记同名 credId 即恢复
-- `getOutbox(opts?)` —— 拉这个用户还没确认收到的服务端消息（`GET /outbox`，amsg-server 2.7.0+ 单用户线）。服务端在每条 Web Push 发出去之前先记进账本，「哪些消息还没收下」因此是查得出来的事实，不用拿本地最近几条去比对着猜。返回 `{ entries, cursor, hasMore }`（走加密响应信封，方法内解密）；每条 entry 形如 `{ id, messageId, taskUuid, sessionId, messageIndex, totalMessages, createdAt, deliveredAt, push }`，其中 **`push` 就是推送信封本身**——与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页把上一页的 `cursor` 当下一页的 `opts.since`，`opts.limit` 为 1–100（缺省由服务端定，50）
+- `getOutbox(opts?)` —— 拉这个用户还没确认收到的服务端消息（`GET /outbox`，单用户线）。服务端在每条 Web Push 发出去之前先记进账本，「哪些消息还没收下」因此是查得出来的事实，不用拿本地最近几条去比对着猜。返回 `{ entries, cursor, hasMore }`（走加密响应信封，方法内解密）；每条 entry 形如 `{ id, messageId, taskUuid, sessionId, messageIndex, totalMessages, createdAt, deliveredAt, push }`，其中 **`push` 就是推送信封本身**——与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页把上一页的 `cursor` 当下一页的 `opts.since`，`opts.limit` 为 1–100（缺省由服务端定，50）
 - `ackOutbox(messageIds)` —— 销账（`POST /outbox/ack`，请求体加密）：这些消息之后不再出现在 `getOutbox()` 的结果里。幂等，单次最多 200 条。顺序要紧——**先落库成功再 ack**，反过来的话账已经销了而落库半途失败，这条消息就补不回来了
 
 以及从 `@rei-standard/amsg-shared` re-export 的运行时常量 / builder / type guard：

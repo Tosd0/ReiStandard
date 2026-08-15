@@ -1,5 +1,11 @@
 # @rei-standard/amsg-instant
 
+> **这个包是维护态：继续修，但新接入建议从 `@rei-standard/amsg-server` 起步。**
+>
+> 它是无后端场景的产物——没有数据库，也就没有服务端收件箱，一条内容能不能到全看那条 Web Push。而「到了客户端不会弹通知的 payload」（思考过程、工具请求、错误）在这条线上没有别的腿可走：推它要跟浏览器赊一次 `userVisibleOnly` 的账（Firefox 按配额退订、iOS 过了订阅宽限期直接吊销），不推内容就真没了。
+>
+> `amsg-server` 单用户线（Cloudflare Worker + D1）解掉的正是这一层：每条 payload 发出去之前先落一行收件箱，客户端上线 `GET /outbox?since=` 补拉，于是不会弹通知的那些干脆不发推送。它同样一个 Worker 装完，也带 `messageType: 'instant'` 这条即时路径。
+
 **零运行时依赖**的无状态明文一次性即时推送处理器：整个生命周期 = 一次 HTTP 函数调用（解析 → 调 LLM → 构造/切分 push payloads → 发 Web Push → 返回 200）。无数据库、无 cron、无租户初始化。从 0.3.0 起 RFC 8291 (`aes128gcm`) payload 加密和 RFC 8292 VAPID JWT 由内置实现完成，不再需要 `web-push` / Node `crypto`。
 
 定位是**单租户自部署**场景下的极简 instant 推送：前端、Worker、LLM key 都在你自己手里，链路只剩浏览器 → Worker 的 HTTPS。应用层加密在该场景下没有实际收益（HTTPS 已加密传输；apiKey 由前端塞进 payload 必然要让 Worker 见到；攻击者拿 Worker URL 也榨不出 apiKey、推不动别人订阅），所以从 0.2.0 起协议改为**纯明文**。
@@ -10,9 +16,9 @@
 
 | 用途                                 | 包                  |
 |--------------------------------------|---------------------|
-| 一次性即时推送（按钮触发 → 通知）    | **amsg-instant**    |
-| 指定时间的定时消息                   | amsg-server         |
-| 周期性消息（每日/每周）              | amsg-server         |
+| 新接入，不管是即时还是定时           | **amsg-server**（单用户线：一个 Worker + D1，带收件箱补拉） |
+| 一次性即时推送，且这个部署连数据库都不想要 | amsg-instant   |
+| 指定时间的定时消息 / 周期性消息      | amsg-server         |
 | 多租户 SaaS（要应用层加密 + 租户隔离）| amsg-server         |
 
 ## 安装
@@ -152,7 +158,9 @@ data: {}
 
 #### SSE backup push（0.9.0+）
 
-正式环境推荐保持默认链路：SSE 正常流式返回，每条 payload enqueue 成功后也发一份 Web Push backup。这份 backup 不是“断了才发”，而是默认常开；重复的部分交给 `@rei-standard/amsg-sw` 的 delivery dedupe 解决。
+这条线的默认链路：SSE 正常流式返回，每条 payload enqueue 成功后也发一份 Web Push backup。这份 backup 不是“断了才发”，而是默认常开；重复的部分交给 `@rei-standard/amsg-sw` 的 delivery dedupe 解决。
+
+没有服务端收件箱可退，backup 就是这条线唯一的补漏手段——包括那些到了客户端不弹通知的 payload，它们也照推，那笔账见本文档开头那段。
 
 | 配置 | 默认值 | 行为 | 生产建议 |
 |------|--------|------|----------|
@@ -567,6 +575,8 @@ return {
 ```
 
 decision 跟 push 内容的 `messageKind` 分布完全解耦——lib 不检查「`tool-request` decision 是不是必须含 `tool_request` push」之类的搭配，hook 想怎么组合就怎么组合。
+
+> 上面那条 `tool_request` 不弹横幅，是要记账的：订阅按 `userVisibleOnly: true` 建，收到 push 却不弹通知，Firefox 按配额退订、iOS 在订阅的宽限期过后直接吊销。这条线上没有服务端收件箱可以退，所以要么给它配上 `notification: { show: 'always', … }`（用 `tag` 折叠加 `silent: true` 压打扰），要么认下这笔账。完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节。
 
 ### `decision: 'continue'` + `nextHistory` 的脚枪
 

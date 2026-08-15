@@ -70,7 +70,7 @@ omit all four.
 
 | Field                | Type                                      | Notes |
 |----------------------|-------------------------------------------|-------|
-| `show`               | `'auto' \| 'always' \| 'when-hidden' \| false` | Display policy. `auto` follows SW defaults. |
+| `show`               | `'auto' \| 'always' \| 'when-hidden' \| false` | Display policy — see [选哪个 `show`](#选哪个-show). |
 | `title`              | `string?`                                | Notification title override. |
 | `body`               | `string?`                                | Notification body override. |
 | `icon`               | `string?`                                | Notification icon URL. |
@@ -83,6 +83,38 @@ omit all four.
 
 Unknown fields are preserved for forward compatibility, but the known
 fields above are validated by the builders when present.
+
+### 选哪个 `show`
+
+订阅是按 `userVisibleOnly: true` 建的，收到 push 却不弹通知就是违约：Chrome 替你弹一条通用横幅，Firefox 有配额、超了退订，iOS 给新订阅几天宽限期（跟条数无关）、过期后一条不弹就吊销订阅。所以口径只有一条，跟机型无关——**要推就一定弹，不想弹就别推。**
+
+| 值 | SW 那边 | 什么时候用 |
+|---|---|---|
+| 不配 / `'auto'` | 按 `messageKind` 走默认（`content` / `result` 弹，其余不弹） | 默认，多数 payload 不用管 |
+| `'always'` | 一定弹 | 要推的一律用它。嫌打扰配 `tag` 折叠加 `silent`，而不是不弹 |
+| `false` | 一定不弹 | 明说这条不弹。有收件箱的发送端据此**根本不发这条 push**，内容落收件箱等客户端补拉 |
+| `'when-hidden'` | 有可见窗口就不弹 | 兼容档，新代码不选——应用在前台时它就是一条不弹的 push，那笔账照记 |
+
+所以 `show: false` 在发送端和接收端不是同一件事：有服务端收件箱的发送端（`@rei-standard/amsg-server` 单用户线）见到它压根不发，SW 那边收不到；没有收件箱的发送端才是「推过去、SW 不弹」。
+
+想要「立刻推到、但页面自己渲染」没有专门的档：用 `'always'` + `tag` + `silent`，页面自绘不受影响（`postMessage` 跟弹不弹通知无关）。
+
+完整取舍见 [`@rei-standard/amsg-sw` README 的「不展示通知的代价」](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md#不展示通知的代价)。
+
+### `notificationIntent(payload)`
+
+把上面这套规则算成一个值，`'always'` / `'when-hidden'` / `'never'`：`notification.show` 说了算，没说才按 `messageKind` 走默认。两端读同一份——SW 拿它决定要不要 `showNotification`，发送端拿它决定这条值不值得占用推送通道（`'never'` 的 payload 推过去不会有任何可见反馈，`@rei-standard/amsg-server` 只把它落进收件箱，等客户端上线 `GET /outbox?since=` 补拉）。
+
+```js
+import { notificationIntent } from '@rei-standard/amsg-shared';
+
+notificationIntent({ messageKind: 'content' });                                  // 'always'
+notificationIntent({ messageKind: 'reasoning' });                                // 'never'
+notificationIntent({ messageKind: 'reasoning', notification: { show: 'always' } }); // 'always'
+notificationIntent({ messageKind: 'content', notification: { show: false } });   // 'never'
+```
+
+`'when-hidden'` 单独占一档，因为它到底弹不弹要看当下有没有可见窗口，那只有 SW 知道；发送端把它当「可能会弹」照发。
 
 ---
 
@@ -168,7 +200,7 @@ The legacy `type` field is **gone** — do not look for it on
 两处与别的 kind 不同：
 
 - **投递路径**：产出方（`@rei-standard/amsg-server` 的 `ctx.emitResult()`）除了推送，还把它落进服务端收件箱，客户端下次 `GET /outbox?since=` 一定拿得到。
-- **通知**：SW 侧默认弹（与 `content` 同待遇，其余三种是静默送给页面）——结果往往正是「跑完了，回来看看」那句话。不想弹就带 `notification: { show: false }`。
+- **通知**：SW 侧默认弹（与 `content` 同待遇，其余三种是静默送给页面）——结果往往正是「跑完了，回来看看」那句话。不想弹就带 `notification: { show: false }`：这一档 `amsg-server` 不发推送、只落收件箱，客户端补拉时拿到（见[选哪个 `show`](#选哪个-show)）。
 
 ---
 

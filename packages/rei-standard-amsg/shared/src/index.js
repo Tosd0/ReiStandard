@@ -133,6 +133,16 @@ export const PUSH_SOURCE = Object.freeze({
  *     `notification` for explicitness; top-level fallback exists so that
  *     legacy un-namespaced payloads keep working byte-for-byte.
  *
+ * 选 `show` 的口径只有一条，跟机型无关：**要推就一定弹**（`"always"`，嫌打扰
+ * 配 `tag` 折叠 + `silent`），**不想弹就别推**（不配或配 `false`，内容落服务端
+ * 收件箱，等客户端上线补拉）。收到 push 却不弹通知是违约：Firefox 按配额退
+ * 订，iOS 过了订阅宽限期直接吊销。`"when-hidden"` 是给老部署留的兼容档，新代
+ * 码不选。`show: false` 在两端也不是同一件事——有收件箱的发送端见到它根本不发
+ * 这条 push，SW 压根收不到。
+ *
+ * 各档取舍见本包 README 的「选哪个 `show`」与 `@rei-standard/amsg-sw` README
+ * 的「不展示通知的代价」。
+ *
  * @typedef {Object} NotificationDirective
  * @property {"auto" | "always" | "when-hidden" | false} [show] - Rendering strategy. Defaults to "auto" (render only if messageKind is content).
  * @property {string}  [title]              - Notification title override (falls back to top-level `title`, then `来自 {contactName}`).
@@ -145,6 +155,47 @@ export const PUSH_SOURCE = Object.freeze({
  * @property {boolean} [silent]             - Suppress sound and vibration (falls back to top-level `silent`, default false at SW).
  * @property {Record<string, unknown>} [data] - Custom payload data to attach to the notification (falls back to top-level `data`).
  */
+
+/**
+ * 这条 payload 到了客户端会不会弹系统通知——发送端与 SW 共用的这一份判定。
+ *
+ * 三个取值：
+ *
+ * | 返回值          | 意思 |
+ * |----------------|------|
+ * | `'always'`     | 一定弹 |
+ * | `'when-hidden'`| 看有没有可见窗口，由 SW 当场定（发送端无从知道）。兼容档，新代码用 `'always'` |
+ * | `'never'`      | 一定不弹 |
+ *
+ * 判定顺序跟 SW 里一模一样：`notification.show` 说了算，没说才按 `messageKind`
+ * 走默认（`content` / `result` 与缺 kind 的 2.0.x 老 payload 弹，`reasoning` /
+ * `tool_request` / `error` 不弹）。
+ *
+ * 两端各拿它做一件事：
+ *
+ * - **SW**：决定要不要 `showNotification`。
+ * - **发送端**：决定这条值不值得占用推送通道。`'never'` 的 payload 推过去就是
+ *   一次「收了 push 却不弹通知」，浏览器那边要记账；有收件箱兜底的发送端
+ *   （`@rei-standard/amsg-server`）因此只落行、不推，等客户端上线补拉。
+ *
+ * @param {Record<string, unknown>|null|undefined} payload
+ * @returns {'always' | 'when-hidden' | 'never'}
+ */
+export function notificationIntent(payload) {
+  const notification = payload && typeof payload === 'object' && payload.notification;
+  const show = notification && typeof notification === 'object' ? notification.show : undefined;
+
+  if (show === 'always') return 'always';
+  if (show === 'when-hidden') return 'when-hidden';
+  if (show === false) return 'never';
+
+  // `'auto'` 与不传：按 kind 走默认。
+  if (!payload || typeof payload !== 'object') return 'never';
+  const kind = payload.messageKind;
+  // 缺 kind 的是 2.0.x 老 payload，那时候每条都弹，兼容路径照旧。
+  if (kind === undefined || kind === null) return 'always';
+  return kind === MESSAGE_KIND.CONTENT || kind === MESSAGE_KIND.RESULT ? 'always' : 'never';
+}
 
 /**
  * Final user-facing content. Sentence-split bursts of N use

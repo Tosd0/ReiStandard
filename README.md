@@ -7,14 +7,14 @@
 | 包 | 用途 |
 |---|---|
 | [`@rei-standard/amsg-shared`](./packages/rei-standard-amsg/shared/README.md) | 推送 schema（`AmsgPush` 判别联合 + builders + 类型守卫） |
-| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 一次性即时推送（SSE 默认传输、always-on Web Push backup） |
-| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | 定时 / 周期消息，多租户 Blob 配置 + token 鉴权 |
+| [`@rei-standard/amsg-server`](./packages/rei-standard-amsg/server/README.md) | 服务端：即时 / 定时 / 周期消息、服务端收件箱、fire-time hooks |
+| [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 无数据库的一次性即时推送（维护态） |
 | [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | 浏览器 SDK：加密、请求封装、Push 订阅、deliver() 送达裁决 / SSE consumer |
 | [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
 
 `amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
 
-**怎么挑服务端包**：只发"按钮点了就立刻推一条" → `amsg-instant`；要定时或周期任务 → `amsg-server`；两种都要就都装，共用同一套 VAPID 与 masterKey。
+**服务端用 `amsg-server`**：即时、定时、周期三种消息都在里面，单用户线（一个 Cloudflare Worker + D1）还带服务端收件箱——每条 payload 发出去之前先落一行，客户端上线补拉，一条不少。`amsg-instant` 是无后端场景的产物，现在是维护态：没有数据库也就没有收件箱，push 漏掉的内容补不回来；已经在用的部署照常工作，新接入不从它起步。
 
 ### 版本与发布
 
@@ -64,19 +64,19 @@ npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/a
 
 ## 🚀 接入
 
-1. 服务端：按你选的包打开它的 README，里面有环境变量、`createReiServer` / `createInstantHandler` 用法、各平台 (Netlify / Vercel / Cloudflare / Node) 的适配器。
-2. 浏览器：装 `amsg-client` 和 `amsg-sw`，按 [Service Worker 规范第 0 章](./standards/service-worker-specification.md#0-快速接入路径推荐使用-sdk-包) 的最小示例接。
+1. 服务端：打开 [`amsg-server` README](./packages/rei-standard-amsg/server/README.md)，里面有两条部署线的差异、环境变量、各平台 (Cloudflare / Netlify / Vercel / Node) 的适配器。新接入走单用户线（Cloudflare Worker + D1）。
+2. 浏览器：装 `amsg-client` 和 `amsg-sw`，按 [Service Worker 规范第 0 章](./standards/service-worker-specification.md#0-快速接入路径推荐使用-sdk-包) 的最小示例接——装 Service Worker，订 Web Push 并 `putPushSubscription()` 登记订阅（不登记就一条推送都收不到）。
+3. **应用启动时拉一次收件箱**（`getOutbox()` → 处理 → `ackOutbox()`）：到了客户端不会弹通知的内容（思考过程、工具请求、错误）只落收件箱、不发推送，少了这步就等于没有。写法见 [`amsg-client` README 的「上线补一次收件箱」](./packages/rei-standard-amsg/client/README.md#上线补一次收件箱)。
 
 ```bash
-# 服务端选其一（或都装）
+# 服务端
 npm install @rei-standard/amsg-server
-npm install @rei-standard/amsg-instant
 
 # 浏览器
 npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 ```
 
-数据库驱动按 `amsg-server` README 提示二选一（`@neondatabase/serverless` 或 `pg`）。
+单用户线用 Cloudflare D1，不用装数据库驱动；多租户线的驱动按 `amsg-server` README 提示二选一（`@neondatabase/serverless` 或 `pg`）。
 
 ## 🗂 仓库布局
 
@@ -85,8 +85,8 @@ ReiStandard/
 ├── standards/                   # 权威规范文本（端点、字段、错误码）
 ├── packages/rei-standard-amsg/  # 5 个发布到 npm 的 SDK 包
 │   ├── shared/                  # 推送 schema（最底层，其他包都依赖）
-│   ├── server/                  # 定时 / 周期消息（多租户 Blob + token）
-│   ├── instant/                 # 一次性即时推送（无 DB / 无 cron）
+│   ├── server/                  # 即时 / 定时 / 周期消息 + 服务端收件箱
+│   ├── instant/                 # 无数据库的一次性即时推送（维护态）
 │   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）
 │   └── sw/                      # Service Worker（推送展示、离线队列）
 ├── examples/                    # 手动接入示例（不用 SDK 包时的备用路径）

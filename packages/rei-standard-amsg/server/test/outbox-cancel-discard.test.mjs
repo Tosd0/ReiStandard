@@ -17,6 +17,7 @@ import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/singl
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptForStorage, encryptPayload, decryptPayload } from '../src/server/lib/encryption.js';
 import { seedPushSubscription } from './helpers/push-subscription.mjs';
+import { withoutOutbox } from './helpers/no-outbox.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -43,14 +44,19 @@ async function decResponse(body) {
 
 /** 起一个 worker + 同一份库的适配器，schema 建好、推送订阅登记好。 */
 async function bootstrap(extra = {}) {
+  // noOutbox：把适配器包成没有 message_outbox 的样子（内置 pg / neon 的现状）。
+  const { noOutbox, ...config } = extra;
   const d1 = createTestD1();
-  const worker = createSingleUserCloudflareWorker((env) => ({
-    db: createD1Adapter(env.DB),
-    masterKey: MASTER_KEY,
-    vapid: VAPID,
-    webpush: extra.webpush || { async sendNotification() {} },
-    ...extra,
-  }));
+  const worker = createSingleUserCloudflareWorker((env) => {
+    const db = createD1Adapter(env.DB);
+    return {
+      db: noOutbox ? withoutOutbox(db) : db,
+      masterKey: MASTER_KEY,
+      vapid: VAPID,
+      webpush: config.webpush || { async sendNotification() {} },
+      ...config,
+    };
+  });
   const env = { DB: d1 };
   await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
   const adapter = createD1Adapter(d1);
@@ -243,7 +249,9 @@ describe('instant 响应里的 reasoningError', () => {
         sent.push(push);
       }
     };
-    const { worker, env } = await bootstrap({ webpush });
+    // 有收件箱时思考过程只落行、不推送（见 lib/push-policy.js）。这条用例要验
+    // 的是「推送失败时把原因说出来」，得站在没有收件箱的部署上。
+    const { worker, env } = await bootstrap({ webpush, noOutbox: true });
     const restore = stubLlm('回答。', '先想想');
     try {
       const res = await worker.fetch(new Request('https://w.dev/schedule-message', {

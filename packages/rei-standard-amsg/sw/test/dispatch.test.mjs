@@ -529,7 +529,7 @@ test('content push triggers showNotification AND postMessage with CONTENT_RECEIV
 // 正文空白的 content push 以前会老老实实弹一条只有标题、正文全空的横幅：用户
 // 在锁屏上看到一条什么都没有的消息、未读 +1，点进去也是空的。
 // 兜底只能是「弹一条有内容的」——订阅是按 userVisibleOnly: true 建的，不弹会
-// 被 Firefox 按配额退订、iOS 可能撤掉推送权限。
+// 被 Firefox 按配额退订、被 iOS 在订阅的宽限期过后吊销。
 test('正文为空的 content push 弹兜底文案，而不是一条空白横幅', async () => {
   const { sw, notifications, triggerPush } = createSwMock();
   installReiSW(sw);

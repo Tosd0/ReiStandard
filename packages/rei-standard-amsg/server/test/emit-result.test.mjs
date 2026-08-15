@@ -135,14 +135,15 @@ describe('ctx.emitResult', () => {
     assert.equal(returned.pushed, true);
   });
 
-  test('宿主自定义通知：标题正文照用，说了别弹就别弹', async () => {
-    const { ctx, pushes } = await bootstrap();
+  test('宿主自定义通知：标题正文照用，说了别弹就干脆不推', async () => {
+    const { adapter, ctx, pushes } = await bootstrap();
+    let quiet;
     const hooks = emittingHooks(async (fireCtx) => {
       await fireCtx.emitResult({
         resultKind: 'fire-pack',
         notification: { title: '生成完毕', body: '点开看看' },
       });
-      await fireCtx.emitResult({
+      quiet = await fireCtx.emitResult({
         resultKind: 'ledger-entry',
         notification: { show: false },
       });
@@ -150,11 +151,20 @@ describe('ctx.emitResult', () => {
 
     await processSingleMessage(await makeTask(), { ...ctx, hooks });
 
-    assert.equal(pushes.length, 2);
+    // 会弹的那条照推，文案原样。
+    assert.equal(pushes.length, 1, '说了别弹的那条不占推送通道');
+    assert.equal(pushes[0].resultKind, 'fire-pack');
     assert.equal(pushes[0].notification.title, '生成完毕');
     assert.equal(pushes[0].notification.body, '点开看看');
     assert.equal(pushes[0].notification.show, 'always', '宿主没表态才补默认值');
-    assert.equal(pushes[1].notification.show, false);
+
+    // 不弹的那条只落收件箱：内容一个字不少，delivered_at 空着等客户端补收。
+    const outbox = await readOutbox(adapter);
+    assert.equal(outbox.length, 2, '两条都在收件箱里');
+    const ledger = outbox.find(o => o.push.resultKind === 'ledger-entry');
+    assert.equal(ledger.push.notification.show, false);
+    assert.equal(ledger.row.delivered_at, null, '没推就不能标 delivered，不然客户端补收拿不到');
+    assert.equal(quiet.pushed, false);
   });
 
   test('推送发不出去不算失败：行还在收件箱等补收', async () => {

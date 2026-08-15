@@ -16,9 +16,9 @@
  *                             assistant turn + tool results, next round
  *
  * 发送后回执：finish 的 pushPayloads 逐段发完（或中途发挂）后，可选的
- * ctx.onAfterSend?.({ task, sentCount, total, error, scratch, readState,
- * writeState }) 会被调用（见 notifyAfterSend），宿主用它把「真的发出去了几
- * 段」写回自己的存储——发送前的 hook 写的副作用，在推送全挂时会变成「云端
+ * ctx.onAfterSend?.({ task, sentCount, pushedCount, total, error, scratch,
+ * readState, writeState }) 会被调用（见 notifyAfterSend），宿主用它把「真的
+ * 发出去了几段」写回自己的存储——发送前的 hook 写的副作用，在推送全挂时会变成「云端
  * 记得说过、用户没收到」。载荷带 task（任务行本身）：tick 内多个任务并发
  * 投递时，hook 靠它区分回执属于哪条任务；带 scratch（与本次 fire 的
  * onBeforeFire / onLLMOutput 同一个引用），前面几个 hook 记下的东西这里直
@@ -27,9 +27,9 @@
  *
  * 收尾回执：onAfterSend 只走「有 push 要发」这条路。**只要 onBeforeFire 被
  * 调用过**，无论结局是发完、跳过（skip / skip-push）还是抛错，可选的
- * ctx.onFireSettled?.({ task, status, skipReason, sentCount, total,
- * iterations, error, scratch, readState, writeState }) 都会被调用一次（见
- * notifyFireSettled）。「开始时占点什么、结束时放掉」的写法挂这个才不会漏。
+ * ctx.onFireSettled?.({ task, status, skipReason, sentCount, pushedCount,
+ * total, iterations, error, scratch, readState, writeState }) 都会被调用一次
+ * （见 notifyFireSettled）。「开始时占点什么、结束时放掉」的写法挂这个才不会漏。
  *
  * The decision contract is shared with @rei-standard/amsg-instant
  * (assertValidDecision / buildSessionContext live in
@@ -128,6 +128,7 @@ import {
   supportsLlmCredentialsStore,
 } from './llm-credentials-store.js';
 import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import { shouldSendPush } from './push-policy.js';
 import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, sendTaggedPush } from './errors.js';
 import { validateTaskPayloadSize } from './validation.js';
 
@@ -715,7 +716,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   // 本次 fire 的进度。收尾回执（onFireSettled）要照实说「发出去几段、跑了几
   // 轮、为什么没发」，而这些数字在半路抛错时是拿不到返回值的，只能一路记在
   // 这里。usage 是最后一轮 LLM 响应的 usage（没跑到 LLM → null）。
-  const progress = { sentCount: 0, total: 0, iterations: 0, skipReason: null, usage: null };
+  const progress = { sentCount: 0, pushedCount: 0, total: 0, iterations: 0, skipReason: null, usage: null };
 
   // 结局默认按 failed 记：下面只要有任何一步抛出去，finally 里发出的就是这个。
   let settledStatus = 'failed';
@@ -740,6 +741,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       status: settledStatus,
       skipReason: settledStatus === 'skipped' ? progress.skipReason : null,
       sentCount: progress.sentCount,
+      pushedCount: progress.pushedCount,
       total: progress.total,
       iterations: progress.iterations,
       error: settledError,
@@ -996,7 +998,11 @@ function taggedRetryableError(message, code) {
  *
  * 载荷各字段：
  *   - task：任务行本身（tick 内最多 8 个任务并发投递，回执要靠它对号入座）
- *   - sentCount / total：发出去几段、一共几段
+ *   - sentCount / total：这批走完了几段、一共几段。`sentCount === total` 就是
+ *     整批都到位了
+ *   - pushedCount：这几段里真的占用了推送通道的有几条。到了客户端不会弹通知
+ *     的段默认只落收件箱、不推送（见 lib/push-policy.js），那种段照样计进
+ *     sentCount，但不计 pushedCount
  *   - error：全部成功为 null；第 k 段失败时 sentCount = k、error 带原始错误，
  *     且 hook 会在错误往上抛之前调用完
  *   - scratch：本次 fire 的便签对象，与 onBeforeFire / onLLMOutput 拿到的是
@@ -1016,10 +1022,13 @@ async function notifyAfterSend(ctx, info) {
 }
 
 /**
- * ctx.onFireSettled?.({ task, status, skipReason, sentCount, total,
- * iterations, error, metadata, usage, scratch, readState, writeState })
+ * ctx.onFireSettled?.({ task, status, skipReason, sentCount, pushedCount,
+ * total, iterations, error, metadata, usage, scratch, readState, writeState })
  * —— 一次 fire 收尾的可选 hook。**onBeforeFire 被调用过，这个就一定会被调用
  * 一次**，无论这次是发完了、跳过了、还是半路抛错。
+ *
+ * sentCount 是这批走完了几段，pushedCount 是其中真的占用了推送通道的有几条
+ * （不会弹通知的段默认只落收件箱，见 lib/push-policy.js）。
  *
  * metadata 是解密 payload 里的 metadata 子字段（与 onStaleSkip 同待遇）：
  * task 行本身是密文，宿主要靠它对上「这是哪个角色的哪类任务」——尤其是链路
@@ -1116,6 +1125,8 @@ async function sendHookPushPayloads({
 }) {
   const total = pushPayloads.length;
   let sentCount = 0;
+  /** 这批里真的占用了推送通道的条数（其余只落收件箱，见 lib/push-policy.js）。 */
+  let pushedCount = 0;
   progress.total = total;
   const afterSendBase = { task, total, scratch, readState, writeState, emitResult, usage: progress.usage };
   const sentIds = [];
@@ -1147,14 +1158,30 @@ async function sendHookPushPayloads({
       stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
       finalized.push(push);
     }
-    await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
+    const outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
+
+    // 到了客户端不会弹通知的那些（hook 发的 tool_request / error，或者显式
+    // `notification: { show: false }` 的）不推，只留在 outbox 里等客户端补
+    // 拉——推过去等于白违约一次 `userVisibleOnly` 的约定，而内容一个字不少。
+    // 见 lib/push-policy.js。
+    const pushGate = { outboxed };
+    const willPush = finalized.map(push => shouldSendPush(push, pushGate));
+    // 段间节流是给推送服务留的，最后一条真正要推的之后没必要再等。
+    const lastPushIndex = willPush.lastIndexOf(true);
 
     for (let i = 0; i < total; i++) {
-      await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(finalized[i]));
+      if (willPush[i]) {
+        await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(finalized[i]));
+        pushedCount++;
+        progress.pushedCount = pushedCount;
+        sentIds.push(finalized[i].messageId);
+      }
+      // 只落收件箱的那几条也算这一批处理过了：sentCount 是「这批走到第几条」，
+      // 宿主拿 sentCount === total 判整批跑完没有，跳过推送不该让它看起来像半
+      // 途失败。真正占用了推送通道的条数在 pushedCount 里。
       sentCount++;
       progress.sentCount = sentCount;
-      sentIds.push(finalized[i].messageId);
-      if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
+      if (willPush[i] && i < lastPushIndex) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   } catch (error) {
     // 部分失败：已发出的段在 outbox 里标 delivered（没标的正是要补收的），
@@ -1167,11 +1194,11 @@ async function sendHookPushPayloads({
         db: ctx.db, userId: task.user_id, pushes: finalized, sentIds,
       });
     }
-    await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });
+    await notifyAfterSend(ctx, { ...afterSendBase, sentCount, pushedCount, error });
     throw error;
   }
   await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-  await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error: null });
+  await notifyAfterSend(ctx, { ...afterSendBase, sentCount, pushedCount, error: null });
   return total;
 }
 

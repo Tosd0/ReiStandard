@@ -536,11 +536,15 @@ export class ReiClient {
   /**
    * Schedule a message.
    *
-   * Note: For `messageType: 'instant'`, prefer `deliver()` (2.5.0+) or
-   * `sendInstant()`. Both route through `@rei-standard/amsg-instant`
-   * (stateless, no DB round-trip) rather than `amsg-server`'s schedule-
-   * message endpoint. This method still works for instant via amsg-server
-   * for backward compatibility — see CHANGELOG / README for details.
+   * `messageType: 'instant'` goes through this method too: `amsg-server`
+   * writes the task, processes it, and lands every payload in the server
+   * outbox before pushing, so the client can refill it with `getOutbox()`
+   * after coming online. That's the path new integrations use.
+   *
+   * `deliver()` / `sendInstant()` target `@rei-standard/amsg-instant`
+   * instead — stateless, no DB, and no outbox to refill from. That package
+   * is in maintenance mode; reach for it only when the deployment genuinely
+   * cannot have a database.
    *
    * The payload is automatically encrypted before transmission.
    *

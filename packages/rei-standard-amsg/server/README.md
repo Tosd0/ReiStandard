@@ -15,7 +15,46 @@ npm install @neondatabase/serverless
 npm install pg
 ```
 
-## 快速使用
+## 两条部署线
+
+| | 单用户线（推荐） | 多租户线 |
+|---|---|---|
+| 入口 | `createSingleUserCloudflareWorker` / `createSingleUserServer` | `createReiServer` |
+| 数据库 | D1 | pg / neon |
+| 一个部署 | 服务一个用户 | 服务多个租户（Blob 存租户配置 + token 鉴权） |
+| 服务端收件箱（`GET /outbox` 补拉） | ✅ | ❌ |
+| `client_state` 云端镜像 | ✅ | ❌ |
+| 推送订阅、LLM 凭据、定时 / 周期任务 | ✅ | ✅ |
+
+**新接入走单用户线。** 收件箱是这套 SDK 的到达保证：每条 payload 发出去之前先落一行 `message_outbox`，客户端上线 `GET /outbox?since=` 一条不少地补得回来。有了它，到了客户端不会弹通知的 payload（思考过程、工具请求、错误）就不必占用推送通道——这是[哪些 payload 会发推送](#哪些-payload-会发推送)那一节的前提，也是不去赌 iOS 订阅宽限期的唯一办法。
+
+多租户线继续维护，任务、推送、凭据这些照常能用——但它的 pg / neon 适配器还没有 `message_outbox` 和 `client_state`，收件箱相关的端点返回 501，不会弹通知的 payload 也只能照旧推送。
+
+> **TODO**：给 pg / neon 适配器补 `message_outbox` 那组方法（D1 的实现见 `src/server/adapters/d1.js`，建表 SQL 见 `adapters/schema.sqlite.js`）。补上之前，多租户线省不掉那些不会弹通知的推送。
+
+## 快速使用（单用户线）
+
+一个 Cloudflare Worker 装完两个入口：`fetch` 收客户端请求，`scheduled` 跑 cron 投递。
+
+```js
+import { createSingleUserCloudflareWorker, createD1Adapter } from '@rei-standard/amsg-server';
+
+export default createSingleUserCloudflareWorker((env) => ({
+  db: createD1Adapter(env.DB),
+  masterKey: env.MASTER_KEY,
+  vapid: {
+    email: env.VAPID_EMAIL,
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+  },
+}));
+```
+
+建表、绑定、cron 配置和 fire-time hook 的完整走法见 [`examples/cloudflare-single-user`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/server/examples/cloudflare-single-user/README.md)。
+
+客户端那侧还差一步：**应用启动时拉一次收件箱**。不会弹通知的内容（思考过程、工具请求、错误）只落收件箱、不发推送，不补拉就等于没有——做法见 [`@rei-standard/amsg-client` README 的「上线补一次收件箱」](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md#上线补一次收件箱)。
+
+## 快速使用（多租户线）
 
 ```js
 import { createReiServer } from '@rei-standard/amsg-server';
@@ -54,9 +93,9 @@ const rei = await createReiServer({
 
 ## 关于 `messageType: 'instant'`
 
-> **两条 instant 路径，按各自特点选一条（都是正式支持路径）：**
-> - **本端点的 `messageType: 'instant'`**（create task → process by UUID → delete task）：任务先写进数据库再处理，投递不绑在请求连接上——客户端断开也没关系，任务行还在，能继续跑、能重试，想跑多久跑多久。适合**有数据库、需要长时间生成或保证消息零丢失**的场景。
-> - **[@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)**：纯 SSE 流 + Web Push backup，不需要数据库，适合无状态边缘运行时（如 Cloudflare Workers）。它的处理挂在响应连接上，客户端一断开就只剩平台给的那点宽限期把活干完（Deno Deploy 实测 ≈20-30s），所以适合**能快速跑完的短即时消息**。
+> **两条 instant 路径：**
+> - **本端点的 `messageType: 'instant'`**（create task → process by UUID → delete task）：任务先写进数据库再处理，投递不绑在请求连接上——客户端断开也没关系，任务行还在，能继续跑、能重试，想跑多久跑多久。落进收件箱的那份客户端上线也补得回来。有数据库就走这条。
+> - **[@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)**：纯 SSE 流 + Web Push backup，不需要数据库，跑得动无状态边缘运行时。处理挂在响应连接上，客户端一断开就只剩平台给的那点宽限期把活干完（Deno Deploy 实测 ≈20-30s）；它也没有服务端收件箱，push 漏了的内容补不回来。这个包现在是维护态，新接入不从它起步。
 
 ## AI 接口 `apiUrl` 约束
 
@@ -142,9 +181,30 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 用比 64 字符更长的 uuid（`scheduleTask` 允许传任意字符串）就自己再多留一点。
 
+### 哪些 payload 会发推送
+
+一条 payload 出门有两条腿：**落进 `message_outbox`**（到达的保证，客户端上线 `GET /outbox?since=` 补拉）和**发一条 Web Push**（及时性，当场叫人回来看）。收件箱那条腿每条 payload 都走，推送这条腿只留给「到了客户端会弹通知」的那些。
+
+| payload | 落收件箱 | 发推送 |
+| --- | --- | --- |
+| `content` / `result` | ✅ | ✅ |
+| `reasoning` / `tool_request` / `error` | ✅ | ❌ |
+| 任意 kind + `notification: { show: false }` | ✅ | ❌ |
+| 任意 kind + `notification: { show: 'always' \| 'when-hidden' }` | ✅ | ✅ |
+
+为什么这么分：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈。`reasoning` / `tool_request` / `error` 在 Service Worker 那边是静默送给页面的，推过去不会有任何可见反馈，却要跟浏览器赊一次账——Firefox 对这类 push 有配额、超了退掉订阅，iOS 给新订阅几天宽限期、过后一条就吊销订阅，而且掉订阅是静默发生的，服务端只看得到后续推送返回 410。而这些内容在收件箱里一个字不少，客户端上线补拉就行（完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节）。
+
+**想让某一条照样弹**，给它带上 `notification: { show: 'always' }`——判定读的是与 Service Worker 同一份规则（`@rei-standard/amsg-shared` 的 `notificationIntent`），宿主说了要弹，发送端就当它值得占用推送通道。逐条控制，不需要在服务端配开关。嫌打扰就配 `tag` 折叠加 `silent: true`，而不是不弹。`show: 'when-hidden'` 也照推（它到底弹不弹只有 Service Worker 当场知道），但那是给老部署留的兼容档，新代码在「一定弹」和「压根不推」里挑一个。
+
+跳过推送的那条不标 `delivered_at`，行留在收件箱里等客户端补收；这正是能跳过的前提。
+
+**前提是这个部署有收件箱。** 内置适配器里只有 D1 实现了 `message_outbox`（见[两条部署线](#两条部署线)）。落不进收件箱时——适配器没实现，或者这一批落行失败——推送是这条内容唯一的腿，所有 payload 照旧全推，包括不会弹通知的那些。宁可跟浏览器违约一次，也不能让内容凭空消失。
+
+agentic 链路的 `onAfterSend` / `onFireSettled` 回执里，`sentCount` 是这批走完了几段，`pushedCount` 是其中真的占用了推送通道的有几条。`sentCount === total` 照旧表示整批都到位了。
+
 ### 装不下就切片：`multipart`
 
-思考过程（reasoning）常常一条 push 装不下。装不下时服务端会把它切成分片逐条发，Service Worker 收齐后还原成原样再走正常派发。切多大一片、最多切几片、收齐前能等多久，都是接收端说了算——所以给 `installReiSW` 传了什么，就把同一份原样传给服务端：
+思考过程（reasoning）常常一条 push 装不下。真要把它推出去时（宿主给它配了 `notification.show`，或者这个部署没有收件箱），服务端会把它切成分片逐条发，Service Worker 收齐后还原成原样再走正常派发。切多大一片、最多切几片、收齐前能等多久，都是接收端说了算——所以给 `installReiSW` 传了什么，就把同一份原样传给服务端：
 
 ```js
 const multipart = { maxChunkBytes: 1800, maxChunks: 128, maxTotalBytes: 256_000, ttlMs: 60_000 };
@@ -167,6 +227,8 @@ createSingleUserCloudflareWorker((env) => ({ …, multipart }));  // CF Worker�
 两边对不上的下场值得记一下：页面把 `maxChunks` 收窄到 32、服务端还按 128 切的话，分片到了接收端会被逐片拒收；节奏排得比窗口长的话，迟到的分片会被当过期丢掉。两种都是「页面上这条思考过程直接没有」，而服务端那边每一片都发成功、看不出任何异常。
 
 ### 思考过程没送到时的可见性
+
+> 这一节说的是**推送真的发出去过、但发挂了**的情况。有收件箱的部署上思考过程只落行、不推送（见[哪些 payload 会发推送](#哪些-payload-会发推送)），那条路上内容没丢，也就不会有下面这些信号。
 
 思考过程是正文之外的附赠内容：它没发出去不影响正文，任务照样算成功。这件事有三处看得见——
 
@@ -324,13 +386,15 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 
 | hook | 什么时候调 | 载荷 |
 |---|---|---|
-| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, total, error, scratch, readState, writeState, emitResult }` |
-| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, total, iterations, error, scratch, readState, writeState, emitResult }` |
+| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, scratch, readState, writeState, emitResult }` |
+| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, pushedCount, total, iterations, error, scratch, readState, writeState, emitResult }` |
 | `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
 
 三个 hook 都自带 `readState` / `writeState` / `emitResult`，作用于当前用户，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
 
 `onAfterSend` 的 `scratch` 与本次 fire 的 `onBeforeFire` / `onLLMOutput` 是同一个引用——「这次生成了哪几段正文」之类的上下文直接从这里读，不用自建按任务分格的登记表。全部成功时 `error` 为 `null`；第 k 段失败时 `sentCount = k`、`error` 带原始错误，且在错误往上抛之前调用完。
+
+`sentCount` 与 `pushedCount` 数的是两件事：`sentCount` 是这批走完了几段（只落收件箱、没占推送通道的那些也算走完），`pushedCount` 是其中真的发了 Web Push 的有几条。判整批跑完没有看 `sentCount === total`。
 
 `onFireSettled` 是「这次 fire 结束了」这一个信号，`status` 说明结局：
 
@@ -412,7 +476,9 @@ const { messageId, pushed } = await ctx.emitResult({
 
 **通知**默认弹（结果与聊天正文同待遇，其余 push 类型是静默送给页面）。标题正文在 `notification` 里自定义，字段与 SW 那套一致（`title` / `body` / `icon` / `tag` / …）；不想弹就 `notification: { show: false }`。
 
-**返回值**里 `pushed` 是「这次推送有没有真的发出去」。`false` 只表示没能当场送达（订阅失效、推送服务抽风、payload 超过 4KB），行还在收件箱里等补收——所以这不算失败，`emitResult` 也不会因此抛错。
+> 带 `show: false` 的结果不发推送、只落收件箱（见[哪些 payload 会发推送](#哪些-payload-会发推送)）：订阅按 `userVisibleOnly: true` 建，收到 push 却不弹通知，Firefox 按配额退订，iOS 在订阅的宽限期过后直接吊销（完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节）。结果这条本来就有收件箱兜底，客户端上线补拉拿得到。
+
+**返回值**里 `pushed` 是「这次推送有没有真的发出去」。两种情况会是 `false`：带 `notification: { show: false }` 的结果按策略压根不推（见[哪些 payload 会发推送](#哪些-payload-会发推送)），以及推了但没送出去（订阅失效、推送服务抽风、payload 超过 4KB）。两种都不算失败，行还在收件箱里等补收，`emitResult` 也不会因此抛错。
 
 **落行失败会抛**：收件箱是到达的保证，静默丢掉正是这个能力要修的病。适配器没有 `message_outbox`（自定义适配器）时同样抛，`code` 是 `OUTBOX_UNSUPPORTED`。
 
