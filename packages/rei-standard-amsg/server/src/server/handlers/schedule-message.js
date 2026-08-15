@@ -9,10 +9,11 @@ import { randomUUID } from '../lib/webcrypto-utils.js';
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage } from '../lib/encryption.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
-import { validateScheduleMessagePayload } from '../lib/validation.js';
+import { validateScheduleMessagePayload, validateTaskPayloadSize } from '../lib/validation.js';
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
 import { processMessagesByUuid } from '../lib/message-processor.js';
+import { discardUndeliveredPushesForTask } from '../lib/outbox-store.js';
 
 export function createScheduleMessageHandler(ctx) {
   async function POST(headers, body) {
@@ -175,7 +176,17 @@ export function createScheduleMessageHandler(ctx) {
       metadata: payload.metadata || {}
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
+    // 正文落库前先量一次大小。加密后走 hex，字节数正好翻倍，D1 的单行上限就是
+    // 这么被顶穿的——在这里 400 并报出实际字节数，好过到 D1 那儿换回一句
+    // `string or blob too big` 的 500。量的是真正要加密的那个字符串，不是请求
+    // 里的 payload：两者不是同一份（这里补了默认值、丢了不认识的字段）。
+    const serializedTaskData = JSON.stringify(fullTaskData);
+    const sizeError = validateTaskPayloadSize(serializedTaskData);
+    if (sizeError) {
+      return { status: 400, body: { success: false, error: sizeError } };
+    }
+
+    const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
     /**
      * In-server instant path. Delivers an instant message through this
@@ -260,6 +271,14 @@ export function createScheduleMessageHandler(ctx) {
       return { status: 500, body: { success: false, error: { code: 'TASK_CREATE_FAILED', message: '创建任务失败' } } };
     }
 
+    // 被顶替的旧任务跟走 DELETE /message 取消是一回事：任务行删了，它此前投递
+    // 到一半失败留下的那几段还在 message_outbox 里等补收，不撤掉的话客户端下次
+    // GET /outbox 会把被顶替的那条重新拉回去。已经推到设备上的分段不动。
+    // best-effort，清不干净也不影响这次顶替（旧行已经删掉了）。
+    if (superseded) {
+      await discardUndeliveredPushesForTask({ db, userId, taskUuid: supersedesUuid });
+    }
+
     // In-server instant path — rationale documented above the VAPID pre-check.
     // Instant type: send immediately
     if (payload.messageType === 'instant') {
@@ -285,6 +304,9 @@ export function createScheduleMessageHandler(ctx) {
               sentAt: new Date().toISOString(),
               status: 'sent',
               retriesUsed: sendResult.retriesUsed || 0,
+              // 思考过程那条 push 没发出去的原因（有才带上）。正文照发，所以
+              // 这次调用仍是成功的；调用方拿它决定要不要提示 / 重发。
+              ...(sendResult.reasoningError ? { reasoningError: sendResult.reasoningError } : {}),
               ...(supersedesUuid ? { superseded } : {})
             }
           }

@@ -18,8 +18,9 @@ import {
   MESSAGE_OUTBOX_TABLE_SQL,
   MESSAGE_OUTBOX_INDEX_SQL
 } from './schema.sqlite.js';
-// 列名不分方言：三个适配器共用 schema.js 里的这一份白名单，加列只改一处。
-import { UPDATABLE_COLUMNS } from './schema.js';
+// 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
+// schema.js 里的这一份，加列只改一处。
+import { UPDATABLE_COLUMNS, TASK_DELIVERY_COLUMNS, TASK_DETAIL_COLUMNS } from './schema.js';
 
 /**
  * 「key 以 prefix 开头」的字典序上界：`key >= prefix AND key < prefixRangeEnd(prefix)`。
@@ -329,7 +330,7 @@ export class D1Adapter {
 
   async getTaskByUuid(uuid, userId) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = ? AND user_id = ? AND status = 'pending'
        LIMIT 1`
@@ -338,7 +339,7 @@ export class D1Adapter {
 
   async getTaskByUuidOnly(uuid) {
     return this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = ? AND status = 'pending'
        LIMIT 1`
@@ -422,7 +423,7 @@ export class D1Adapter {
   async getPendingTasks(limit = 50) {
     const now = this._now();
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= ?
          AND (lease_until IS NULL OR lease_until <= ?)
@@ -537,7 +538,7 @@ export class D1Adapter {
     const total = Number(countRow.count) || 0;
 
     const res = await this._db.prepare(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC
@@ -680,6 +681,35 @@ export class D1Adapter {
        ORDER BY key ASC`
     ).bind(userId, namespace).all();
     return res.results || [];
+  }
+
+  /**
+   * 例行清理：把指定命名空间下太久没更新的条目删掉（run-tick 每跳顺手调，
+   * 宿主配了 `clientStateTtl` 才会调）。
+   *
+   * 不限用户——「这个命名空间只留最近 N 天」是命名空间级的约定，单用户部署
+   * 下也就是这一个用户的行。指令由 lib/client-state-store.js 的
+   * `planClientStateCleanup` 算好（含大值切片所在的保留命名空间），这里只负
+   * 责照着删。
+   *
+   * @param {Array<{ namespace: string, updatedBefore: number }>} targets
+   *   `updatedBefore` 是 epoch 毫秒，与 `updated_at` 列同一把尺子。
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async cleanupClientState(targets = []) {
+    if (!Array.isArray(targets) || targets.length === 0) return 0;
+    const SQL = 'DELETE FROM client_state WHERE namespace = ? AND updated_at < ?';
+    const statements = targets.map((target) =>
+      this._db.prepare(SQL).bind(target.namespace, target.updatedBefore)
+    );
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const statement of statements) results.push(await statement.run());
+    }
+    return results.reduce((sum, res) => sum + (res.meta.changes || 0), 0);
   }
 
   /**
@@ -891,6 +921,28 @@ export class D1Adapter {
         `UPDATE message_outbox SET delivered_at = ?
          WHERE user_id = ? AND message_id IN (${placeholders})`,
       [deliveredAt, userId],
+      messageIds
+    );
+  }
+
+  /**
+   * 把这一批还没发出去的行删掉（任务投递到一半被取消 / 顶替时用）。
+   *
+   * 只删 delivered_at 仍为 NULL 的行：已经推给设备的那几条撤不回来，行留着让
+   * 客户端照常 ack。已 ack 的行更不动。
+   *
+   * @param {string} userId
+   * @param {string[]} messageIds
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async discardOutboxMessages(userId, messageIds) {
+    if (!messageIds || messageIds.length === 0) return 0;
+    return this._runInClauseWrite(
+      (placeholders) =>
+        `DELETE FROM message_outbox
+         WHERE user_id = ? AND delivered_at IS NULL AND acked_at IS NULL
+           AND message_id IN (${placeholders})`,
+      [userId],
       messageIds
     );
   }

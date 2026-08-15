@@ -22,7 +22,8 @@
  * 记得说过、用户没收到」。载荷带 task（任务行本身）：tick 内多个任务并发
  * 投递时，hook 靠它区分回执属于哪条任务；带 scratch（与本次 fire 的
  * onBeforeFire / onLLMOutput 同一个引用），前面几个 hook 记下的东西这里直
- * 接读；带 readState / writeState，回执要落进 client_state 时不用另想办法。
+ * 接读；带 readState / writeState / emitResult，回执要落进 client_state、或者
+ * 要给客户端补一条结果时，不用另想办法。
  *
  * 收尾回执：onAfterSend 只走「有 push 要发」这条路。**只要 onBeforeFire 被
  * 调用过**，无论结局是发完、跳过（skip / skip-push）还是抛错，可选的
@@ -46,6 +47,12 @@
  * writeState，读到和写出的都是客户端 `GET/PUT /client-state` 那套数据。写口
  * 在 sessionCtx 上也给，是因为「这条内容太大、塞不进 push」往往到工具跑完、
  * 组 pushPayloads 时才知道，那时 onBeforeFire 早已返回。
+ *
+ * 自定义结果：同样这几个位置上还挂着 emitResult(payload)，把一条**不是聊天
+ * 内容**的结果送给客户端——整理好的一份数据、一条账目、后台生成的产物。它同
+ * 时落进服务端收件箱并推一条 Web Push：推送负责及时（生成完当场弹一下），
+ * 收件箱负责到达（客户端下次 `GET /outbox?since=` 一定拿得到）。客户端因此
+ * 不必为每种结果各写一套轮询。实现见 lib/result-emitter.js。
  *
  * scratch：每次 fire 新建一个普通对象，onBeforeFire 的 fireCtx、同一次 fire
  * 每轮的 sessionCtx、以及发送后的 onAfterSend 都持有同一个引用，hook 之间借
@@ -109,6 +116,7 @@ import { decryptFromStorage, encryptForStorage } from './encryption.js';
 import { isUniqueViolation } from './db-errors.js';
 import { callLlm } from './llm.js';
 import { createStateAccessors } from './state-accessors.js';
+import { createResultEmitter } from './result-emitter.js';
 import { projectTask } from './task-projection.js';
 import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
@@ -119,7 +127,9 @@ import {
   resolveLlmCredential as resolveLlmCredentialFromStore,
   supportsLlmCredentialsStore,
 } from './llm-credentials-store.js';
-import { appendPushesToOutbox, markPushesDelivered } from './outbox-store.js';
+import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, sendTaggedPush } from './errors.js';
+import { validateTaskPayloadSize } from './validation.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -233,8 +243,11 @@ function normalizeBeforeFireResult(result) {
       toolChoice: result.toolChoice,
     };
   }
-  throw new TypeError(
-    'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
+  throw markPermanent(
+    new TypeError(
+      'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
+    ),
+    'AGENTIC_BAD_BEFORE_FIRE'
   );
 }
 
@@ -275,7 +288,10 @@ function firstPositiveNumber(values, fallback) {
 export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
   if (typeof hooks.onLLMOutput !== 'function') {
-    throw new Error('AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds');
+    throw new DeploymentConfigError(
+      'AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds',
+      { code: 'AGENTIC_CONFIG_ERROR' }
+    );
   }
 
   // Injectable seams for tests only (fake clock / no real 1500ms pacing).
@@ -289,6 +305,31 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     userId: task.user_id,
     userKey,
     maxStateValueBytes: ctx.maxStateValueBytes,
+    now: nowFn,
+  });
+
+  // 这一次 fire 的三个身份值，整条链共用一份：sessionId 钉在（任务 id + 名义
+  // 触发时刻）上，同一 occurrence 的重试复用同一个 session、不同 occurrence 各
+  // 一个（见 occurrenceSuffix）。它是给日志和去重用的**不透明 id**，想知道是哪
+  // 条任务、哪一次触发，读 sessionCtx 上的 taskId / taskUuid / occurrenceMs，
+  // 别去拆它。messageIdBase 同理，是推送与结果两条路的 messageId 前缀——两边
+  // 各算一份的话，任务行没有 id 时（instant 那条路）两边会各掷一个随机数。
+  const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
+  const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
+  const occurrenceMs = occurrenceMsOf(task);
+
+  // 结果出口：把一条宿主自定义的结果落进收件箱并推出去（见
+  // lib/result-emitter.js）。与 readState / writeState 同待遇，fire 级和每轮的
+  // sessionCtx、以及收尾 hook 上都挂着同一个。
+  const { emitResult } = createResultEmitter({
+    db: ctx.db,
+    task,
+    userKey,
+    decryptedPayload,
+    messageIdBase,
+    sessionId,
+    occurrenceMs,
+    webpush: ctx.webpush,
     now: nowFn,
   });
 
@@ -426,20 +467,6 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw new TypeError('scheduleTask: uuid 必须是非空字符串');
     }
 
-    // ---- 额度 ----
-    if (scheduledTaskCount >= maxScheduledTasksPerFire) {
-      throw new RangeError(
-        `scheduleTask: 单次 fire 最多建 ${maxScheduledTasksPerFire} 条任务` +
-        `（factory 配置 maxScheduledTasksPerFire 可调），这是第 ${scheduledTaskCount + 1} 条`
-      );
-    }
-    // readState 在适配器不支持时降级成空数组；建任务不一样，静默成功会让宿主
-    // 以为后续那条已经排上了，其实谁也不会触发它。
-    if (!ctx.db || typeof ctx.db.createTask !== 'function') {
-      throw new Error('AGENTIC_SCHEDULE_UNSUPPORTED: 当前数据库适配器不支持建任务（缺 createTask）');
-    }
-    scheduledTaskCount++;
-
     // 字段构成与 POST /schedule-message 落库的那份保持一致，只是走库内部、不经 HTTP。
     const fullTaskData = {
       contactName,
@@ -484,7 +511,40 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       metadata,
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(fullTaskData), userKey);
+    // 与 POST /schedule-message 同一道闸门：任务内容太大在这里就说清楚，别等
+    // 落库时撞上存储的单行上限、抛一句看不出所以然的错。hook 往 metadata 里塞
+    // 一坨大对象是最容易撞上的。
+    //
+    // 位置排在额度之前，跟其余参数护栏（contactName / uuid / tzId / …）一致：
+    // 正文超限也是「这次调用的参数不合法」，不该烧掉一次建任务额度——hook 捕获
+    // 之后换份小 metadata 重排时，会莫名其妙撞上「单次 fire 最多建 N 条」。
+    const serializedTaskData = JSON.stringify(fullTaskData);
+    const sizeError = validateTaskPayloadSize(serializedTaskData);
+    if (sizeError) {
+      throw markPermanent(
+        new RangeError(`${sizeError.code}: ${sizeError.message}`),
+        sizeError.code
+      );
+    }
+
+    // ---- 额度 ----
+    if (scheduledTaskCount >= maxScheduledTasksPerFire) {
+      throw new RangeError(
+        `scheduleTask: 单次 fire 最多建 ${maxScheduledTasksPerFire} 条任务` +
+        `（factory 配置 maxScheduledTasksPerFire 可调），这是第 ${scheduledTaskCount + 1} 条`
+      );
+    }
+    // readState 在适配器不支持时降级成空数组；建任务不一样，静默成功会让宿主
+    // 以为后续那条已经排上了，其实谁也不会触发它。
+    if (!ctx.db || typeof ctx.db.createTask !== 'function') {
+      throw new DeploymentConfigError(
+        'AGENTIC_SCHEDULE_UNSUPPORTED: 当前数据库适配器不支持建任务（缺 createTask）',
+        { code: 'AGENTIC_SCHEDULE_UNSUPPORTED' }
+      );
+    }
+    scheduledTaskCount++;
+
+    const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
     let created;
     try {
@@ -511,7 +571,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw error;
     }
     if (!created) {
-      throw new Error('AGENTIC_SCHEDULE_FAILED: createTask 没有返回新建的任务行');
+      throw new NonRetryableError(
+        'AGENTIC_SCHEDULE_FAILED: createTask 没有返回新建的任务行',
+        { code: 'AGENTIC_SCHEDULE_FAILED' }
+      );
     }
     return {
       created: true,
@@ -548,7 +611,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       );
     }
     if (!ctx.db || typeof ctx.db.deleteTaskByUuid !== 'function') {
-      throw new Error('AGENTIC_CANCEL_UNSUPPORTED: 当前数据库适配器不支持删任务（缺 deleteTaskByUuid）');
+      throw new DeploymentConfigError(
+        'AGENTIC_CANCEL_UNSUPPORTED: 当前数据库适配器不支持删任务（缺 deleteTaskByUuid）',
+        { code: 'AGENTIC_CANCEL_UNSUPPORTED' }
+      );
     }
     const cancelled = await ctx.db.deleteTaskByUuid(uuid, task.user_id);
     return { cancelled: !!cancelled };
@@ -588,7 +654,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       );
     }
     if (!ctx.db || typeof ctx.db.getTaskByUuid !== 'function' || typeof ctx.db.updateTaskByUuid !== 'function') {
-      throw new Error('AGENTIC_RENEW_UNSUPPORTED: 当前数据库适配器不支持改任务（缺 getTaskByUuid / updateTaskByUuid）');
+      throw new DeploymentConfigError(
+        'AGENTIC_RENEW_UNSUPPORTED: 当前数据库适配器不支持改任务（缺 getTaskByUuid / updateTaskByUuid）',
+        { code: 'AGENTIC_RENEW_UNSUPPORTED' }
+      );
     }
     const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
     if (!row) return { renewed: false, reason: 'not_found' };
@@ -634,6 +703,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     userId: task.user_id,
     readState,
     writeState,
+    emitResult,
     scheduleTask,
     cancelTask,
     renewTask,
@@ -653,8 +723,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-      readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+      readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
       resolveLlmCredential, fireCtx, progress,
+      sessionId, messageIdBase, occurrenceMs,
     });
     settledStatus = !outcome.handled
       ? 'not-handled'
@@ -683,6 +754,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       scratch,
       readState,
       writeState,
+      emitResult,
     });
   }
 }
@@ -696,8 +768,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
  */
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-  readState, writeState, scratch, scheduleTask, cancelTask, renewTask,
+  readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
   resolveLlmCredential, fireCtx, progress,
+  sessionId, messageIdBase, occurrenceMs,
 }) {
   const before = await hooks.onBeforeFire(fireCtx);
   if (before == null) return { handled: false };
@@ -722,13 +795,6 @@ async function runFireChain({
   );
   const deadline = nowFn() + totalTimeoutMs;
 
-  // Same sessionId scheme as the legacy path: pinned to (task id + 名义触发
-  // 时刻)，同一 occurrence 的重试复用同一个 session，不同 occurrence 各一个
-  // （见 occurrenceSuffix）。这个字符串是给日志和去重用的**不透明 id**，
-  // 想知道是哪条任务、哪一次触发，读 sessionCtx 上的 taskId / taskUuid /
-  // occurrenceMs，别去拆它。
-  const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
-  const occurrenceMs = occurrenceMsOf(task);
   let messages = normalized.messages.slice();
 
   // chat 凭据进循环前解析一次（多轮共用同一份；credRefs.chat 缺席时是 null，
@@ -789,6 +855,7 @@ async function runFireChain({
       occurrenceMs,
       readState,
       writeState,
+      emitResult,
       scheduleTask,
       cancelTask,
       renewTask,
@@ -796,7 +863,13 @@ async function runFireChain({
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
-    assertValidDecision(decision, { inlineToolCalls: true });
+    try {
+      assertValidDecision(decision, { inlineToolCalls: true });
+    } catch (error) {
+      // 决策形状不合契约：宿主的分类器返回了库不认的东西，重试必然同败。
+      // 标成确定性失败之前保住它原本的 TypeError 身份（宿主可能按类型分流）。
+      throw markPermanent(error, 'AGENTIC_BAD_DECISION');
+    }
 
     if (decision.decision === 'continue') {
       messages = decision.nextHistory.slice();
@@ -814,6 +887,7 @@ async function runFireChain({
         decryptedPayload,
         ctx,
         sessionId,
+        messageIdBase,
         occurrenceMs,
         task,
         userKey,
@@ -821,6 +895,7 @@ async function runFireChain({
         scratch,
         readState,
         writeState,
+        emitResult,
         progress,
       });
       return { handled: true, result: { success: true, messagesSent, status: 'finished', iterations: iteration + 1 } };
@@ -829,10 +904,19 @@ async function runFireChain({
     // 'tool-request' — execute right here in the worker.
     const toolCalls = extractToolCallsFromDecision(decision);
     if (toolCalls.length === 0) {
-      throw new Error('AGENTIC_EMPTY_TOOL_REQUEST: tool-request decision carried no toolCalls (neither decision.toolCalls nor pushPayloads[].toolCalls)');
+      // 留在退避阶梯里：这一轮模型没吐出能解析的 tool_calls，是这次生成的结果，
+      // 不是部署配置错了。判成终态的话，一次性任务第一次掷歪就永久 failed，而
+      // 且行离开 pending 之后连 PUT 都救不回来（409 TASK_ALREADY_COMPLETED）。
+      throw taggedRetryableError(
+        'AGENTIC_EMPTY_TOOL_REQUEST: tool-request decision carried no toolCalls (neither decision.toolCalls nor pushPayloads[].toolCalls)',
+        'AGENTIC_EMPTY_TOOL_REQUEST'
+      );
     }
     if (typeof hooks.executeToolCalls !== 'function') {
-      throw new Error('AGENTIC_CONFIG_ERROR: onLLMOutput returned tool-request but hooks.executeToolCalls is not configured');
+      throw new DeploymentConfigError(
+        'AGENTIC_CONFIG_ERROR: onLLMOutput returned tool-request but hooks.executeToolCalls is not configured',
+        { code: 'AGENTIC_CONFIG_ERROR' }
+      );
     }
     if (iteration === maxToolIterations - 1) {
       // No LLM round left to consume the results — executing tools now
@@ -879,7 +963,28 @@ async function runFireChain({
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 
-  throw new Error(`AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`);
+  // 同样留在退避阶梯里：把回合数用光是模型这一轮的走向，隔两分钟重掷一次通常
+  // 就正常收尾了。
+  throw taggedRetryableError(
+    `AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`,
+    'AGENTIC_LOOP_EXCEEDED'
+  );
+}
+
+/**
+ * 带 `code` 的普通错误——会走 run-tick 的重试阶梯。
+ *
+ * 跟 {@link NonRetryableError} 的分界线：错误只跟「这一次生成掷出了什么」有关
+ * 就用这个（重掷一次多半就好了），跟部署配置 / 宿主 hook 契约有关才用那个。
+ *
+ * @param {string} message
+ * @param {string} code
+ * @returns {Error}
+ */
+function taggedRetryableError(message, code) {
+  const error = new Error(message);
+  /** @type {any} */ (error).code = code;
+  return error;
 }
 
 /**
@@ -998,6 +1103,7 @@ async function sendHookPushPayloads({
   decryptedPayload,
   ctx,
   sessionId,
+  messageIdBase,
   occurrenceMs,
   task,
   userKey,
@@ -1005,13 +1111,16 @@ async function sendHookPushPayloads({
   scratch,
   readState,
   writeState,
+  emitResult,
   progress,
 }) {
   const total = pushPayloads.length;
   let sentCount = 0;
   progress.total = total;
-  const afterSendBase = { task, total, scratch, readState, writeState, usage: progress.usage };
+  const afterSendBase = { task, total, scratch, readState, writeState, emitResult, usage: progress.usage };
   const sentIds = [];
+  /** 定稿后的整批 push（发送前就落进 outbox 的那一份）。取消收尾要按它撤行。 */
+  const finalized = [];
   try {
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
@@ -1024,12 +1133,10 @@ async function sendHookPushPayloads({
       userKey,
       legacyFallback: (decryptedPayload && decryptedPayload.pushSubscription) ?? null,
     });
-    const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
 
     // 先定稿整批（补 id / index / 任务身份），再发送——发送前整批落进
     // message_outbox（客户端补收的事实来源，best-effort，见 lib/outbox-store.js），
     // 落的必须是发送时的同一份内容。
-    const finalized = [];
     for (let i = 0; i < total; i++) {
       const push = { ...pushPayloads[i] };
       if (typeof push.messageId !== 'string' || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
@@ -1043,7 +1150,7 @@ async function sendHookPushPayloads({
     await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
 
     for (let i = 0; i < total; i++) {
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(finalized[i]));
+      await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(finalized[i]));
       sentCount++;
       progress.sentCount = sentCount;
       sentIds.push(finalized[i].messageId);
@@ -1053,6 +1160,13 @@ async function sendHookPushPayloads({
     // 部分失败：已发出的段在 outbox 里标 delivered（没标的正是要补收的），
     // 再让宿主知道已经发出去了几段——先通知，再把错误往上抛。
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
+    if (isTaskCancelledError(error)) {
+      // 投递到一半任务被取消 / 顶替：剩下这几条不会再发了，行也别留着——留着
+      // 客户端会从 GET /outbox 把它们补收回去（见 lib/outbox-store.js）。
+      await discardUndeliveredPushes({
+        db: ctx.db, userId: task.user_id, pushes: finalized, sentIds,
+      });
+    }
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, error });
     throw error;
   }

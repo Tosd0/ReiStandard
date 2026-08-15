@@ -8,7 +8,8 @@
  * Three orthogonal axes:
  *   1. messageType    — how the push was produced (instant / fixed / prompted / auto)
  *   2. messageSubtype — caller's business classification (free-form string)
- *   3. messageKind    — what the push carries (content / reasoning / tool_request / error)
+ *   3. messageKind    — what the push carries (content / reasoning / tool_request /
+ *                       error / result)
  *
  * Zero runtime dependencies. The package is ESM/CJS dual-published and
  * intentionally has no `dependencies:` entry — every other amsg sub-
@@ -27,7 +28,7 @@
 /**
  * What the push carries. Fixed enum — packages must not add values.
  *
- * @typedef {'content' | 'reasoning' | 'tool_request' | 'error'} MessageKind
+ * @typedef {'content' | 'reasoning' | 'tool_request' | 'error' | 'result'} MessageKind
  */
 
 /**
@@ -56,6 +57,7 @@ export const MESSAGE_KIND = Object.freeze({
   REASONING: 'reasoning',
   TOOL_REQUEST: 'tool_request',
   ERROR: 'error',
+  RESULT: 'result',
 });
 
 /**
@@ -118,8 +120,9 @@ export const PUSH_SOURCE = Object.freeze({
  * so producers get builder validation for the fields the SW actually reads.
  *
  * Routing in SW:
- *   - By default (`show: "auto"` or omitted), `messageKind: 'content'` (and legacy un-kinded payloads)
- *     will display a system notification. `reasoning` / `tool_request` / `error` will dispatch silently.
+ *   - By default (`show: "auto"` or omitted), `messageKind: 'content'` / `'result'` (and legacy
+ *     un-kinded payloads) will display a system notification. `reasoning` / `tool_request` /
+ *     `error` will dispatch silently.
  *   - `show: "always"`, `"when-hidden"`, or `false` overrides this default.
  *   - When rendering, `notification.*` is consulted first, with per-field
  *     fallback to the matching top-level payload fields (`title`,
@@ -220,19 +223,53 @@ export const PUSH_SOURCE = Object.freeze({
  * string; `iteration` is the agentic-loop iteration number when
  * relevant (0 / absent otherwise).
  *
+ * `llmStatus` / `providerCode` 是失败来自 LLM 调用时的机读标注：上游回的 HTTP
+ * 状态码，以及 provider 自己的错误码（`invalid_api_key` /
+ * `context_length_exceeded` 之类）。客户端靠它们分流「Key 失效要去改配置」和
+ * 「上游一时抽风等会儿再说」，不用回去正则匹配 `message` 那句人话——那句是给
+ * 用户看的，措辞随时会变。失败跟 LLM 无关时两个都不出现。
+ *
  * @typedef {AmsgPushCommon & {
  *   messageKind: 'error',
  *   code:    string,
  *   message: string,
  *   iteration?: number,
+ *   llmStatus?: number,
+ *   providerCode?: string,
  * }} ErrorPush
+ */
+
+/**
+ * 宿主自定义的一条结果，不是聊天内容。
+ *
+ * 用在「这次跑完产出了点什么，客户端拿去自己消化」的场合：整理好的一份数据、
+ * 一条账目、一次后台生成的产物。形状由宿主定，库只固定三件事——`messageKind`
+ * 是 `'result'`（客户端一眼分得出这不是聊天），`resultKind` 是宿主给这类结果
+ * 起的名字（有多种结果时按它分流，不用去猜字段），其余字段随便加。
+ *
+ * 与另外四种 kind 的区别在投递路径：这一条同时落进服务端收件箱
+ * （`message_outbox`），客户端下次 `GET /outbox?since=` 一定拿得到——推送没送
+ * 到、内容超过一条推送的 4KB 上限，都不会让它丢。产出方见
+ * `@rei-standard/amsg-server` 的 `ctx.emitResult()`。
+ *
+ * SW 侧默认弹通知（与 `content` 同待遇，其余三种是静默送给页面）：结果往往正
+ * 是「跑完了，回来看看」那句话。不想弹就带
+ * `notification: { show: false }`，标题正文也在 `notification` 里自定义。
+ *
+ * @typedef {AmsgPushCommon & {
+ *   messageKind: 'result',
+ *   resultKind: string,
+ *   title?:   string,
+ *   body?:    string,
+ *   data?:    Object,
+ * }} ResultPush
  */
 
 /**
  * Discriminated union of all pushes the SW can receive. TS consumers
  * `switch` on `messageKind` and the compiler narrows automatically.
  *
- * @typedef {ContentPush | ReasoningPush | ToolRequestPush | ErrorPush} AmsgPush
+ * @typedef {ContentPush | ReasoningPush | ToolRequestPush | ErrorPush | ResultPush} AmsgPush
  */
 
 // ─── Builder helpers ────────────────────────────────────────────────────
@@ -498,6 +535,8 @@ function validateNotificationArg(kind, value) {
  * @param {string}      [args.messageSubtype]
  * @param {Object}      [args.metadata]
  * @param {NotificationDirective} [args.notification]
+ * @param {number}      [args.llmStatus]     - 上游 LLM 回的 HTTP 状态码（见 ErrorPush）
+ * @param {string}      [args.providerCode]  - provider 自己的错误码（见 ErrorPush）
  * @returns {ErrorPush}
  */
 export function buildErrorPush(args) {
@@ -526,7 +565,54 @@ export function buildErrorPush(args) {
   if (args.messageSubtype !== undefined) push.messageSubtype = args.messageSubtype;
   if (args.metadata !== undefined) push.metadata = args.metadata;
   if (args.notification !== undefined) push.notification = args.notification;
+  if (args.llmStatus !== undefined) push.llmStatus = args.llmStatus;
+  if (args.providerCode !== undefined) push.providerCode = args.providerCode;
   return push;
+}
+
+/**
+ * Build a {@link ResultPush} —— 宿主自定义的一条结果。
+ *
+ * 与另外四个 builder 有一处不同：**认识以外的字段原样保留**。结果的形状本来
+ * 就由宿主定，白名单式的复制等于把内容删掉一半。库只保证 `messageKind` 与
+ * `timestamp` 到位，其余交给宿主。
+ *
+ * `resultKind` 必填：宿主给这类结果起的名字（`'fire-pack'`、`'ledger-entry'`
+ * ……）。客户端有多种结果时按它分流，不用靠「有没有某个字段」去猜是哪一种。
+ *
+ * @param {Object} args - 整条 payload；下列几个字段有约束，其余原样带过去。
+ * @param {MessageType} args.messageType
+ * @param {PushSource}  args.source
+ * @param {string}      args.messageId
+ * @param {string}      args.sessionId
+ * @param {string}      args.resultKind - 这类结果的名字（宿主自定义）
+ * @param {string}      [args.timestamp]
+ * @param {string}      [args.title]  - 通知标题的兜底（`notification.title` 优先）
+ * @param {string}      [args.body]   - 通知正文的兜底（`notification.body` 优先）
+ * @param {NotificationDirective} [args.notification]
+ * @returns {ResultPush}
+ */
+export function buildResultPush(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error('[amsg-shared] ResultPush: payload must be a plain object');
+  }
+  requireField('ResultPush', 'messageType', args.messageType);
+  requireField('ResultPush', 'source', args.source);
+  requireField('ResultPush', 'messageId', args.messageId);
+  requireField('ResultPush', 'sessionId', args.sessionId);
+  if (typeof args.resultKind !== 'string' || !args.resultKind.trim()) {
+    throw new Error(
+      "[amsg-shared] ResultPush: 'resultKind' must be a non-empty string"
+      + '（给这类结果起个名字，客户端按它分流）'
+    );
+  }
+  validateNotificationArg('ResultPush', args.notification);
+
+  return /** @type {ResultPush} */ ({
+    ...args,
+    messageKind: 'result',
+    timestamp: args.timestamp || new Date().toISOString(),
+  });
 }
 
 // ─── Narrowing helpers ──────────────────────────────────────────────────
@@ -573,6 +659,17 @@ export function isToolRequestPush(value) {
 export function isErrorPush(value) {
   return !!value && typeof value === 'object'
     && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'error';
+}
+
+/**
+ * Type guard: returns true if the argument is a {@link ResultPush}.
+ *
+ * @param {unknown} value
+ * @returns {value is ResultPush}
+ */
+export function isResultPush(value) {
+  return !!value && typeof value === 'object'
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'result';
 }
 
 // ─── Reasoning byte chunker ─────────────────────────────────────────────
@@ -688,10 +785,14 @@ export { LLM_MESSAGES_ERROR, validateLlmMessagesShape } from './llm-messages.js'
 // 响应 + trim），instant 的 callLlmRaw 与 server 的 callLlm 共用这一份，
 // 两侧差异（stream 字段 / tools 转发 / timeoutMs）走 options 参数化。
 // 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+// `redactCredentials` 是这套里唯一一份脱敏规则：server 的
+// `sanitizeErrorSummary`（落库的 last_error 列）与 instant 的 cloudflare
+// 适配器（跨域 502 响应体）都调它，各自只负责后面的截断长度。
 export {
   callLlm,
   buildLlmRequestBody,
   normalizeAiApiUrl,
+  redactCredentials,
 } from './llm-call.js';
 
 // Web Push 加密栈（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID），
@@ -715,11 +816,21 @@ export {
   DEFAULT_MULTIPART_TTL_MS,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
+  MULTIPART_FAILURE_REASON,
   REI_AMSG_POSTMESSAGE_TYPE,
   REI_SW_EVENT,
   REI_SW_MESSAGE_TYPE,
   REI_AMSG_DELIVER_MESSAGE_TYPE,
 } from './protocol.js';
+
+// multipart transport 的发送端切片构造：装不下单条 push 的 payload 切成
+// 若干 `_multipart` 分片，sw 收齐后还原。instant 与 server 两个发送端共用
+// 这一份，切出来的分片形状由上面那批线协议常量约束。
+// 实现在独立模块 — shared 内部按主题拆文件，index 只负责聚合导出。
+export {
+  buildMultipartPushPayloads,
+  DEFAULT_MULTIPART_CHUNK_BYTES,
+} from './multipart.js';
 
 /**
  * True when `value` parses as an absolute URL.

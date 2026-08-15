@@ -15,8 +15,16 @@
  * @property {string}  next_send_at
  * @property {string}  status
  * @property {number}  retry_count
- * @property {string}  created_at
- * @property {string}  updated_at
+ * @property {string}  [created_at]
+ * @property {string}  [updated_at]
+ * @property {string|null} [retry_after]
+ *   退避时刻。投递链路读的行（getPendingTasks / getTaskByUuidOnly）必须带上
+ *   它，读接口返回的行（getTaskByUuid / listTasks）不带。
+ * @property {string|null} [last_error]
+ *   上一次投递失败的脱敏摘要（JSON 串）。读接口返回的行才带。
+ *
+ * 两条链路各要一套列，内置适配器统一从 adapters/schema.js 的
+ * `TASK_DELIVERY_COLUMNS` / `TASK_DETAIL_COLUMNS` 取，三种方言共用一份。
  */
 
 /**
@@ -53,6 +61,9 @@
  *   Fetch a single pending task by uuid + user_id.
  * @property {(uuid: string) => Promise<TaskRow|null>} getTaskByUuidOnly
  *   Fetch a single pending task by uuid only (used by instant processing).
+ *   返回的行要和 `getPendingTasks` 是同一套列（`TASK_DELIVERY_COLUMNS`）：
+ *   `runTask` 拿这一行走同一条投递链，少了 `retry_after`，退避守卫读到的永远
+ *   是 undefined，还在等重试的任务会被当场再跑一遍。
  * @property {(uuid: string) => Promise<{ status: string }|null>} [getTaskStatusByUuidOnly]
  *   （可选）这条 uuid 现在是什么状态——不限用户，也不限状态。`runTask` 用它
  *   把「这条已经跑完进终态了」和「压根没这条」分开回报；不实现时两种都归
@@ -103,6 +114,11 @@
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
+ * @property {(targets: Array<{ namespace: string, updatedBefore: number }>) => Promise<number>} [cleanupClientState]
+ *   （可选；单用户/D1）按命名空间清掉 `updated_at` 早于 `updatedBefore`（epoch 毫秒）
+ *   的行，不限用户。宿主配了 `clientStateTtl` 时 runScheduledTick 每跳顺手调；
+ *   指令由 lib/client-state-store.js 的 `planClientStateCleanup` 算好（含大值切片
+ *   所在的保留命名空间）。不实现 → 不清理，与不配 TTL 时行为一致。
  * @property {(userId: string) => Promise<{ subscription: string, updated_at: number }|null>} [getPushSubscription]
  *   这个用户当前登记的 Web Push 订阅（`subscription` 是密文，解密在上层）。没有登记过 → null。
  *   一个用户一份：任务行不携带订阅，到点投递时读这里。
@@ -134,6 +150,12 @@
  *   （可选）投递期间的租约续期（runScheduledTick 的心跳）。只在行仍是
  *   pending 且 lease_until 非空时生效——收尾放掉租约之后，迟到的心跳不会把
  *   它复活。不实现 → 心跳自动关闭，退回一次性长租约（claimLeaseMs）。
+ *
+ *   返回值现在还是「这条任务是不是被取消/顶替了」的信号：明确返回 `false`
+ *   会中止这次投递剩下的推送（行已经不在了，再发就是「取消接口回了成功，
+ *   消息照样送达」）。所以匹配不到行时必须返回 `false`，不能返回 undefined
+ *   ——什么都不返回等于关掉这条信号，取消撞上投递时又会照发。抛错不算行没
+ *   了，只当作这次没续上，下个心跳再试。
  * @property {(uuid: string, userId: string) => Promise<{ status: string, last_error: string|null }|null>} [getTaskStatusInfo]
  *   （可选）状态 + last_error 列（脱敏失败摘要的 JSON 串）。GET /message 用
  *   它把「为什么失败」透给已失败的行；不实现时退回 getTaskStatus（409 里就
@@ -146,16 +168,24 @@
  *   (user_id, message_id) 冲突时更新未 ack 的行、不动已 ack 的。
  * @property {(userId: string, messageIds: string[], deliveredAt: number) => Promise<number>} [markOutboxDelivered]
  *   （可选；单用户/D1）把发出去的段标 delivered_at。
+ * @property {(userId: string, messageIds: string[]) => Promise<number>} [discardOutboxMessages]
+ *   （可选；单用户/D1）把还没发出去的行删掉。任务投递到一半被取消 / 顶替时，
+ *   剩下那几条 push 已经落了行却不会再发，不撤掉的话客户端会从 `GET /outbox`
+ *   把它们补收回去。不实现 → 取消只挡住 Web Push 这一路。
  * @property {(userId: string, sinceId: number, limit: number) => Promise<Array<Object>>} [listUnackedOutbox]
- *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。
+ *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。行上要带
+ *   `task_uuid` 和 `delivered_at`：`DELETE /message` 和 supersedesUuid 顶替这两
+ *   条路靠翻这份名单找出该任务名下还没发出去的行（没有按 task_uuid 查的读法），
+ *   缺任一字段就挑不出来，那两条路上的 outbox 清理会静默跳过。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
  *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
  * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]
  *   （可选；单用户/D1）outbox 例行清理（runScheduledTick 每跳顺手调）。
  *
- *   outbox 五个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
+ *   outbox 这几个方法要么都实现、要么都不实现：缺写入侧的（append / mark），
  *   发送链路静默跳过落行；缺读取侧的（list / ack），`GET /outbox` 与
- *   `POST /outbox/ack` 返回 501。内置只有 D1 实现（与 client_state 同待遇）。
+ *   `POST /outbox/ack` 返回 501；缺 discard（或取消那条路上缺 list），取消只挡
+ *   住 Web Push。内置只有 D1 实现（与 client_state 同待遇）。
  */
 
 export {};

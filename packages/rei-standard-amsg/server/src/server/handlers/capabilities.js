@@ -94,6 +94,12 @@ export const SERVER_FEATURES = Object.freeze([
   // credRefs（fire 时按引用现读、自排任务复制引用），hook ctx 带
   // resolveLlmCredential。
   'llm-credentials',
+  // 请求体带 Content-Encoding: gzip 时自动解压，所有带 body 的端点都认。
+  'gzip-request-body',
+  // client_state 按命名空间过期清理（config 的 clientStateTtl，cron 每跳顺手做）。
+  'client-state-ttl',
+  // hook ctx 带 emitResult(payload)：往客户端补一条自定义结果（落收件箱 + 推送）。
+  'emit-result',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

@@ -7,8 +7,20 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
-import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../lib/validation.js';
+import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize, taskPayloadByteLength } from '../lib/validation.js';
 import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs } from '../lib/llm-credentials-store.js';
+
+/**
+ * 行级列名 → 对应的请求字段名。
+ *
+ * 正文字段改的是密文那一份（走 appliedPatch，键名就是请求字段名），行级字段改
+ * 的是列（走 extraFields，键名是列名）。回执里的 `updatedFields` 报的是请求字
+ * 段名，所以行级那一侧要翻译一下。
+ *
+ * 这里没有的列是本接口自己写的（重置 retry_count / 放掉 retry_after），不来自
+ * 请求，自然也不该出现在 `updatedFields` 里。
+ */
+const REQUEST_FIELD_BY_COLUMN = { next_send_at: 'nextSendAt' };
 
 export function createUpdateMessageHandler(ctx) {
   async function PUT(url, headers, body) {
@@ -74,6 +86,36 @@ export function createUpdateMessageHandler(ctx) {
       (typeof updates.contactName !== 'string' || !updates.contactName.trim())
     ) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'contactName 必须是非空字符串', details: { invalidFields: ['contactName'] } } } };
+    }
+
+    // userMessage 给了就必须是字符串（口径同 POST /schedule-message）：正文
+    // 到点要过正则切分，传个数字进来这一步收得下、投递时才炸。
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'userMessage') &&
+      updates.userMessage !== null &&
+      typeof updates.userMessage !== 'string'
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'userMessage 必须是字符串', details: { invalidFields: ['userMessage'] } } } };
+    }
+
+    // messageSubtype：自由字符串标签，只查类型不查取值（分类法是调用方的事）。
+    // 显式传 null = 改回默认，所以走 hasOwnProperty。
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'messageSubtype') &&
+      updates.messageSubtype !== null &&
+      typeof updates.messageSubtype !== 'string'
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'messageSubtype 必须是字符串', details: { invalidFields: ['messageSubtype'] } } } };
+    }
+
+    // llmExtraBody：透传给 LLM 中转的非标准参数，只查形状（普通对象）。
+    // 显式传 null = 不再透传。
+    if (
+      Object.prototype.hasOwnProperty.call(updates, 'llmExtraBody') &&
+      updates.llmExtraBody !== null &&
+      !isPlainObject(updates.llmExtraBody)
+    ) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'llmExtraBody 必须是普通对象', details: { invalidFields: ['llmExtraBody'] } } } };
     }
 
     if (updates.recurrenceType && !['none', 'daily', 'weekly'].includes(updates.recurrenceType)) {
@@ -200,8 +242,9 @@ export function createUpdateMessageHandler(ctx) {
       promptUpdates.completePrompt = null;
     }
 
-    const updatedData = {
-      ...existingData,
+    // 这次真正落进 payload 的那些改动。跟 existingData 分开建，是为了下面回
+    // 报 updatedFields 时能说清「哪些字段确实改了」。
+    const appliedPatch = {
       ...promptUpdates,
       ...(Object.prototype.hasOwnProperty.call(updates, 'contactName') && { contactName: updates.contactName }),
       ...(updates.userMessage && { userMessage: updates.userMessage }),
@@ -225,10 +268,31 @@ export function createUpdateMessageHandler(ctx) {
       // splitPattern: hasOwnProperty so that explicit `null` (= revert to
       // default) doesn't get swallowed by truthy-spread the way the optional
       // string fields above are.
-      ...(Object.prototype.hasOwnProperty.call(updates, 'splitPattern') && { splitPattern: updates.splitPattern ?? null })
+      ...(Object.prototype.hasOwnProperty.call(updates, 'splitPattern') && { splitPattern: updates.splitPattern ?? null }),
+      // messageSubtype / llmExtraBody：显式传 null 表示改回默认（分别是投递时
+      // 的 'chat' 和「不透传额外参数」），所以跟 tzId 那几个一样走
+      // hasOwnProperty，不被 truthy spread 吞掉。
+      ...(Object.prototype.hasOwnProperty.call(updates, 'messageSubtype') && { messageSubtype: updates.messageSubtype ?? null }),
+      ...(Object.prototype.hasOwnProperty.call(updates, 'llmExtraBody') && { llmExtraBody: updates.llmExtraBody ?? null })
     };
 
-    const encryptedPayload = await encryptForStorage(JSON.stringify(updatedData), userKey);
+    const updatedData = { ...existingData, ...appliedPatch };
+
+    // 大小闸门量的是合并之后的正文，不是这次的 patch：patch 本身可能很小，但
+    // 叠到存量正文上就顶穿了 D1 的单行上限（口径与 schedule-message 同一份，
+    // 见 lib/validation.js）。
+    //
+    // 只拦「这次改动把它变大了」：上限是后加的，比它更早建出来的大任务本来跑得
+    // 好好的，一律按合并后的大小拒的话，那条任务连把 nextSendAt 往后挪一小时都
+    // 做不到，只能删掉重建。改小、或者大小没变的改动照常放行。
+    const serializedUpdatedData = JSON.stringify(updatedData);
+    const sizeError = validateTaskPayloadSize(serializedUpdatedData);
+    if (sizeError
+        && sizeError.details.bytes > taskPayloadByteLength(JSON.stringify(existingData))) {
+      return { status: 400, body: { success: false, error: sizeError } };
+    }
+
+    const encryptedPayload = await encryptForStorage(serializedUpdatedData, userKey);
     // 更新即视为「重新出发」：把重试计数清零、把退避放掉。不清的话，刚修好
     // apiKey / 改好排期的任务还背着之前攒下的 retry_count，下一次哪怕是瞬时
     // 故障也可能直接触发终审处置。retry_after 只在支持占位的适配器上写
@@ -240,11 +304,26 @@ export function createUpdateMessageHandler(ctx) {
       ...(updates.nextSendAt ? { next_send_at: updates.nextSendAt } : {})
     };
 
+
     const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
 
     if (!result) {
       return { status: 409, body: { success: false, error: { code: 'UPDATE_CONFLICT', message: '任务更新失败，任务可能已被修改或删除' } } };
     }
+
+    // 只报真正生效的字段。请求里带了但没被应用的键（这个接口不接受的、拼错
+    // 的、或者传了 null 走 truthy spread 被忽略的），照单报成「改了」会让调用
+    // 方以为生效了，其实库里一个字节没动。
+    //
+    // 两个来源都算：正文字段进 appliedPatch（密文那一份），行级字段进
+    // extraFields（列那一份）。只数 appliedPatch、再给行级字段一个个补特例的
+    // 话，下一个行级可更新字段会悄无声息地从 updatedFields 里漏掉——那正是这
+    // 个字段要消灭的那种谎报。
+    const applied = new Set([
+      ...Object.keys(appliedPatch),
+      ...Object.keys(extraFields).map(column => REQUEST_FIELD_BY_COLUMN[column]),
+    ]);
+    const updatedFields = Object.keys(updates).filter(name => applied.has(name));
 
     return {
       status: 200,
@@ -252,7 +331,7 @@ export function createUpdateMessageHandler(ctx) {
         success: true,
         data: {
           uuid: taskUuid,
-          updatedFields: Object.keys(updates),
+          updatedFields,
           updatedAt: result.updated_at
         }
       }

@@ -13,7 +13,9 @@ import {
   LLM_CREDENTIALS_TABLE_SQL,
   VERIFY_TABLE_SQL,
   COLUMNS_SQL,
-  UPDATABLE_COLUMNS
+  UPDATABLE_COLUMNS,
+  TASK_DELIVERY_COLUMNS,
+  TASK_DETAIL_COLUMNS
 } from './schema.js';
 import * as pgShared from './pg-shared.js';
 
@@ -26,7 +28,13 @@ export class NeonAdapter {
     this._sql = null;
   }
 
-  /** @private */
+  /**
+   * neon() 的 HTTP 驱动：一次查询一个 fetch，两次查询之间不留连接。所以它没有
+   * pg 那种「空闲连接被服务端掐断」的问题——连接层面的错误只会让当次调用的
+   * Promise 失败，落在调用方的 try/catch 里，不会变成进程级未捕获异常。
+   *
+   * @private
+   */
   _getSql() {
     if (!this._sql) {
       this._sql = neon(this._connectionString);
@@ -111,7 +119,7 @@ export class NeonAdapter {
   async getTaskByUuid(uuid, userId) {
     const sql = this._getSql();
     const rows = await sql.query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = $1 AND user_id = $2 AND status = 'pending'
        LIMIT 1`,
@@ -123,7 +131,7 @@ export class NeonAdapter {
   async getTaskByUuidOnly(uuid) {
     const sql = this._getSql();
     const rows = await sql.query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = $1 AND status = 'pending'
        LIMIT 1`,
@@ -218,7 +226,7 @@ export class NeonAdapter {
   async getPendingTasks(limit = 50) {
     const sql = this._getSql();
     return sql.query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= NOW()
          AND (lease_until IS NULL OR lease_until <= NOW())
@@ -266,7 +274,7 @@ export class NeonAdapter {
 
     const taskParams = [...params, limit, offset];
     const tasks = await sql.query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC

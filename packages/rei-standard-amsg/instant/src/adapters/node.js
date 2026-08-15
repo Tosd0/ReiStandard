@@ -22,6 +22,10 @@
  *     lifecycle. If your host exposes one, pass it through the optional
  *     adapter options so `createInstantHandler` can protect the main
  *     LLM → split → push pipeline.
+ *   - 响应是边产边写的（instant 的默认传输是 SSE）。中间件如果自己缓冲响应，
+ *     流式就会被它压回非流式：`compression` 默认会把 `text/event-stream` 一起
+ *     压，压缩缓冲区攒够才吐字节。这条路由上把它关掉即可
+ *     （`compression({ filter: (req) => req.path !== '/instant' })`）。
  */
 
 /**
@@ -49,6 +53,24 @@ async function ensureWebCryptoPolyfill() {
 }
 
 /**
+ * Lazy `node:stream` helpers, same reasoning as the crypto polyfill above:
+ * `adapters/vercel.js` re-exports `toNodeHandler` for the Node runtime, so a
+ * static `import 'node:stream'` here would end up inside the Edge bundle too
+ * (ESM imports evaluate eagerly) and break a runtime that has no such module.
+ */
+let _streamHelpers = null;
+async function loadStreamHelpers() {
+  if (!_streamHelpers) {
+    const [{ Readable }, { pipeline }] = await Promise.all([
+      import('node:stream'),
+      import('node:stream/promises'),
+    ]);
+    _streamHelpers = { Readable, pipeline };
+  }
+  return _streamHelpers;
+}
+
+/**
  * @typedef {Object} NodeAdapterOptions
  * @property {(work: Promise<unknown>) => void} [waitUntil]
  * @property {{ waitUntil?: (work: Promise<unknown>) => void }} [runtime]
@@ -68,10 +90,23 @@ export function toNodeHandler(fetchHandler, options = {}) {
       const fetchResponse = await fetchHandler(fetchRequest, resolveNodeRuntime(options, req, res));
       await writeFetchResponseToNode(fetchResponse, res);
     } catch (err) {
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      // 能走到这里的都是服务端自己的故障——客户端提前断开在
+      // writeFetchResponseToNode 里就当成正常收场了。先留一行能归因的日志再说：
+      // SSE 中途炸掉时响应头早就发出去了，状态码这条路已经用不上，不记日志的话
+      // 这次失败就彻底没痕迹，运维只能从客户端那句 `TypeError: network error`
+      // 反推。
+      console.error('[amsg-instant] toNodeHandler: 请求处理失败:', err);
+      // 连接已经收尾（响应写完了 / 流已经被销毁）就没有能报错的地方了。
+      if (res.writableEnded || res.destroyed) return;
+      if (res.headersSent) {
+        // 字节已经在路上（多半是 SSE 流中途炸的）：200 + 半截流已经发出去，
+        // 再追加一个 JSON 信封只是往流里塞垃圾。直接断掉，让调用方看到一个
+        // 明确失败的连接——而不是一条看起来正常收尾、其实少了后半截的流。
+        res.destroy(err);
+        return;
       }
+      res.statusCode = 500;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(
         JSON.stringify({
           success: false,
@@ -135,13 +170,82 @@ function readBody(req) {
   });
 }
 
+/**
+ * 对端把连接掐了——写不动是必然的，正常收场，不是服务端故障。
+ *
+ * 这两个码只可能来自 socket 层：写到一个已经关掉的管道 / 连接被对方重置。
+ */
+function isPeerGone(err) {
+  const code = err && err.code;
+  return code === 'EPIPE' || code === 'ECONNRESET';
+}
+
+/**
+ * 「流没写完就结束了」——但谁先走的，从这里分不出来。
+ *
+ * 客户端提前断开会走到这里；服务端自己的流中途死掉（宿主运行时掐了 isolate、
+ * 上游 reader 被销毁）也走到这里，pipeline 给的是同一个
+ * `ERR_STREAM_PREMATURE_CLOSE`。也不能拿 `res` 的状态当判据：pipeline 无论因为
+ * 什么失败都会先把目的端销毁，到这一步 `res.destroyed` 恒为 true、
+ * `writableFinished` 恒为 false。
+ *
+ * 分不出来就不硬猜，但也不能一声不吭：这两种情况 socket 都已经没了，往上抛只
+ * 会让外层去写一个没人读的 500，所以不抛——改成留一行日志。不留的话，服务端自
+ * 己的流死掉时这里一个字都没有，运维只能从客户端那句
+ * `TypeError: network error` 反推。
+ */
+function isPrematureClose(err) {
+  const code = err && err.code;
+  return code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED';
+}
+
+/**
+ * 把 Fetch Response 写到 Node 的 `res` 上——边收边写，不整体缓冲。
+ *
+ * instant 的默认传输是 SSE：响应体是一个「LLM 边跑边吐、全部推送发完才关」的
+ * ReadableStream。先 `arrayBuffer()` 读完再写的话，传输层就静默退化成非流式——
+ * 客户端要等整轮跑完才收到第一个字节，keepalive 心跳全被压在缓冲里（它本来就是
+ * 为了防连接闲置被掐才存在的），中间隔着 nginx 之类的反代还会直接
+ * proxy_read_timeout 判 504；而响应头写的仍然是 `text/event-stream`，从外面
+ * 完全看不出已经不流式了。
+ *
+ * 用 `Readable.fromWeb` + `pipeline` 而不是手写 reader 循环：背压、错误传播、
+ * 两端销毁都交给 stream 机制。客户端提前断开时 pipeline 会销毁源 Readable，
+ * 销毁会 cancel 上游那个 ReadableStream —— instant 的 SSE 分支收到 cancel 就停
+ * keepalive 定时器、把剩下的消息切到 Web Push 兜底，不会留下一个没人读的流。
+ *
+ * 非流式的 JSON 响应走同一条路：字节一样，只是改由 chunked 传输编码发出。
+ */
 async function writeFetchResponseToNode(response, res) {
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
     res.setHeader(name, value);
   });
-  const body = await response.arrayBuffer();
-  res.end(Buffer.from(body));
+
+  // 204 / 304 这类没有 body 的响应，`response.body` 是 null。
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
+  const { Readable, pipeline } = await loadStreamHelpers();
+  try {
+    await pipeline(Readable.fromWeb(response.body), res);
+  } catch (err) {
+    if (isPeerGone(err)) return;
+    if (isPrematureClose(err)) {
+      // warn 不是 error：用户随手关掉页面是家常便饭，记成故障会把日志淹掉。但
+      // 也不能一个字都不留——服务端自己的流死掉时走的是同一条路，全静默的话这
+      // 条链路等于没有故障信号。
+      console.warn(
+        '[amsg-instant] 响应流提前结束（客户端断开，或服务端的流中途失败）:',
+        (err && err.code) || 'unknown',
+        (err && err.message) || err
+      );
+      return;
+    }
+    throw err;
+  }
 }
 
 export default { toNodeHandler };

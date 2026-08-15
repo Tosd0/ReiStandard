@@ -33,6 +33,46 @@ export function stateValueBytes(value) {
   return utf8.encode(value).length;
 }
 
+/** 已经就「这个 namespace 的 TTL 配得不对」告过警的键（每个只说一次）。 */
+const warnedInvalidTtl = new Set();
+
+/**
+ * 把 `clientStateTtl` 配置（`{ 命名空间: 天数 }`）算成清理指令。
+ *
+ * 一个命名空间出两条：它自己，加上它的切片命名空间（大值分块存在那儿，见
+ * lib/state-chunks.js）。两边共用同一个截止时刻——同一次写入的根行和切片行
+ * `updated_at` 相同，所以要么一起留、要么一起走，不会留下半截数据。
+ *
+ * 天数不是正数的条目跳过并告警（每个键只说一次）：配错了就该看得见，但不能
+ * 让 cron 每分钟刷一条。
+ *
+ * @param {Record<string, number>|null|undefined} ttl - `{ 命名空间: 天数 }`；天数可带小数
+ * @param {number} now - 当前时刻（epoch 毫秒）
+ * @returns {Array<{ namespace: string, updatedBefore: number }>}
+ *   `updatedBefore` 是 epoch 毫秒：这个命名空间下 `updated_at` 早于它的条目该清掉。
+ */
+export function planClientStateCleanup(ttl, now) {
+  if (!ttl || typeof ttl !== 'object' || Array.isArray(ttl)) return [];
+  const targets = [];
+  for (const [namespace, days] of Object.entries(ttl)) {
+    if (!namespace) continue;
+    if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0) {
+      if (!warnedInvalidTtl.has(namespace)) {
+        warnedInvalidTtl.add(namespace);
+        console.warn(
+          `[amsg-server] clientStateTtl['${namespace}'] 不是正数（收到 ${JSON.stringify(days)}），`
+          + '这个命名空间不做清理'
+        );
+      }
+      continue;
+    }
+    const updatedBefore = now - days * 24 * 60 * 60 * 1000;
+    targets.push({ namespace, updatedBefore });
+    targets.push({ namespace: chunkNamespaceFor(namespace), updatedBefore });
+  }
+  return targets;
+}
+
 /**
  * 把逻辑条目写进 client_state。条目要么是覆盖写（`value` 是字符串），要么是
  * 删除（`value` 为 `null`）：

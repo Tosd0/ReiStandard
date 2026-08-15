@@ -39,6 +39,9 @@ export { getSchemaVersion, ensureSchema, SCHEMA_VERSION } from './lib/schema-ver
 // 500 响应体里 error.cause 的组装（宿主自己包一层路由、也想回同样形状时用）。
 export { summarizeErrorCause, NonRetryableError, isNonRetryableError } from './lib/errors.js';
 export { isValidTimeZoneId, advanceOccurrence, nextFutureOccurrence, planNextOccurrence } from './lib/recurrence.js';
+// 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原）。自己包路由的宿主
+// 用它代替 `await request.text()`，压缩请求体就跟这个 Worker 一样自动认。
+export { readRequestBody, DEFAULT_MAX_REQUEST_BODY_BYTES } from './lib/request.js';
 export {
   deriveUserEncryptionKey,
   decryptPayload,

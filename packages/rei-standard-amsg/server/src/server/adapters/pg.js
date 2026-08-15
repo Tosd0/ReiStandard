@@ -15,7 +15,9 @@ import {
   LLM_CREDENTIALS_TABLE_SQL,
   VERIFY_TABLE_SQL,
   COLUMNS_SQL,
-  UPDATABLE_COLUMNS
+  UPDATABLE_COLUMNS,
+  TASK_DELIVERY_COLUMNS,
+  TASK_DETAIL_COLUMNS
 } from './schema.js';
 import * as pgShared from './pg-shared.js';
 
@@ -32,6 +34,21 @@ export class PgAdapter {
   _getPool() {
     if (!this._pool) {
       this._pool = new Pool({ connectionString: this._connectionString });
+      // 池子里**空闲**的那些连接被服务端那侧掐断时（主从切换、
+      // pg_terminate_backend、实例维护重启、网络 RST），错误不在任何一次
+      // query 的调用栈上——适配器和 handler 里的 try/catch 一个也接不住。
+      // Pool 是 EventEmitter，'error' 没人监听时 emit 会直接抛成进程级未捕获
+      // 异常，把整个 Node 进程带走，日志里只留一句栈全在 pg 内部的
+      // `Connection terminated unexpectedly`，看不出跟本库有任何关系。
+      //
+      // 出错的那条连接 pg-pool 自己已经从池子里摘掉了，这里没有别的事可做，
+      // 只把它记成一条认得出出处的日志；下一次查询会照常建新连接。
+      this._pool.on('error', (error) => {
+        console.error(
+          '[amsg-server pg] 连接池里的空闲连接出错（该连接已被摘除，下次查询会重连）:',
+          error && error.message
+        );
+      });
     }
     return this._pool;
   }
@@ -115,7 +132,7 @@ export class PgAdapter {
 
   async getTaskByUuid(uuid, userId) {
     const rows = await this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = $1 AND user_id = $2 AND status = 'pending'
        LIMIT 1`,
@@ -126,7 +143,7 @@ export class PgAdapter {
 
   async getTaskByUuidOnly(uuid) {
     const rows = await this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE uuid = $1 AND status = 'pending'
        LIMIT 1`,
@@ -215,7 +232,7 @@ export class PgAdapter {
 
   async getPendingTasks(limit = 50) {
     return this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count
+      `SELECT ${TASK_DELIVERY_COLUMNS}
        FROM scheduled_messages
        WHERE status = 'pending' AND next_send_at <= NOW()
          AND (lease_until IS NULL OR lease_until <= NOW())
@@ -260,7 +277,7 @@ export class PgAdapter {
 
     const taskParams = [...params, limit, offset];
     const tasks = await this._query(
-      `SELECT id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at
+      `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
        ORDER BY next_send_at ASC

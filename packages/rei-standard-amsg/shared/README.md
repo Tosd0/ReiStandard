@@ -17,7 +17,7 @@ A single push is described by three independent dimensions:
 |----------------|-------------------|-------------------------------------------------------|--------------------|
 | Dispatch       | `messageType`     | `instant` / `fixed` / `prompted` / `auto`             | Package (fixed)    |
 | Business       | `messageSubtype`  | Any string                                            | Caller (free-form) |
-| Content        | `messageKind`     | `content` / `reasoning` / `tool_request` / `error`    | Package (fixed)    |
+| Content        | `messageKind`     | `content` / `reasoning` / `tool_request` / `error` / `result` | Package (fixed) |
 
 `messageType` answers **how this push was produced** (one-shot
 `instant` worker, scheduled `fixed` ping, AI-`prompted` reply, fully
@@ -154,6 +154,22 @@ Replaces the legacy 0.7.0 `{ type: 'error', code: '...' }` envelope.
 The legacy `type` field is **gone** — do not look for it on
 `ErrorPush`.
 
+### `ResultPush` — 宿主自定义的一条结果
+
+| Field         | Type       | Notes                                                          |
+|---------------|------------|----------------------------------------------------------------|
+| `messageKind` | `'result'` | Discriminator.                                                 |
+| `resultKind`  | `string`   | 宿主给这类结果起的名字（`'fire-pack'`、`'ledger-entry'`……），客户端按它分流。 |
+| `title`       | `string?`  | 通知标题的兜底（`notification.title` 优先）。                    |
+| `body`        | `string?`  | 通知正文的兜底（`notification.body` 优先）。                     |
+
+不是聊天内容，而是「这次跑完产出了点什么，客户端拿去自己消化」：整理好的一份数据、一条账目、后台生成的产物。形状由宿主定，`buildResultPush` 是唯一**保留自己不认识的字段**的 builder——白名单式的复制会把内容删掉一半。
+
+两处与别的 kind 不同：
+
+- **投递路径**：产出方（`@rei-standard/amsg-server` 的 `ctx.emitResult()`）除了推送，还把它落进服务端收件箱，客户端下次 `GET /outbox?since=` 一定拿得到。
+- **通知**：SW 侧默认弹（与 `content` 同待遇，其余三种是静默送给页面）——结果往往正是「跑完了，回来看看」那句话。不想弹就带 `notification: { show: false }`。
+
 ---
 
 ## Usage
@@ -184,6 +200,9 @@ function dispatch(push: AmsgPush) {
     case 'error':
       console.error(push.code, push.message);
       break;
+    case 'result':
+      // push.resultKind is `string` — 宿主自己的结果，按它分流
+      break;
   }
 }
 ```
@@ -196,6 +215,7 @@ import {
   buildReasoningPush,
   buildToolRequestPush,
   buildErrorPush,
+  buildResultPush,
 } from '@rei-standard/amsg-shared';
 
 // One sentence in an N-split burst
@@ -238,12 +258,24 @@ const error = buildErrorPush({
   message: 'onLLMOutput threw: ...',
   iteration: 2,
 });
+
+// 宿主自定义的一条结果（认识以外的字段原样保留）
+const result = buildResultPush({
+  messageType: 'auto',
+  source: 'scheduled',
+  messageId: 'msg_task_7@1700000000000_result_0',
+  sessionId: 'sess_abc',
+  resultKind: 'fire-pack',
+  packId: 'pack_42',
+  entries: [{ id: 1 }, { id: 2 }],
+  notification: { title: '整理好了', body: '点开看看' },
+});
 ```
 
 ### Type guards
 
 ```js
-import { isContentPush, isReasoningPush, isToolRequestPush, isErrorPush } from '@rei-standard/amsg-shared';
+import { isContentPush, isReasoningPush, isToolRequestPush, isErrorPush, isResultPush } from '@rei-standard/amsg-shared';
 
 if (isContentPush(push)) {
   // push.message is `string`
@@ -261,6 +293,7 @@ MESSAGE_KIND.CONTENT;       // 'content'
 MESSAGE_KIND.REASONING;     // 'reasoning'
 MESSAGE_KIND.TOOL_REQUEST;  // 'tool_request'
 MESSAGE_KIND.ERROR;         // 'error'
+MESSAGE_KIND.RESULT;        // 'result'
 
 MESSAGE_TYPE.INSTANT;       // 'instant'
 MESSAGE_TYPE.FIXED;         // 'fixed'

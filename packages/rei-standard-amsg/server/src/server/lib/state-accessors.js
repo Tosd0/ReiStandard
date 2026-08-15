@@ -12,6 +12,7 @@
  */
 
 import { decryptFromStorage } from './encryption.js';
+import { DeploymentConfigError } from './errors.js';
 import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
   INTERNAL_STATE_CHAR_RE,
@@ -101,7 +102,10 @@ export function createStateAccessors({ db, userId, userKey, maxStateValueBytes, 
     // readState 在适配器不支持时返回空数组（读不到状态，hook 走自己的兜底）。
     // 写不一样：静默成功会让 push 带上一个指向不存在数据的引用键，所以这里报错。
     if (!db || typeof db.upsertClientState !== 'function') {
-      throw new Error('AGENTIC_STATE_WRITE_UNSUPPORTED: 当前数据库适配器不支持 client_state 写入');
+      throw new DeploymentConfigError(
+        'AGENTIC_STATE_WRITE_UNSUPPORTED: 当前数据库适配器不支持 client_state 写入',
+        { code: 'AGENTIC_STATE_WRITE_UNSUPPORTED' }
+      );
     }
 
     const at = nowFn();

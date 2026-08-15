@@ -5,10 +5,10 @@
 
 ## v2.1.0 — 按 kind 分发的客户端事件
 
-2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error`）区分内容类型。SW 在收到 push 后会做两件事：
+2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error` / `result`）区分内容类型。SW 在收到 push 后会做两件事：
 
 1. **永远** 通过 `postMessage` 把 payload 广播给所有受控窗口（包括 `includeUncontrolled: true` 的未受控窗口）。
-2. **仅当** `messageKind === 'content'` 或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
+2. **仅当** `messageKind === 'content'` / `'result'`，或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
 
 ### 新增导出 `REI_SW_EVENT`
 
@@ -20,7 +20,8 @@
 | `REI_SW_EVENT.REASONING_RECEIVED`    | `'rei-amsg-reasoning-received'`    | `payload.messageKind === 'reasoning'` |
 | `REI_SW_EVENT.TOOL_REQUEST_RECEIVED` | `'rei-amsg-tool-request-received'` | `payload.messageKind === 'tool_request'` |
 | `REI_SW_EVENT.ERROR_RECEIVED`        | `'rei-amsg-error-received'`        | `payload.messageKind === 'error'` |
-| `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片 TTL 到期仍未收齐 |
+| `REI_SW_EVENT.RESULT_RECEIVED`       | `'rei-amsg-result-received'`       | `payload.messageKind === 'result'`（宿主自定义的结果） |
+| `REI_SW_EVENT.MULTIPART_EXPIRED`     | `'rei-amsg-multipart-expired'`     | `_multipart` 分片拼不起来（`payload.reason` 说明是哪种） |
 | `REI_SW_EVENT.UNKNOWN_RECEIVED`      | `'rei-amsg-unknown-received'`      | 缺 `messageKind`（2.0.x 老 payload / blob envelope） |
 
 ### 客户端订阅示例
@@ -37,6 +38,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
     case REI_SW_EVENT.REASONING_RECEIVED:    /* 渲染思考中 UI */ break;
     case REI_SW_EVENT.TOOL_REQUEST_RECEIVED: /* 弹出工具执行确认 */ break;
     case REI_SW_EVENT.ERROR_RECEIVED:        /* 显示错误 toast */ break;
+    case REI_SW_EVENT.RESULT_RECEIVED:       /* 宿主自定义结果，页面自己消化 */ break;
     case REI_SW_EVENT.MULTIPART_EXPIRED:     /* 观测 transport 缺片 */ break;
     case REI_SW_EVENT.UNKNOWN_RECEIVED:      /* 2.0.x 老 payload 的兼容路径 */ break;
   }
@@ -46,7 +48,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 ### 通知显示策略 (Notification Rendering)
 
 默认情况下：
-- `content` 和老式 payload：自动弹系统通知。
+- `content`、`result` 和老式 payload：自动弹系统通知。
 - `reasoning` / `tool_request` / `error`：不弹通知，只触发 client 事件。
 
 通过 `payload.notification.show`，你可以显式覆盖这个默认行为。此字段由服务端或产生 payload 时指定：
@@ -150,7 +152,8 @@ const registration = await navigator.serviceWorker.ready;
 const channel = new MessageChannel();
 
 channel.port1.onmessage = (event) => {
-  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string, businessError?: string }
+  // 成功：{ ok: true, duplicate?: boolean, key?: string, requestId?: string,
+  //        businessError?: string, dedupeError?: string, notificationError?: string }
   // 失败：{ ok: false, error: string, key?: string, requestId?: string }
 };
 
@@ -178,6 +181,11 @@ channel.port1.onmessage = (event) => {
 ```
 
 这样设计是为了向后兼容：`ok` 的含义保持不变，原本只看 `ok` 的调用方不受影响；需要严格区分「传输成功」和「业务落库成功」的调用方读 `businessError` 即可。webpush `push` 路径没有 ack，业务回调失败只会在 SW 内部 `console.error`，不会让投递 promise reject。
+
+同一套口径下还有两个可选字段，`ok` 一样保持 `true`：
+
+- `notificationError`：通知没弹出来（权限被撤、系统配额、OS 错误）。payload 收下了也分发了，但用户没被提醒——把 `deliver()` 当备份通道用的发送端靠它判断是回退还是重试。首投和重复包补通知两条路都带。
+- `dedupeError`：去重仓库读写失败，这条 payload 是绕过去重直接投递的。分发本身成功了，但这次没有去重保护，同一条消息的另一路 backup 可能会再投一次。
 
 `businessError` 会持久化到 dedupe 记录上，并且是 duplicate 自愈的开关：记录上带着 `businessError` 时，之后**同 key 的重复包**（发送方重试、或另一条 transport 的 backup）到达会重跑一次 `onBusinessPayload`——重跑成功就清掉记录上的 `businessError`（本次 ack 不带该字段，之后的重复包恢复纯去重），重跑仍失败则用新的失败信息更新记录、照旧在 ack 上报。业务成功过的记录不受影响：重复包永不重跑业务，只按当前 `notification.show` 策略决定要不要补通知。
 
@@ -268,15 +276,44 @@ installReiSW(self, {
 });
 ```
 
-TTL 到期仍未收齐时，SW 会清理 pending 并广播：
+一条 multipart 拼不起来时（等到 TTL 也没收齐，或者当场就判废了），SW 会清理
+pending 并广播：
 
 ```js
 {
   type: 'REI_AMSG_PUSH',
   event: 'rei-amsg-multipart-expired',
-  payload: { id, received, total, originalMessageKind }
+  payload: { id, received, total, originalMessageKind, reason }
 }
 ```
+
+`reason` 说明是哪条路走到这一步的，取值从 `MULTIPART_FAILURE_REASON` 里来
+（和其他常量一样，页面侧请从 `@rei-standard/amsg-shared` import）：
+
+| 取值 | 什么情况 |
+|------|---------|
+| `'ttl-expired'`         | TTL 到期仍未收齐，或收到的分片本身已经过期 |
+| `'invalid-chunk'`       | 分片信封不合规：version / encoding 对不上、index 越界、chunk 不是合法 base64url |
+| `'chunk-conflict'`      | 同一个 id 的分片报了不一样的 total / encoding，已收的部分拼不回去 |
+| `'size-limit-exceeded'` | 累计字节数超过 `multipart.maxTotalBytes` |
+| `'restore-failed'`      | 收齐了但拼不回原 payload |
+| `'storage-failed'`      | 分片仓库（IndexedDB）读写失败 |
+| `'disabled'`            | 本地把 multipart 关了（`multipart.enabled === false`），分片没法重组 |
+
+`'ttl-expired'` 之外的几种通常意味着发送端或链路有问题，值得报上去。同一条
+信息也会打进 `console.error`。
+
+一条 multipart 消息只会报一次收不了。分片是一起发出来的，逐片报的话页面会为
+同一条消息收到几十条一模一样的事件。
+
+报出去的结论就是最终结论：这条 id 之后的分片一律不再收，包括推送服务对失败那
+片的重投。`'storage-failed'` 这种一阵子就好的故障也照此办理——不然剩下的分片
+会把这条消息照常拼齐投递出去，而页面上那句「收不到」已经没有任何事件能撤掉了。
+
+重组窗口从**本地收到第一片**起算（长度取发送端标的 `ttlMs` 与本地
+`multipart.ttlMs` 里更紧的那个）。窗口过完之后才到的分片，会连同这条 id 已落
+库的分片一起清掉，之后同 id 的分片静默丢弃——留着旧分片的话，新窗口的计数从零
+重来，而旧分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。
 
 业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知。
 
@@ -373,7 +410,10 @@ export async function enqueueRequestToSW(requestPayload) {
 
 - `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到 outbox，并立即尝试发送
 - `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送
-- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果（`ok` / `error` / `queueId`）
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果（`ok` / `error` / `queueId`）。点对点，一次入队一条
+- `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
+
+`QUEUE_DROPPED` 单独占一个 type，是因为它跟 `QUEUE_RESULT` 的收信人不是一回事：它是广播，可能来自后台 `sync` 冲刷、说的也可能是另一条早就排在队列里的旧请求。页面等自己那条入队回执时，不会被它打岔。
 
 `request` 结构示例：
 
@@ -418,6 +458,7 @@ export async function enqueueRequestToSW(requestPayload) {
 - `ENQUEUE_REQUEST`
 - `FLUSH_QUEUE`
 - `QUEUE_RESULT`
+- `QUEUE_DROPPED`
 
 ## 模块格式与类型（ESM/CJS/Types）
 

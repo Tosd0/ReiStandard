@@ -54,7 +54,29 @@ export async function savePushSubscription({ db, userId, userKey, subscription, 
 }
 
 /**
+ * 把一行 push_subscriptions 解成明文订阅。行不在、或订阅列是空的 → null；
+ * 密文解不开（换过 masterKey 之类）、解出来不是 JSON → 抛。
+ *
+ * 单独拎出来是为了让调用方分得开两类失败：`db.getPushSubscription()` 抛出来
+ * 的是基础设施问题（表没建、读超时），换个时候重试有救；这里抛出来的是这一
+ * 行的密文废了，重试多少次都一样。两者压在同一个 try 里就只能一起处理，读不
+ * 到库会被当成「这个用户没登记过」。
+ *
+ * @param {{ subscription?: unknown, updated_at?: unknown }|null|undefined} row - `getPushSubscription()` 读回的行
+ * @param {string} userKey
+ * @returns {Promise<{ subscription: Object, updatedAt: number|null }|null>}
+ */
+export async function decodePushSubscriptionRow(row, userKey) {
+  if (!row || typeof row.subscription !== 'string' || !row.subscription) return null;
+  const subscription = JSON.parse(await decryptFromStorage(row.subscription, userKey));
+  return { subscription, updatedAt: row.updated_at ?? null };
+}
+
+/**
  * 读回这个用户的订阅（解密后的明文对象）。没有登记过 → null。
+ *
+ * 读库失败和解密失败都原样抛出去：投递链路上这两种都得让任务失败，分不分得
+ * 开无所谓；要分开处理的调用方（GET /push-subscription）自己走上面两步。
  *
  * @param {Object} args
  * @param {import('../adapters/interface.js').DbAdapter} args.db
@@ -63,10 +85,7 @@ export async function savePushSubscription({ db, userId, userKey, subscription, 
  * @returns {Promise<{ subscription: Object, updatedAt: number|null }|null>}
  */
 export async function loadPushSubscription({ db, userId, userKey }) {
-  const row = await db.getPushSubscription(userId);
-  if (!row || typeof row.subscription !== 'string' || !row.subscription) return null;
-  const subscription = JSON.parse(await decryptFromStorage(row.subscription, userKey));
-  return { subscription, updatedAt: row.updated_at ?? null };
+  return decodePushSubscriptionRow(await db.getPushSubscription(userId), userKey);
 }
 
 /** 带稳定 `code` 属性的错误：消费方按 error.code 分支，不用字符串匹配 message。 */

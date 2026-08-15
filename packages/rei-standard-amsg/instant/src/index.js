@@ -553,15 +553,21 @@ export function createInstantHandler(options) {
               // same logical failure. Other errors (LlmCallError,
               // unexpected) had no in-loop diagnostic and DO need one.
               if (!(err instanceof HookError)) {
+                const code = err?.code || 'INTERNAL_ERROR';
                 const diag = buildErrorPush({
                   messageType: MESSAGE_TYPE.INSTANT,
                   source: PUSH_SOURCE.INSTANT,
                   messageId: `msg_${randomUUID()}_error`,
                   sessionId,
-                  code: err?.code || 'INTERNAL_ERROR',
+                  code,
                   message: err?.message || '内部错误',
                   timestamp: new Date().toISOString(),
                 });
+                // 机读标注跟 JSON 信封同一个来源（describeUpstreamFailure），不
+                // 在这儿再抄一份：SSE 是默认传输方式，字段只挂在信封那条路上的
+                // 话，浏览器客户端遇到 Key 失效只能回去正则匹配人话消息。这份
+                // diag 掉线时会原样走 Web Push 兜底，字段跟着一起到。
+                Object.assign(diag, describeUpstreamFailure(err, code));
                 await safeEnqueue('error', diag, (pushErr) => {
                   onEvent({ type: 'sse_error_fallback_failed', sessionId, cause: pushErr });
                 });
@@ -596,12 +602,15 @@ export function createInstantHandler(options) {
       );
 
     } catch (err) {
-      onEvent({ type: 'error', code: err?.code, message: err?.message });
       const code = err?.code || 'INTERNAL_ERROR';
+      // 上游状态码走同一个出口：响应信封给调用方分流用，error 事件给宿主的
+      // 日志 / 告警用。少给事件一份，宿主就分不清「订阅死了」和「推送服务抽风」。
+      const upstream = describeUpstreamFailure(err, code);
+      onEvent({ type: 'error', code: err?.code, message: err?.message, ...upstream });
       const status = mapErrorStatus(err, code);
       return respond(status, {
         success: false,
-        error: { code, message: err?.message || '内部错误' },
+        error: { code, message: err?.message || '内部错误', ...upstream },
       });
     }
   };
@@ -695,12 +704,59 @@ function resolvePositiveInt(value, fallback, fieldName) {
 }
 
 /**
+ * 失败时的机读标注：上游回的 HTTP 状态码，以及 LLM 那边 provider 自己的错误码。
+ *
+ * 三个出口共用这一份：纯推送模式的 JSON 信封、宿主拿去做日志 / 告警的 onEvent
+ * error 事件、SSE 的 `event: error`。各写各的话，同一次失败换个传输方式字段就少
+ * 几个——SSE 还是默认传输方式。
+ *
+ * 名字按上游分开写，不合成一个 `status`：合起来既跟响应自身的 502 撞名字，读
+ * 日志时也分不清那个数字是谁回的。`pushStatus` 与 amsg-server 记进 lastError
+ * 的字段同名同义，两个包的告警规则能照抄一份。
+ *
+ * `pushStatus` 认 `err.statusCode`（sendWebPush 挂上去的），所以要先按 code 圈
+ * 定是推送这一步失败的——`statusCode` 名字太通用，别的来源也可能挂它。
+ * `llmStatus` / `providerCode` 名字本身就说明了来源，不用再圈一次。
+ *
+ * 「这次失败还值不值得重试」也靠这两个数字读：推送服务回 410 / 404 说明订阅已
+ * 经没了，同一份订阅重发多少次都是同一个结果——而 instant 是先跑 LLM 再推送，
+ * 每次重试都要把整轮生成重跑一遍。HTTP 状态码维持原样（见 mapErrorStatus），
+ * 终态与否交给这个字段说，跟 amsg-server 那边的做法一致。
+ *
+ * @param {unknown} err
+ * @param {string} code
+ * @returns {{ pushStatus?: number, llmStatus?: number, providerCode?: string }}
+ */
+function describeUpstreamFailure(err, code) {
+  const raw = /** @type {{ statusCode?: unknown, llmStatus?: unknown, providerCode?: unknown }} */ (err || {});
+  /** @type {{ pushStatus?: number, llmStatus?: number, providerCode?: string }} */
+  const upstream = {};
+  if (code === 'PUSH_SEND_FAILED' && Number.isInteger(raw.statusCode)) {
+    upstream.pushStatus = /** @type {number} */ (raw.statusCode);
+  }
+  if (Number.isInteger(raw.llmStatus)) {
+    upstream.llmStatus = /** @type {number} */ (raw.llmStatus);
+  }
+  if (typeof raw.providerCode === 'string' && raw.providerCode) {
+    upstream.providerCode = raw.providerCode;
+  }
+  return upstream;
+}
+
+/**
  * Map an Error to its HTTP status code. `HookError` is in-process
  * caller-supplied code that misbehaved — 500. `LlmCallError` /
  * `PUSH_SEND_FAILED` are upstream — 502. `PayloadTooLargeError` is
  * a config mismatch (no blob store) on a hook-path response — 500
  * is more honest than 413 since the limit isn't the HTTP body, it's
  * the *push payload*.
+ *
+ * 终态的推送失败（订阅被推送服务判死，410 / 404）也仍然是 502，不另映射成
+ * 4xx：请求确实到了推送服务、也确实拿到了答复，502 没说错；而信封里的
+ * `code` 是这个包对外承诺的分流依据（README §错误信封），改状态码会把按 502
+ * 分支的老调用方一起打掉，换来的信息量并不比 `pushStatus` 多。要不要重试读
+ * `error.pushStatus` 就够——这跟 amsg-server 把终态判定表达成 lastError 里的
+ * 字段、而不是换一种失败形态，是同一个口径。
  *
  * @param {unknown} err
  * @param {string} code
@@ -829,7 +885,7 @@ async function readRequestBodyText(request) {
  * @param {{ allowOrigin?: string } | undefined} cors
  * @returns {Record<string, string>}
  */
-function buildCorsHeaders(cors) {
+export function buildCorsHeaders(cors) {
   const allowOrigin = (cors && typeof cors.allowOrigin === 'string' && cors.allowOrigin.trim())
     ? cors.allowOrigin.trim()
     : '*';

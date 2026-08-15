@@ -5,6 +5,7 @@ import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptForStorage, decryptFromStorage } from '../src/server/lib/encryption.js';
 import { projectTask } from '../src/server/lib/task-projection.js';
+import { sendWebPush } from '../src/server/lib/webpush-webcrypto.js';
 import { seedPushSubscription } from './helpers/push-subscription.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
@@ -738,14 +739,19 @@ test('循环任务发送后写库失败不标 sent：推进到下个周期继续
   const dueAt = recentDue();
   await seed(adapter, { uuid: 'daily-hiccup', recurrenceType: 'daily', nextSendAt: dueAt });
 
-  // 发送后的第一笔写库（推进排期）抛错一次，之后恢复正常。
+  // 发送后的写库（推进排期）失败，之后恢复正常。
+  //
+  // 抛两笔而不是一笔：推进排期这一步顺手把上一轮的 last_error 清成 null，这两样
+  // 是合成一笔写的，写不进去还会退回去只写状态字段再来一次（见 run-tick 的
+  // updateTaskWithLastError）。只抛第一笔的话退回的那笔就成了，压根到不了「发送
+  // 后写库失败」这条路。
   let updateCalls = 0;
   const db = new Proxy(adapter, {
     get(target, prop) {
       if (prop === 'updateTaskById') {
         return async (...args) => {
           updateCalls++;
-          if (updateCalls === 1) throw new Error('d1 hiccup');
+          if (updateCalls <= 2) throw new Error('d1 hiccup');
           return target.updateTaskById(...args);
         };
       }
@@ -1012,8 +1018,8 @@ test('410 的失败记录带 pushStatus: 410，reason 仍是那句人话摘要',
   assert.equal(rowLastError.pushStatus, 410);
   assert.match(rowLastError.reason, /Web Push delivery failed: 410 Gone/);
 
-  // 投影优先读 payload 里那份 lastError，所以两处都得有——只写行上那一列的
-  // 话，GET /messages 交出去的记录里 pushStatus 会凭空消失。
+  // 两处都得有：投影读行上那一列，而没有这一列的适配器读的是密文 payload 里
+  // 这一份——少写哪一边，那类部署的 GET /messages 里 pushStatus 就凭空消失。
   const payload = await decryptPayloadOf(row);
   assert.equal(payload.lastError.pushStatus, 410);
   assert.equal(payload.lastError.reason, rowLastError.reason);
@@ -1082,4 +1088,538 @@ test('循环任务撞上 410：跳到下一次 occurrence，不进 failed 终态
   assert.equal(row.next_send_at, plusMs(dueAt, DAY));
   assert.equal(row.retry_count, 0);
   assert.equal(JSON.parse((await adapter.getTaskStatusInfo('gone-daily', USER)).last_error).pushStatus, 410);
+});
+
+// ─── 成功之后失败记录要清干净 ───────────────────────────────────────────
+
+/** 等一个条件成立，到点还不成立就当断言失败——别让测试挂死在 while 里。 */
+async function waitUntil(predicate, message, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+// 循环任务失败一次（订阅回 410）之后，用户重新登记订阅、之后天天正常送达——
+// GET /message 里不该永远挂着那次 410。客户端就是按 pushStatus 判断「要不要
+// 提示用户重建订阅」的，挂着就会在一切正常时无限提示。
+test('循环任务成功一次之后，lastError 不再挂着上一轮的 410', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'recovered', recurrenceType: 'daily', nextSendAt: recentDue() });
+
+  await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(410, 'Gone')
+  });
+  const failed = await adapter.getTaskByUuid('recovered', USER);
+  assert.equal(projectTask(failed, await decryptPayloadOf(failed)).lastError.pushStatus, 410);
+  assert.equal((await decryptPayloadOf(failed)).lastError.pushStatus, 410, '密文 payload 里也留了一份');
+
+  // 排期已经跳到明天，拨回到点再跑一跳——这次正常送达。
+  await adapter.updateTaskById(failed.id, { next_send_at: recentDue() });
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+  assert.equal(res.successCount, 1);
+
+  const row = await adapter.getTaskByUuid('recovered', USER);
+  assert.equal(row.last_error, null, '行上的失败记录成功时被清掉');
+  // 密文里那份成功时没人清（只为一条记录重写整份密文不划算），所以投影必须以
+  // 行上那一列为准——反过来的话这里会读到那条早就过去的 410。
+  assert.equal(projectTask(row, await decryptPayloadOf(row)).lastError, null);
+});
+
+// 没有 last_error 列的适配器（自定义适配器），失败原因只落在密文 payload 里，
+// 那它就是权威的那一份，成功时也得擦掉。
+test('没有 last_error 列的适配器：成功之后 payload 里的 lastError 也清掉', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'no-column', recurrenceType: 'daily', nextSendAt: recentDue() });
+  const db = withoutClaimTask(adapter);
+
+  await runScheduledTick({
+    db, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(410, 'Gone')
+  });
+  const failed = await adapter.getTaskByUuid('no-column', USER);
+  assert.equal((await decryptPayloadOf(failed)).lastError.pushStatus, 410);
+
+  await adapter.updateTaskById(failed.id, { next_send_at: recentDue() });
+  const res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+  assert.equal(res.successCount, 1);
+
+  const row = await adapter.getTaskByUuid('no-column', USER);
+  assert.equal((await decryptPayloadOf(row)).lastError, undefined, '成功之后不该还留着上一轮的失败');
+});
+
+// ─── 内容装不下（PUSH_PAYLOAD_TOO_LARGE / 413） ─────────────────────────
+
+/** 走真正的大小护栏：超限的 payload 在加密之前就抛，fetch 永远不会被调用。 */
+function webpushWithRealSizeGuard() {
+  const calls = { count: 0 };
+  return {
+    calls,
+    async sendNotification(subscription, payload) {
+      calls.count++;
+      return sendWebPush({
+        subscription,
+        payload,
+        vapid: VAPID,
+        fetch: () => { throw new Error('超限的 payload 不该发出去'); }
+      });
+    }
+  };
+}
+
+// 投递是先跑 LLM 再推送。「这条内容装不下」跟这一轮生成出来的内容绑死，退避两
+// 分钟后重来只会把生成整轮重跑一次，再撞同一堵墙。
+test('payload 超限（PUSH_PAYLOAD_TOO_LARGE）当场判终态，不走 2/4/6 分钟的梯子', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'too-large', recurrenceType: 'none', nextSendAt: recentDue(),
+    payload: { userMessage: 'x'.repeat(5000) }
+  });
+
+  const webpush = webpushWithRealSizeGuard();
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.details.failedTasks[0].status, 'permanently_failed');
+  assert.equal(res.details.failedTasks[0].permanent, true);
+  assert.equal(res.details.failedTasks[0].nextRetryAt, undefined, '不该排下一次重试');
+  assert.equal(webpush.calls.count, 1, '只试一次，不重跑一轮生成');
+
+  const row = await findTaskAnyStatus(adapter, 'too-large');
+  assert.equal(row.status, 'failed');
+  assert.equal(row.retry_count, 0);
+  // 下游要知道「为什么发不出去」才能去裁短内容，读的是 errorCode 不是 reason。
+  assert.equal(JSON.parse(row.last_error).errorCode, 'PUSH_PAYLOAD_TOO_LARGE');
+  assert.equal(
+    projectTask(row, await decryptPayloadOf(row)).lastError.errorCode,
+    'PUSH_PAYLOAD_TOO_LARGE'
+  );
+});
+
+// 密文超限时推送服务回 413，说的是同一件事，只是发现得晚一步。
+test('推送服务回 413（密文超限）同样当终态', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'too-large-413', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(413, 'Payload Too Large')
+  });
+
+  assert.equal(res.details.failedTasks[0].status, 'permanently_failed');
+  assert.equal(res.details.failedTasks[0].permanent, true);
+  const row = await findTaskAnyStatus(adapter, 'too-large-413');
+  assert.equal(row.retry_count, 0);
+  assert.equal(JSON.parse(row.last_error).pushStatus, 413);
+});
+
+// VAPID 配错（400 / 401 / 403）重试同样好不了，但那是整个部署级别的故障：判终
+// 态会把这段时间内每一条一次性任务都永久标 failed，配置修好也回不来了。这类
+// 失败留在退避阶梯里，原因靠 last_error 里的机读字段说清楚。
+test('推送回 401（VAPID 配置错）照旧走重试梯子，不判终态', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'vapid-401', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID,
+    webpush: webpushRejectingWithStatus(401, 'Unauthorized')
+  });
+
+  assert.equal(res.details.failedTasks[0].retryCount, 1);
+  assert.ok(res.details.failedTasks[0].nextRetryAt, '排了下一次重试');
+  assert.equal(res.details.failedTasks[0].permanent, undefined);
+
+  const pending = await adapter.getTaskByUuidOnly('vapid-401');
+  assert.equal(pending.status, 'pending');
+  const lastError = JSON.parse((await adapter.getTaskStatusInfo('vapid-401', USER)).last_error);
+  assert.equal(lastError.pushStatus, 401);
+  assert.equal(lastError.errorCode, 'PUSH_SEND_FAILED');
+});
+
+// ─── 投递期间任务被取消 ─────────────────────────────────────────────────
+
+// DELETE /message 是无条件删行 + 当场回「任务已成功取消」。投递侧从占位到推送
+// 之间不再读库，唯一能知道「这条已经不归我了」的信号就是续租的条件写扑空。
+test('投递期间任务被取消：剩下的推送不再发出，也不算成功', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'cancel-mid', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markInside;
+  const inside = new Promise((resolve) => { markInside = resolve; });
+  let renewMisses = 0;
+
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      // 读订阅是推送前的最后一步：卡在这里等于「内容都备好了，还没推出去」。
+      if (prop === 'getPushSubscription') {
+        return async (...args) => {
+          markInside();
+          await gate;
+          return target.getPushSubscription(...args);
+        };
+      }
+      if (prop === 'renewTaskLease') {
+        return async (...args) => {
+          const renewed = await target.renewTaskLease(...args);
+          if (!renewed) renewMisses++;
+          return renewed;
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const webpush = fakeWebpush();
+  const tick = runScheduledTick({
+    db, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10
+  });
+  await inside;
+
+  // 用户这时候点了取消，接口当场回 200「任务已成功取消」。
+  assert.equal(await adapter.deleteTaskByUuid('cancel-mid', USER), true);
+  await waitUntil(() => renewMisses > 0, '续租一直没扑空，取消信号没传到投递侧');
+  openGate();
+
+  const res = await tick;
+  assert.equal(webpush.sent.length, 0, '回了「已取消」就不能再把消息发出去');
+  assert.equal(res.successCount, 0);
+  assert.equal(res.failedCount, 0, '取消不是投递失败，不该混进 failedTasks');
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_mid_delivery']);
+});
+
+// 心跳的间隔盖不住的那段窗口：推送已经发完，收尾删行才发现行早没了。消息确实
+// 送达了，但这一跳不能记成功——记成功的话 summary 里一点痕迹都没有。
+test('推送发完才发现任务已被取消：不算成功，summary 里看得见', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'cancel-late', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+  const sent = [];
+  const webpush = {
+    async sendNotification(_subscription, payload) {
+      sent.push(payload);
+      markSending();
+      await gate;
+    }
+  };
+
+  // 心跳关掉：这条走的是「收尾写库匹配不到行」那条路，与心跳无关。
+  const tick = runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 0
+  });
+  await sending;
+  assert.equal(await adapter.deleteTaskByUuid('cancel-late', USER), true);
+  openGate();
+
+  const res = await tick;
+  assert.equal(sent.length, 1, '这条已经发出去了，改不了');
+  assert.equal(res.successCount, 0);
+  assert.equal(res.details.deletedOnceOffTasks, 0);
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_after_delivery']);
+});
+
+// 取消只挡住 Web Push 是不够的：整批 push 在发送前就已经落进 message_outbox
+// （补收的事实来源），剩下没发出去的那几行不撤掉，客户端下一次 GET /outbox 会
+// 照样把它们拉回去——用户看到的就是「取消接口回了成功，消息还是来了」。
+test('投递期间被取消：没发出去的那几条从 outbox 里撤掉，补收拉不到', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'cancel-outbox',
+    recurrenceType: 'none',
+    nextSendAt: recentDue(),
+    // 拆成两句：第一句发得出去，取消发生在第二句之前。
+    payload: { userMessage: '第一句。第二句。' }
+  });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+  let renewMisses = 0;
+  const sent = [];
+
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'renewTaskLease') {
+        return async (...args) => {
+          const renewed = await target.renewTaskLease(...args);
+          if (!renewed) renewMisses++;
+          return renewed;
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const webpush = {
+    async sendNotification(_subscription, payload) {
+      sent.push(payload);
+      if (sent.length === 1) {
+        markSending();
+        await gate;
+      }
+    }
+  };
+
+  const tick = runScheduledTick({
+    db, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10
+  });
+  await sending;
+
+  // 第一句已经推出去了，用户这时候点了取消。
+  assert.equal(await adapter.deleteTaskByUuid('cancel-outbox', USER), true);
+  await waitUntil(() => renewMisses > 0, '续租一直没扑空，取消信号没传到投递侧');
+  openGate();
+
+  const res = await tick;
+  assert.equal(sent.length, 1, '第二句被拦下了');
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_mid_delivery']);
+
+  const unacked = await adapter.listUnackedOutbox(USER, 0, 50);
+  assert.equal(unacked.length, 1, '只剩已经推出去的那一条，第二句不能留在补收队列里');
+  assert.equal(unacked[0].message_index, 1);
+  assert.ok(unacked[0].delivered_at, '留下的那条是真发出去过的');
+});
+
+// 冻结的 webpush 对象：宿主按常见写法传 Object.freeze({ sendNotification })。
+// 取消检查那一层要是用 Proxy 包，get trap 返回包装函数会踩 Proxy 不变式当场抛
+// TypeError——那个部署下每一条定时消息都发不出去，还照常走 2/4/6 分钟的梯子。
+test('宿主传冻结的 webpush 对象：消息照常发得出去', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'frozen-webpush', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const sent = [];
+  const webpush = Object.freeze({
+    async sendNotification(_subscription, payload) { sent.push(payload); }
+  });
+
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10
+  });
+
+  assert.equal(res.successCount, 1, `冻结的 webpush 不该把投递打挂：${JSON.stringify(res.details.failedTasks)}`);
+  assert.equal(res.failedCount, 0);
+  assert.equal(sent.length, 1);
+});
+
+// 跟着包内 schema 建表、但没实现可选的 claimTask 的自定义适配器：行上有
+// last_error 这一列，投影也认它权威，写入侧却按「实现了 claimTask 才写」跳过
+// ——结果 GET /message 的 lastError 永远是 null，客户端看不到上次为什么没发出去。
+test('没实现 claimTask 但有 last_error 列的适配器：失败原因照样读得到', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'no-claim-lasterror', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const db = withoutClaimTask(adapter);
+  const webpush = {
+    async sendNotification() {
+      const error = new Error('subscription gone');
+      error.statusCode = 410;
+      throw error;
+    }
+  };
+
+  const res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+  assert.equal(res.failedCount, 1);
+
+  const row = await findTaskAnyStatus(adapter, 'no-claim-lasterror');
+  const projected = projectTask(row, await decryptPayloadOf(row));
+  assert.ok(projected.lastError, '行上有 last_error 列，投影认它权威，写入侧就必须往里写');
+  assert.equal(projected.lastError.pushStatus, 410);
+});
+
+// 投递跑 LLM 的几十秒里用户 PUT 改了任务。收尾清 lastError 时若把领取时的
+// payload 快照原样写回去，那次修改会被静默回滚——界面上再查还是旧内容。
+test('成功收尾清 lastError：不覆盖投递期间用户改过的正文', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'concurrent-put',
+    recurrenceType: 'daily',
+    nextSendAt: recentDue(),
+    // 上一轮失败留下的记录：成功收尾时要清掉它，才会走到重写密文那一步。
+    payload: { userMessage: '旧的正文。', lastError: { at: '2026-01-01T00:00:00.000Z', reason: 'push failed' } }
+  });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+
+  const webpush = {
+    async sendNotification() {
+      markSending();
+      await gate;
+    }
+  };
+
+  // 心跳关掉：这条测的是密文覆盖，跟租约无关（没实现 claimTask 的适配器本来
+  // 就没有租约拦着）。
+  const tick = runScheduledTick({
+    db: withoutClaimTask(adapter), masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 0
+  });
+  await sending;
+
+  // 用户这时候把正文改了，接口回了 200。
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const updated = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei',
+    messageType: 'fixed',
+    userMessage: '用户刚改的正文。',
+    recurrenceType: 'daily'
+  }), userKey);
+  assert.ok(await adapter.updateTaskByUuid('concurrent-put', USER, updated, { retry_count: 0 }));
+  openGate();
+
+  await tick;
+
+  const row = await findTaskAnyStatus(adapter, 'concurrent-put');
+  const payload = await decryptPayloadOf(row);
+  assert.equal(payload.userMessage, '用户刚改的正文。', '投递收尾不能把用户刚保存的改动写回旧值');
+});
+
+// 投递跑到一半失败，而用户在这几十秒里 PUT 改了任务。失败收尾要往 payload 里
+// 记 lastError，但它写的是领取时的快照——原样写回去，那次修改就被静默回滚了。
+// 成功收尾那条路早就有这个守卫，失败这条路走得更勤，一样得有。
+test('失败收尾记 lastError：不覆盖投递期间用户改过的正文', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'concurrent-put-on-failure',
+    recurrenceType: 'daily',
+    nextSendAt: recentDue(),
+    payload: { userMessage: '旧的正文。' }
+  });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+
+  const webpush = {
+    async sendNotification() {
+      markSending();
+      await gate;
+      throw new Error('push failed');
+    }
+  };
+
+  const tick = runScheduledTick({
+    db: withoutClaimTask(adapter), masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 0
+  });
+  await sending;
+
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const updated = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei',
+    messageType: 'fixed',
+    userMessage: '用户刚改的正文。',
+    recurrenceType: 'daily'
+  }), userKey);
+  assert.ok(await adapter.updateTaskByUuid('concurrent-put-on-failure', USER, updated, { retry_count: 0 }));
+  openGate();
+
+  await tick;
+
+  const row = await findTaskAnyStatus(adapter, 'concurrent-put-on-failure');
+  const payload = await decryptPayloadOf(row);
+  assert.equal(payload.userMessage, '用户刚改的正文。', '失败收尾也不能把用户刚保存的改动写回旧值');
+  // 行上那一列照常记得下失败原因，跟密文那份互不影响。
+  assert.ok(row.last_error, '失败原因该记在行上');
+});
+
+// 自建适配器可能既没有 last_error 列、拒绝未知字段时又只回一句自己的话。状态
+// 推进不能被这条锦上添花的记录挡住——挡住的话 retry_count 不涨、next_send_at
+// 不动，这条任务会被每一跳 cron 重新捞起来，LLM 每次重跑一遍还每次都计费。
+test('适配器拒收 last_error 且措辞对不上关键词：状态照样推进', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'opaque-adapter', recurrenceType: 'none', nextSendAt: recentDue() });
+
+  const rejected = [];
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') return undefined;
+      if (prop === 'updateTaskById') {
+        return async (taskId, fields) => {
+          if (Object.prototype.hasOwnProperty.call(fields, 'last_error')) {
+            rejected.push(fields);
+            throw new Error('unsupported update field');
+          }
+          return target.updateTaskById(taskId, fields);
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const webpush = { async sendNotification() { throw new Error('push failed'); } };
+  const res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush });
+
+  assert.equal(res.failedCount, 1);
+  assert.notEqual(
+    res.details.failedTasks[0].status, 'retry_update_failed',
+    `写库不该整笔失败：${JSON.stringify(res.details.failedTasks[0])}`,
+  );
+  assert.ok(rejected.length >= 1, '得先真的试过写这一列，才谈得上退而求其次');
+
+  const row = await adapter.getTaskByUuidOnly('opaque-adapter');
+  assert.equal(row.retry_count, 1, '重试计数必须往前走，不然这条任务永远卡在原地');
+  assert.notEqual(row.next_send_at, null);
+  // 这一列写不进去就不写了，但重试排期已经落库——下一跳按退避走，不是立刻重跑。
+  assert.ok(Date.parse(row.next_send_at) > Date.now(), '退避要真的排出去');
+});
+
+// 收尾写库会把 lease_until 置空，之后心跳当然续不上租约——那是我们自己放的
+// 手。报成「行被取消或顶替」的话，运维会在 tick 日志里看到一条正常送达的消息
+// 带着取消告警，而这个分支存在的意义正是让取消看得见。
+test('正常收尾不会被心跳误报成「任务被取消」', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'clean-finish', recurrenceType: 'daily', nextSendAt: recentDue() });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+
+  let res;
+  try {
+    // 心跳每 1ms 敲一次：收尾之后、processTask 停表之前，必然有几次落在中间。
+    // onStaleSkip 之类的宿主 hook 会把这段窗口拉得更长，这里用 afterSend 模拟。
+    res = await runScheduledTick({
+      db: adapter,
+      masterKey: MASTER_KEY,
+      vapid: VAPID,
+      webpush: fakeWebpush(),
+      leaseHeartbeatMs: 1,
+      onAfterSend: async () => { await new Promise((resolve) => { setTimeout(resolve, 30); }); }
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(res.successCount, 1, '这条消息是正常送达的');
+  assert.equal(res.details.cancelledTasks.length, 0);
+  assert.equal(
+    warnings.filter((line) => line.includes('租约已失效')).length, 0,
+    `正常收尾不该报租约失效：${JSON.stringify(warnings)}`,
+  );
 });

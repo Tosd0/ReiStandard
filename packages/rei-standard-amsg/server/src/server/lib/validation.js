@@ -127,6 +127,81 @@ export function validateLlmMessagesArray(messages) {
   }
 }
 
+// ─── 任务正文的大小闸门 ────────────────────────────────────────────────
+//
+// 一条任务的正文（messages / completePrompt / metadata …）整个加密成一个字符
+// 串，落在 scheduled_messages.encrypted_payload 这一列上。D1 对「单个字符串 /
+// 单行」的上限是 2,000,000 字节
+// （https://developers.cloudflare.com/d1/platform/limits/），而
+// encryptForStorage 的输出是 `hex(iv):hex(tag):hex(密文)`——十六进制让字节数正
+// 好翻倍：
+//
+//   落库字符串字节数 = 2 × 明文字节数 + 66   （iv / tag 各 32 个 hex 字符 + 两个冒号）
+//
+// 顶穿之后 D1 回的是 `D1_ERROR: string or blob too big`，包到 500 里，调用方既
+// 看不出是哪份数据太大、也看不出上限是多少。本地测试跑的是 SQLite（单值上限
+// 十亿字节）、Postgres 的 text 上限 1GB，两边都碰不到这条线，只有线上 D1 会炸。
+// 所以在写库之前先量一次，超了当场 400 并把字节数报回去。
+//
+// 上限对所有适配器一视同仁：同一份任务在 D1 / Postgres 之间搬家时契约不该跟着
+// 变（client_state 的单条 value 上限也是这么定的）。
+
+/** D1 的单个字符串 / 单行上限（字节）。 */
+const D1_MAX_ROW_BYTES = 2_000_000;
+/** hex 密文的固定开销：iv 与 tag 各 16 字节 → 各 32 个 hex 字符，加两个冒号。 */
+const STORAGE_HEX_OVERHEAD_BYTES = 66;
+/** 同一行里除 encrypted_payload 之外的列（uuid / user_id / 时间戳 / last_error…）。 */
+const TASK_ROW_OTHER_COLUMNS_BYTES = 4096;
+// 投递失败时 run-tick 会往明文正文里补一段 lastError 再加密回写。这段增量长在
+// 明文那侧（落库同样翻倍），预算里先扣掉——不扣的话，正好卡在上限的任务建得进
+// 去，第一次投递失败时才在回写那一步炸，而且那条路径既不推进重试计数也不放租约。
+const TASK_LAST_ERROR_RESERVED_BYTES = 2048;
+
+/**
+ * 一条任务正文（`JSON.stringify` 的结果）的明文上限，UTF-8 字节数。
+ * 客户端想在提交前自己预算就读这个数（从 `@rei-standard/amsg-server` 导出）。
+ */
+export const MAX_TASK_PAYLOAD_BYTES = Math.floor(
+  (D1_MAX_ROW_BYTES - TASK_ROW_OTHER_COLUMNS_BYTES - STORAGE_HEX_OVERHEAD_BYTES) / 2
+) - TASK_LAST_ERROR_RESERVED_BYTES;
+
+const taskPayloadEncoder = new TextEncoder();
+
+/**
+ * 落库前量一次任务正文。合法返回 null，超限返回可以直接放进 400 响应体的
+ * error 对象——`POST /schedule-message` 与 `PUT /update-message` 共用同一个错
+ * 误码和同一套 details，下游判断读 `details.bytes` / `details.maxBytes`，不用
+ * 去解析那句人话。
+ *
+ * 按 UTF-8 字节算而不是字符数：D1 限的是字节，加密前也是先转 UTF-8，一段全中
+ * 文的正文字符数只有字节数的三分之一，用 `.length` 量等于把上限放大三倍。
+ *
+ * @param {string} serializedPayload - 将要交给 encryptForStorage 的那个字符串。
+ * @returns {{ code: string, message: string, details: { bytes: number, maxBytes: number } } | null}
+ */
+export function validateTaskPayloadSize(serializedPayload) {
+  const bytes = taskPayloadByteLength(serializedPayload);
+  if (bytes <= MAX_TASK_PAYLOAD_BYTES) return null;
+  return {
+    code: 'TASK_PAYLOAD_TOO_LARGE',
+    message: `任务内容 ${bytes} 字节，超过 ${MAX_TASK_PAYLOAD_BYTES} 字节上限`,
+    details: { bytes, maxBytes: MAX_TASK_PAYLOAD_BYTES }
+  };
+}
+
+/**
+ * 任务正文的 UTF-8 字节数（与 {@link validateTaskPayloadSize} 同一把尺子）。
+ *
+ * `PUT /update-message` 拿它跟改动前的正文比大小：上限是后加的，比它更早建出来
+ * 的大任务不该因此连排期都改不了，只要这次改动没把它变得更大就放行。
+ *
+ * @param {string} serializedPayload
+ * @returns {number}
+ */
+export function taskPayloadByteLength(serializedPayload) {
+  return taskPayloadEncoder.encode(serializedPayload).length;
+}
+
 /**
  * Validate the schedule-message request payload.
  *
@@ -210,6 +285,18 @@ export function validateScheduleMessagePayload(payload) {
     (!Number.isInteger(payload.maxTokens) || payload.maxTokens <= 0)
   ) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['maxTokens'] } };
+  }
+
+  // userMessage 给了就必须是字符串。正文最终要过 splitMessageIntoSentences 的
+  // 正则切分，传个数字进来这一步收得下、到点投递时才炸在 `chunk.split` 上——
+  // 那时早已离开 HTTP 请求，用户只看到一条任务莫名其妙失败，还要连着重试三轮
+  // 同样地失败。
+  if (
+    payload.userMessage !== undefined &&
+    payload.userMessage !== null &&
+    typeof payload.userMessage !== 'string'
+  ) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { invalidFields: ['userMessage (must be a string)'] } };
   }
 
   if (payload.messageType === 'fixed') {

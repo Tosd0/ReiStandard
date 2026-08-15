@@ -57,6 +57,11 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @typedef {Object} ReiServerConfig
  * @property {VapidConfig} [vapid]   - VAPID keys for Web Push.
  * @property {TenantServerConfig} tenant - Tenant config & auth settings.
+ * @property {{ maxChunkBytes?: number, maxChunks?: number, maxTotalBytes?: number, ttlMs?: number }} [multipart]
+ *   分片传输的限额，跟传给 `installReiSW` 的那一份保持一致（同名同键，原样传过来
+ *   即可）。一条 push 装不下的思考过程要切片发，切多大、最多几片、重组窗口多长由
+ *   接收端说了算——发送端不知道这份配置的话，切出来的分片到了那边会被逐片拒收，
+ *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
  */
 
 /**
@@ -130,6 +135,10 @@ export async function createReiServer(config) {
       privateKey: vapid.privateKey || ''
     },
     webpush: webpushModule,
+    // 分片传输的限额（与 installReiSW 的 multipart 同一份）。instant 消息在
+    // schedule-message 里就地投递、定时消息走 send-notifications 的 tick，两条路
+    // 都从这个 ctx 展开，所以配一次两边都认。
+    multipart: config.multipart || null,
     tenant: {
       initSecret
     },
@@ -167,9 +176,16 @@ export {
   sanitizeErrorSummary,
 } from './lib/run-tick.js';
 // hook 侧标注「重试也好不了」的失败：run-tick 收到即直接终审处置，不进退避
-// 阶梯（见 lib/errors.js）。summarizeErrorCause 是 500 响应体里 error.cause 的
-// 组装口（宿主自己包一层路由、想回同样形状时用同一份）。
-export { NonRetryableError, isNonRetryableError, summarizeErrorCause } from './lib/errors.js';
+// 阶梯（见 lib/errors.js）。DeploymentConfigError 是它旁边那一档——坏的是整个
+// 部署而不是这条任务，照旧走退避阶梯，配置修好后还在阶梯上的任务能自己发出去。
+// summarizeErrorCause 是 500 响应体里 error.cause 的组装口（宿主自己包一层路
+// 由、想回同样形状时用同一份）。
+export {
+  NonRetryableError,
+  DeploymentConfigError,
+  isNonRetryableError,
+  summarizeErrorCause,
+} from './lib/errors.js';
 // Schema 自查 / 补齐：升级后老部署的表没跟上时，cron 会每分钟静默挂在缺的那
 // 一列上（见 lib/schema-version.js）。
 export { getSchemaVersion, ensureSchema, SCHEMA_VERSION } from './lib/schema-version.js';
@@ -194,6 +210,13 @@ export {
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
+// 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原）。自己包路由的宿主
+// 用它代替 `await request.text()`，压缩请求体就跟单用户 Worker 一样自动认。
+export { readRequestBody, DEFAULT_MAX_REQUEST_BODY_BYTES } from './lib/request.js';
+// 一条任务正文的明文字节上限（超了 POST /schedule-message、PUT /update-message
+// 回 400 TASK_PAYLOAD_TOO_LARGE）。客户端想在提交前自己预算就读这一份，别手抄
+// 第二个数——它是按 D1 的单行上限反推出来的，见 lib/validation.js。
+export { MAX_TASK_PAYLOAD_BYTES } from './lib/validation.js';
 // 用户级 LLM 凭据存储（llm_credentials 表；任务 payload 的 credRefs 引用它）。
 // 自定义适配器 / 自己包路由的宿主用得到校验和解析口。
 export {
