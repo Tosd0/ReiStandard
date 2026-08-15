@@ -1,5 +1,161 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.4.0-next.4
+
+### Minor Changes
+
+- 922afe1: 取消的消息不再从收件箱补收回去；失败细节里的模型名不再被脱敏吃掉
+
+  **1. 投递到一半被取消：没发出去的那几条从 outbox 里撤掉**
+
+  整批 push 是发送前就落进 `message_outbox` 的（那是补收的事实来源），而取消只拦得住 Web Push 这一路。剩下没发出去的行不撤掉的话，客户端下一次 `GET /outbox` 会照样把它们拉回去——用户看到的是「取消接口回了成功，消息还是来了」。
+
+  现在 `DELETE /message` 取消和 `supersedesUuid` 顶替都会把该任务名下还没发出去的行撤掉，两种时机都算：投递正跑到一半时（老链路和 agentic 链路两条发送路都覆盖），以及更常见的那种——上一次投递早就失败了、还没等到重试就被取消。已经推给设备的那几条不动，行留着让客户端照常 ack；取消的意思是「别再发后面的」，不是「把用户已经收到的从收件箱里抹掉」。
+
+  清理是 best-effort：适配器没实现 outbox、或者清理本身出错，都不影响取消 / 顶替的成功返回（任务行已经删掉了）。
+
+  适配器接口新增可选方法 `discardOutboxMessages(userId, messageIds)`，内置只有 D1 实现；不实现的适配器行为与以前一致（取消只挡住 Web Push）。取消 / 顶替这条路还要读一遍未 ack 的行来挑出这条任务的那几段，所以 `listUnackedOutbox` 返回的行上要带 `task_uuid` 和 `delivered_at`（包内 schema 本来就有）。
+
+  **2. 脱敏规则收敛成一份，模型 ID 不受影响**
+
+  错误细节里长得像凭据的串会被遮成 `[redacted]`：`sk-…` / `xai-…` / `sk-ant-api03-…` 这种「短前缀 + 长随机串」，`Bearer …` 连值一起遮，以及光是一长串的 base64 / JWT 片段。随机段里夹着 `-` 和 `_` 的 Key 整条遮掉，不留半截。
+
+  模型 ID 原样保留。上游那句「你写的这个模型不存在」里最关键的就是模型名，遮掉它报错只剩「有个东西不存在」，而模型名写错是这套错误细节要解决的头号场景。
+
+  模型 ID 跟 Key 长得很像，认它靠四道一起：全小写字母数字、被 `-` / `.` 切成一串短段（`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`）；不以公认的凭据前缀开头（`sk` / `key` / `api` / `token` / `xai` …，跟在它们后面的东西不管长什么形状都不豁免）；不含 uuid（8-4-4-4-12 hex）；没有「随机段」（一段里字母块数字块来回切三次以上，`mixtral-8x7b` 那种短版本段例外）。
+
+  单看形状是不够的——自建中转（one-api / new-api / LiteLLM 这类）发的 Key 常常是 `sk-<uuid>`、`key-1a2b3c4d5e6f-7a8b9c0d1e2f` 这样全小写按短横线分段的，跟模型 ID 完全同形。判据里没有任何厂商的模型清单。
+
+  判过是模型名的串也不会被「光长随机串」那条规则二次吞掉：`deepseek-ai.deepseek-v3-0324-thinking-preview-latest` 这类超过 48 字符的模型 ID 照样留着。
+
+  规则本身只有一份，在 `@rei-standard/amsg-shared` 的 `redactCredentials`；amsg-server 的 `sanitizeErrorSummary`（落库的 `last_error` 列）和 amsg-instant 的 Cloudflare 适配器（跨域 502 响应体）都调它，各自只负责后面的截断长度。
+
+  **3. instant 任务的 `last_error` 带上 `errorCode` / `pushStatus`**
+
+  `messageType: 'instant'` 的任务终审失败时，写进 `last_error` 的记录原来只有 `{ at, occurrence, reason }`。现在跟定时任务那条路共用同一份形状：`reason` 是给用户看的人话，`errorCode` / `pushStatus` 是给下游判定用的——`pushStatus === 410` 表示订阅已注销，客户端据此引导用户重新登记，不用回去正则匹配 `reason`。
+
+  **4. `last_error` 一律往行上写**
+
+  原来只有实现了可选的 `claimTask` 的适配器才往行上的 `last_error` 列写。跟着包内 SQL schema 建表、但没实现 `claimTask` 的自定义适配器，行上有这一列、`GET /message` 的投影也认它权威，却没人往里写——`lastError` 读出来永远是 `null`。
+
+  现在一律写，默认状态字段和 `last_error` 合成一笔：库有这一列时永远只花一个来回。
+
+  这一笔挂了才分开重来——先只写状态字段。这笔成了，就说明问题出在 `last_error` 这个字段上（`updateTaskById` 是单条 UPDATE，字段不认时整条不生效，所以退回重写是安全的）；这笔也挂了，那是库真出问题了，原样抛出去按既有路径处理。状态推进（标 failed / 推进排期 / 放租约）无论如何都不受这一列影响：靠错误措辞去猜「是不是缺这一列」的话，猜不中就是 `retry_count` 不涨、`next_send_at` 不动，任务被每一跳 cron 重新捞起来，LLM 每次重跑一遍还每次都计费。
+
+  认定「这个库没有这一列」要连续撞上两次同一个形状，中间只要成功一次就清零：连接重置、语句超时、D1 的 `Network connection lost` 这类瞬时错误落在带 `last_error` 的那笔写上时，跟缺列长得一模一样，而认定的后果是永久的（长驻 Node 部署里适配器活到进程结束）。认定之后不再带这个字段，失败原因仍记在密文 payload 的 `lastError` 里。
+
+  带 `last_error` 的写第一次没成功就会打一行提示（每个 isolate 只说一次，措辞把「缺列」和「偶发」两种可能都写出来）——Cloudflare 部署每个请求都新建适配器，等坐实再说的话运维永远看不到。
+
+  投递成功时行上的列和密文 payload 里的那份记录一起清掉。重写密文之前会先确认行上的密文还是领取时那一份——投递跑几十秒，其间用户 `PUT /update-message` 改过的话，把快照原样写回去等于把那次修改静默回滚；失败收尾写 `lastError` 走同一道确认。
+
+- ca83382: 新增 `ctx.emitResult(payload)`：往客户端送一条不是聊天内容的结果
+
+  聊天正文之外的产出——整理好的一份数据、一条账目、后台生成的产物——之前只能宿主自己拼：`db.appendOutboxMessages` 加 `encryptForStorage` 手工组一行，落什么列、怎么加密全靠照着库里的实现抄，公开 API 拼得出来但无文档无测试。现在收编成正式能力。
+
+  **server**：fire 级 `fireCtx`、每轮 `sessionCtx`，以及 config 级的 `onAfterSend` / `onFireSettled` / `onStaleSkip` 载荷上都挂着 `emitResult(payload)`，与 `readState` / `writeState` 同待遇。一条结果走两条路——落进 `message_outbox`（到达：客户端下次 `GET /outbox?since=` 一定拿得到，推送没送到、内容超过一条推送 4KB 上限都不会让它丢），同时发一条 Web Push（及时：跑完当场弹一下叫人回来看）。客户端因此不必为每种结果各写一套轮询。
+
+  ```js
+  const { messageId, pushed } = await ctx.emitResult({
+    resultKind: "fire-pack", // 必填：这类结果的名字，客户端按它分流
+    packId: "pack_42", // 以下随便加，形状由宿主定
+    notification: { title: "整理好了", body: "点开看看" },
+  });
+  ```
+
+  - 落行失败会抛（收件箱是到达的保证）；适配器没有 `message_outbox` 时抛 `OUTBOX_UNSUPPORTED`。推送发不出去只记日志、返回 `pushed: false`——行还在收件箱等补收，不算失败。
+  - 结果行带 `task_uuid`，取消 / 顶替这条任务时**还没送到**的结果跟聊天分段一起撤；已推到设备上的留着让客户端照常 ack。
+  - `messageId` 缺省值掺了任务 id 与本次名义触发时刻，同一次触发重跑时不会补出第二条。
+
+  **shared**：`messageKind` 新增第五种 `'result'`（`MESSAGE_KIND.RESULT`、`ResultPush`、`buildResultPush`、`isResultPush`）。`buildResultPush` 是唯一保留自己不认识的字段的 builder——结果的形状由宿主定，白名单式的复制会把内容删掉一半。
+
+  **sw**：`messageKind: 'result'` 派发 `REI_SW_EVENT.RESULT_RECEIVED`，并且**默认弹通知**（与 `content` 同待遇，其余三种仍是静默送给页面）——结果往往正是「跑完了，回来看看」那句话。标题正文照旧在 `payload.notification` 里自定义，不想弹就 `notification: { show: false }`。
+
+  特性位：`emit-result`。
+
+- 785e1a3: 离线队列被拒的请求不再无声消失，去重仓库出错也不再吞掉整条 push
+
+  **离线队列：4xx 被拒会报出来**
+
+  队列里的请求被服务端 4xx 拒绝时，SW 照旧不再重试、把记录删掉（重试策略不变，4xx 重试多少次都是同一个结果）。原来删完就没了：页面拿到的还是 `{ ok: true, queueId }`，应用以为「已入队、早晚会发出去」，实际这条请求永远不会再发，没有事件、没有日志、队列里也查不到。最常见的触发是 token 轮换后还拿着旧 token（401），其次是 X-User-Id 不合法（400）、payload 超限（413）、路由改名（404）。
+
+  现在这条请求被删掉时会同时给出三个出口：
+
+  - 入队 ack 上新增机读字段。`ok: true` 的含义不变（=「已入队」，老调用方不受影响），新增 `delivered` 表示这次立即冲刷有没有真把它发出去；被永久拒绝时另外带上 `dropped: true`、`status`（HTTP 状态码）和 `error`。三种结局分别是：发出去了（`delivered: true`）、还在队列里等重试（`delivered: false`）、已被拒且删掉（`delivered: false, dropped: true`）。
+  - 广播给所有窗口一条 `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`（`{ ok: false, queueId, dropped: true, status, error, request: { url, method } }`），页面在全局 `navigator.serviceWorker` 的 message 事件里就能收到，不必持有当初入队用的 MessageChannel。出于安全考虑广播里不带 headers 和 body。
+
+    广播用独立的 message type，跟点对点的入队回执（`QUEUE_RESULT`，字段不变）分开：这条是广播，可能由后台 `sync` 冲刷触发、说的也可能是另一条早就排在队列里的旧请求。共用一个 type 的话，页面等自己那条入队回执时会先收到这条广播、当成自己的结果，明明入队成功却报「排队失败」。
+
+  - 一条带 url / method / 状态码的 `console.error`。
+
+  **push：去重或分片存储出错不再吞掉整条消息**
+
+  去重记录写 IndexedDB 失败时（设备存储写满、存储压力下连接被强关且重开失败、用户清站点数据的瞬间、宿主占用了同名 `dedupe.dbName` 却没有对应的 store），原来整个 push 事件会挂掉：通知不弹、页面收不到 postMessage、`onBusinessPayload` 不跑，只在 SW 控制台留一条大多数用户看不到的 unhandled rejection；用 `deliver()` 观察的发送端看到的是超时，排查方向整个是反的。
+
+  去重是「防重复弹」的优化，坏了应该多弹一条，不该一条都不弹。现在这种情况会降级成「当作首次投递照常分发」，并留一条能归因的日志；`REI_AMSG_DELIVER` 的 ack 仍是 `ok: true`，但会带上 `dedupeError`，让发送端知道这条没走去重保护、另一路 backup 可能还会再投一次。
+
+  multipart 分片的存储出错走另一种降级：手里只有一个分片，不能当完整消息发出去，所以放弃这个分片 id，按既有的 `rei-amsg-multipart-expired` 事件告诉页面别再等，同样留下日志。
+
+  同一条 multipart 消息只报一次收不了。分片是一起发出来的，逐片报的话（信封不合规、本地关掉了 multipart、分片仓库坏掉）页面会为一条消息收到几十条一模一样的事件。
+
+  重组窗口过完（剩下的分片迟到得超过了整个 `ttlMs`）时，这条 id 连同已落库的分片一起清掉。只清等待记录、把分片留在库里的话，新窗口的计数从零重来，而旧分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。
+
+  另外，补弹通知被系统拒绝（权限被撤、配额、OS 错误）时也不再让整条 push 挂掉，与首次投递路径的处理保持一致：记一条日志，并在 `onDuplicate(info)` 里如实报 `duplicateNotificationShown: false`。
+
+  通知没弹出来这件事同时写进 `REI_AMSG_DELIVER` 的 ack：`ok` 保持 `true`（payload 收下了也分发了），另带 `notificationError`。把 `deliver()` 当备份通道用的发送端靠它判断用户到底看没看见这条消息，首投和重复包两条路都带。
+
+- 922afe1: 分片拼不起来时不再静默丢弃，`MULTIPART_EXPIRED` 带上失败原因
+
+  **1. 拼不起来的 multipart 现在都会上报**
+
+  `_multipart` 分片走到这几条路时，原来是删掉已收的分片、直接返回，既不打日志也不广播事件——页面拿着 sessionId 一直等，而这条消息其实已经废了：
+
+  - 分片信封不合规（version / encoding 对不上、index 越界、chunk 不是合法 base64url）
+  - 同一个 id 的分片报了不一样的 `total` / `encoding`
+  - 累计字节数超过 `multipart.maxTotalBytes`
+  - 收齐了但拼不回原 payload
+  - 本地把 multipart 关了（`multipart.enabled === false`），但发送端还在切片
+
+  现在这几条路都走同一个出口：打一条 `console.error`，并按既有的 `REI_SW_EVENT.MULTIPART_EXPIRED` 广播给页面。
+
+  **2. `MULTIPART_EXPIRED` 事件多了 `reason`**
+
+  事件 payload 从 `{ id, received, total, originalMessageKind }` 变成 `{ id, received, total, originalMessageKind, reason }`。`reason` 说明这条 id 是怎么废的，取值见新导出的 `MULTIPART_FAILURE_REASON`（`'ttl-expired'` / `'invalid-chunk'` / `'chunk-conflict'` / `'size-limit-exceeded'` / `'restore-failed'` / `'storage-failed'` / `'disabled'`）。
+
+  `'ttl-expired'` 之外的几种通常意味着发送端或链路有问题，值得报上去。原有字段和事件名都没变，只读 `id` / `total` 的页面代码不受影响。
+
+  `MULTIPART_FAILURE_REASON` 和其他线协议常量一样住在 `@rei-standard/amsg-shared`，`@rei-standard/amsg-sw` re-export 同一份；页面侧请从 shared import。
+
+  **3. 拼好之后的收尾出错，不再把成功的重组报成丢了**
+
+  分片收齐、payload 已经还原出来之后，还要做两件收尾的事：清掉已用的分片、写一条短期 done 标记（防推送服务重投递造成二次业务事件）。原来这两步是裸 `await`，IndexedDB 在这里抖一下，异常会一路冒到外层，把一次**成功的重组**报成 `MULTIPART_EXPIRED`——通知不弹、`onBusinessPayload` 不跑，完整数据在手里反倒丢了。
+
+  现在收尾整段兜住，出错只记日志，payload 照常弹通知、进 `onBusinessPayload`、广播 `CONTENT_RECEIVED`。
+
+  **4. 一条 id 有了结论就到此为止**
+
+  不管是收齐还原了，还是中途放弃了（分片对不上、超限、拼不回来、分片仓库出错、本地把 multipart 关了），结论都是粘的：这个 id 之后再来分片一律不再收，包括推送服务对失败那片的重投。
+
+  收齐还原和中途放弃走同一套收尾：先写一条 done 墓碑，再清 pending 记录和已收的分片。分片一片都没落库的那几条路（信封不合规、multipart 关着、仓库出错）写不了墓碑——仓库出错那次坏的正是 IndexedDB——结论记在内存里，重组路径和 TTL 清扫都认它。
+
+  `'storage-failed'` 这种一阵子就好的故障也照此办理：不钉死的话，剩下的分片会把这条消息照常拼齐投递出去，而页面上那句「这条收不到」已经没有任何事件能撤掉了——用户看到的是一条读得到的消息旁边永远挂着失败横幅。
+
+  粘性是必须的：不然 `multipart.maxTotalBytes` 拦下的那份，重投几次就能重新凑齐还原出来。TTL 清扫也认结论：清理途中万一出错、pending 记录留了下来，清扫看见结论就知道这个 id 已经了结，不会为一条已经还原并渲染出来的消息再广播一次 `MULTIPART_EXPIRED`。
+
+  **5. 分片的重组窗口从本地收到第一片起算**
+
+  `multipart.ttlMs`（默认 60 秒）说的是「攒着半截分片等剩下的能等多久」。这个窗口按接收端本地收到第一片的时刻起算，不看发送端写在信封里的 `createdAt`。
+
+  分片是一起发出去的、也会一起送到，中间在推送服务里躺了多久跟这个窗口没关系——定时消息的传输层 TTL 是四周，设备离线时段排出去的那条只要晚到超过窗口长度，按 `createdAt` 算就会每一片都在到达的那一刻被判过期。发送端和设备的时钟差也不再影响判定。
+
+### Patch Changes
+
+- Updated dependencies [922afe1]
+- Updated dependencies [ca83382]
+- Updated dependencies [c3e1906]
+- Updated dependencies [922afe1]
+- Updated dependencies [922afe1]
+  - @rei-standard/amsg-shared@0.4.0-next.6
+
 ## 2.4.0-next.3
 
 ### Minor Changes
