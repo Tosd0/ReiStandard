@@ -28,6 +28,7 @@
     "amsg-llm-credentials",
     "amsg-llm-extra-body",
     "amsg-notification-ios-grace-period",
+    "amsg-notification-silent-when-visible",
     "amsg-protocol-constants-to-shared",
     "amsg-recommended-path-single-user",
     "amsg-review-hardening",

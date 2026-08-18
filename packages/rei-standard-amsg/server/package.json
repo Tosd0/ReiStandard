@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/amsg-server",
-  "version": "2.6.0-next.22",
+  "version": "2.6.0-next.23",
   "description": "ReiStandard Active Messaging server SDK with pluggable database adapters. Three-axis push schema (messageKind / messageType / messageSubtype) from @rei-standard/amsg-shared. Auto-emits ReasoningPush when the LLM response carries reasoning_content.",
   "repository": {
     "type": "git",
@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "@netlify/blobs": "^8.1.0",
-    "@rei-standard/amsg-shared": "^0.4.0-next.7",
+    "@rei-standard/amsg-shared": "^0.4.0-next.8",
     "web-push": "^3.6.7"
   },
   "peerDependencies": {
