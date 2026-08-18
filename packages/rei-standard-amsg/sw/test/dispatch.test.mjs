@@ -1072,6 +1072,204 @@ test('notification.silent is passed through to notification options', async () =
   assert.equal(notifications[0].options.silent, true);
 });
 
+// `silent: 'when-visible'` 的存在意义就是「前台安静、后台照响」，而响不响只有
+// SW 收到这条时才知道。下面几条把两边都钉住：定值档（true / false / 不写）不
+// 受可见性影响，字符串档必须两种可见性下给出相反的结果。
+
+test("notification.silent: 'when-visible' silences while a window is visible", async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 2, visibleCount: 1 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'User is watching',
+    notification: { show: 'always', silent: 'when-visible' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, true);
+});
+
+test("notification.silent: 'when-visible' rings when every window is hidden", async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 2, visibleCount: 0 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'User stepped away',
+    notification: { show: 'always', silent: 'when-visible' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, false);
+});
+
+test("notification.silent: 'when-visible' rings when there is no window client at all", async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 0 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'App fully closed',
+    notification: { show: 'always', silent: 'when-visible' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, false);
+});
+
+test('notification.silent: true stays silent even with no visible window', async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 0 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Always quiet',
+    notification: { show: 'always', silent: true }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, true);
+});
+
+test('notification.silent: false and an omitted silent stay audible with a visible window', async () => {
+  for (const notification of [{ show: 'always', silent: false }, { show: 'always' }]) {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+    installReiSW(sw);
+
+    await triggerPush({
+      ...COMMON,
+      messageKind: 'content',
+      message: 'Ring anyway',
+      notification
+    });
+
+    assert.equal(notifications.length, 1);
+    assert.equal(
+      notifications[0].options.silent,
+      false,
+      `notification ${JSON.stringify(notification)} should stay audible`
+    );
+  }
+});
+
+test("top-level silent: 'when-visible' is resolved the same way as the namespaced one", async () => {
+  // 顶层 `silent` 是 2.0.x 老 payload 的兜底档，跟 `notification.silent` 读同
+  // 一套规则——否则同一个字符串在两处一个当字符串真值、一个按可见性算。
+  {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+    installReiSW(sw);
+
+    await triggerPush({
+      ...COMMON,
+      messageKind: 'content',
+      message: 'Legacy visible',
+      silent: 'when-visible',
+      notification: { show: 'always' }
+    });
+
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].options.silent, true);
+  }
+
+  {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 0 });
+    installReiSW(sw);
+
+    await triggerPush({
+      ...COMMON,
+      messageKind: 'content',
+      message: 'Legacy hidden',
+      silent: 'when-visible',
+      notification: { show: 'always' }
+    });
+
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].options.silent, false);
+  }
+});
+
+test('notification.silent wins over the top-level fallback', async () => {
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Namespaced wins',
+    silent: true,
+    notification: { show: 'always', silent: 'when-visible' }
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].options.silent, true);
+});
+
+test("notification.silent: 'when-visible' is resolved on the duplicate repair path too", async () => {
+  // 补通知走的是另一条路（首投没弹、backup 到达时补一条）。它读的必须是补这
+  // 一刻的可见性，不是首投那一刻的。
+  {
+    const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+    installReiSW(sw);
+    const base = {
+      ...COMMON,
+      messageId: 'msg_silent_repair_visible',
+      messageKind: 'content',
+      message: 'repair me',
+    };
+
+    await triggerPush({ ...base, notification: { show: false } });
+    assert.equal(notifications.length, 0, 'first delivery is policy-suppressed');
+
+    await triggerPush({ ...base, notification: { show: 'always', silent: 'when-visible' } });
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].options.silent, true);
+  }
+
+  {
+    const { sw, notifications, triggerPush, setVisibleCount } = createSwMock({
+      clientCount: 1,
+      visibleCount: 1,
+    });
+    installReiSW(sw);
+    const base = {
+      ...COMMON,
+      messageId: 'msg_silent_repair_hidden',
+      messageKind: 'content',
+      message: 'repair me',
+    };
+
+    await triggerPush({ ...base, notification: { show: false } });
+    assert.equal(notifications.length, 0, 'first delivery is policy-suppressed');
+
+    // 用户在这中间切走了：补出来的这条要响。
+    setVisibleCount(0);
+    await triggerPush({ ...base, notification: { show: 'always', silent: 'when-visible' } });
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].options.silent, false);
+  }
+});
+
+test("notification.silent: 'when-visible' does not change whether the notification shows", async () => {
+  // silent 只管响不响。弹不弹还是 `show` 说了算——有可见窗口时 'when-hidden'
+  // 照旧不弹，别让新的一档顺手把这条判定带偏。
+  const { sw, notifications, triggerPush } = createSwMock({ clientCount: 1, visibleCount: 1 });
+  installReiSW(sw);
+
+  await triggerPush({
+    ...COMMON,
+    messageKind: 'content',
+    message: 'Suppressed by show',
+    notification: { show: 'when-hidden', silent: 'when-visible' }
+  });
+
+  assert.equal(notifications.length, 0);
+});
+
 test('multipart fully received payload with notification.show: "when-hidden" checks visible client', async () => {
   // Test 1: with visible client -> no notification
   {

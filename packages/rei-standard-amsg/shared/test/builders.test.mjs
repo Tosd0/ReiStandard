@@ -171,12 +171,49 @@ test('buildContentPush rejects non-string notification.{title,body,icon,badge,ta
   }
 });
 
-test('buildContentPush rejects non-boolean notification.{renotify,requireInteraction,silent}', () => {
-  for (const field of ['renotify', 'requireInteraction', 'silent']) {
+test('buildContentPush rejects non-boolean notification.{renotify,requireInteraction}', () => {
+  for (const field of ['renotify', 'requireInteraction']) {
     assert.throws(
       () => buildContentPush({ ...COMMON, message: 'hi', notification: { [field]: 'yes' } }),
       new RegExp(`'notification\\.${field}' must be a boolean`),
       `notification.${field}: "yes" should reject`,
+    );
+  }
+});
+
+test("buildContentPush accepts notification.silent: 'when-visible'", () => {
+  // `silent` 比另外两个布尔字段多一档：`'when-visible'` 让 SW 收到时按窗口可
+  // 见性现算响不响。校验放行它，别的字符串照旧拒。
+  const push = buildContentPush({
+    ...COMMON,
+    message: 'hi',
+    notification: { show: 'always', silent: 'when-visible' },
+  });
+  assert.equal(push.notification.silent, 'when-visible');
+});
+
+test("buildResultPush accepts notification.silent: 'when-visible'", () => {
+  const push = buildResultPush({
+    ...COMMON,
+    resultKind: 'ledger-entry',
+    notification: { show: 'always', silent: 'when-visible' },
+  });
+  assert.equal(push.notification.silent, 'when-visible');
+});
+
+test('buildContentPush still accepts boolean notification.silent', () => {
+  for (const silent of [true, false]) {
+    const push = buildContentPush({ ...COMMON, message: 'hi', notification: { silent } });
+    assert.equal(push.notification.silent, silent);
+  }
+});
+
+test("buildContentPush rejects any notification.silent string other than 'when-visible'", () => {
+  for (const bad of ['yes', 'when-hidden', 'always', '', 'WHEN-VISIBLE', 1, null]) {
+    assert.throws(
+      () => buildContentPush({ ...COMMON, message: 'hi', notification: { silent: bad } }),
+      /'notification\.silent' must be true, false, or "when-visible"/,
+      `notification.silent: ${JSON.stringify(bad)} should reject`,
     );
   }
 });

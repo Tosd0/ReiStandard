@@ -429,7 +429,7 @@ function buildNotificationOptions(data) {
 }
 ```
 
-> 上面 `buildNotificationOptions` 是「不用包」的手写参考实现，默认值（`vibrate`、`actions`、`renotify: true`）由你自定。SDK 的 `createNotificationFromPayload`（`@rei-standard/amsg-sw`）默认更克制：不带 `vibrate` / `actions`，`renotify` / `requireInteraction` / `silent` 默认 `false`，`tag` 缺省回落到 `payload.messageId`，这些都可被 `payload.notification` 覆盖。
+> 上面 `buildNotificationOptions` 是「不用包」的手写参考实现，默认值（`vibrate`、`actions`、`renotify: true`）由你自定。SDK 的 `createNotificationFromPayload`（`@rei-standard/amsg-sw`）默认更克制：不带 `vibrate` / `actions`，`renotify` / `requireInteraction` / `silent` 默认 `false`，`tag` 缺省回落到 `payload.messageId`，这些都可被 `payload.notification` 覆盖。`silent` 除 `true` / `false` 外还认 `"when-visible"`，含义见 [4.1.2](#412-不展示通知的代价)。
 
 **通知数据结构**（与 [主动消息API标准](./active-messaging-api.md#63-推送-wire-shapeamsgpush-判别联合) 一致）:
 
@@ -712,7 +712,7 @@ if ('serviceWorker' in navigator) {
 
 #### 与系统通知的关系
 
-本节说的是「前台自己渲染一份」，跟弹不弹系统通知是两件独立的事：`postMessage` 一定派发，`showNotification` 按 `notification.show` 走。所以前台自绘不需要、也不应该顺手把系统通知关掉——嫌打扰用 `tag` 折叠加 `silent: true`。真把通知关掉是另一回事，代价见 [4.1.2 不展示通知的代价](#412-不展示通知的代价)。
+本节说的是「前台自己渲染一份」，跟弹不弹系统通知是两件独立的事：`postMessage` 一定派发，`showNotification` 按 `notification.show` 走。所以前台自绘不需要、也不应该顺手把系统通知关掉——嫌打扰用 `tag` 折叠加 `silent`（页面自绘的这类用 `"when-visible"`，前台安静、切后台照响，见 [4.1.2](#412-不展示通知的代价)）。真把通知关掉是另一回事，代价见 [4.1.2 不展示通知的代价](#412-不展示通知的代价)。
 
 ### 4.1.2 不展示通知的代价
 
@@ -734,8 +734,18 @@ if ('serviceWorker' in navigator) {
 
 所以口径只有一条，跟客户端跑在什么设备上无关：**要推就一定弹，不想弹就别推。**
 
-- 要推 → `notification.show = "always"`。嫌打扰就用 `tag` 折叠（同 `tag` 的通知互相覆盖，通知栏里只留一条）加 `silent: true`（不响铃不震动），而不是不弹。弹了通知不影响页面自绘，`postMessage` 照样派发。
+- 要推 → `notification.show = "always"`。嫌打扰就用 `tag` 折叠（同 `tag` 的通知互相覆盖，通知栏里只留一条）加 `silent`（不响铃不震动），而不是不弹。弹了通知不影响页面自绘，`postMessage` 照样派发。
 - 不想弹 → 压根别把它发成 push，落服务端收件箱，等客户端上线补拉。
+
+**`notification.silent` 管的是响不响，不是弹不弹**，所以它不参与上面这笔账——通知照样弹出来、照样进通知中心，只是安静地进。三个取值：
+
+| 值 | 行为 |
+|---|---|
+| 不配 / `false` | 正常响铃震动 |
+| `true` | 一律不响 |
+| `"when-visible"` | 有 `visibilityState === "visible"` 的客户端时静音，没有就照常响 |
+
+`"when-visible"` 是给「页面自己会把内容画出来」的那类消息准备的：用户正盯着页面时安静，人切后台或锁屏了照样叫得动。它和 `show: "when-hidden"` 一样只有 Service Worker 当场算得出来——产出端发推那一刻并不知道用户此刻在不在前台，写死 `silent: true` 的结果是切到后台也不响。实现上两者读同一份窗口可见性，一条 payload 只取一次结论。
 
 `"when-hidden"` 卡在这两条中间：应用在前台时它就是一条不弹的 push（规范允许 user agent 在有可见窗口时免掉展示约束，Chrome 认这条豁免，iOS 不认），那笔账照记。它是给既有部署留的兼容档，新实现在上面两条里挑一个。
 

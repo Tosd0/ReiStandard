@@ -68,6 +68,16 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 当设置了弹通知时，通知文案完全由 `payload.notification` 决定（支持 `title`, `body`, `icon`, `badge`, `tag`, `renotify`, `requireInteraction`, `silent`, `data` 等字段）。如果缺省，会后备到 payload 根级属性。
 
+`silent` 管的是「响不响铃、震不震」，弹不弹还是 `show` 说了算。除了 `true` / `false`，它还认一个 `"when-visible"`：
+
+| 值 | 行为 |
+|---|---|
+| 不配 / `false` | 正常响铃震动 |
+| `true` | 一律不响 |
+| `"when-visible"` | 有 `visibilityState === "visible"` 的客户端就静音，没有就照常响 |
+
+`"when-visible"` 是给「页面自己会把内容画出来」的那类消息准备的：用户正盯着页面时通知安静地躺进通知中心，人切后台或锁屏了照样响。它跟 `show: "when-hidden"` 一样只有 SW 当场算得出来——发送端发推那一刻并不知道用户在不在前台，写死 `silent: true` 的话切到后台也不会响。两者读的是同一份窗口可见性，一条 payload 只算一次。
+
 正文一路取下来是空的（或只有空白字符）时，SW 用兜底文案顶上，默认 `New message`，`installReiSW(self, { defaultBody })` 可以换成自己的。这里不能改成「干脆不弹」：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，代价见下面那节。弹一条只有标题、正文空白的横幅同样不行——用户在锁屏上看到一条什么都没有的消息、未读 +1，点进去也是空的。
 
 #### 不展示通知的代价
@@ -90,7 +100,7 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 所以口径只有一条，跟机型无关：**要推就一定弹，不想弹就别推。**
 
-- 要推 → `notification: { show: 'always' }`。嫌打扰就用 `tag` 折叠（同 `tag` 的通知互相覆盖，通知栏里只留一条）加 `silent: true`（不响铃不震动），而不是不弹。弹了通知不影响页面自绘，`postMessage` 照样派发。
+- 要推 → `notification: { show: 'always' }`。嫌打扰就用 `tag` 折叠（同 `tag` 的通知互相覆盖，通知栏里只留一条）加 `silent`（不响铃不震动），而不是不弹。只在用户看着页面时想安静的，`silent` 配 `'when-visible'`。弹了通知不影响页面自绘，`postMessage` 照样派发。
 - 不想弹 → 压根别把它发成 push，落服务端收件箱，等客户端上线补拉。
 
 `"when-hidden"` 卡在这两条中间：规范允许 user agent 在有可见窗口时免掉展示约束，Chrome 认这条豁免，iOS 不认——应用在前台时它就是一条不弹的 push，那笔账照记。它是给老部署留的兼容档，新代码不选。
@@ -131,12 +141,14 @@ navigator.serviceWorker.addEventListener('message', (e) => {
   "notification": {
     "show": "always",
     "tag": "rei-chat",
-    "silent": true
+    "silent": "when-visible"
   }
 }
 ```
 
 页面自绘照做——`postMessage` 跟弹不弹通知无关，前台照样能收到事件去渲染 Toast。系统通知那条被同 `tag` 的下一条覆盖掉，通知栏里始终只有一条，用户不会被刷屏。前台那条通知看着重复，代价却比「前台静默」小得多，理由见上一节。
+
+`silent: "when-visible"` 让这条通知在用户盯着页面时安静地进通知中心（页面已经把消息画出来了，再响一声是纯打扰），人切后台或锁屏时照常响铃震动。想不管前后台一律安静就写 `silent: true`。
 
 > **注意：对于 multipart 传输**
 > 当 payload 通过 `_multipart` 分片时，未收齐前不仅不派发业务事件，也**绝不**弹系统通知。收齐并还原为原始 payload 后，再按原始 payload 的 `notification.show` 策略执行判定。
@@ -247,7 +259,7 @@ channel.port1.onmessage = (event) => {
 | Web Push | 只发「到了客户端会弹通知」的那些 | 当场把用户叫回来。不会弹的（思考过程、工具请求、错误）不占推送通道 |
 | SW 侧 | `installReiSW(self, { onBusinessPayload })` | 落业务、按 `notification.show` 弹通知、包级 dedupe |
 | 客户端上线 | `client.getOutbox()` → 处理 → `client.ackOutbox()` | 补齐没推送的和推送没送到的，一条不少 |
-| 通知策略 | `payload.notification.show` | 要推的一律 `'always'` + `tag` 折叠 + `silent: true`；不想弹的别推，走收件箱（见[上一节](#不展示通知的代价)） |
+| 通知策略 | `payload.notification.show` / `.silent` | 要推的一律 `'always'` + `tag` 折叠 + `silent`（页面自绘的那类用 `'when-visible'`，前台安静后台照响）；不想弹的别推，走收件箱（见[上一节](#不展示通知的代价)） |
 
 一个最小形态：
 

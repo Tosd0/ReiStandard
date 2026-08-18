@@ -78,7 +78,7 @@ omit all four.
 | `tag`                | `string?`                                | Notification grouping tag. |
 | `renotify`           | `boolean?`                               | Re-alert when a matching `tag` replaces an existing notification. |
 | `requireInteraction` | `boolean?`                               | Keep the notification visible until the user dismisses it. |
-| `silent`             | `boolean?`                               | Suppress notification sound and vibration. |
+| `silent`             | `(boolean \| 'when-visible')?`            | Suppress notification sound and vibration — see [选哪个 `silent`](#选哪个-silent). |
 | `data`               | `Record<string, unknown>?`               | Custom data passed to the notification. |
 
 Unknown fields are preserved for forward compatibility, but the known
@@ -100,6 +100,18 @@ fields above are validated by the builders when present.
 想要「立刻推到、但页面自己渲染」没有专门的档：用 `'always'` + `tag` + `silent`，页面自绘不受影响（`postMessage` 跟弹不弹通知无关）。
 
 完整取舍见 [`@rei-standard/amsg-sw` README 的「不展示通知的代价」](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md#不展示通知的代价)。
+
+### 选哪个 `silent`
+
+`silent` 管的是「响不响铃、震不震」，跟弹不弹（`show`）是两件独立的事——通知照样进通知中心，只是安静地进。
+
+| 值 | SW 那边 | 什么时候用 |
+|---|---|---|
+| 不配 / `false` | 正常响铃震动 | 默认 |
+| `true` | 一律不响 | 一串连着来的通知配 `tag` 折叠，只想在通知中心留个痕迹 |
+| `'when-visible'` | 有可见窗口就静音，没有就照常响 | 页面自己会把内容画出来的那类消息：用户正看着页面就别再响一声，人切后台了照样叫得动 |
+
+`'when-visible'` 只能由 Service Worker 当场算：发送端发推那一刻并不知道用户此刻在不在前台，写死 `silent: true` 的话，用户切到后台收到的那条也不会响。判定用的是跟 `show: 'when-hidden'` 同一套窗口可见性口径，一条 payload 只算一次。
 
 ### `notificationIntent(payload)`
 

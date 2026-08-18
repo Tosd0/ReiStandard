@@ -361,8 +361,12 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
     // Ignored
   }
 
+  // 一条 payload 只取一次可见性结论，`show` 与 `silent` 共用（见
+  // hasVisibleClient 的注释）。
+  const visibleClient = hasVisibleClient(clientList);
+
   const notificationState = {
-    shouldRender: shouldRenderNotification(payload, clientList),
+    shouldRender: shouldRenderNotification(payload, visibleClient),
     shown: false,
   };
 
@@ -370,7 +374,7 @@ async function dispatchBusinessPayload(sw, payload, defaults, onNotificationSett
   const notificationWork = [dispatchPushToClients(sw, eventName, payload, clientList)];
 
   if (notificationState.shouldRender) {
-    const notification = createNotificationFromPayload(payload, defaults);
+    const notification = createNotificationFromPayload(payload, defaults, visibleClient);
     // A rejected showNotification (permission revoked / quota / OS error)
     // must NOT stop onNotificationSettled from running — that callback is
     // the only thing that clears `notificationStatePending`, and leaving
@@ -458,6 +462,21 @@ function resolveEventName(payload) {
 }
 
 /**
+ * 当下有没有一个可见的窗口客户端——「用户此刻正盯着页面吗」这件事，全 SW
+ * 只有这一处口径。`show: 'when-hidden'`（弹不弹）与 `silent: 'when-visible'`
+ * （响不响）都读它，而且每条 payload 只算一次、两处共用同一个结论：
+ * `client.visibilityState` 是实时属性，分头各读一次可能读到两个时刻的状态，
+ * 弹出来的通知就会「按 A 时刻决定要弹、按 B 时刻决定静音」。
+ *
+ * @param {Array<Client>} clientList - 已经取好的 `clients.matchAll` 结果
+ * @returns {boolean}
+ */
+function hasVisibleClient(clientList) {
+  return Array.isArray(clientList)
+    && clientList.some(client => client && client.visibilityState === 'visible');
+}
+
+/**
  * True when the payload should trigger `showNotification`.
  *
  * 弹不弹的判定本身在 `@rei-standard/amsg-shared` 的 `notificationIntent`：
@@ -470,10 +489,10 @@ function resolveEventName(payload) {
  * 而那只有 SW 知道。
  *
  * @param {Record<string, unknown>} payload
- * @param {Array<Client>} clientList
+ * @param {boolean} visibleClient - `hasVisibleClient(clientList)` 的结论
  * @returns {boolean}
  */
-function shouldRenderNotification(payload, clientList) {
+function shouldRenderNotification(payload, visibleClient) {
   const intent = notificationIntent(payload);
   if (intent === 'always') return true;
   if (intent === 'never') return false;
@@ -482,7 +501,7 @@ function shouldRenderNotification(payload, clientList) {
   // 样记账，宽限期过了就吊销订阅。所以它是给老部署留的兼容档，新代码要推就发
   // 'always' + tag 折叠，不想弹就别把它发成 push（见 README 的「不展示通知的
   // 代价」一节）。
-  return !clientList.some(client => client.visibilityState === 'visible');
+  return !visibleClient;
 }
 
 /**
@@ -572,7 +591,32 @@ function resolveNotificationBody(value, defaults) {
   return typeof fallback === 'string' && fallback.trim() ? fallback : DEFAULT_NOTIFICATION_BODY;
 }
 
-function createNotificationFromPayload(payload, defaults) {
+/**
+ * `notification.silent` 取到的值算成 `showNotification` 要的布尔。
+ *
+ * `true` / `false` 是定值；`'when-visible'` 表示「用户正看着页面就别响」——
+ * 静不静音由 SW 收到这条时的窗口可见性定，而不是发送端发推那一刻。发送端定
+ * 不了这件事：它不知道用户此刻在不在前台，写死 `silent: true` 的结果是切后台
+ * 也不响。别的值按老规矩走 `Boolean()`，行为跟以前逐字节一致。
+ *
+ * @param {unknown} value - `notification.silent` ?? 顶层 `silent`
+ * @param {boolean} visibleClient - `hasVisibleClient(clientList)` 的结论
+ * @returns {boolean}
+ */
+function resolveNotificationSilent(value, visibleClient) {
+  if (value === 'when-visible') return visibleClient === true;
+  return Boolean(value);
+}
+
+/**
+ * @param {Record<string, unknown>} payload
+ * @param {Object} defaults
+ * @param {boolean} [visibleClient] - `hasVisibleClient(clientList)` 的结论，
+ *   `silent: 'when-visible'` 要用。取不到时按「没有可见窗口」算：宁可多响一
+ *   声，也不能让切在后台的用户错过这条。
+ * @returns {{ title: string, options: Record<string, unknown> }}
+ */
+function createNotificationFromPayload(payload, defaults, visibleClient = false) {
   if (!payload || typeof payload !== 'object') {
     return {
       title: 'New notification',
@@ -616,7 +660,10 @@ function createNotificationFromPayload(payload, defaults) {
       requireInteraction: Boolean(
         pushNotification.requireInteraction ?? payload.requireInteraction ?? false
       ),
-      silent: Boolean(pushNotification.silent ?? payload.silent ?? false)
+      silent: resolveNotificationSilent(
+        pushNotification.silent ?? payload.silent ?? false,
+        visibleClient
+      )
     }
   };
 }
@@ -897,7 +944,9 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
     // Ignored
   }
 
-  if (!shouldRenderNotification(payload, clientList)) {
+  const visibleClient = hasVisibleClient(clientList);
+
+  if (!shouldRenderNotification(payload, visibleClient)) {
     return { shown: false, reason: 'policy-suppressed' };
   }
 
@@ -905,7 +954,7 @@ async function maybeShowDuplicateNotification(sw, payload, claim, ctx) {
     defaultIcon: ctx.defaultIcon,
     defaultBadge: ctx.defaultBadge,
     defaultBody: ctx.defaultBody,
-  });
+  }, visibleClient);
 
   try {
     await sw.registration.showNotification(notification.title, notification.options);
