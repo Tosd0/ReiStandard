@@ -194,7 +194,7 @@ const message = body.length <= remainingBytes ? body : body.slice(0, remainingBy
 
 为什么这么分：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈。`reasoning` / `tool_request` / `error` 在 Service Worker 那边是静默送给页面的，推过去不会有任何可见反馈，却要跟浏览器赊一次账——Firefox 对这类 push 有配额、超了退掉订阅，iOS 给新订阅几天宽限期、过后一条就吊销订阅，而且掉订阅是静默发生的，服务端只看得到后续推送返回 410。而这些内容在收件箱里一个字不少，客户端上线补拉就行（完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节）。
 
-**想让某一条照样弹**，给它带上 `notification: { show: 'always' }`——判定读的是与 Service Worker 同一份规则（`@rei-standard/amsg-shared` 的 `notificationIntent`），宿主说了要弹，发送端就当它值得占用推送通道。逐条控制，不需要在服务端配开关。嫌打扰就配 `tag` 折叠加 `silent: true`，而不是不弹。`show: 'when-hidden'` 也照推（它到底弹不弹只有 Service Worker 当场知道），但那是给老部署留的兼容档，新代码在「一定弹」和「压根不推」里挑一个。
+**想让某一条照样弹**，给它带上 `notification: { show: 'always' }`——判定读的是与 Service Worker 同一份规则（`@rei-standard/amsg-shared` 的 `notificationIntent`），宿主说了要弹，发送端就当它值得占用推送通道。逐条控制，不需要在服务端配开关。嫌打扰就配 `tag` 折叠加 `silent`，而不是不弹——只在用户看着页面时想安静的写 `silent: 'when-visible'`，静不静音由 Service Worker 收到时现算（发送端定不了这件事，它不知道用户此刻在不在前台）。`show: 'when-hidden'` 也照推（它到底弹不弹只有 Service Worker 当场知道），但那是给老部署留的兼容档，新代码在「一定弹」和「压根不推」里挑一个。
 
 跳过推送的那条不标 `delivered_at`，行留在收件箱里等客户端补收；这正是能跳过的前提。
 

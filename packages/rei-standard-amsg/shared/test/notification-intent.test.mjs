@@ -49,4 +49,22 @@ describe('notificationIntent', () => {
     assert.equal(notificationIntent({ messageKind: 'content', notification: 'always' }), 'always');
     assert.equal(notificationIntent({ messageKind: 'reasoning', notification: 'always' }), 'never');
   });
+
+  test('silent 只管响不响，不影响弹不弹的判定', () => {
+    // 发送端拿这个判定决定「这条值不值得占用推送通道」。silent 无论取哪档都
+    // 不该动它——不然 `silent: 'when-visible'` 的消息会被当成不弹的那类，
+    // 只落收件箱、推送根本不发。
+    for (const silent of [true, false, 'when-visible']) {
+      assert.equal(
+        notificationIntent({ messageKind: 'content', notification: { silent } }),
+        'always',
+        `silent: ${JSON.stringify(silent)} 不该把 content 变成不弹`,
+      );
+      assert.equal(
+        notificationIntent({ messageKind: 'reasoning', notification: { silent } }),
+        'never',
+        `silent: ${JSON.stringify(silent)} 不该把 reasoning 变成弹`,
+      );
+    }
+  });
 });

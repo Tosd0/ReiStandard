@@ -576,7 +576,7 @@ return {
 
 decision 跟 push 内容的 `messageKind` 分布完全解耦——lib 不检查「`tool-request` decision 是不是必须含 `tool_request` push」之类的搭配，hook 想怎么组合就怎么组合。
 
-> 上面那条 `tool_request` 不弹横幅，是要记账的：订阅按 `userVisibleOnly: true` 建，收到 push 却不弹通知，Firefox 按配额退订、iOS 在订阅的宽限期过后直接吊销。这条线上没有服务端收件箱可以退，所以要么给它配上 `notification: { show: 'always', … }`（用 `tag` 折叠加 `silent: true` 压打扰），要么认下这笔账。完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节。
+> 上面那条 `tool_request` 不弹横幅，是要记账的：订阅按 `userVisibleOnly: true` 建，收到 push 却不弹通知，Firefox 按配额退订、iOS 在订阅的宽限期过后直接吊销。这条线上没有服务端收件箱可以退，所以要么给它配上 `notification: { show: 'always', … }`（用 `tag` 折叠加 `silent` 压打扰，页面自绘的那类可以配 `silent: 'when-visible'`，前台安静、切后台照响），要么认下这笔账。完整取舍见 `@rei-standard/amsg-sw` README 的「不展示通知的代价」一节。
 
 ### `decision: 'continue'` + `nextHistory` 的脚枪
 

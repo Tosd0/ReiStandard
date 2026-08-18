@@ -124,6 +124,10 @@ export const PUSH_SOURCE = Object.freeze({
  *     un-kinded payloads) will display a system notification. `reasoning` / `tool_request` /
  *     `error` will dispatch silently.
  *   - `show: "always"`, `"when-hidden"`, or `false` overrides this default.
+ *   - `silent: "when-visible"` is resolved by the SW at render time from the
+ *     same window-visibility check `show: "when-hidden"` uses: silent while a
+ *     `visibilityState === "visible"` window client exists, audible otherwise.
+ *     `true` / `false` stay literal.
  *   - When rendering, `notification.*` is consulted first, with per-field
  *     fallback to the matching top-level payload fields (`title`,
  *     `body`/`message`, `icon`/`avatarUrl`, `badge`, `tag`/`messageId`,
@@ -140,6 +144,11 @@ export const PUSH_SOURCE = Object.freeze({
  * 码不选。`show: false` 在两端也不是同一件事——有收件箱的发送端见到它根本不发
  * 这条 push，SW 压根收不到。
  *
+ * 想要「前台安静、切后台照常响」就配 `silent: "when-visible"`：`show` 照旧
+ * `"always"`（通知一定弹出来，那笔账不欠），响不响铃由 SW 收到时看有没有可见
+ * 窗口现算。发送端定不了这件事——它发推那一刻并不知道用户在不在前台，写死
+ * `silent: true` 的结果是切后台也不响。
+ *
  * 各档取舍见本包 README 的「选哪个 `show`」与 `@rei-standard/amsg-sw` README
  * 的「不展示通知的代价」。
  *
@@ -152,7 +161,7 @@ export const PUSH_SOURCE = Object.freeze({
  * @property {string}  [tag]                - Notification grouping tag; matching tag replaces the prior notification (falls back to top-level `tag`, then `messageId`, then a generated unique tag).
  * @property {boolean} [renotify]           - When tag matches, still vibrate/sound (falls back to top-level `renotify`, default false at SW).
  * @property {boolean} [requireInteraction] - Notification stays until user dismisses (falls back to top-level `requireInteraction`, default false at SW).
- * @property {boolean} [silent]             - Suppress sound and vibration (falls back to top-level `silent`, default false at SW).
+ * @property {boolean | "when-visible"} [silent] - Suppress sound and vibration. `true` / `false` are literal; `"when-visible"` is decided by the SW at render time — silent while a window client is visible, audible otherwise (falls back to top-level `silent`, default false at SW).
  * @property {Record<string, unknown>} [data] - Custom payload data to attach to the notification (falls back to top-level `data`).
  */
 
@@ -537,8 +546,9 @@ export function buildToolRequestPush(args) {
  * Validate the optional `notification` argument.
  * Plain object required (`null` / arrays / primitives rejected); field-level shape is
  * checked best-effort — `title` / `body` / `icon` / `badge` / `tag`
- * must be strings when present, `renotify` / `requireInteraction` / `silent`
- * must be booleans. Unknown keys are tolerated so the SW's
+ * must be strings when present, `renotify` / `requireInteraction`
+ * must be booleans, `silent` takes a boolean or the string `"when-visible"`.
+ * Unknown keys are tolerated so the SW's
  * forward-compatibility (it just won't read them) is preserved.
  *
  * @param {string} kind
@@ -558,10 +568,15 @@ function validateNotificationArg(kind, value) {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a string when present`);
     }
   }
-  for (const f of ['renotify', 'requireInteraction', 'silent']) {
+  for (const f of ['renotify', 'requireInteraction']) {
     if (n[f] !== undefined && typeof n[f] !== 'boolean') {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a boolean when present`);
     }
+  }
+  // `silent` 比另外两个多一档：`'when-visible'` 把「响不响」推迟到 SW 收到时
+  // 按窗口可见性现算，别的字符串照旧拒掉。
+  if (n.silent !== undefined && typeof n.silent !== 'boolean' && n.silent !== 'when-visible') {
+    throw new Error(`[amsg-shared] ${kind}: 'notification.silent' must be true, false, or "when-visible"`);
   }
   if (n.data !== undefined && (n.data === null || typeof n.data !== 'object' || Array.isArray(n.data))) {
     throw new Error(`[amsg-shared] ${kind}: 'notification.data' must be a plain object when present`);
