@@ -96,7 +96,7 @@ interface StorageAdapter {
 
 ```ts
 await store.gc({ refSources, minAgeMs = 72 * 3600 * 1000 });
-// → { deleted: number, kept: number }
+// → { deleted: number, kept: number, aborted: boolean }（aborted=true 即安全阀触发、整轮放弃）
 ```
 
 - **mark**：`refSources` 是宿主提供的、吐字符串的 async iterable（例如：资产表每行的 JSON 串、localStorage 全量值）。SDK 对每段字符串跑 `extractRefs`，汇总出「在用令牌」集合。
