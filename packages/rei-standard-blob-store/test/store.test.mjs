@@ -44,6 +44,13 @@ test('delete best-effort：非令牌不动、适配器抛错吞掉', async () =>
   await createBlobStore({ adapter: brokenAdapter() }).delete('blobref:b_1_0_aaaaaa'); // 不抛
 });
 
+test('delete：非令牌根本不碰适配器', async () => {
+  const calls = [];
+  const adapter = { get: async () => null, put: async () => {}, delete: async (id) => { calls.push(id); }, keys: async () => [] };
+  await createBlobStore({ adapter }).delete('data:xxx');
+  assert.deepEqual(calls, []);
+});
+
 test('resolveToDataUrl：令牌→data URL、非令牌透传、丢图→空串', async () => {
   const store = createBlobStore({ adapter: memoryAdapter() });
   const token = await store.put(blobOf('pic'));
