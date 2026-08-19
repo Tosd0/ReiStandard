@@ -15,7 +15,7 @@ export function genId() {
 }
 
 /**
- * 反解 id 里的创建时间（毫秒时间戳）。只认识本包生成的 `b_` 格式，其余返回 null。
+ * 反解 id 里的创建时间（毫秒时间戳）。格式不匹配、或时间明显不合理（未来 24 小时之后）时返回 null。
  * 反解出的时间戳如果落在未来（超出当前时刻 24 小时），说明这不是本包生成的 id
  * （多半是宿主存量的其他格式撞上了 `b_` 前缀），同样返回 null——交给 GC 按「老」处理，
  * 避免这类外来 id 被新鲜豁免永久保护、造成泄漏。
@@ -41,7 +41,8 @@ export function parseIdTimestamp(id) {
  */
 export function extractRefs(str, prefix = DEFAULT_PREFIX) {
   if (typeof str !== 'string') return [];
-  if (!prefix) return [];
+  // 空前缀是配置错误——静默返回 [] 会被 GC 当成「无人引用」，整库清场；非字符串那条保持返回 []（数据问题，答「没有 ref」是实话）。
+  if (!prefix) throw new TypeError('extractRefs: prefix 不能为空');
   const refs = [];
   let i = 0;
   while ((i = str.indexOf(prefix, i)) !== -1) {

@@ -40,8 +40,8 @@ test('extractRefs 提取多个令牌、支持自定义前缀、裸前缀不算',
   assert.deepEqual(extractRefs('pic:abc_1', 'pic:'), ['pic:abc_1']);
 });
 
-test('extractRefs 空前缀返回空数组且不死循环', () => {
-  assert.deepEqual(extractRefs('abc', ''), []);
+test('extractRefs 空前缀是配置错误，抛 TypeError', () => {
+  assert.throws(() => extractRefs('abc', ''), TypeError);
 });
 
 test('extractRefs 非字符串输入返回空数组', () => {
