@@ -54,7 +54,7 @@ import { createBlobStore, createIdbAdapter, dataUrlToBlob, blobToDataUrl, extrac
 
 const store = createBlobStore({ adapter, prefix = 'blobref:' });
 
-await store.put(blob);              // → 'blobref:<id>'
+await store.put(blob);              // → 'blobref:<id>'；非 Blob 入参抛 TypeError（防静默产出死令牌）
 await store.get(token);             // → Blob | null（非令牌 / 不存在 / 读失败都是 null，不抛）
 await store.delete(token);          // best-effort，失败静默
 store.isRef(v);                     // 类型谓词收窄，无品牌类型
@@ -102,13 +102,14 @@ await store.gc({ refSources, minAgeMs = 72 * 3600 * 1000 });
 - **mark**：`refSources` 是宿主提供的、吐字符串的 async iterable（例如：资产表每行的 JSON 串、localStorage 全量值）。SDK 对每段字符串跑 `extractRefs`，汇总出「在用令牌」集合。
 - **sweep**：`adapter.keys()` 里不在集合中的 id 删除。
 
-三道安全阀，总原则「宁可留孤儿，绝不删活图」：
+四道安全阀，总原则「宁可留孤儿，绝不删活图」：
 
 1. 任何一个 refSource 迭代中抛错 → 整轮放弃，一个都不删。
 2. 新鲜豁免：id 反解出的创建时间距今不足 `minAgeMs` 的不删。这挡住一个竞态：`put` 返回令牌到宿主把令牌写进业务字段并持久化之间有窗口，此时扫描看不到引用。
 3. 反解不出时间的 id（宿主存量数据）按「老」处理，正常参与判定——老数据早该被引用了，扫不到引用即真孤儿。
+4. 超出 id 字符集 `[A-Za-z0-9_]` 的 id（如存量 UUID 带 `-`）一律保留：`extractRefs` 按该字符集划边界，这类 id 结构上不可能被 mark 到，「无引用」对它们不构成孤儿证据。代价是这类 id 永不回收，想回收先迁移。
 
-**宿主的义务（README 显眼处必须写）**：`refSources` 必须枚举全部可能含令牌的持久化面。漏掉一个面，那个面独占引用的图会被当孤儿删掉。接入方应在代码里维护一份引用面清单并随新功能更新。
+**宿主的义务（README 显眼处必须写）**：`refSources` 必须枚举全部可能含令牌的持久化面，且吐出的字符串必须是令牌逐字可见的明文——压缩/加密/编码过的面要先还原再吐（这种情况安全阀不触发，令牌不可见等于该面没扫）。漏掉一个面，那个面独占引用的图会被当孤儿删掉。接入方应在代码里维护一份引用面清单并随新功能更新。
 
 ## `/react` 子路径
 
@@ -138,7 +139,7 @@ const url = useBlobUrl(store, value);
 - GC 宁留勿删（任何不确定 → 不删）
 - 迁移失败回退原串，调用方永远拿到可渲染的值
 
-抛错只发生在明确的编程错误上（如给 `dataUrlToBlob` 传非 data URL）。
+抛错只发生在明确的编程错误上（如给 `dataUrlToBlob` 传非 data URL、给 `put` 传非 Blob）。
 
 ## 测试策略
 

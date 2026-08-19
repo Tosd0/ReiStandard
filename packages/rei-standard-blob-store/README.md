@@ -67,15 +67,22 @@ react 是可选 peerDependency，不用 React 的项目零负担。
 const result = await store.gc({
   refSources: (async function* () {
     for (const row of await myDb.getAllAssets()) yield JSON.stringify(row);
-    for (let i = 0; i < localStorage.length; i++) yield localStorage.getItem(localStorage.key(i)) ?? '';
+    // localStorage 先同步快照再吐：async generator 每次 yield 都会挂起，
+    // 挂起期间并发的 removeItem 会让下标移位、漏扫一个 key
+    const localValues = [];
+    for (let i = 0; i < localStorage.length; i++) localValues.push(localStorage.getItem(localStorage.key(i)) ?? '');
+    yield* localValues;
   })(),
 });
 // → { deleted, kept, aborted }
 ```
 
-**⚠️ 宿主义务：`refSources` 必须枚举全部可能含令牌的持久化面。漏掉一个面，那个面独占引用的图会被当孤儿删掉。** 建议在代码里维护一份引用面清单并随新功能更新。
+**⚠️ 宿主义务（GC 唯一要你自己保证对的部分）：**
 
-安全阀（总原则「宁可留孤儿，绝不删活图」）：任一来源抛错整轮放弃（`aborted: true`）；创建不足 72 小时（`minAgeMs` 可配）的不删，挡住「已 put、引用未落盘」的竞态。`refSources` 传错东西（单个字符串、吐非字符串的迭代器、不可迭代对象）会直接抛 `TypeError`——配置错误吵着失败，不会静默清库。
+- **引用面要全**：`refSources` 必须枚举全部可能含令牌的持久化面。漏掉一个面，那个面独占引用的图会被当孤儿删掉。建议在代码里维护一份引用面清单并随新功能更新。
+- **吐出来的必须是令牌逐字可见的明文**：某个面若压缩（如 lz-string）、加密或 URL 编码后才落盘，要先还原成明文再吐。这种情况枚举不报错、安全阀也不触发，但令牌在文本里不可见，等于这个面没扫——照样删活图。
+
+安全阀（总原则「宁可留孤儿，绝不删活图」）：任一来源抛错整轮放弃（`aborted: true`）；创建不足 72 小时（`minAgeMs` 可配）的不删，挡住「已 put、引用未落盘」的竞态；超出 `[A-Za-z0-9_]` 字符集的 id（比如存量数据直接拿 UUID 当 id，含 `-`）一律保留不删——这类 id 在文本提取时会被截断、无法安全判定引用，读写不受影响，只是想让它们参与回收得先迁移成本包生成的 id。`refSources` 传错东西（单个字符串、吐非字符串的迭代器、不可迭代对象）会直接抛 `TypeError`——配置错误吵着失败，不会静默清库。
 
 调用时机不用讲究：挑个后台空闲的时候跑一次，或者干脆挂在设置页的「清理缓存」之类的手动按钮上，不需要频繁跑。反过来，`refSources` 的引用面清单没把握齐全时，先别开 GC——孤儿 Blob 只是多占点空间，删活图才是不可逆的。
 
@@ -85,10 +92,10 @@ const result = await store.gc({
 
 | 方法 | 签名 | 语义 |
 |---|---|---|
-| `createBlobStore` | `createBlobStore({ adapter, prefix? }) → store` | 创建 store 实例；`adapter` 必填，`prefix` 默认 `blobref:`，必须是非空字符串（配置错误抛 `TypeError`） |
+| `createBlobStore` | `createBlobStore({ adapter, prefix? }) → store` | 创建 store 实例；`adapter` 必填，`prefix` 默认 `blobref:`，必须是非空字符串（配置错误抛 `TypeError`）。自定义前缀建议以 `:` 这类非 `[A-Za-z0-9_]` 字符收尾——`pic` 这种前缀会把普通字符串（如 `picture.png`）误判成令牌 |
 | `store.prefix` | `string`（勿修改） | 当前令牌前缀 |
 | `store.isRef(value)` | `(value: unknown) → boolean` | 判断 `value` 是不是本 store 生成的令牌 |
-| `store.put(blob)` | `(blob: Blob) → Promise<string>` | 存入 Blob，返回令牌；适配器失败会上抛 |
+| `store.put(blob)` | `(blob: Blob) → Promise<string>` | 存入 Blob，返回令牌；适配器失败会上抛。入参不是 Blob（如误传 data URL 字符串）抛 `TypeError`——字符串请走 `migrateDataUrl` |
 | `store.get(token)` | `(token: unknown) → Promise<Blob \| null>` | 令牌 → Blob；非令牌 / 不存在 / 读失败一律返回 `null` |
 | `store.delete(token)` | `(token: unknown) → Promise<void>` | best-effort 删除，失败静默不抛。同一令牌可能被多处引用，删之前先确认没人再用它——误删会让其他引用处变成死链；拿不准就交给上面的 GC，别手动 delete |
 | `store.resolveToDataUrl(value)` | `(value: string) → Promise<string>` | 令牌 → data URL；非令牌原样返回；图已丢或编码失败返回空串 |
