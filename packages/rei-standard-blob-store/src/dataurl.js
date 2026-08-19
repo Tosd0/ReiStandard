@@ -1,21 +1,27 @@
 // data URL ⇄ Blob。base64 编解码优先走 Uint8Array.fromBase64 / toBase64
 //（Safari 18.2+ / Firefox 133+ / Chrome 140+），老环境回退 atob/btoa 手编。
-// Blob → data URL 在浏览器主线程优先 FileReader（原生高效、经消费者验证的路径）。
+// Blob → data URL 优先走 FileReader（原生高效、经消费者验证的路径，Window / Worker 都支持）。
 
 /**
  * `data:<mime>[;base64],<payload>` → Blob。非 data URL 抛错。
+ * 只取媒体类型，`;charset=` 等参数丢弃。
  * @param {string} dataUrl
  * @returns {Blob}
  */
 export function dataUrlToBlob(dataUrl) {
+  if (typeof dataUrl !== 'string') throw new TypeError('Invalid data URL');
   const comma = dataUrl.indexOf(',');
-  if (!dataUrl.startsWith('data:') || comma < 0) throw new Error('Invalid data URL');
+  if (!dataUrl.startsWith('data:') || comma < 0) throw new TypeError('Invalid data URL');
   const header = dataUrl.slice(0, comma);
   const mimeMatch = header.match(/^data:([^;,]+)/);
   const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-  if (!/;base64/i.test(header)) {
-    // 非 base64（如 utf8 编码的 svg），按 UTF-8 处理。
-    return new Blob([decodeURIComponent(dataUrl.slice(comma + 1))], { type: mime });
+  if (!/;base64$/i.test(header)) {
+    // 宽容解码：合法的 %XX 段照常解码，坏转义段（如 SVG 里的 width="100%"）原样保留，
+    // 与浏览器对 data URL 的 percent-decode 行为一致。
+    const text = dataUrl.slice(comma + 1).replace(/(?:%[0-9A-Fa-f]{2})+/g, (m) => {
+      try { return decodeURIComponent(m); } catch { return m; }
+    });
+    return new Blob([text], { type: mime });
   }
   const b64 = dataUrl.slice(comma + 1);
   let bytes;
@@ -43,7 +49,7 @@ export async function blobToDataUrl(blob) {
       reader.readAsDataURL(blob);
     });
   }
-  // 无 FileReader（Worker / Node）或无 type（FileReader 会丢 MIME 头）时手编。
+  // 无 FileReader（Node 等非浏览器环境）或无 type（FileReader 会丢 MIME 头）时手编。
   const mime = blob.type || 'application/octet-stream';
   const bytes = new Uint8Array(await blob.arrayBuffer());
   let b64;
