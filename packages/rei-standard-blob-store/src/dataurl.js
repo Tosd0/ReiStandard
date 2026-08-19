@@ -11,9 +11,10 @@
 export function dataUrlToBlob(dataUrl) {
   if (typeof dataUrl !== 'string') throw new TypeError('Invalid data URL');
   const comma = dataUrl.indexOf(',');
-  if (!dataUrl.startsWith('data:') || comma < 0) throw new TypeError('Invalid data URL');
+  // scheme 大小写不敏感（RFC 2397）：DATA:image/png 浏览器照常渲染
+  if (!/^data:/i.test(dataUrl) || comma < 0) throw new TypeError('Invalid data URL');
   const header = dataUrl.slice(0, comma);
-  const mimeMatch = header.match(/^data:([^;,]+)/);
+  const mimeMatch = header.match(/^data:([^;,]+)/i);
   const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
   if (!/;base64$/i.test(header)) {
     // 宽容解码：合法的 %XX 段照常解码，坏转义段（如 SVG 里的 width="100%"）原样保留，

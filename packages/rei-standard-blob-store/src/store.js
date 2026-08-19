@@ -36,8 +36,14 @@ export function createBlobStore(options) {
      * 存入 Blob，返回令牌。适配器失败会上抛。
      * @param {Blob} blob
      * @returns {Promise<string>}
+     * @throws {TypeError} 入参不是 Blob——非 Blob 往往能被适配器存下，但 get 侧会归一成
+     *   null，等于静默产出一个永远解析为空的死令牌。编程错误吵着抛；
+     *   跨 realm 的 instanceof 不可靠，按能力鸭子判定。
      */
     async put(blob) {
+      if (!blob || typeof blob.arrayBuffer !== 'function' || typeof blob.slice !== 'function') {
+        throw new TypeError('put: 需要 Blob；data URL 字符串请走 migrateDataUrl');
+      }
       const id = genId();
       await adapter.put(id, blob);
       return prefix + id;
@@ -133,8 +139,9 @@ async function resolveDeep(store, root) {
     const node = stack.pop();
     if (seen.has(node)) continue;
     seen.add(node);
-    // 数组走 keys()：洞也会产出下标，读出来是 undefined，不会中断遍历
-    const keys = Array.isArray(node) ? node.keys() : Object.keys(node);
+    // Object.keys 对数组同时覆盖下标键与 expando 属性（structuredClone 会保留后者）；
+    // 稀疏数组的洞没有自有键、直接跳过，同样不会中断遍历
+    const keys = Object.keys(node);
     for (const key of keys) {
       const v = node[key];
       if (store.isRef(v)) {

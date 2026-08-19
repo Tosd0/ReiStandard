@@ -4,11 +4,18 @@
 //      引用落盘之前的竞态窗口）；
 //   3) 反解不出时间的存量 id 按「老」处理：老数据早该被引用了，扫不到即真孤儿。
 //   4) 入参传错（refSources 不是可迭代对象、混进非字符串）→ 吵着抛 TypeError，不静默当空处理。
-// 宿主义务：refSources 必须枚举全部可能含令牌的持久化面，漏一个面就会删活图。
+//   5) 超出令牌字符集 [A-Za-z0-9_] 的 id（如 UUID 带 `-`）一律保留：extractRefs 按该字符集
+//      划边界，这类 id 结构上不可能被 mark 到，「无引用」对它们不构成孤儿证据。
+//      代价是这类存量 id 永不回收——想回收先迁移成本包生成的格式。
+// 宿主义务：refSources 必须枚举全部可能含令牌的持久化面，且吐出令牌逐字可见的明文
+//（压缩/加密/编码过的面先还原再吐）——面漏了或令牌不可见，都会删活图。
 
 import { extractRefs, parseIdTimestamp } from './token.js';
 
 const DEFAULT_MIN_AGE_MS = 72 * 3600 * 1000;
+
+// 与 extractRefs 的 id 边界字符集保持一致（见 token.js）
+const ID_CHARSET = /^[A-Za-z0-9_]+$/;
 
 /**
  * @typedef {Object} GcOptions
@@ -19,7 +26,7 @@ const DEFAULT_MIN_AGE_MS = 72 * 3600 * 1000;
 /**
  * @typedef {Object} GcResult
  * @property {number} deleted 实际删除数
- * @property {number} kept 保留数 = 被引用的 + 新鲜豁免的 + 删除失败的
+ * @property {number} kept 保留数 = 被引用的 + 新鲜豁免的 + 删除失败的 + 超出令牌字符集豁免的
  * @property {boolean} aborted 安全阀触发（来源出错 / keys 读不出）→ 整轮放弃，一个都没删
  */
 
@@ -68,7 +75,8 @@ export async function runGc({ adapter, prefix }, opts) {
   // 串行删除是刻意的——GC 是后台活儿，并行只会压满 IDB。
   for (const id of ids) {
     if (used.has(id)) { kept++; continue; }
-    const ts = parseIdTimestamp(id);
+    if (!ID_CHARSET.test(id)) { kept++; continue; } // 安全阀 5：mark 不可能命中的 id，无引用不构成证据
+    const ts = parseIdTimestamp(id, now);
     if (ts !== null && now - ts < minAgeMs) { kept++; continue; }
     try {
       await adapter.delete(id);

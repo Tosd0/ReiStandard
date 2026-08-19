@@ -20,14 +20,15 @@ export function genId() {
  * （多半是宿主存量的其他格式撞上了 `b_` 前缀），同样返回 null——交给 GC 按「老」处理，
  * 避免这类外来 id 被新鲜豁免永久保护、造成泄漏。
  * @param {string} id
+ * @param {number} [now] 注入的当前时间（测试用；GC 会把它的时钟传进来，避免两个钟不一致），默认 Date.now()
  * @returns {number | null}
  */
-export function parseIdTimestamp(id) {
+export function parseIdTimestamp(id, now = Date.now()) {
   const m = /^b_([0-9a-z]+)_/.exec(id);
   if (!m) return null;
   const ts = parseInt(m[1], 36);
   if (!Number.isFinite(ts)) return null;
-  if (ts > Date.now() + 24 * 3600 * 1000) return null;
+  if (ts > now + 24 * 3600 * 1000) return null;
   return ts;
 }
 

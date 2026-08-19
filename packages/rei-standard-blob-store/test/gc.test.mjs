@@ -173,3 +173,19 @@ test('refSources 里非字符串行对象先出现、后面那句才抛错——
   await assert.rejects(() => store.gc({ refSources: gen(), minAgeMs: 0 }), TypeError);
   assert.equal(adapter.map.size, 2);
 });
+
+test('超出令牌字符集的 id（如 UUID 带 -）一律保留：extractRefs 会在越界字符处截断，这类 id 不可能被 mark 到，「无引用」不构成孤儿证据', async () => {
+  const { store, adapter } = await seed(0);
+  const referenced = '550e8400-e29b-41d4-a716-446655440000';
+  const stray = 'a1b2c3d4-ffff-0000-8888-123456789abc';
+  adapter.map.set(referenced, blobOf('u'));
+  adapter.map.set(stray, blobOf('o'));
+  // referenced 明明被业务字段引用，但 mark 集里只有截断的半截 'blobref:550e8400'——
+  // 没有字符集豁免的话，两个都会被当孤儿删掉（含被引用的活图）
+  const result = await store.gc({
+    refSources: [JSON.stringify({ wallpaper: 'blobref:' + referenced })],
+    minAgeMs: 0,
+  });
+  assert.deepEqual(result, { deleted: 0, kept: 2, aborted: false });
+  assert.equal(adapter.map.size, 2);
+});

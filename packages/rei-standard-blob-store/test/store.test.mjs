@@ -172,3 +172,23 @@ test('resolveDeep：死令牌出现 3 次也只读一次适配器（空串同样
   assert.equal(root.d[0], '');
   assert.equal(reads, 1);
 });
+
+test('put 传非 Blob（如误传 data URL 字符串 / undefined）抛 TypeError，不产出死令牌', async () => {
+  const adapter = memoryAdapter();
+  const store = createBlobStore({ adapter });
+  await assert.rejects(() => store.put('data:image/png;base64,AAAA'), TypeError);
+  await assert.rejects(() => store.put(undefined), TypeError);
+  await assert.rejects(() => store.put({ size: 3, type: 'image/png' }), TypeError);
+  assert.equal(adapter.map.size, 0); // 什么都没存进去
+});
+
+test('resolveDeep 覆盖数组上的 expando 属性（structuredClone 会保留它们，漏了令牌就进备份）', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const token = await store.put(blobOf('x'));
+  const arr = [token];
+  arr.cover = token;
+  const root = { list: arr };
+  await store.resolveDeep(root);
+  assert.match(root.list[0], /^data:/);
+  assert.match(root.list.cover, /^data:/);
+});

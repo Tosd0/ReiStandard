@@ -165,3 +165,9 @@ test('blobToDataUrl 在 FileReader 出错时 reject', async () => {
     await assert.rejects(() => blobToDataUrl(new Blob([PNG_BYTES], { type: 'image/png' })), /boom/);
   });
 });
+
+test('data: scheme 大小写不敏感（RFC 2397）：DATA:image/png 浏览器照常渲染，这里也得认', async () => {
+  const blob = dataUrlToBlob('DATA:image/png;base64,YWJj');
+  assert.equal(blob.type, 'image/png'); // mime 提取的正则也要带 i，否则会掉到 octet-stream
+  assert.equal(await blob.text(), 'abc');
+});

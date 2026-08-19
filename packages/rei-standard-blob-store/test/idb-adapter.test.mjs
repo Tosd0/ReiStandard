@@ -55,3 +55,42 @@ test('开库同步抛（没有 indexedDB 全局）不会把失败缓存住', asy
   await adapter.put('a1', new Blob(['x']));   // 缓存被毒化的话这里还会挂
   assert.deepEqual(await adapter.keys(), ['a1']);
 });
+
+test('事务错误保真：error 事件派发时 t.error 还是 null，reject 出来的必须是 request 上的真错（QuotaExceededError 不能退化成笼统的 transaction failed）', async () => {
+  // fake-indexeddb 造不出配额错误，这里手工模拟规范时序：error 事件阶段 abort 还没跑，
+  // 事务的 error 属性仍是 null，真错只在 request 上。
+  const quota = new Error('quota exceeded');
+  quota.name = 'QuotaExceededError';
+  const fakeIdb = {
+    open() {
+      const openReq = {};
+      queueMicrotask(() => {
+        openReq.result = {
+          objectStoreNames: { contains: () => true },
+          transaction() {
+            const t = { error: null };
+            t.objectStore = () => ({
+              put() {
+                const req = { error: quota };
+                queueMicrotask(() => { if (t.onerror) t.onerror(); });
+                return req;
+              },
+            });
+            return t;
+          },
+          close() {},
+        };
+        if (openReq.onsuccess) openReq.onsuccess();
+      });
+      return openReq;
+    },
+  };
+  const realIdb = globalThis.indexedDB;
+  globalThis.indexedDB = fakeIdb;
+  try {
+    const adapter = createIdbAdapter('blob-store-test-6');
+    await assert.rejects(() => adapter.put('a1', new Blob(['x'])), (err) => err === quota);
+  } finally {
+    globalThis.indexedDB = realIdb;
+  }
+});

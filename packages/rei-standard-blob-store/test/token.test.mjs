@@ -63,3 +63,12 @@ test('extractRefs 提取值切掉前缀后交给 parseIdTimestamp 能还原出�
   const ts = parseIdTimestamp(bareId);
   assert.ok(ts !== null && ts >= before - 1000 && ts <= Date.now() + 1000);
 });
+
+test('parseIdTimestamp 的「未来 24h」判定用注入的 now，不偷用真实时钟（与 GC 注入的钟保持一致）', () => {
+  const ts = Date.now();
+  const id = `b_${ts.toString(36)}_0_aaaaaa`;
+  // 相对注入时钟，ts 落在 25 小时之后 → 判为外来 id 返回 null。
+  // 内部若误用 Date.now()，ts 就是「现在」、不在未来，会错误地返回 ts。
+  assert.equal(parseIdTimestamp(id, ts - 25 * 3600 * 1000), null);
+  assert.equal(parseIdTimestamp(id, ts), ts);
+});
