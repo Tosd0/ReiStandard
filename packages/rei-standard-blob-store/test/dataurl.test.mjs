@@ -42,7 +42,7 @@ test('非 base64 data URL（utf8 svg）按 UTF-8 解码', async () => {
 
 test('非 data URL 抛错（明确的编程错误才抛）', () => {
   assert.throws(() => dataUrlToBlob('https://example.com/a.png'));
-  assert.throws(() => dataUrlToBlob(null), TypeError);
+  assert.throws(() => dataUrlToBlob(null), { name: 'TypeError', message: /Invalid data URL/ });
 });
 
 test('裸 mime 的 base64 data URL 落到 application/octet-stream（FileReader 给无 type Blob 产出的正是这个形状）', async () => {
