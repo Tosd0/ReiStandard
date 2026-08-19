@@ -11,6 +11,7 @@
 | [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 无数据库的一次性即时推送（维护态） |
 | [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | 浏览器 SDK：加密、请求封装、Push 订阅、deliver() 送达裁决 / SSE consumer |
 | [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
+| [`@rei-standard/blob-store`](./packages/rei-standard-blob-store/README.md) | 令牌式 Blob 存储——二进制进 IndexedDB，业务字段只留 `blobref:` 令牌；含孤儿 GC 与 `/react` hook |
 
 `amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
 
@@ -82,17 +83,19 @@ npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 
 ```text
 ReiStandard/
-├── standards/                   # 权威规范文本（端点、字段、错误码）
-├── packages/rei-standard-amsg/  # 5 个发布到 npm 的 SDK 包
-│   ├── shared/                  # 推送 schema（最底层，其他包都依赖）
-│   ├── server/                  # 即时 / 定时 / 周期消息 + 服务端收件箱
-│   ├── instant/                 # 无数据库的一次性即时推送（维护态）
-│   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）
-│   └── sw/                      # Service Worker（推送展示、离线队列）
-├── examples/                    # 手动接入示例（不用 SDK 包时的备用路径）
-├── tests/                       # 手动 E2E 冒烟脚本（打真实部署验证，不接 CI）
-├── scripts/                     # 仓库自检脚本（ESM 语法 / 包管理器检查）
-└── docs/                        # 本地测试、生产监控
+├── standards/                    # 权威规范文本（端点、字段、错误码）
+├── packages/                     # 6 个发布到 npm 的 SDK 包
+│   ├── rei-standard-amsg/        # 主动消息 API 标准（5 个包）
+│   │   ├── shared/               # 推送 schema（最底层，其他包都依赖）
+│   │   ├── server/               # 即时 / 定时 / 周期消息 + 服务端收件箱
+│   │   ├── instant/              # 无数据库的一次性即时推送（维护态）
+│   │   ├── client/               # 浏览器 SDK（加密、请求封装、Push 订阅）
+│   │   └── sw/                   # Service Worker（推送展示、离线队列）
+│   └── rei-standard-blob-store/  # 令牌式 Blob 存储（IndexedDB + 孤儿 GC）
+├── examples/                     # 手动接入示例（不用 SDK 包时的备用路径）
+├── tests/                        # 手动 E2E 冒烟脚本（打真实部署验证，不接 CI）
+├── scripts/                      # 仓库自检脚本（ESM 语法 / 包管理器检查）
+└── docs/                         # 本地测试、生产监控
 ```
 
 ## 📖 文档
