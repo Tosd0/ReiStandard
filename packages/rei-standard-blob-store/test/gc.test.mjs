@@ -106,10 +106,20 @@ test('refSources 传成没 await 的 Promise → 抛错（同样原先会被静�
   assert.equal(adapter.map.size, 1);
 });
 
-test('refSources 的 [Symbol.iterator] 存在但一调用就抛 → 仍是安全阀 aborted:true，不是被护栏提前拒绝（钉住用 in 探测而非读取/调用的选择）', async () => {
+test('refSources 的 [Symbol.iterator] 存在但一调用就抛 → 仍是安全阀 aborted:true，不是被护栏提前拒绝', async () => {
   const { store, adapter } = await seed(2);
   const poison = {
     [Symbol.iterator]() { throw new Error('boom'); },
+  };
+  const result = await store.gc({ refSources: poison, minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 0, aborted: true });
+  assert.equal(adapter.map.size, 2);
+});
+
+test('refSources 的 [Symbol.iterator] 是「读」就抛的 getter → 仍是安全阀 aborted:true（真正钉住用 in 探测而非 typeof 读属性的选择——普通方法属性「读」不会触发，只有 getter 会）', async () => {
+  const { store, adapter } = await seed(2);
+  const poison = {
+    get [Symbol.iterator]() { throw new Error('boom'); },
   };
   const result = await store.gc({ refSources: poison, minAgeMs: 0 });
   assert.deepEqual(result, { deleted: 0, kept: 0, aborted: true });
@@ -139,4 +149,27 @@ test('adapter.keys 读不出来 → 整轮放弃，不删', async () => {
   const result = await store.gc({ refSources: [], minAgeMs: 0 });
   assert.deepEqual(result, { deleted: 0, kept: 0, aborted: true });
   assert.equal(adapter.map.size, 1);
+});
+
+test('refSources 吐出 null 会被跳过，后续字符串里的令牌照常标记（localStorage.getItem 合法吐 null）', async () => {
+  const { store, tokens } = await seed(1);
+  const [used] = tokens;
+  async function* gen() {
+    yield null;
+    yield `wallpaper: ${used}`;
+  }
+  const result = await store.gc({ refSources: gen(), minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
+  assert.ok(await store.get(used));
+});
+
+test('refSources 里非字符串行对象先出现、后面那句才抛错——先报「传错类型」，不会被后面的抛错吞成 aborted（钉住 break 而非 continue 的选择）', async () => {
+  const { store, adapter, tokens } = await seed(2);
+  const [used] = tokens;
+  async function* gen() {
+    yield { wallpaper: used }; // 非字符串，先出现：break 立刻掐断，后面这句永远不会执行到
+    throw new Error('source broke'); // 若用 continue 迭代下去，这句才会真正抛出、把误用吞成 aborted:true
+  }
+  await assert.rejects(() => store.gc({ refSources: gen(), minAgeMs: 0 }), TypeError);
+  assert.equal(adapter.map.size, 2);
 });

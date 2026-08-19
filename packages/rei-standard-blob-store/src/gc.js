@@ -3,6 +3,7 @@
 //   2) 新鲜豁免：id 反解创建时间距今不足 minAgeMs 的不删（挡住 put 之后、
 //      引用落盘之前的竞态窗口）；
 //   3) 反解不出时间的存量 id 按「老」处理：老数据早该被引用了，扫不到即真孤儿。
+//   4) 入参传错（refSources 不是可迭代对象、混进非字符串）→ 吵着抛 TypeError，不静默当空处理。
 // 宿主义务：refSources 必须枚举全部可能含令牌的持久化面，漏一个面就会删活图。
 
 import { extractRefs, parseIdTimestamp } from './token.js';
@@ -26,6 +27,7 @@ const DEFAULT_MIN_AGE_MS = 72 * 3600 * 1000;
  * @param {{ adapter: import('./store.js').StorageAdapter, prefix: string }} ctx
  * @param {GcOptions} opts
  * @returns {Promise<GcResult>}
+ * @throws {TypeError} refSources 缺失/是裸字符串/不可迭代/吐出非字符串——都是编程错误，吵着抛，不静默
  */
 export async function runGc({ adapter, prefix }, opts) {
   const { refSources, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now() } = opts || {};
