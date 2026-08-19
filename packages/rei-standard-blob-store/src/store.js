@@ -1,0 +1,90 @@
+// createBlobStore：令牌式 Blob 存储的核心。存储后端经 StorageAdapter 注入，
+// 本模块完全不碰 IndexedDB。错误哲学：读失败 null、删失败吞、put 失败上抛
+//（调用方必须知道图没存进去）、迁移失败回退原串。
+
+import { DEFAULT_PREFIX, genId } from './token.js';
+import { dataUrlToBlob, blobToDataUrl } from './dataurl.js';
+import { runGc } from './gc.js';
+
+/**
+ * @typedef {Object} StorageAdapter
+ * @property {(id: string) => Promise<Blob | null>} get
+ * @property {(id: string, blob: Blob) => Promise<void>} put
+ * @property {(id: string) => Promise<void>} delete
+ * @property {() => Promise<string[]>} keys GC 扫描用；blob 表行数是千级，全量返回没有压力
+ */
+
+/**
+ * @param {{ adapter: StorageAdapter, prefix?: string }} options
+ */
+export function createBlobStore(options) {
+  const { adapter, prefix = DEFAULT_PREFIX } = options || {};
+  if (!adapter) throw new Error('createBlobStore: adapter is required');
+
+  /** @param {unknown} v @returns {boolean} */
+  const isRef = (v) => typeof v === 'string' && v.startsWith(prefix);
+  /** @param {string} ref */
+  const idOf = (ref) => ref.slice(prefix.length);
+
+  const store = {
+    prefix,
+    isRef,
+
+    /** 存入 Blob，返回令牌。适配器失败会上抛。 */
+    async put(blob) {
+      const id = genId();
+      await adapter.put(id, blob);
+      return prefix + id;
+    },
+
+    /** 令牌 → Blob。非令牌 / 不存在 / 读失败一律 null。 */
+    async get(token) {
+      if (!isRef(token)) return null;
+      try {
+        return (await adapter.get(idOf(token))) ?? null;
+      } catch {
+        return null;
+      }
+    },
+
+    /** best-effort 删除；非令牌不动，失败静默。 */
+    async delete(token) {
+      if (!isRef(token)) return;
+      try {
+        await adapter.delete(idOf(token));
+      } catch { /* best-effort */ }
+    },
+
+    /** 令牌 → data URL；非令牌透传；Blob 已丢返回空串（别把死令牌当 src 用）。 */
+    async resolveToDataUrl(value) {
+      if (!isRef(value)) return value;
+      const blob = await store.get(value);
+      return blob ? blobToDataUrl(blob) : '';
+    },
+
+    /** data URL → 令牌；失败回退原串，调用方永远拿到可渲染的值。 */
+    async migrateDataUrl(dataUrl) {
+      try {
+        return await store.put(dataUrlToBlob(dataUrl));
+      } catch {
+        return dataUrl;
+      }
+    },
+
+    /** 深度遍历对象树，令牌原地替换成 data URL（备份导出前调用）。见 Task 5。 */
+    async resolveDeep(root) {
+      return resolveDeep(store, root);
+    },
+
+    /** 孤儿 GC，语义见 gc.js。 */
+    async gc(opts) {
+      return runGc({ adapter, prefix }, opts);
+    },
+  };
+  return store;
+}
+
+/* resolveDeep 在 Task 5 实现；本 Task 先放一个抛错占位，Task 5 的测试会替换它。 */
+async function resolveDeep(_store, _root) {
+  throw new Error('not implemented yet');
+}
