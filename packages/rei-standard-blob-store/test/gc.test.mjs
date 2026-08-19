@@ -16,7 +16,7 @@ async function seed(n) {
 }
 
 test('老孤儿被删，被引用的保留', async () => {
-  const { store, adapter, tokens } = await seed(2);
+  const { store, tokens } = await seed(2);
   const [used, orphan] = tokens;
   const result = await store.gc({
     refSources: [JSON.stringify({ wallpaper: used })],
@@ -56,8 +56,8 @@ test('任一 refSource 抛错 → 整轮放弃，一个都不删', async () => {
 test('refSources 支持 async generator（数组形态首个测试已覆盖）', async () => {
   const { store, tokens } = await seed(1);
   async function* gen() { yield `x ${tokens[0]} y`; }
-  const r1 = await store.gc({ refSources: gen(), minAgeMs: 0 });
-  assert.deepEqual(r1, { deleted: 0, kept: 1, aborted: false });
+  const result = await store.gc({ refSources: gen(), minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
 });
 
 test('自定义前缀的 store，GC 按该前缀提取引用', async () => {
@@ -73,5 +73,70 @@ test('自定义前缀的 store，GC 按该前缀提取引用', async () => {
 
 test('缺 refSources 直接抛（编程错误，不是静默全删）', async () => {
   const { store } = await seed(1);
-  await assert.rejects(() => store.gc({}));
+  await assert.rejects(() => store.gc({}), { name: 'TypeError', message: /refSources/ });
+});
+
+test('refSources 传成裸字符串会被逐字符迭代、什么都标记不到——必须抛错，不能静默清库', async () => {
+  const { store, adapter, tokens } = await seed(2);
+  const [used] = tokens;
+  await assert.rejects(
+    () => store.gc({ refSources: JSON.stringify({ wallpaper: used }), minAgeMs: 0 }),
+    TypeError,
+  );
+  assert.equal(adapter.map.size, 2);
+});
+
+test('refSources 里混进非字符串行对象（忘了 JSON.stringify）→ 抛错，不删', async () => {
+  const { store, adapter, tokens } = await seed(2);
+  const [used] = tokens;
+  async function* gen() { yield { wallpaper: used }; }
+  await assert.rejects(() => store.gc({ refSources: gen(), minAgeMs: 0 }), TypeError);
+  assert.equal(adapter.map.size, 2);
+});
+
+test('refSources 传成不可迭代的真值对象 → 抛错（原先会被 for-await 静默判成来源坏了，返回 aborted:true）', async () => {
+  const { store, adapter } = await seed(1);
+  await assert.rejects(() => store.gc({ refSources: { a: 1 }, minAgeMs: 0 }), TypeError);
+  assert.equal(adapter.map.size, 1);
+});
+
+test('refSources 传成没 await 的 Promise → 抛错（同样原先会被静默判成来源坏了）', async () => {
+  const { store, adapter } = await seed(1);
+  await assert.rejects(() => store.gc({ refSources: Promise.resolve([]), minAgeMs: 0 }), TypeError);
+  assert.equal(adapter.map.size, 1);
+});
+
+test('refSources 的 [Symbol.iterator] 存在但一调用就抛 → 仍是安全阀 aborted:true，不是被护栏提前拒绝（钉住用 in 探测而非读取/调用的选择）', async () => {
+  const { store, adapter } = await seed(2);
+  const poison = {
+    [Symbol.iterator]() { throw new Error('boom'); },
+  };
+  const result = await store.gc({ refSources: poison, minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 0, aborted: true });
+  assert.equal(adapter.map.size, 2);
+});
+
+test('默认新鲜豁免窗口是 72h：71h 内不删，73h 之后删', async () => {
+  const { store, adapter } = await seed(1);
+  const H = 3600 * 1000;
+  // 不传 minAgeMs：71h 仍在默认豁免期内，73h 已过
+  const base = Date.now();
+  assert.deepEqual(await store.gc({ refSources: [], now: base + 71 * H }), { deleted: 0, kept: 1, aborted: false });
+  assert.deepEqual(await store.gc({ refSources: [], now: base + 73 * H }), { deleted: 1, kept: 0, aborted: false });
+});
+
+test('adapter.delete 失败按 kept 计入、不抛，图还在', async () => {
+  const { store, adapter, tokens } = await seed(1);
+  adapter.delete = async () => { throw new Error('delete boom'); };
+  const result = await store.gc({ refSources: [], minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
+  assert.ok(await store.get(tokens[0]));
+});
+
+test('adapter.keys 读不出来 → 整轮放弃，不删', async () => {
+  const { store, adapter } = await seed(1);
+  adapter.keys = async () => { throw new Error('keys boom'); };
+  const result = await store.gc({ refSources: [], minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 0, aborted: true });
+  assert.equal(adapter.map.size, 1);
 });

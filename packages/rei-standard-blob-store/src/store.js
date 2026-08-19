@@ -103,7 +103,11 @@ export function createBlobStore(options) {
       return resolveDeep(store, root);
     },
 
-    /** 孤儿 GC，语义见 gc.js。 */
+    /**
+     * 孤儿 GC，语义见 gc.js。
+     * @param {import('./gc.js').GcOptions} opts
+     * @returns {Promise<import('./gc.js').GcResult>}
+     */
     async gc(opts) {
       return runGc({ adapter, prefix }, opts);
     },
