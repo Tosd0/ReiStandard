@@ -118,10 +118,50 @@ test('resolveDeep：同一令牌只读一次适配器', async () => {
   assert.equal(reads, 1);
 });
 
-test('resolveDeep：循环引用不挂', async () => {
+test('resolveDeep：数组有洞照样走完（备份树里任何一个洞都不该让整份导出失败）', async () => {
   const store = createBlobStore({ adapter: memoryAdapter() });
-  const a = { name: 'a' };
+  const token = await store.put(blobOf('sparse'));
+  // structuredClone 会原样保留洞，而「传独立副本」最顺手的做法正是 structuredClone
+  const root = structuredClone({ icons: [token, , 'https://a/b.png'], tags: ['x', , 'y'] });
+  const dropped = [token, 'gone'];
+  delete dropped[1]; // delete 留下的洞是另一条来源
+  root.dropped = dropped;
+  await store.resolveDeep(root);
+  assert.match(root.icons[0], /^data:text\/plain;base64,/);
+  assert.equal(root.icons.length, 3);
+  assert.equal(root.icons[2], 'https://a/b.png');
+  assert.equal(root.tags[2], 'y'); // 跟令牌毫无关系的洞同样不能中断遍历
+  assert.match(root.dropped[0], /^data:text\/plain;base64,/);
+});
+
+test('resolveDeep：环里的令牌照样还原（防循环不能顺手把子树跳过）', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const token = await store.put(blobOf('cycle'));
+  const a = { name: 'a', pic: token };
   a.self = a;
-  await store.resolveDeep(a); // 不超时、不抛即通过
-  assert.equal(a.name, 'a');
+  await store.resolveDeep(a);
+  assert.match(a.pic, /^data:text\/plain;base64,/);
+  assert.equal(a.self, a);
+});
+
+test('resolveDeep：适配器全挂也不 reject，令牌全部变空串', async () => {
+  const store = createBlobStore({ adapter: brokenAdapter() });
+  const root = { a: 'blobref:b_1_0_aaaaaa', b: { c: 'blobref:b_2_0_bbbbbb' } };
+  await store.resolveDeep(root);
+  assert.equal(root.a, '');
+  assert.equal(root.b.c, '');
+});
+
+test('resolveDeep：死令牌出现 3 次也只读一次适配器（空串同样要走缓存，不能被当成"没缓存过"）', async () => {
+  const adapter = memoryAdapter();
+  let reads = 0;
+  const counting = { ...adapter, get: async (id) => { reads++; return adapter.get(id); } };
+  const store = createBlobStore({ adapter: counting });
+  const dead = 'blobref:b_gone_0_aaaaaa';
+  const root = { a: dead, b: { c: dead }, d: [dead] };
+  await store.resolveDeep(root);
+  assert.equal(root.a, '');
+  assert.equal(root.b.c, '');
+  assert.equal(root.d[0], '');
+  assert.equal(reads, 1);
 });
