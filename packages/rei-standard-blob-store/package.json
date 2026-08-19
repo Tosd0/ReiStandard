@@ -1,0 +1,56 @@
+{
+  "name": "@rei-standard/blob-store",
+  "version": "0.0.0",
+  "description": "ReiStandard token-based Blob storage — binary in IndexedDB, a short blobref: token in your data fields; orphan GC included",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tosd0/ReiStandard.git",
+    "directory": "packages/rei-standard-blob-store"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.json && node -e \"const fs=require('fs');for(const f of fs.readdirSync('dist'))if(f.endsWith('.d.ts'))fs.copyFileSync('dist/'+f,'dist/'+f.slice(0,-5)+'.d.cts')\"",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "react": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "fake-indexeddb": "^6.0.0",
+    "react": "^18.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
