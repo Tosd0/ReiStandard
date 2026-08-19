@@ -197,3 +197,8 @@ test('utf8 data URL 的多字节转义按整段解码（%C3%A9 → é）：逐�
   const blob = dataUrlToBlob('data:text/plain,%C3%A9');
   assert.equal(await blob.text(), 'é');
 });
+
+test('base64 标志本身大小写不敏感（fetch 规范按 ASCII 不区分大小写匹配）：;BASE64 不能静默走文本分支存坏字节', async () => {
+  assert.equal(await dataUrlToBlob('data:text/plain;BASE64,aGk=').text(), 'hi');
+  assert.equal(await dataUrlToBlob('data:text/plain;Base64,aGk=').text(), 'hi');
+});

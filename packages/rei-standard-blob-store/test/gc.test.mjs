@@ -248,3 +248,12 @@ test('安全阀 6 的失效可观测性：引用面里一段杂散的「blobref:
   assert.deepEqual(result, { deleted: 0, kept: 3, keptBoundary: 3, aborted: false });
   assert.equal(adapter.map.size, 3);
 });
+
+test('新鲜豁免先于边界歧义豁免：又新鲜又互为前缀的 id 记 kept 不记 keptBoundary（新鲜保留是常态，不该拉响排查信号）', async () => {
+  const { store } = await seed(1); // 刚 put 的 id 新鲜，且 'blobref:b_' 提出的超短在用 id 'b_' 是它的前缀
+  const result = await store.gc({
+    refSources: ['note: token format is blobref:b_ followed by stuff'],
+    minAgeMs: 3 * DAY,
+  });
+  assert.deepEqual(result, { deleted: 0, kept: 1, keptBoundary: 0, aborted: false });
+});

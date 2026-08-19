@@ -109,3 +109,10 @@ test('parseIdTimestamp：b_ 出现在中间的宿主存量 id（thumb_…）不�
   const ts = 1755600000000;
   assert.equal(parseIdTimestamp(`thumb_${ts.toString(36)}_0_aaaaaa`, ts), null);
 });
+
+test('未来容忍窗的上界：+23.5h 的时间戳仍反解成功（窗的规格是 24h，悄悄缩窗会没收跨设备快钟 id 的新鲜豁免）', () => {
+  const now = 1755600000000;
+  const ts = now + 23.5 * 3600 * 1000;
+  assert.equal(parseIdTimestamp(`b_${ts.toString(36)}_0_aaaaaa`, now), ts);
+  assert.equal(parseIdTimestamp(`b_${(now + 25 * 3600 * 1000).toString(36)}_0_aaaaaa`, now), null);
+});

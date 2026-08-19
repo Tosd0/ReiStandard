@@ -125,7 +125,8 @@ export function createBlobStore(options) {
  * 深度遍历对象树，把所有令牌字符串原地替换成 data URL。原地修改传入对象，
  * 调用方须传独立副本。解析不到的令牌置空串（图已丢，别导出恢复端认不得的死令牌）。
  * 迭代遍历 + WeakSet 防循环；同一令牌只读一次。
- * 只遍历普通对象与数组（JSON 能表达的部分），Map/Set 内容不遍历；副本须可写
+ * 只遍历普通对象与数组（JSON 能表达的部分），Map/Set 内容不遍历，二进制视图
+ * （TypedArray/DataView）整块跳过；副本须可写
  * （frozen 节点会抛）；根是字符串等非对象时为 no-op（原地修改改不了原始值，
  * 单个令牌请用 resolveToDataUrl）。
  */
@@ -139,6 +140,11 @@ async function resolveDeep(store, root) {
     const node = stack.pop();
     if (seen.has(node)) continue;
     seen.add(node);
+    // 二进制视图整块跳过：元素只能是数字、结构上不含令牌，而 Object.keys 会把每个
+    // 下标物化成字符串键——几十 MB 的波形/纹理够把备份导出拖垮甚至 OOM。
+    // structuredClone 不保留视图上的 expando（数组会保留、视图不会），
+    // 按「传独立副本」的契约跳过零损失。
+    if (ArrayBuffer.isView(node)) continue;
     // Object.keys 对数组同时覆盖下标键与 expando 属性（structuredClone 会保留后者）；
     // 稀疏数组的洞没有自有键、直接跳过，同样不会中断遍历
     const keys = Object.keys(node);

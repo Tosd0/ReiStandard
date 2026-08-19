@@ -209,3 +209,30 @@ test('resolveDeep 覆盖数组上的 expando 属性（structuredClone 会保留�
   assert.match(root.list[0], /^data:/);
   assert.match(root.list.cover, /^data:/);
 });
+
+test('resolveDeep 整块跳过二进制视图（TypedArray/DataView）：不逐下标枚举，令牌照常还原', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const token = await store.put(blobOf('x'));
+  const wave = new Uint8Array(64);
+  const view = new DataView(new ArrayBuffer(16));
+  const root = { img: token, wave, nested: { view } };
+  // 计时断言在快慢机器间不可靠，直接钉「有没有枚举」这个行为本身：实现用 Object.keys
+  // 展开节点，拿它当探针——视图进过 Object.keys 就算失守（它对 TypedArray 返回全部
+  // 下标键，几十 MB 的波形/纹理会把备份导出拖垮甚至 OOM）。
+  const realKeys = Object.keys;
+  let enumeratedView = false;
+  Object.keys = (o) => {
+    if (ArrayBuffer.isView(o)) enumeratedView = true;
+    return realKeys(o);
+  };
+  try {
+    await store.resolveDeep(root);
+  } finally {
+    Object.keys = realKeys;
+  }
+  assert.equal(enumeratedView, false);
+  assert.match(root.img, /^data:/);
+  assert.equal(root.wave, wave); // 视图原封不动，同一引用
+  assert.equal(root.nested.view, view);
+  await store.resolveDeep(new Uint8Array(4)); // 根本身是视图：no-op、不抛
+});
