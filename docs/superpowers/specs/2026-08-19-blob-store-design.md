@@ -1,7 +1,7 @@
 # @rei-standard/blob-store 设计
 
 日期：2026-08-19
-状态：设计定稿，待实现
+状态：已实现（实现与本 spec 同仓交付；行为以 `standards/blob-storage.md` 与包 README 为准）
 
 ## 这是什么
 
