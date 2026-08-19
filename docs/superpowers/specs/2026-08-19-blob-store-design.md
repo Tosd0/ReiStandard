@@ -102,7 +102,7 @@ await store.gc({ refSources, minAgeMs = 72 * 3600 * 1000 });
 - **mark**：`refSources` 是宿主提供的、吐字符串的 async iterable（例如：资产表每行的 JSON 串、localStorage 全量值）。SDK 对每段字符串跑 `extractRefs`，汇总出「在用令牌」集合。
 - **sweep**：`adapter.keys()` 里不在集合中的 id 删除。
 
-四道安全阀，总原则「宁可留孤儿，绝不删活图」：
+安全阀总原则「宁可留孤儿，绝不删活图」。完整清单（含入参形态校验、删除失败按保留计、令牌边界歧义豁免）以 `standards/blob-storage.md` §5 为准，代表性的几道：
 
 1. 任何一个 refSource 迭代中抛错 → 整轮放弃，一个都不删。
 2. 新鲜豁免：id 反解出的创建时间距今不足 `minAgeMs` 的不删。这挡住一个竞态：`put` 返回令牌到宿主把令牌写进业务字段并持久化之间有窗口，此时扫描看不到引用。
@@ -143,7 +143,7 @@ const url = useBlobUrl(store, value);
 
 ## 测试策略
 
-- **core**：`node --test` + 内存假适配器（Map 实现），不需要任何 IDB 环境。令牌生成/解析、resolveDeep、extractRefs、GC 三道安全阀（含新鲜豁免的时间边界）都在这层钉住。
+- **core**：`node --test` + 内存假适配器（Map 实现），不需要任何 IDB 环境。令牌生成/解析、resolveDeep、extractRefs、GC 各道安全阀（含新鲜豁免的时间边界）都在这层钉住。
 - **createIdbAdapter**：devDependency 引入 fake-indexeddb 单独测。
 - **react hook**：逻辑极薄，本仓只做构建验证；行为测试随首个消费者（SullyOS）接入时补——最低要求钉住「令牌切换期间返回 undefined、不吐已 revoke 的旧 URL」这条契约（SullyOS 已有 jsdom + react-dom + vitest，无需新增依赖）。
 
