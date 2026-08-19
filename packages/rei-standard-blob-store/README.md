@@ -3,10 +3,10 @@
 纯前端应用的令牌式 Blob 存储：图片 / 音频 / 模型文件等二进制存 IndexedDB，业务字段里只留一个短令牌 `blobref:<id>`。字段仍是普通 string——JSON 序列化、结构化克隆、备份导出都不受影响；渲染时令牌解析成 objectURL。相比 base64 内嵌省 ~33% 空间，且二进制不再常驻 JS 堆。
 
 ```bash
-npm install @rei-standard/blob-store
+npm install @rei-standard/blob-store@next
 ```
 
-目前处于预发布期，请装 `@rei-standard/blob-store@next`（稳定版发布后本句移除）。
+目前处于预发布期，请装 `@next`（稳定版发布后本句和上面的 `@next` 一起移除）。
 
 ## 最小接入
 
@@ -18,7 +18,7 @@ const store = createBlobStore({ adapter: createIdbAdapter('my-app-blobs') });
 
 const token = await store.put(file);      // → 'blobref:b_xxx' 存进业务字段
 const blob = await store.get(token);      // 渲染时取回
-const url = URL.createObjectURL(blob);    // 喂给 <img>/CSS；用完 URL.revokeObjectURL(url)，否则内存泄漏
+const url = blob ? URL.createObjectURL(blob) : '';   // get 可能返回 null，喂给 <img>/CSS 前判空；用完 URL.revokeObjectURL(url)，否则内存泄漏
 ```
 
 React 项目直接用下面的 `useBlobUrl`，revoke 交给 hook 代管，不用自己写这几行。
