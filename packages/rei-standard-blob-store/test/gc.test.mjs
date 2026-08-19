@@ -189,3 +189,24 @@ test('超出令牌字符集的 id（如 UUID 带 -）一律保留：extractRefs 
   assert.deepEqual(result, { deleted: 0, kept: 2, aborted: false });
   assert.equal(adapter.map.size, 2);
 });
+
+test('refSources 吐出 undefined 与 null 同款跳过，不误触「非字符串」的 TypeError（某些存储 API 对缺失键吐的是 undefined）', async () => {
+  const { store, tokens } = await seed(1);
+  const [used] = tokens;
+  async function* gen() {
+    yield undefined;
+    yield `wallpaper: ${used}`;
+  }
+  const result = await store.gc({ refSources: gen(), minAgeMs: 0 });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
+});
+
+test('sweep 反解 id 时间戳用的是 GC 注入的钟：相对注入钟落在未来 24h 外的 id 判外来、按「老」删除（内部偷用真实时钟的话会被新鲜豁免错误保护）', async () => {
+  const { store, adapter } = await seed(0);
+  const ts = Date.now() - 3600 * 1000; // 相对真实时钟只是 1 小时前的「新」id
+  adapter.map.set(`b_${ts.toString(36)}_0_aaaaaa`, blobOf('x'));
+  // 相对注入的钟，ts 落在 47 小时之后 → 反解判外来返回 null → 按「老」处理 → 无引用即删。
+  // 反解若误用 Date.now()，ts 是合法的近期时间，会走进新鲜豁免（age 为负 < minAgeMs）被保留。
+  const result = await store.gc({ refSources: [], now: ts - 47 * 3600 * 1000 });
+  assert.deepEqual(result, { deleted: 1, kept: 0, aborted: false });
+});

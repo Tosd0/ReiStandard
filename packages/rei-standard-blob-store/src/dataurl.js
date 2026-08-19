@@ -26,7 +26,12 @@ export function dataUrlToBlob(dataUrl) {
     });
     return new Blob([text], { type: mime });
   }
-  const b64 = dataUrl.slice(comma + 1);
+  // 浏览器处理 data URL 是先 percent-decode 再 forgiving-base64（URL 标准）：
+  // 经过 URL 编码上下文的 payload（padding 变 %3D、+ 变 %2B）浏览器照常渲染，
+  // 这里也要先还原。宽容策略与上面文本分支一致：坏转义段原样保留。
+  const b64 = dataUrl.slice(comma + 1).replace(/(?:%[0-9A-Fa-f]{2})+/g, (m) => {
+    try { return decodeURIComponent(m); } catch { return m; }
+  });
   let bytes;
   if (typeof Uint8Array.fromBase64 === 'function') {
     bytes = Uint8Array.fromBase64(b64);

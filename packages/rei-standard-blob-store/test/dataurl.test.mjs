@@ -171,3 +171,10 @@ test('data: scheme 大小写不敏感（RFC 2397）：DATA:image/png 浏览器�
   assert.equal(blob.type, 'image/png'); // mime 提取的正则也要带 i，否则会掉到 octet-stream
   assert.equal(await blob.text(), 'abc');
 });
+
+test('base64 payload 里的 %3D/%2B 先 percent-decode 再解码（浏览器对 data URL 的处理顺序），经过 URL 编码上下文的 data URL 不该抛错', async () => {
+  const padded = dataUrlToBlob('data:text/plain;base64,aGk%3D');
+  assert.equal(await padded.text(), 'hi');
+  const plus = dataUrlToBlob('data:text/plain;base64,aGl%2B'); // 'aGl+' → 'hi~'
+  assert.equal(await plus.text(), 'hi~');
+});

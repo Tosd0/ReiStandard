@@ -182,6 +182,13 @@ test('put 传非 Blob（如误传 data URL 字符串 / undefined）抛 TypeError
   assert.equal(adapter.map.size, 0); // 什么都没存进去
 });
 
+test('put 鸭子判定两叉都要真：有 arrayBuffer 没 slice 的冒牌对象同样拒收', async () => {
+  const adapter = memoryAdapter();
+  const store = createBlobStore({ adapter });
+  await assert.rejects(() => store.put({ arrayBuffer: async () => new ArrayBuffer(0) }), TypeError);
+  assert.equal(adapter.map.size, 0);
+});
+
 test('resolveDeep 覆盖数组上的 expando 属性（structuredClone 会保留它们，漏了令牌就进备份）', async () => {
   const store = createBlobStore({ adapter: memoryAdapter() });
   const token = await store.put(blobOf('x'));

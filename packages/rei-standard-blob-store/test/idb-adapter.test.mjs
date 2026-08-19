@@ -94,3 +94,56 @@ test('事务错误保真：error 事件派发时 t.error 还是 null，reject �
     globalThis.indexedDB = realIdb;
   }
 });
+
+test('同一 dbName 配第二个 storeName：吵着失败并指路，不静默变 NotFoundError（upgradeneeded 只在建库那次触发，第二个 store 永远建不出来）', async () => {
+  const first = createIdbAdapter('blob-store-test-7', { storeName: 'avatars' });
+  await first.put('a1', new Blob(['x'])); // 建库，store 只有 avatars
+  const second = createIdbAdapter('blob-store-test-7', { storeName: 'walls' });
+  await assert.rejects(() => second.put('b1', new Blob(['y'])), { message: /换 dbName/ });
+});
+
+test('浏览器强制关闭连接（close 事件，非 versionchange 路径）后放掉缓存，下次调用重开而不是复用死连接', async () => {
+  // fake-indexeddb 模拟不了浏览器强关连接，手工假 IDB 数 open 次数。
+  let opens = 0;
+  let lastDb = null;
+  const fakeIdb = {
+    open() {
+      opens++;
+      const openReq = {};
+      queueMicrotask(() => {
+        const db = {
+          objectStoreNames: { contains: () => true },
+          transaction() {
+            const t = {};
+            t.objectStore = () => ({
+              get() {
+                const req = {};
+                queueMicrotask(() => { req.result = undefined; if (t.oncomplete) t.oncomplete(); });
+                return req;
+              },
+            });
+            return t;
+          },
+          close() {},
+        };
+        lastDb = db;
+        openReq.result = db;
+        if (openReq.onsuccess) openReq.onsuccess();
+      });
+      return openReq;
+    },
+  };
+  const realIdb = globalThis.indexedDB;
+  globalThis.indexedDB = fakeIdb;
+  try {
+    const adapter = createIdbAdapter('blob-store-test-8');
+    await adapter.get('a1');
+    assert.equal(opens, 1);
+    assert.equal(typeof lastDb.onclose, 'function'); // 自愈钩子必须挂上
+    lastDb.onclose(); // 浏览器强关连接
+    await adapter.get('a1');
+    assert.equal(opens, 2); // 缓存被放掉、重开了
+  } finally {
+    globalThis.indexedDB = realIdb;
+  }
+});

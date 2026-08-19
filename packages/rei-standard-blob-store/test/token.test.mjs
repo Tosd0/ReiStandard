@@ -72,3 +72,12 @@ test('parseIdTimestamp 的「未来 24h」判定用注入的 now，不偷用真�
   assert.equal(parseIdTimestamp(id, ts - 25 * 3600 * 1000), null);
   assert.equal(parseIdTimestamp(id, ts), ts);
 });
+
+test('extractRefs 不漏提紧跟在字面前缀文本之后的令牌（双前缀串里第二个才是真令牌）', () => {
+  // 宿主拼重前缀（prefix + token）会产出这种串：第一段提出来的 'blobref:blobref'
+  // 是死引用，第二段才对应真实 id——漏提它，被引用的 blob 就成了 GC 眼里的孤儿。
+  assert.deepEqual(
+    extractRefs('blobref:blobref:b_123_0_abcdef'),
+    ['blobref:blobref', 'blobref:b_123_0_abcdef'],
+  );
+});

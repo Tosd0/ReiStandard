@@ -50,7 +50,10 @@ export function extractRefs(str, prefix = DEFAULT_PREFIX) {
     let j = i + prefix.length;
     while (j < str.length && /[A-Za-z0-9_]/.test(str[j])) j++;
     if (j > i + prefix.length) refs.push(str.slice(i, j));
-    i = j; // prefix 非空时 j 必然 > i，向前推进，不会死循环
+    // 只跳过 prefix 本身、不跳过整个 id 段：'blobref:blobref:b_x' 里第二个令牌
+    // 紧贴在第一个 id 段（恰好是字面 'blobref'）之后，跳过 id 段就漏提了。
+    // 多提只会多保（GC 方向安全）；prefix 非空所以必然前进，不会死循环。
+    i += prefix.length;
   }
   return refs;
 }

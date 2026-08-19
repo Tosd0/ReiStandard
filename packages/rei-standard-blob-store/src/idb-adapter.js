@@ -29,6 +29,13 @@ export function createIdbAdapter(dbName, { storeName = 'blobs' } = {}) {
         };
         req.onsuccess = () => {
           const db = req.result;
+          // upgradeneeded 只在建库那一次触发：同一个 dbName 配第二个 storeName 时
+          // store 永远建不出来，所有操作静默变 NotFoundError。这里吵着失败并说清出路。
+          if (!db.objectStoreNames.contains(storeName)) {
+            db.close();
+            reject(new Error(`createIdbAdapter: 库 "${dbName}" 已存在但没有 store "${storeName}"——一个 dbName 只有首次创建时的 storeName 生效，要另一个 store 请换 dbName`));
+            return;
+          }
           // 版本钉死 1，这个库由适配器独占，没有自己的升级线（也因此 open 不会收到 blocked）。
           // 外部删库 / 浏览器强制关连接时放掉缓存，下次访问重开。
           db.onversionchange = () => { db.close(); dropCache(); };
