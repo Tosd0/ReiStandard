@@ -1,6 +1,6 @@
 # ReiStandard
 
-**主动消息 API 标准**：让纯前端项目（小手机类）也能可靠地推定时 / 即时消息。端到端加密、Serverless 部署、三包接入。一个数据库就能持续跑，全程免费。
+**主动消息 API 标准**：让纯前端项目（小手机类）也能可靠地推定时 / 即时消息。端到端加密、Serverless 部署、三包接入。一个数据库就能持续跑，全程免费。同一仓库下还收录 **Blob 存储标准**：图片 / 音频等二进制走令牌化存储，业务字段只留一个短令牌。
 
 ## 📦 包
 
@@ -24,8 +24,10 @@
 **安装最新版（`latest` dist-tag）**：
 
 ```bash
-npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
+npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client @rei-standard/blob-store@next
 ```
+
+`@rei-standard/blob-store` 目前只有 `next` 预发布版，没有 `latest`；等它随 Changesets 发出第一个正式版，这里会去掉 `@next`。
 
 仓库处于 Changesets pre（`next`）模式期间，新功能先以 `x.y.z-next.N` 版本发到 `next` dist-tag，`latest` 停在进入 pre 模式前的稳定线。要用最新功能请显式装 `next`（如 `npm install @rei-standard/amsg-client@next`）；是否处于 pre 模式以 `.changeset/pre.json` 为准，详见 [`RELEASING.md`](./RELEASING.md)。
 
@@ -83,7 +85,7 @@ npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 
 ```text
 ReiStandard/
-├── standards/                    # 权威规范文本（端点、字段、错误码）
+├── standards/                    # 权威规范文本（amsg 端点与字段、Blob 存储契约）
 ├── packages/                     # 6 个发布到 npm 的 SDK 包
 │   ├── rei-standard-amsg/        # 主动消息 API 标准（5 个包）
 │   │   ├── shared/               # 推送 schema（最底层，其他包都依赖）
@@ -102,7 +104,7 @@ ReiStandard/
 
 - [API 技术规范](./standards/active-messaging-api.md) — 端点、字段、错误码、鉴权
 - [Service Worker 规范](./standards/service-worker-specification.md) — SW 行为、消息协议、兼容性
-- [Blob 存储规范](./standards/blob-storage.md) — 令牌式 Blob 存储规范
+- [Blob 存储规范](./standards/blob-storage.md) — 令牌与 id 格式、适配器契约、GC 安全阀、备份互操作
 - [手动接入示例](./examples/README.md) — 不用 SDK 包的备用路径（**滞后于最新 SDK 字段**，新接入请用包）
 - [本地测试](./docs/TEST_README.md) · [生产监控](./docs/VERCEL_TEST_DEPLOY.md)
 
