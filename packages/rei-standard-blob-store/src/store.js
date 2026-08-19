@@ -19,9 +19,11 @@ import { runGc } from './gc.js';
  */
 export function createBlobStore(options) {
   const { adapter, prefix = DEFAULT_PREFIX } = options || {};
-  if (!adapter) throw new Error('createBlobStore: adapter is required');
+  if (!adapter) throw new TypeError('createBlobStore: adapter is required');
+  // 空前缀是配置错误——不拦会让 isRef 匹配一切字符串，resolveToDataUrl 把真实 data URL 都清空。
+  if (typeof prefix !== 'string' || !prefix) throw new TypeError('createBlobStore: prefix must be a non-empty string');
 
-  /** @param {unknown} v @returns {boolean} */
+  /** @param {unknown} v @returns {v is string} */
   const isRef = (v) => typeof v === 'string' && v.startsWith(prefix);
   /** @param {string} ref */
   const idOf = (ref) => ref.slice(prefix.length);
@@ -30,14 +32,22 @@ export function createBlobStore(options) {
     prefix,
     isRef,
 
-    /** 存入 Blob，返回令牌。适配器失败会上抛。 */
+    /**
+     * 存入 Blob，返回令牌。适配器失败会上抛。
+     * @param {Blob} blob
+     * @returns {Promise<string>}
+     */
     async put(blob) {
       const id = genId();
       await adapter.put(id, blob);
       return prefix + id;
     },
 
-    /** 令牌 → Blob。非令牌 / 不存在 / 读失败一律 null。 */
+    /**
+     * 令牌 → Blob。非令牌 / 不存在 / 读失败一律 null。
+     * @param {unknown} token
+     * @returns {Promise<Blob | null>}
+     */
     async get(token) {
       if (!isRef(token)) return null;
       try {
@@ -47,7 +57,11 @@ export function createBlobStore(options) {
       }
     },
 
-    /** best-effort 删除；非令牌不动，失败静默。 */
+    /**
+     * best-effort 删除；非令牌不动，失败静默。
+     * @param {unknown} token
+     * @returns {Promise<void>}
+     */
     async delete(token) {
       if (!isRef(token)) return;
       try {
@@ -55,14 +69,27 @@ export function createBlobStore(options) {
       } catch { /* best-effort */ }
     },
 
-    /** 令牌 → data URL；非令牌透传；Blob 已丢返回空串（别把死令牌当 src 用）。 */
+    /**
+     * 令牌 → data URL；非令牌透传；Blob 已丢、或读到的 Blob 编码失败同样返回空串（别把死令牌当 src 用）。
+     * @param {string} value
+     * @returns {Promise<string>}
+     */
     async resolveToDataUrl(value) {
       if (!isRef(value)) return value;
       const blob = await store.get(value);
-      return blob ? blobToDataUrl(blob) : '';
+      if (!blob) return '';
+      try {
+        return await blobToDataUrl(blob);
+      } catch {
+        return '';
+      }
     },
 
-    /** data URL → 令牌；失败回退原串，调用方永远拿到可渲染的值。 */
+    /**
+     * data URL → 令牌；失败回退原串，调用方永远拿到可渲染的值。
+     * @param {string} dataUrl
+     * @returns {Promise<string>}
+     */
     async migrateDataUrl(dataUrl) {
       try {
         return await store.put(dataUrlToBlob(dataUrl));
