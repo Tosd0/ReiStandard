@@ -17,7 +17,9 @@ export function dataUrlToBlob(dataUrl) {
   const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
   if (!/;base64$/i.test(header)) {
     // 宽容解码：合法的 %XX 段照常解码，坏转义段（如 SVG 里的 width="100%"）原样保留，
-    // 与浏览器对 data URL 的 percent-decode 行为一致。
+    // 这与浏览器对 data URL 的 percent-decode 行为一致，但仅限文本内容——非 UTF-8
+    // 的字节转义（如 %FF）不在这条文本向分支的覆盖范围内：浏览器会还原出原始字节，
+    // 这里选择保留字面量。
     const text = dataUrl.slice(comma + 1).replace(/(?:%[0-9A-Fa-f]{2})+/g, (m) => {
       try { return decodeURIComponent(m); } catch { return m; }
     });

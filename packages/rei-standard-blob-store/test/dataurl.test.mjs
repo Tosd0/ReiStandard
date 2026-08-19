@@ -42,6 +42,13 @@ test('非 base64 data URL（utf8 svg）按 UTF-8 解码', async () => {
 
 test('非 data URL 抛错（明确的编程错误才抛）', () => {
   assert.throws(() => dataUrlToBlob('https://example.com/a.png'));
+  assert.throws(() => dataUrlToBlob(null), TypeError);
+});
+
+test('裸 mime 的 base64 data URL 落到 application/octet-stream（FileReader 给无 type Blob 产出的正是这个形状）', async () => {
+  const blob = dataUrlToBlob('data:;base64,YWJj');
+  assert.equal(blob.type, 'application/octet-stream');
+  assert.equal(await blob.text(), 'abc');
 });
 
 test('utf8 data URL 宽容解码：合法 %XX 段照常解码，坏转义段原样保留', async () => {
@@ -82,34 +89,41 @@ test('dataUrlToBlob 的 fromBase64 快路径与 atob 回退路径解出同样的
 test('blobToDataUrl 的 toBase64 快路径无参调用，且与 btoa 回退结果一致', async () => {
   const blob = new Blob([PNG_BYTES], { type: 'image/png' });
 
-  let argsLength = -1;
-  const fastUrl = await withPatch(
-    Uint8Array.prototype,
-    'toBase64',
-    function toBase64Stub(...args) {
-      argsLength = args.length;
-      return Buffer.from(this).toString('base64');
-    },
-    () => blobToDataUrl(blob),
-  );
-  assert.equal(argsLength, 0);
+  // 手编路径只在没有 FileReader 时才会跑到；显式打掉 FileReader，别指望
+  // 当前跑测试的环境（Node）恰好没有它——未来的 Node / jsdom 可能会有。
+  await withPatch(globalThis, 'FileReader', undefined, async () => {
+    let argsLength = -1;
+    const fastUrl = await withPatch(
+      Uint8Array.prototype,
+      'toBase64',
+      function toBase64Stub(...args) {
+        argsLength = args.length;
+        return Buffer.from(this).toString('base64');
+      },
+      () => blobToDataUrl(blob),
+    );
+    assert.equal(argsLength, 0);
 
-  const fallbackUrl = await withPatch(Uint8Array.prototype, 'toBase64', undefined, () => blobToDataUrl(blob));
+    const fallbackUrl = await withPatch(Uint8Array.prototype, 'toBase64', undefined, () => blobToDataUrl(blob));
 
-  assert.equal(fastUrl, fallbackUrl);
+    assert.equal(fastUrl, fallbackUrl);
+  });
 });
 
 test('btoa 回退路径在 0x8000 分块边界上下都不丢字节', async () => {
   const lengths = [0, 1, 0x8000 - 1, 0x8000, 0x8000 + 1];
-  await withPatch(Uint8Array.prototype, 'toBase64', undefined, async () => {
-    for (const len of lengths) {
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) bytes[i] = i % 256;
-      const dataUrl = await blobToDataUrl(new Blob([bytes], { type: 'application/octet-stream' }));
-      const back = dataUrlToBlob(dataUrl);
-      assert.deepEqual(new Uint8Array(await back.arrayBuffer()), bytes, `length=${len}`);
-    }
-  });
+  // 同上：显式打掉 FileReader，逼进手编路径，不依赖环境恰好没有它。
+  await withPatch(globalThis, 'FileReader', undefined, () =>
+    withPatch(Uint8Array.prototype, 'toBase64', undefined, async () => {
+      for (const len of lengths) {
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = i % 256;
+        const dataUrl = await blobToDataUrl(new Blob([bytes], { type: 'application/octet-stream' }));
+        const back = dataUrlToBlob(dataUrl);
+        assert.deepEqual(new Uint8Array(await back.arrayBuffer()), bytes, `length=${len}`);
+      }
+    }),
+  );
 });
 
 test('blobToDataUrl 有 type 的 Blob 走 FileReader、无 type 的 Blob 走手工编码', async () => {
