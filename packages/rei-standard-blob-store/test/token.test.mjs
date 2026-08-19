@@ -73,6 +73,18 @@ test('parseIdTimestamp 的「未来 24h」判定用注入的 now，不偷用真�
   assert.equal(parseIdTimestamp(id, ts), ts);
 });
 
+test('全词字符前缀（img_）的对抗输入下 extractRefs 保持线性：记忆化 run 终点，不逐点重扫成 O(n²)', () => {
+  const s = 'img_'.repeat(20000); // 80KB。O(n²) 时此规模实测要数秒，线性则毫秒级
+  const t0 = process.hrtime.bigint();
+  const refs = extractRefs(s, 'img_');
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  // 记忆化不改变提取结果：每个匹配点提出「该点到 run 尾」，最后一个匹配点后面没有 id 字符、不提
+  assert.equal(refs.length, 19999);
+  assert.equal(refs[0], s);
+  assert.equal(refs[1], s.slice(4));
+  assert.ok(ms < 1500, `extractRefs 花了 ${ms}ms，疑似退化回 O(n²)`);
+});
+
 test('extractRefs 不漏提紧跟在字面前缀文本之后的令牌（双前缀串里第二个才是真令牌）', () => {
   // 宿主拼重前缀（prefix + token）会产出这种串：第一段提出来的 'blobref:blobref'
   // 是死引用，第二段才对应真实 id——漏提它，被引用的 blob 就成了 GC 眼里的孤儿。

@@ -210,3 +210,29 @@ test('sweep 反解 id 时间戳用的是 GC 注入的钟：相对注入钟落在
   const result = await store.gc({ refSources: [], now: ts - 47 * 3600 * 1000 });
   assert.deepEqual(result, { deleted: 1, kept: 0, aborted: false });
 });
+
+test('安全阀 6：令牌被拼进复合键（`${token}_thumb`）时不删——提取出的 id 比真实 id 长，真实 id 是它的前缀', async () => {
+  const { store, tokens } = await seed(1);
+  const [token] = tokens;
+  // 令牌逐字可见、引用面也全，满足其他宿主义务的字面要求——但按最长词字符段截出的
+  // id 是 'b_..._thumb'，真实 id 不在 mark 集里，没有这道阀就会删活图
+  const result = await store.gc({
+    refSources: [JSON.stringify({ thumbKey: `${token}_thumb` })],
+    minAgeMs: 0,
+  });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
+  assert.ok(await store.get(token));
+});
+
+test('安全阀 6：refSources 分块恰好把令牌从 id 中间切开时不删——提出的半截 id 是真实 id 的前缀', async () => {
+  const { store, tokens } = await seed(1);
+  const [token] = tokens;
+  const text = `wallpaper: ${token}`;
+  const cut = text.length - 3; // 切在 id 内部：前块提出半截 id，后块提不出任何令牌
+  const result = await store.gc({
+    refSources: [text.slice(0, cut), text.slice(cut)],
+    minAgeMs: 0,
+  });
+  assert.deepEqual(result, { deleted: 0, kept: 1, aborted: false });
+  assert.ok(await store.get(token));
+});

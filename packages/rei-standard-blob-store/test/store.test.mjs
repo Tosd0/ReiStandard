@@ -182,6 +182,16 @@ test('put 传非 Blob（如误传 data URL 字符串 / undefined）抛 TypeError
   assert.equal(adapter.map.size, 0); // 什么都没存进去
 });
 
+test('中缀含令牌的普通字符串不是令牌（令牌必须在 0 位）：isRef false、resolve 原样透传，resolveDeep 不抹掉这类字段', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const css = 'url(blobref:b_1_0_aaaaaa)'; // CSS 值这类中缀形态，误判成令牌会被 resolve 清成空串
+  assert.equal(store.isRef(css), false);
+  assert.equal(await store.resolveToDataUrl(css), css);
+  const root = { style: css };
+  await store.resolveDeep(root);
+  assert.equal(root.style, css);
+});
+
 test('put 鸭子判定两叉都要真：有 arrayBuffer 没 slice 的冒牌对象同样拒收', async () => {
   const adapter = memoryAdapter();
   const store = createBlobStore({ adapter });

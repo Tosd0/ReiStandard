@@ -46,9 +46,12 @@ export function extractRefs(str, prefix = DEFAULT_PREFIX) {
   if (!prefix) throw new TypeError('extractRefs: prefix 不能为空');
   const refs = [];
   let i = 0;
+  let runEnd = 0; // 已扫过的词字符 run 终点。全词字符前缀（如 'img_'）会让每个匹配点都落在同一条 run 里，不记这个终点就会逐点重扫整条 run、退化成 O(n²)
   while ((i = str.indexOf(prefix, i)) !== -1) {
     let j = i + prefix.length;
+    if (j < runEnd) j = runEnd; // i 落在上一条已扫 run 内：[j, runEnd) 都是词字符，直接续用终点
     while (j < str.length && /[A-Za-z0-9_]/.test(str[j])) j++;
+    runEnd = j;
     if (j > i + prefix.length) refs.push(str.slice(i, j));
     // 只跳过 prefix 本身、不跳过整个 id 段：'blobref:blobref:b_x' 里第二个令牌
     // 紧贴在第一个 id 段（恰好是字面 'blobref'）之后，跳过 id 段就漏提了。

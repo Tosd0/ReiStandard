@@ -7,6 +7,10 @@
 //   5) 超出令牌字符集 [A-Za-z0-9_] 的 id（如 UUID 带 `-`）一律保留：extractRefs 按该字符集
 //      划边界，这类 id 结构上不可能被 mark 到，「无引用」对它们不构成孤儿证据。
 //      代价是这类存量 id 永不回收——想回收先迁移成本包生成的格式。
+//   6) 边界歧义豁免：存储 id 与某个在用 id 互为前缀时不删。这是令牌被拼进复合键
+//     （`${token}_thumb` 提出的 id 比真实 id 长）或引用面文本在令牌中间被切开
+//     （只提出半截 id）时留下的痕迹——真实 id 都进不了 mark 集，但前缀关系还在。
+//      这是兜底不是许可：切在前缀边界上时连痕迹都没有，宿主仍须守边界义务（见 README）。
 // 宿主义务：refSources 必须枚举全部可能含令牌的持久化面，且吐出令牌逐字可见的明文
 //（压缩/加密/编码过的面先还原再吐）——面漏了或令牌不可见，都会删活图。
 // 另外两条同级义务（详见 README「孤儿 GC 与宿主义务」）：一张 blob 表只能配一个前缀
@@ -22,14 +26,14 @@ const ID_CHARSET = /^[A-Za-z0-9_]+$/;
 
 /**
  * @typedef {Object} GcOptions
- * @property {Iterable<string> | AsyncIterable<string>} refSources 全部可能含令牌的持久化面；吐字符串
+ * @property {(Iterable<string> | AsyncIterable<string>) & object} refSources 全部可能含令牌的持久化面；吐字符串。`& object` 把裸字符串挡在类型层——string 本身满足 Iterable<string>，而那恰是会「逐字符迭代、什么都标记不到」的最危险误用
  * @property {number} [minAgeMs] 新鲜豁免窗口，默认 72h；0 = 关掉第二道阀（只应出现在测试里）
  * @property {number} [now] 注入的当前时间（测试用），默认 Date.now()
  */
 /**
  * @typedef {Object} GcResult
  * @property {number} deleted 实际删除数
- * @property {number} kept 保留数 = 被引用的 + 新鲜豁免的 + 删除失败的 + 超出令牌字符集豁免的
+ * @property {number} kept 保留数 = 被引用的 + 新鲜豁免的 + 删除失败的 + 超出令牌字符集豁免的 + 边界歧义豁免的
  * @property {boolean} aborted 安全阀触发（来源出错 / keys 读不出）→ 整轮放弃，一个都没删
  */
 
@@ -75,12 +79,16 @@ export async function runGc({ adapter, prefix }, opts) {
 
   let deleted = 0;
   let kept = 0;
+  const usedIds = [...used]; // 安全阀 6 要线性扫，循环外物化一次
   // 串行删除是刻意的——GC 是后台活儿，并行只会压满 IDB。
   for (const id of ids) {
     if (used.has(id)) { kept++; continue; }
     if (!ID_CHARSET.test(id)) { kept++; continue; } // 安全阀 5：mark 不可能命中的 id，无引用不构成证据
     const ts = parseIdTimestamp(id, now);
     if (ts !== null && now - ts < minAgeMs) { kept++; continue; }
+    // 安全阀 6：与某个在用 id 互为前缀 = 令牌边界出过事（复合键拼接 / 分块切开）的痕迹，不删。
+    // 放在最后一道：只有走到「要删」的 id 才付这趟 O(在用数) 的线性扫。
+    if (usedIds.some((u) => u.startsWith(id) || id.startsWith(u))) { kept++; continue; }
     try {
       await adapter.delete(id);
       deleted++;

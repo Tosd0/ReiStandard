@@ -178,3 +178,22 @@ test('base64 payload 里的 %3D/%2B 先 percent-decode 再解码（浏览器对 
   const plus = dataUrlToBlob('data:text/plain;base64,aGl%2B'); // 'aGl+' → 'hi~'
   assert.equal(await plus.text(), 'hi~');
 });
+
+test('`; base64` / `;base64 ` 这类带空白的规范合法变体也认（fetch 规范允许 ; 后与 base64 前后有空白），不能静默走文本分支存坏字节', async () => {
+  const variants = [
+    'data:text/plain; base64,aGk=',
+    'data:text/plain;base64 ,aGk=',
+    'data:text/plain;\tbase64,aGk=',
+    'data: text/plain ;base64,aGk=', // mime 首尾空白同款剥掉，别把 " text/plain " 当 MIME
+  ];
+  for (const url of variants) {
+    const blob = dataUrlToBlob(url);
+    assert.equal(await blob.text(), 'hi', url);
+    assert.equal(blob.type, 'text/plain', url);
+  }
+});
+
+test('utf8 data URL 的多字节转义按整段解码（%C3%A9 → é）：逐个转义解码会 URIError、整段保留字面，内容就坏了', async () => {
+  const blob = dataUrlToBlob('data:text/plain,%C3%A9');
+  assert.equal(await blob.text(), 'é');
+});

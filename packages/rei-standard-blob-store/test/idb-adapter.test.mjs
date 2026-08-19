@@ -147,3 +147,46 @@ test('浏览器强制关闭连接（close 事件，非 versionchange 路径）�
     globalThis.indexedDB = realIdb;
   }
 });
+
+test('事务 abort-only 收尾（commit 期配额失败的真实形态：request 上没有 error 事件）也必须 reject——put 悬死不 settle 就违反「失败必须上抛」契约', async () => {
+  const abortErr = new Error('quota during commit');
+  abortErr.name = 'QuotaExceededError';
+  const fakeIdb = {
+    open() {
+      const openReq = {};
+      queueMicrotask(() => {
+        openReq.result = {
+          objectStoreNames: { contains: () => true },
+          transaction() {
+            const t = { error: abortErr }; // abort 步骤已给事务赋了错，request 上没有
+            t.objectStore = () => ({
+              put() {
+                const req = { error: null };
+                queueMicrotask(() => { if (t.onabort) t.onabort(); }); // 只发 abort，不发 error
+                return req;
+              },
+            });
+            return t;
+          },
+          close() {},
+        };
+        if (openReq.onsuccess) openReq.onsuccess();
+      });
+      return openReq;
+    },
+  };
+  const realIdb = globalThis.indexedDB;
+  globalThis.indexedDB = fakeIdb;
+  try {
+    const adapter = createIdbAdapter('blob-store-test-9');
+    await assert.rejects(
+      () => Promise.race([
+        adapter.put('a1', new Blob(['x'])),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('put 悬死：onabort 没接住，promise 永不 settle')), 250)),
+      ]),
+      (err) => err === abortErr,
+    );
+  } finally {
+    globalThis.indexedDB = realIdb;
+  }
+});

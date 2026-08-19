@@ -15,8 +15,11 @@ export function dataUrlToBlob(dataUrl) {
   if (!/^data:/i.test(dataUrl) || comma < 0) throw new TypeError('Invalid data URL');
   const header = dataUrl.slice(0, comma);
   const mimeMatch = header.match(/^data:([^;,]+)/i);
-  const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-  if (!/;base64$/i.test(header)) {
+  // fetch 规范的 data: URL processor 会剥 mimeType 首尾空白，这里同款 trim；剥完为空落回 octet-stream
+  const mime = (mimeMatch && mimeMatch[1].trim()) || 'application/octet-stream';
+  // `; base64` / `;base64 ` 这类带空白的变体是规范合法形态（fetch 规范允许 `;` 后、`base64` 前后有空白），
+  // 只认 `;base64` 会让它们静默走文本分支、把 base64 字面存成坏字节。
+  if (!/;[ \t]*base64[ \t]*$/i.test(header)) {
     // 宽容解码：合法的 %XX 段照常解码，坏转义段（如 SVG 里的 width="100%"）原样保留，
     // 这与浏览器对 data URL 的 percent-decode 行为一致，但仅限文本内容——非 UTF-8
     // 的字节转义（如 %FF）不在这条文本向分支的覆盖范围内：浏览器会还原出原始字节，
