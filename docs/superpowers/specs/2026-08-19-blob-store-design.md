@@ -57,7 +57,7 @@ const store = createBlobStore({ adapter, prefix = 'blobref:' });
 await store.put(blob);              // → 'blobref:<id>'
 await store.get(token);             // → Blob | null（非令牌 / 不存在 / 读失败都是 null，不抛）
 await store.delete(token);          // best-effort，失败静默
-store.isRef(v);                     // 类型守卫，正分支收窄成品牌 string 子类型
+store.isRef(v);                     // 类型谓词收窄，无品牌类型
 await store.resolveToDataUrl(v);    // 令牌 → data URL；非令牌透传；Blob 已丢返回空串
 await store.resolveDeep(root);      // 深度遍历对象树，令牌原地替换成 data URL（备份导出前调用）
 await store.migrateDataUrl(url);    // data URL → 令牌；失败回退返回原串，调用方永远拿到可渲染的值
@@ -88,7 +88,7 @@ interface StorageAdapter {
 ```
 
 - 已有自己 IndexedDB 的宿主（多数情况）：拿现成的 DB 方法包一层即可，连接管理、版本升级、自愈逻辑全部自理，SDK 不参与。
-- 没有 DB 的项目：`createIdbAdapter(dbName)` 提供开箱即用的独立数据库适配器（单 store，含 versionchange/blocked 的基本处理，保持简单）。
+- 没有 DB 的项目：`createIdbAdapter(dbName)` 提供开箱即用的独立数据库适配器（单 store，含 versionchange 的基本处理；版本钉死 1，open 不会收到 blocked，保持简单）。
 
 ## 孤儿 GC
 

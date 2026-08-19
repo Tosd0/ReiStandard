@@ -86,7 +86,7 @@ const result = await store.gc({
 | 方法 | 签名 | 语义 |
 |---|---|---|
 | `createBlobStore` | `createBlobStore({ adapter, prefix? }) → store` | 创建 store 实例；`adapter` 必填，`prefix` 默认 `blobref:`，必须是非空字符串（配置错误抛 `TypeError`） |
-| `store.prefix` | `string`（只读） | 当前令牌前缀 |
+| `store.prefix` | `string`（勿修改） | 当前令牌前缀 |
 | `store.isRef(value)` | `(value: unknown) → boolean` | 判断 `value` 是不是本 store 生成的令牌 |
 | `store.put(blob)` | `(blob: Blob) → Promise<string>` | 存入 Blob，返回令牌；适配器失败会上抛 |
 | `store.get(token)` | `(token: unknown) → Promise<Blob \| null>` | 令牌 → Blob；非令牌 / 不存在 / 读失败一律返回 `null` |
