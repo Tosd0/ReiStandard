@@ -96,7 +96,9 @@ interface StorageAdapter {
 
 ```ts
 await store.gc({ refSources, minAgeMs = 72 * 3600 * 1000 });
-// → { deleted: number, kept: number, aborted: boolean }（aborted=true 即安全阀触发、整轮放弃）
+// → { deleted: number, kept: number, keptBoundary: number, aborted: boolean }
+//   （aborted=true 即安全阀触发、整轮放弃；keptBoundary 是边界歧义豁免的单独计数——
+//     接近库存量说明某个引用面混进了杂散的令牌前缀文本、GC 实际在整轮空转）
 ```
 
 - **mark**：`refSources` 是宿主提供的、吐字符串的 async iterable（例如：资产表每行的 JSON 串、localStorage 全量值）。SDK 对每段字符串跑 `extractRefs`，汇总出「在用令牌」集合。
@@ -145,7 +147,7 @@ const url = useBlobUrl(store, value);
 
 - **core**：`node --test` + 内存假适配器（Map 实现），不需要任何 IDB 环境。令牌生成/解析、resolveDeep、extractRefs、GC 各道安全阀（含新鲜豁免的时间边界）都在这层钉住。
 - **createIdbAdapter**：devDependency 引入 fake-indexeddb 单独测。
-- **react hook**：逻辑极薄，本仓只做构建验证；行为测试随首个消费者（SullyOS）接入时补——最低要求钉住「令牌切换期间返回 undefined、不吐已 revoke 的旧 URL」这条契约（SullyOS 已有 jsdom + react-dom + vitest，无需新增依赖）。
+- **react hook**：逻辑极薄，本仓只做构建验证；行为测试随首个消费者（SullyOS）接入时补——最低要求钉住两条契约：「令牌切换期间返回 undefined、不吐已 revoke 的旧 URL」和「非令牌渲染期直接透传、不滞后一帧」（SullyOS 已有 jsdom + react-dom + vitest，无需新增依赖）。
 
 ## 首个消费者接入（SullyOS，独立的第二步）
 
