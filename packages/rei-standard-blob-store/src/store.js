@@ -98,7 +98,7 @@ export function createBlobStore(options) {
       }
     },
 
-    /** 深度遍历对象树，令牌原地替换成 data URL（备份导出前调用）。见 Task 5。 */
+    /** 深度遍历对象树，令牌原地替换成 data URL（备份导出前调用）。 */
     async resolveDeep(root) {
       return resolveDeep(store, root);
     },

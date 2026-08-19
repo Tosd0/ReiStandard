@@ -52,6 +52,8 @@ react 是可选 peerDependency，不用 React 的项目零负担。
 
 令牌只在本机数据库里有意义。导出备份前调用 `store.resolveDeep(backupObject)`，对象树里的全部令牌原地变回 data URL——备份文件里永远没有令牌，格式与是否用本包解耦。导入侧可用 `store.migrateDataUrl(dataUrl)` 惰性转回令牌。
 
+`resolveDeep` 会**原地修改**传入对象，导出前先做独立副本（如 `structuredClone`）再传进来。
+
 ## 孤儿 GC 与宿主义务
 
 令牌方案下删除是保守的（同一令牌可能被多处引用），孤儿 Blob 靠 GC 收口：

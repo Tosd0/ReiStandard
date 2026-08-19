@@ -13,13 +13,13 @@
 | [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
 | [`@rei-standard/blob-store`](./packages/rei-standard-blob-store/README.md) | 令牌式 Blob 存储——二进制进 IndexedDB，业务字段只留 `blobref:` 令牌；含孤儿 GC 与 `/react` hook |
 
-`amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
+`amsg-shared` 是依赖图最底层：其他四个 amsg 包都依赖它，反过来不行；它本身零运行时依赖。
 
 **服务端用 `amsg-server`**：即时、定时、周期三种消息都在里面，单用户线（一个 Cloudflare Worker + D1）还带服务端收件箱——每条 payload 发出去之前先落一行，客户端上线补拉，一条不少。`amsg-instant` 是无后端场景的产物，现在是维护态：没有数据库也就没有收件箱，push 漏掉的内容补不回来；已经在用的部署照常工作，新接入不从它起步。
 
 ### 版本与发布
 
-版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。五个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
+版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。六个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
 
 **安装最新版（`latest` dist-tag）**：
 
@@ -102,6 +102,7 @@ ReiStandard/
 
 - [API 技术规范](./standards/active-messaging-api.md) — 端点、字段、错误码、鉴权
 - [Service Worker 规范](./standards/service-worker-specification.md) — SW 行为、消息协议、兼容性
+- [Blob 存储规范](./standards/blob-storage.md) — 令牌式 Blob 存储规范
 - [手动接入示例](./examples/README.md) — 不用 SDK 包的备用路径（**滞后于最新 SDK 字段**，新接入请用包）
 - [本地测试](./docs/TEST_README.md) · [生产监控](./docs/VERCEL_TEST_DEPLOY.md)
 
