@@ -111,7 +111,40 @@ export function createBlobStore(options) {
   return store;
 }
 
-/* resolveDeep 在 Task 5 实现；本 Task 先放一个抛错占位，Task 5 的测试会替换它。 */
-async function resolveDeep(_store, _root) {
-  throw new Error('not implemented yet');
+/**
+ * 深度遍历对象树，把所有令牌字符串原地替换成 data URL。原地修改传入对象，
+ * 调用方须传独立副本。解析不到的令牌置空串（图已丢，别导出恢复端认不得的死令牌）。
+ * 迭代遍历 + WeakSet 防循环；同一令牌只读一次。
+ */
+async function resolveDeep(store, root) {
+  if (root === null || typeof root !== 'object') return;
+  /** @type {Array<{ container: any, key: string | number, ref: string }>} */
+  const hits = [];
+  const seen = new WeakSet();
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (seen.has(node)) continue;
+    seen.add(node);
+    const entries = Array.isArray(node)
+      ? node.map((v, i) => [i, v])
+      : Object.keys(node).map((k) => [k, node[k]]);
+    for (const [key, v] of entries) {
+      if (store.isRef(v)) {
+        hits.push({ container: node, key, ref: v });
+      } else if (v !== null && typeof v === 'object') {
+        stack.push(v);
+      }
+    }
+  }
+  if (!hits.length) return;
+  const cache = new Map();
+  for (const { container, key, ref } of hits) {
+    let dataUrl = cache.get(ref);
+    if (dataUrl === undefined) {
+      dataUrl = await store.resolveToDataUrl(ref);
+      cache.set(ref, dataUrl);
+    }
+    container[key] = dataUrl;
+  }
 }

@@ -92,3 +92,36 @@ test('空前缀在工厂阶段直接抛（否则 isRef 会匹配一切字符串�
 test('缺 adapter 直接抛（编程错误）', () => {
   assert.throws(() => createBlobStore({}), { name: 'TypeError', message: /adapter/ });
 });
+
+test('resolveDeep：嵌套对象/数组里的令牌原地变 data URL，丢图置空串', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const token = await store.put(blobOf('deep'));
+  const root = {
+    theme: { wallpaper: token, color: '#fff' },
+    icons: [token, 'https://a/b.png'],
+    dead: 'blobref:b_gone_0_aaaaaa',
+  };
+  await store.resolveDeep(root);
+  assert.match(root.theme.wallpaper, /^data:text\/plain;base64,/);
+  assert.equal(root.icons[0], root.theme.wallpaper);
+  assert.equal(root.icons[1], 'https://a/b.png');
+  assert.equal(root.dead, '');
+});
+
+test('resolveDeep：同一令牌只读一次适配器', async () => {
+  const adapter = memoryAdapter();
+  let reads = 0;
+  const counting = { ...adapter, get: async (id) => { reads++; return adapter.get(id); } };
+  const store = createBlobStore({ adapter: counting });
+  const token = await store.put(blobOf('once'));
+  await store.resolveDeep({ a: token, b: { c: token }, d: [token] });
+  assert.equal(reads, 1);
+});
+
+test('resolveDeep：循环引用不挂', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const a = { name: 'a' };
+  a.self = a;
+  await store.resolveDeep(a); // 不超时、不抛即通过
+  assert.equal(a.name, 'a');
+});
