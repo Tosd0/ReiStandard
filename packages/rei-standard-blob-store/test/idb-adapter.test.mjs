@@ -190,3 +190,49 @@ test('事务 abort-only 收尾（commit 期配额失败的真实形态：request
     globalThis.indexedDB = realIdb;
   }
 });
+
+test('迟到的旧连接 onclose 不抹掉重开后的新连接缓存（dropCache 只认自己那一版），否则新连接被泄漏成悬空、下次又多开一条', async () => {
+  let opens = 0;
+  const dbs = [];
+  const fakeIdb = {
+    open() {
+      opens++;
+      const openReq = {};
+      queueMicrotask(() => {
+        const db = {
+          objectStoreNames: { contains: () => true },
+          transaction() {
+            const t = {};
+            t.objectStore = () => ({
+              get() {
+                const req = {};
+                queueMicrotask(() => { req.result = undefined; if (t.oncomplete) t.oncomplete(); });
+                return req;
+              },
+            });
+            return t;
+          },
+          close() {},
+        };
+        dbs.push(db);
+        openReq.result = db;
+        if (openReq.onsuccess) openReq.onsuccess();
+      });
+      return openReq;
+    },
+  };
+  const realIdb = globalThis.indexedDB;
+  globalThis.indexedDB = fakeIdb;
+  try {
+    const adapter = createIdbAdapter('blob-store-test-10');
+    await adapter.get('a1');       // 开出连接 A
+    dbs[0].onversionchange();      // A 被外力关闭，清掉 A 那一版缓存
+    await adapter.get('a1');       // 重开得连接 B
+    assert.equal(opens, 2);
+    dbs[0].onclose();              // A 的迟到 onclose 这才到达
+    await adapter.get('a1');       // 必须复用 B
+    assert.equal(opens, 2);        // 迟到事件把 B 的缓存抹了的话，这里会开出第 3 条
+  } finally {
+    globalThis.indexedDB = realIdb;
+  }
+});
