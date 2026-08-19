@@ -7,8 +7,8 @@ import { useEffect, useState } from 'react';
 /**
  * 把字段值解析成可直接用于 <img src> / CSS url() 的字符串。
  *   · 令牌 → 读 Blob 建 objectURL，卸载 / value 变化时 revoke，不泄漏；
- *   · 非令牌（data: / http(s) / 渐变串 / undefined）→ 原样返回；
- *   · 令牌解析完成前返回 undefined（首帧无图；切换令牌时旧图会显示到本次 effect 清空为止，
+ *   · 非令牌（data: / http(s) / 渐变串 / undefined）→ 渲染期直接透传，不等 effect、无一帧滞后；
+ *   · 令牌解析完成前返回 undefined（首帧无图；切换令牌时旧值会显示到本次 effect 清空为止，
  *     随后先空一下再出新图，属预期——React 的 effect 在提交后才跑，切换那一次提交仍是旧值）。
  * @param {{ isRef: (v: unknown) => boolean, get: (token: string) => Promise<Blob | null> }} store
  *   createBlobStore 的返回值（只用到 isRef/get，结构化声明以免 allowJs 声明生成翻车）。
@@ -21,6 +21,9 @@ export function useBlobUrl(store, value) {
 
   useEffect(() => {
     if (!store.isRef(value)) {
+      // 非令牌的返回值走下面的渲染期透传，这笔 setUrl 只负责把 state 洗干净：
+      // 不洗的话 state 还攥着上一个令牌的（已 revoke 的）objectURL，
+      // 下次切回令牌时「切换那一帧显示旧值」显示的就是它。
       setUrl(value ?? undefined);
       return;
     }
@@ -45,5 +48,8 @@ export function useBlobUrl(store, value) {
     };
   }, [store, value]);
 
-  return url;
+  // 非令牌在渲染期直接透传：effect 是提交后才跑的，靠它转发会让切换那次提交
+  // 吐出上一个值——文档承诺的「原样返回」滞后一帧，令牌切走时那一帧甚至是
+  // 马上要被 cleanup revoke 的旧 objectURL。
+  return store.isRef(value) ? url : (value ?? undefined);
 }

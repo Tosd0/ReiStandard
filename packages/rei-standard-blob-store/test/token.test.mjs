@@ -93,3 +93,19 @@ test('extractRefs 不漏提紧跟在字面前缀文本之后的令牌（双前�
     ['blobref:blobref', 'blobref:b_123_0_abcdef'],
   );
 });
+
+test('parseIdTimestamp：注入钟落后创建时刻一小时仍能反解（跨设备时钟偏差不吞新鲜豁免）', () => {
+  // 「未来 24h 容忍窗」的下界方向：快钟一方生成的 id，在慢钟一方跑 GC 时时间戳落在
+  // 「未来」，但只要在容忍窗内就必须照常反解——否则被判外来 → 按「老」处理 → 新鲜豁免
+  // 失守，put→引用落盘之间的竞态窗内会被删。收紧成 ts > now 的实现会在这里挂。
+  const ts = 1755600000000;
+  const id = `b_${ts.toString(36)}_0_aaaaaa`;
+  assert.equal(parseIdTimestamp(id, ts - 3600 * 1000), ts);
+});
+
+test('parseIdTimestamp：b_ 出现在中间的宿主存量 id（thumb_…）不从中间误解析出时间戳', () => {
+  // 正则丢了 ^ 锚点的话，'thumb_<近期ts36>_x' 会从第 3 个字符起匹配出一个「新」时间戳、
+  // 错误吃到新鲜豁免——泄漏方向的错，但存量 id 该老老实实按「老」参与 GC。
+  const ts = 1755600000000;
+  assert.equal(parseIdTimestamp(`thumb_${ts.toString(36)}_0_aaaaaa`, ts), null);
+});

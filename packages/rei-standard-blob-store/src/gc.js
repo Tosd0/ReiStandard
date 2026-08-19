@@ -34,6 +34,10 @@ const ID_CHARSET = /^[A-Za-z0-9_]+$/;
  * @typedef {Object} GcResult
  * @property {number} deleted 实际删除数
  * @property {number} kept 保留数 = 被引用的 + 新鲜豁免的 + 删除失败的 + 超出令牌字符集豁免的 + 边界歧义豁免的
+ * @property {number} keptBoundary kept 里被边界歧义豁免（安全阀 6）拦下的那部分，单独计数。
+ *   它接近库存量时，多半是某个引用面里混进了杂散的令牌前缀文本（比如把 'blobref:b_' 当例子
+ *   写进了会被扫到的文案）——提出来的短 id 是每个 SDK 生成 id 的前缀，GC 从此整轮空转，
+ *   而 deleted:0 与「本来就没垃圾」同形，这个计数是宿主唯一能察觉的信号。
  * @property {boolean} aborted 安全阀触发（来源出错 / keys 读不出）→ 整轮放弃，一个都没删
  */
 
@@ -65,7 +69,7 @@ export async function runGc({ adapter, prefix }, opts) {
       for (const ref of extractRefs(chunk, prefix)) used.add(ref.slice(prefix.length));
     }
   } catch {
-    return { deleted: 0, kept: 0, aborted: true };
+    return { deleted: 0, kept: 0, keptBoundary: 0, aborted: true };
   }
   if (nonStringChunk) throw new TypeError('gc: refSources 只能吐字符串（整行对象请自己 JSON.stringify 后再吐）');
 
@@ -74,11 +78,12 @@ export async function runGc({ adapter, prefix }, opts) {
   try {
     ids = await adapter.keys();
   } catch {
-    return { deleted: 0, kept: 0, aborted: true };
+    return { deleted: 0, kept: 0, keptBoundary: 0, aborted: true };
   }
 
   let deleted = 0;
   let kept = 0;
+  let keptBoundary = 0;
   const usedIds = [...used]; // 安全阀 6 要线性扫，循环外物化一次
   // 串行删除是刻意的——GC 是后台活儿，并行只会压满 IDB。
   for (const id of ids) {
@@ -88,7 +93,9 @@ export async function runGc({ adapter, prefix }, opts) {
     if (ts !== null && now - ts < minAgeMs) { kept++; continue; }
     // 安全阀 6：与某个在用 id 互为前缀 = 令牌边界出过事（复合键拼接 / 分块切开）的痕迹，不删。
     // 放在最后一道：只有走到「要删」的 id 才付这趟 O(在用数) 的线性扫。
-    if (usedIds.some((u) => u.startsWith(id) || id.startsWith(u))) { kept++; continue; }
+    // 单独计数：一个杂散的超短「在用」id（如文案里的 'blobref:b_'）会让这道阀拦下全库、
+    // GC 静默整体失效——keptBoundary 暴涨是宿主该去排查引用面的信号（见 GcResult）。
+    if (usedIds.some((u) => u.startsWith(id) || id.startsWith(u))) { kept++; keptBoundary++; continue; }
     try {
       await adapter.delete(id);
       deleted++;
@@ -96,5 +103,5 @@ export async function runGc({ adapter, prefix }, opts) {
       kept++; // 删失败按保留计，下轮再试
     }
   }
-  return { deleted, kept, aborted: false };
+  return { deleted, kept, keptBoundary, aborted: false };
 }
