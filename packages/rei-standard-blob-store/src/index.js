@@ -2,5 +2,6 @@
 export { DEFAULT_PREFIX, extractRefs } from './token.js';
 export { dataUrlToBlob, blobToDataUrl } from './dataurl.js';
 export { createBlobStore } from './store.js';
+export { createIdbAdapter } from './idb-adapter.js';
 
 /** @typedef {import('./store.js').StorageAdapter} StorageAdapter */
