@@ -144,7 +144,7 @@ const url = useBlobUrl(store, value);
 
 - **core**：`node --test` + 内存假适配器（Map 实现），不需要任何 IDB 环境。令牌生成/解析、resolveDeep、extractRefs、GC 三道安全阀（含新鲜豁免的时间边界）都在这层钉住。
 - **createIdbAdapter**：devDependency 引入 fake-indexeddb 单独测。
-- **react hook**：逻辑极薄，行为守卫依托首个消费者（SullyOS）侧的既有测试，随薄壳继续运行。
+- **react hook**：逻辑极薄，本仓只做构建验证；行为测试随首个消费者（SullyOS）接入时补——最低要求钉住「令牌切换期间返回 undefined、不吐已 revoke 的旧 URL」这条契约（SullyOS 已有 jsdom + react-dom + vitest，无需新增依赖）。
 
 ## 首个消费者接入（SullyOS，独立的第二步）
 

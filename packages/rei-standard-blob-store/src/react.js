@@ -8,9 +8,10 @@ import { useEffect, useState } from 'react';
  * 把字段值解析成可直接用于 <img src> / CSS url() 的字符串。
  *   · 令牌 → 读 Blob 建 objectURL，卸载 / value 变化时 revoke，不泄漏；
  *   · 非令牌（data: / http(s) / 渐变串 / undefined）→ 原样返回；
- *   · 令牌解析完成前返回 undefined（首帧无图，读出后再渲染，属预期）。
+ *   · 令牌解析完成前返回 undefined（首帧无图、切换令牌时也会先空一下再出新图，属预期）。
  * @param {{ isRef: (v: unknown) => boolean, get: (token: string) => Promise<Blob | null> }} store
- *   createBlobStore 的返回值（只用到 isRef/get，结构化声明以免 allowJs 声明生成翻车）
+ *   createBlobStore 的返回值（只用到 isRef/get，结构化声明以免 allowJs 声明生成翻车）。
+ *   须身份稳定——模块级常量或 useMemo 持有；它进了 effect 依赖，每次渲染新建会把读取打成循环。
  * @param {string | undefined | null} value
  * @returns {string | undefined}
  */
@@ -23,6 +24,7 @@ export function useBlobUrl(store, value) {
       return;
     }
     let alive = true;
+    setUrl(undefined); // 令牌变了先清空，别把上一轮 revoke 掉的 URL 交出去（首挂载时 state 本就是 undefined，eagerState 短路，零额外渲染）
     /** @type {string | undefined} */
     let objUrl;
     store.get(value).then((blob) => {
@@ -33,6 +35,8 @@ export function useBlobUrl(store, value) {
       } else {
         setUrl(undefined);
       }
+    }, () => {
+      if (alive) setUrl(undefined);
     });
     return () => {
       alive = false;
