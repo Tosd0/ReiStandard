@@ -45,3 +45,13 @@ test('外部删库触发 versionchange 后放掉缓存，下次调用自动重�
 test('dbName 缺失或非字符串直接抛（编程错误）', () => {
   assert.throws(() => createIdbAdapter(), { name: 'TypeError', message: /dbName/ });
 });
+
+test('开库同步抛（没有 indexedDB 全局）不会把失败缓存住', async () => {
+  const adapter = createIdbAdapter('blob-store-test-5');
+  const realIdb = globalThis.indexedDB;
+  delete globalThis.indexedDB;
+  await assert.rejects(() => adapter.put('a1', new Blob(['x'])));
+  globalThis.indexedDB = realIdb;
+  await adapter.put('a1', new Blob(['x']));   // 缓存被毒化的话这里还会挂
+  assert.deepEqual(await adapter.keys(), ['a1']);
+});
