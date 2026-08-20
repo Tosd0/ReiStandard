@@ -82,6 +82,7 @@
     "amsg-webcrypto-utils-to-shared",
     "amsg-webpush-stack-to-shared",
     "blob-store-initial",
+    "blob-store-restore",
     "license-files",
     "phase0-dts-and-hardening"
   ]
