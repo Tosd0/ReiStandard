@@ -1,6 +1,6 @@
 # 发布流程
 
-本仓库用 [Changesets](https://github.com/changesets/changesets) 管理版本号、CHANGELOG 和发布。五个包（`shared` / `client` / `instant` / `server` / `sw`）各自独立版本。
+本仓库用 [Changesets](https://github.com/changesets/changesets) 管理版本号、CHANGELOG 和发布。六个包（`shared` / `client` / `instant` / `server` / `sw` / `blob-store`）各自独立版本。
 
 ## 怎么发版
 

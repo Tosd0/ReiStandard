@@ -17,7 +17,7 @@ node_modules/
 .claude/
 
 # Build output
-packages/*/*/dist/
+packages/**/dist/
 
 # Worktrees
 .worktrees/

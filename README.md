@@ -1,6 +1,6 @@
 # ReiStandard
 
-**主动消息 API 标准**：让纯前端项目（小手机类）也能可靠地推定时 / 即时消息。端到端加密、Serverless 部署、三包接入。一个数据库就能持续跑，全程免费。
+**主动消息 API 标准**：让纯前端项目（小手机类）也能可靠地推定时 / 即时消息。端到端加密、Serverless 部署、三包接入。一个数据库就能持续跑，全程免费。同一仓库下还收录 **Blob 存储标准**：图片 / 音频等二进制走令牌化存储，业务字段只留一个短令牌。
 
 ## 📦 包
 
@@ -11,20 +11,23 @@
 | [`@rei-standard/amsg-instant`](./packages/rei-standard-amsg/instant/README.md) | 无数据库的一次性即时推送（维护态） |
 | [`@rei-standard/amsg-client`](./packages/rei-standard-amsg/client/README.md) | 浏览器 SDK：加密、请求封装、Push 订阅、deliver() 送达裁决 / SSE consumer |
 | [`@rei-standard/amsg-sw`](./packages/rei-standard-amsg/sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
+| [`@rei-standard/blob-store`](./packages/rei-standard-blob-store/README.md) | 令牌式 Blob 存储——二进制进 IndexedDB，业务字段只留 `blobref:` 令牌；含孤儿 GC 与 `/react` hook |
 
-`amsg-shared` 是依赖图最底层：其他四个包都依赖它，反过来不行；它本身零运行时依赖。
+`amsg-shared` 是依赖图最底层：其他四个 amsg 包都依赖它，反过来不行；它本身零运行时依赖。
 
 **服务端用 `amsg-server`**：即时、定时、周期三种消息都在里面，单用户线（一个 Cloudflare Worker + D1）还带服务端收件箱——每条 payload 发出去之前先落一行，客户端上线补拉，一条不少。`amsg-instant` 是无后端场景的产物，现在是维护态：没有数据库也就没有收件箱，push 漏掉的内容补不回来；已经在用的部署照常工作，新接入不从它起步。
 
 ### 版本与发布
 
-版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。五个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
+版本号、CHANGELOG 与发布由 [Changesets](https://github.com/changesets/changesets) 管理。六个包各自独立版本（不绑成同一个号）。发布流程见 [`RELEASING.md`](./RELEASING.md)：写 changeset → 合到 `main` → CI 开「Version Packages」PR，合并该 PR 即发版。
 
 **安装最新版（`latest` dist-tag）**：
 
 ```bash
-npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client
+npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client @rei-standard/blob-store@next
 ```
+
+`@rei-standard/blob-store` 目前只有 `next` 预发布版，没有 `latest`；等它随 Changesets 发出第一个正式版，这里会去掉 `@next`。
 
 仓库处于 Changesets pre（`next`）模式期间，新功能先以 `x.y.z-next.N` 版本发到 `next` dist-tag，`latest` 停在进入 pre 模式前的稳定线。要用最新功能请显式装 `next`（如 `npm install @rei-standard/amsg-client@next`）；是否处于 pre 模式以 `.changeset/pre.json` 为准，详见 [`RELEASING.md`](./RELEASING.md)。
 
@@ -82,23 +85,26 @@ npm install @rei-standard/amsg-client @rei-standard/amsg-sw
 
 ```text
 ReiStandard/
-├── standards/                   # 权威规范文本（端点、字段、错误码）
-├── packages/rei-standard-amsg/  # 5 个发布到 npm 的 SDK 包
-│   ├── shared/                  # 推送 schema（最底层，其他包都依赖）
-│   ├── server/                  # 即时 / 定时 / 周期消息 + 服务端收件箱
-│   ├── instant/                 # 无数据库的一次性即时推送（维护态）
-│   ├── client/                  # 浏览器 SDK（加密、请求封装、Push 订阅）
-│   └── sw/                      # Service Worker（推送展示、离线队列）
-├── examples/                    # 手动接入示例（不用 SDK 包时的备用路径）
-├── tests/                       # 手动 E2E 冒烟脚本（打真实部署验证，不接 CI）
-├── scripts/                     # 仓库自检脚本（ESM 语法 / 包管理器检查）
-└── docs/                        # 本地测试、生产监控
+├── standards/                    # 权威规范文本（amsg 端点与字段、Blob 存储契约）
+├── packages/                     # 6 个发布到 npm 的 SDK 包
+│   ├── rei-standard-amsg/        # 主动消息 API 标准（5 个包）
+│   │   ├── shared/               # 推送 schema（最底层，其他包都依赖）
+│   │   ├── server/               # 即时 / 定时 / 周期消息 + 服务端收件箱
+│   │   ├── instant/              # 无数据库的一次性即时推送（维护态）
+│   │   ├── client/               # 浏览器 SDK（加密、请求封装、Push 订阅）
+│   │   └── sw/                   # Service Worker（推送展示、离线队列）
+│   └── rei-standard-blob-store/  # 令牌式 Blob 存储（IndexedDB + 孤儿 GC）
+├── examples/                     # 手动接入示例（不用 SDK 包时的备用路径）
+├── tests/                        # 手动 E2E 冒烟脚本（打真实部署验证，不接 CI）
+├── scripts/                      # 仓库自检脚本（ESM 语法 / 包管理器检查）
+└── docs/                         # 本地测试、生产监控
 ```
 
 ## 📖 文档
 
 - [API 技术规范](./standards/active-messaging-api.md) — 端点、字段、错误码、鉴权
 - [Service Worker 规范](./standards/service-worker-specification.md) — SW 行为、消息协议、兼容性
+- [Blob 存储规范](./standards/blob-storage.md) — 令牌与 id 格式、适配器契约、GC 安全阀、备份互操作
 - [手动接入示例](./examples/README.md) — 不用 SDK 包的备用路径（**滞后于最新 SDK 字段**，新接入请用包）
 - [本地测试](./docs/TEST_README.md) · [生产监控](./docs/VERCEL_TEST_DEPLOY.md)
 
