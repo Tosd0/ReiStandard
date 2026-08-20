@@ -199,6 +199,67 @@ test('put 鸭子判定两叉都要真：有 arrayBuffer 没 slice 的冒牌对�
   assert.equal(adapter.map.size, 0);
 });
 
+test('restore：把 Blob 写回令牌原有的 id 下，get 取回同字节同 type（备份导入不换 id，令牌身份不丢）', async () => {
+  const adapter = memoryAdapter();
+  const store = createBlobStore({ adapter });
+  const token = 'blobref:b_1_0_aaaaaa';
+  await store.restore(token, new Blob(['restored'], { type: 'image/png' }));
+  assert.ok(adapter.map.has('b_1_0_aaaaaa')); // 写在令牌原 id 下，不是新生成的 id
+  const blob = await store.get(token);
+  assert.equal(await blob.text(), 'restored');
+  assert.equal(blob.type, 'image/png');
+});
+
+test('restore 拒收：错误前缀 / 非令牌 / 字符集外 id / 空 id / 非 Blob，各自抛 TypeError 且什么都没写', async () => {
+  const adapter = memoryAdapter();
+  const store = createBlobStore({ adapter });
+  const ok = blobOf('x');
+  await assert.rejects(() => store.restore('pic:b_1_0_aaaaaa', ok), TypeError); // 别的 store 的令牌
+  await assert.rejects(() => store.restore('b_1_0_aaaaaa', ok), TypeError); // 裸 id 不是令牌
+  await assert.rejects(() => store.restore('blobref:550e8400-e29b', ok), TypeError); // 含 `-`：extractRefs 提不全、GC 永不能回收
+  await assert.rejects(() => store.restore('blobref:', ok), TypeError); // 空 id
+  await assert.rejects(() => store.restore('blobref:b_1_0_aaaaaa', 'data:image/png;base64,AAAA'), TypeError); // 非 Blob
+  await assert.rejects(() => store.restore('blobref:b_1_0_aaaaaa', { arrayBuffer: async () => new ArrayBuffer(0) }), TypeError); // 鸭子判定与 put 同款，两叉都要真
+  assert.equal(adapter.map.size, 0);
+});
+
+test('restore 同 id 二次写入是覆盖（同一份备份导两遍幂等），get 拿到第二次的内容', async () => {
+  const store = createBlobStore({ adapter: memoryAdapter() });
+  const token = 'blobref:b_1_0_aaaaaa';
+  await store.restore(token, blobOf('first'));
+  await store.restore(token, blobOf('second'));
+  assert.equal(await (await store.get(token)).text(), 'second');
+});
+
+test('restore 适配器写失败向上抛（与 put 同族：调用方必须知道没写进去）', async () => {
+  const store = createBlobStore({ adapter: brokenAdapter() });
+  await assert.rejects(() => store.restore('blobref:b_1_0_aaaaaa', blobOf('x')));
+});
+
+test('restore 的老 id 没有新鲜豁免（README「导入期间别并发跑 GC」义务的回归守卫）：引用落盘前撞上 GC 即被删，落盘后才安全', async () => {
+  const DAY = 24 * 3600 * 1000;
+  // 老时间戳 id：restore 写回的正是备份里的原 id，反解出的创建时间是当年的，不是导入这一刻
+  const token = `blobref:b_${(Date.now() - 10 * DAY).toString(36)}_0_aaaaaa`;
+
+  // 引用已落盘：GC 保留
+  const safe = createBlobStore({ adapter: memoryAdapter() });
+  await safe.restore(token, blobOf('safe'));
+  assert.deepEqual(
+    await safe.gc({ refSources: [JSON.stringify({ wallpaper: token })] }),
+    { deleted: 0, kept: 1, keptBoundary: 0, aborted: false },
+  );
+  assert.ok(await safe.get(token));
+
+  // 引用尚未落盘：默认 minAgeMs（72h）下照删——新鲜豁免按 id 时间戳算，救不了老 id
+  const exposed = createBlobStore({ adapter: memoryAdapter() });
+  await exposed.restore(token, blobOf('gone'));
+  assert.deepEqual(
+    await exposed.gc({ refSources: [] }),
+    { deleted: 1, kept: 0, keptBoundary: 0, aborted: false },
+  );
+  assert.equal(await exposed.get(token), null);
+});
+
 test('resolveDeep 覆盖数组上的 expando 属性（structuredClone 会保留它们，漏了令牌就进备份）', async () => {
   const store = createBlobStore({ adapter: memoryAdapter() });
   const token = await store.put(blobOf('x'));

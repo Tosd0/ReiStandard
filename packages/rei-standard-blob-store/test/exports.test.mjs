@@ -18,7 +18,7 @@ test('store 实例的方法表面', async () => {
   const store = api.createBlobStore({
     adapter: { get: async () => null, put: async () => {}, delete: async () => {}, keys: async () => [] },
   });
-  assert.deepEqual(Object.keys(store).sort(), ['delete', 'gc', 'get', 'isRef', 'migrateDataUrl', 'prefix', 'put', 'resolveDeep', 'resolveToDataUrl']);
+  assert.deepEqual(Object.keys(store).sort(), ['delete', 'gc', 'get', 'isRef', 'migrateDataUrl', 'prefix', 'put', 'resolveDeep', 'resolveToDataUrl', 'restore']);
   assert.equal(store.prefix, 'blobref:');
 });
 
