@@ -37,6 +37,7 @@ import {
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
   DEFAULT_MULTIPART_TTL_MS,
+  assertChunkBytesFitPushLimit,
 } from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -660,13 +661,17 @@ function resolveMultipartOptions(options) {
     }
   }
 
-  return {
+  const resolved = {
     enabled,
     maxChunkBytes: resolvePositiveInt(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES, 'multipart.maxChunkBytes'),
     ttlMs: resolvePositiveInt(multipart.ttlMs, DEFAULT_MULTIPART_TTL_MS, 'multipart.ttlMs'),
     maxChunks: resolvePositiveInt(multipart.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS, 'multipart.maxChunks'),
     maxTotalBytes: resolvePositiveInt(multipart.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES, 'multipart.maxTotalBytes'),
   };
+  // 正整数只是下限；maxChunkBytes 还有上限——满载一片的信封必须装得进单条
+  // push 的明文上限，超了每一片都会被推送服务拒收（见 multipart.js）。
+  assertChunkBytesFitPushLimit(resolved);
+  return resolved;
 }
 
 function resolveSseOptions(input) {

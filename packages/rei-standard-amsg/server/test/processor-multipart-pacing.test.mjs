@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_MULTIPART_TTL_MS } from '@rei-standard/amsg-shared';
 import { processSingleMessage } from '../src/server/lib/message-processor.js';
+import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from '../src/server/lib/webpush-webcrypto.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { createSingleUserServer } from '../src/server/single-user.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
@@ -144,6 +145,40 @@ describe('思考过程分片的发送节奏', () => {
     assert.equal(chunks.length, 0, '既然装不进窗口，一片都不该发出去');
     assert.match(result.reasoningError || '', /重组窗口/);
     assert.ok(sent.some((entry) => entry.push.messageKind === 'content'), '正文照发');
+  });
+});
+
+describe('maxChunkBytes 的上限校验', () => {
+  // 每片原文经 base64url 膨胀 4/3、再套上分片信封之后，必须仍装得进单条 push
+  // 的明文上限（约 3993 字节）。配得太大的话每一片都会被推送服务拒收——原来的
+  // 下场是每次触发时思考过程静默丢失，只留一条跟配置对不上号的推送错误。
+
+  it('配超过上限 → 配置错误响亮失败，一片都不切', async () => {
+    // 3000 字节原文 → base64 后 4000 字符，信封一套就超限。
+    const { result, chunks } = await deliverWithClock({
+      reasoningChars: 20_000,
+      multipart: { maxChunkBytes: 3000 },
+    });
+
+    assert.equal(result.success, false, '配置错误不能靠「思考过程静默丢掉」糊过去');
+    assert.equal(result.errorCode, 'MULTIPART_CHUNK_BYTES_TOO_LARGE');
+    assert.match(result.error, /maxChunkBytes/);
+    assert.match(result.error, /最大 \d+/, '错误信息要把当前配置下的上限说出来');
+    assert.equal(chunks.length, 0);
+  });
+
+  it('收窄到上限之内照常切片，且每一片的信封都装得进单条 push', async () => {
+    const { result, chunks } = await deliverWithClock({
+      reasoningChars: 20_000,
+      multipart: { maxChunkBytes: 2600 },
+    });
+
+    assert.equal(result.success, true);
+    assert.ok(chunks.length >= 2, `该切成多片，实际 ${chunks.length} 片`);
+    for (const { push } of chunks) {
+      const { bytes, withinLimit } = measurePushPayload(JSON.stringify(push));
+      assert.ok(withinLimit, `分片信封 ${bytes} 字节，超过单条 push 的 ${MAX_PUSH_PAYLOAD_BYTES} 字节上限`);
+    }
   });
 });
 

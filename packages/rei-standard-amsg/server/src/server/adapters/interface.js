@@ -172,11 +172,18 @@
  *   （可选；单用户/D1）把还没发出去的行删掉。任务投递到一半被取消 / 顶替时，
  *   剩下那几条 push 已经落了行却不会再发，不撤掉的话客户端会从 `GET /outbox`
  *   把它们补收回去。不实现 → 取消只挡住 Web Push 这一路。
+ * @property {(userId: string, taskUuid: string) => Promise<number>} [discardUndeliveredOutboxForTask]
+ *   （可选；单用户/D1）按 task_uuid 一次删掉该任务名下还没发出去的行
+ *   （delivered_at 与 acked_at 均为 NULL）。取消 / 顶替的 outbox 清理优先走
+ *   它：一个来回，且不受未 ack 积压量的影响。不实现 → 退回
+ *   listUnackedOutbox + discardOutboxMessages 的翻页扫描，扫描有行数上限
+ *   （见 lib/outbox-store.js），积压超过上限时会漏撤并打日志。
  * @property {(userId: string, sinceId: number, limit: number) => Promise<Array<Object>>} [listUnackedOutbox]
  *   （可选；单用户/D1）未 ack 的行，id 升序游标翻页（GET /outbox）。行上要带
- *   `task_uuid` 和 `delivered_at`：`DELETE /message` 和 supersedesUuid 顶替这两
- *   条路靠翻这份名单找出该任务名下还没发出去的行（没有按 task_uuid 查的读法），
- *   缺任一字段就挑不出来，那两条路上的 outbox 清理会静默跳过。
+ *   `task_uuid` 和 `delivered_at`：适配器没实现 discardUndeliveredOutboxForTask
+ *   时，`DELETE /message` 和 supersedesUuid 顶替这两条路靠翻这份名单找出该任务
+ *   名下还没发出去的行，缺任一字段就挑不出来，那两条路上的 outbox 清理会静默
+ *   跳过。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
  *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
  * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]

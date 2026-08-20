@@ -17,6 +17,7 @@ export function withoutOutbox(adapter) {
     'appendOutboxMessages',
     'markOutboxDelivered',
     'discardOutboxMessages',
+    'discardUndeliveredOutboxForTask',
     'listUnackedOutbox',
     'ackOutboxMessages',
     'cleanupOutbox',

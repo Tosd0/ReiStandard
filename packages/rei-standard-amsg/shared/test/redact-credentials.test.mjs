@@ -20,6 +20,9 @@ const MODEL_IDS = [
   'gemini-2.0-flash-thinking-exp-01-21',
   'text-embedding-3-small',
   'deepseek-reasoner',
+  // MoE 尺寸段（8x7b）是真实模型名里唯一「字母数字来回切三次以上」的段，
+  // 收紧随机段判定时它要继续放行。
+  'nous-hermes-2-mixtral-8x7b-dpo',
 ];
 
 /**
@@ -47,6 +50,11 @@ const MODEL_SHAPED_CREDENTIALS = [
   // 前缀不在已知凭据名单里，靠 uuid 形状 / 随机段认出来。
   'relay-12345678-abcd-1234-abcd-123456789012',
   'relay-abc123def456-ghi789jkl012',
+  // 前缀不认识、字母数字也不来回切：随机段全落在 hex 字母表里，靠「连续 hex
+  // 段累计过长」认出来。
+  'mycorp-aaaabbbbcccc-ddddeeeeffff',
+  // 短随机段（al7b）不该搭 MoE 尺寸段（8x7b）豁免的便车。
+  'mist-al7b-secret-key1',
 ];
 
 describe('redactCredentials', () => {

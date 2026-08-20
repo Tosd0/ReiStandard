@@ -467,6 +467,79 @@ describe('toNodeHandler 流式转发', () => {
     }
   });
 
+  // 「断连」这档只属于「字节已经发出去一部分」的场景。首字节前就失败的流，
+  // 客户端一个字节都没收到，断连没有任何信息量——pipeline 失败会先把 res 销毁，
+  // 拿「res 被销毁了」当「连接已收尾」的判据的话，这一档就只剩一句
+  // UND_ERR_SOCKET，读不到状态码也读不到错误码。
+  it('流在首次 pull 就失败（懒加载资源没起来）→ 干净的 500 信封，不是断连', { timeout: 15000 }, async () => {
+    const failsOnFirstPull = async () => new Response(
+      new ReadableStream({
+        pull() {
+          throw new Error('lazy resource failed to load');
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+    const server = await startServer(toNodeHandler(failsOnFirstPull));
+
+    const originalError = console.error;
+    const lines = [];
+    console.error = (...args) => { lines.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    try {
+      const res = await fetch(server.url, {
+        method: 'POST',
+        body: '{}',
+        signal: AbortSignal.timeout(3000),
+      });
+
+      assert.equal(res.status, 500);
+      assert.match(res.headers.get('content-type') || '', /application\/json/);
+      const body = await res.json();
+      assert.equal(body.success, false);
+      assert.equal(body.error.code, 'ADAPTER_ERROR');
+      assert.equal(body.error.message, 'lazy resource failed to load');
+      // 这是服务端自己的故障，归因日志照旧要有。
+      assert.equal(
+        lines.some((line) => line.includes('lazy resource failed to load')),
+        true,
+        `首字节前的流错误必须留下痕迹：${JSON.stringify(lines)}`,
+      );
+    } finally {
+      console.error = originalError;
+      await server.close();
+    }
+  });
+
+  it('流在 start 里就 error（一个字节都没吐）→ 同样是 500 信封', { timeout: 15000 }, async () => {
+    const failsInStart = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(new Error('stream dead on arrival'));
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+    const server = await startServer(toNodeHandler(failsInStart));
+
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const res = await fetch(server.url, {
+        method: 'POST',
+        body: '{}',
+        signal: AbortSignal.timeout(3000),
+      });
+
+      assert.equal(res.status, 500);
+      const body = await res.json();
+      assert.equal(body.error.code, 'ADAPTER_ERROR');
+      assert.equal(body.error.message, 'stream dead on arrival');
+    } finally {
+      console.error = originalError;
+      await server.close();
+    }
+  });
+
   it('客户端提前断开不写错误日志（那是正常收场，不是故障）', { timeout: 15000 }, async () => {
     const gate = deferred();
     const state = { upstreamFinished: false, canceled: false };

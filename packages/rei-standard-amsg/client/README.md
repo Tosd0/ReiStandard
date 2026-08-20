@@ -584,7 +584,7 @@ try {
 - `deletePushSubscription()` —— 删掉服务端登记的订阅（设置页的「停止接收推送」）。删掉之后已有的定时任务到点会投递失败并记下原因，不会静默消失
 - `putLlmCredentials(credentials)` —— 批量登记 / 覆盖用户级 LLM 凭据（`PUT /llm-credentials`；worker 支不支持用 `getCapabilities()` 探测 features 含 `llm-credentials`，别判版本号）。credentials 为 `[{ credId, value: { apiUrl, apiKey, primaryModel } }]`；`credId` 由客户端起名（约定 `char:<charId>/<purpose>`、`global/<purpose>`）。登记后排程 payload 用 `credRefs: { chat: credId }` 引用它，任务到点现读——换 Key 覆盖对应行就够，所有引用它的任务（含角色自排的）自动跟随
 - `listLlmCredentials()` —— 云端凭据对账清单 `{ credentials: [{ credId, updatedAt }] }`，凭据本体永远不回传
-- `deleteLlmCredentials(opts)` —— 删凭据：`{ credIds: [...] }` 删指定那几行（如角色删除时清它名下的），`{ all: true }` 全删（「清空云端数据」）。删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，重新登记同名 credId 即恢复
+- `deleteLlmCredentials(opts)` —— 删凭据：`{ credIds: [...] }` 删指定那几行（如角色删除时清它名下的），`{ all: true }` 全删（「清空云端数据」）。两种删法互斥，`all: true` 和 `credIds` 同时传直接抛 TypeError、不发请求（跟服务端对这种 body 的 400 同一口径）——用两份状态拼 opts 时记得只留一个字段。删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，重新登记同名 credId 即恢复
 - `getOutbox(opts?)` —— 拉这个用户还没确认收到的服务端消息（`GET /outbox`，单用户线）。服务端在每条 Web Push 发出去之前先记进账本，「哪些消息还没收下」因此是查得出来的事实，不用拿本地最近几条去比对着猜。返回 `{ entries, cursor, hasMore }`（走加密响应信封，方法内解密）；每条 entry 形如 `{ id, messageId, taskUuid, sessionId, messageIndex, totalMessages, createdAt, deliveredAt, push }`，其中 **`push` 就是推送信封本身**——与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页把上一页的 `cursor` 当下一页的 `opts.since`，`opts.limit` 为 1–100（缺省由服务端定，50）
 - `ackOutbox(messageIds)` —— 销账（`POST /outbox/ack`，请求体加密）：这些消息之后不再出现在 `getOutbox()` 的结果里。幂等，单次最多 200 条。顺序要紧——**先落库成功再 ack**，反过来的话账已经销了而落库半途失败，这条消息就补不回来了
 

@@ -230,6 +230,73 @@ test('queue: a network failure keeps the request queued and is not reported as d
   assert.equal(recovered.calls.length, 1, '记录仍在队列里，恢复后照常重试');
 });
 
+// --- 离线队列：被并发 flush 抢先结算的请求，ack 不能撒谎 ---------------------
+
+/**
+ * 入队方 add 完还要 await 一次 Background Sync 注册才轮到自己 flush；这个空当
+ * 里，刚注册的 sync flush（或别的窗口发的 FLUSH_QUEUE）完全可能先跑完、把这条
+ * 记录结算掉。在 mock 的 sync.register 里就地跑完一轮并发 flush，就是把这个
+ * 空当钉死放大。
+ */
+function armConcurrentFlush(sw, triggerMessage) {
+  const state = { runs: 0 };
+  sw.registration.sync = {
+    async register() {
+      if (state.runs > 0) return;
+      state.runs += 1;
+      await triggerMessage({ type: FLUSH_QUEUE });
+    },
+  };
+  return state;
+}
+
+test('queue: 并发 flush 抢先送走的请求，ack 要如实报 delivered:true', async () => {
+  const { sw, postedMessages, triggerMessage } = createSwMock();
+  installReiSW(sw);
+  const concurrent = armConcurrentFlush(sw, triggerMessage);
+
+  const fetchStub = stubFetch(() => ({ ok: true, status: 200 }));
+  let replies;
+  const { lines } = await captureErrors(async () => {
+    replies = await triggerMessage({ type: ENQUEUE_REQUEST, request: QUEUED_REQUEST });
+  });
+  fetchStub.restore();
+
+  assert.equal(concurrent.runs, 1, '并发 flush 得真的抢跑过，不然这条测试白测了');
+  assert.equal(fetchStub.calls.length, 1, '请求只发了一次（并发那轮发的），没有重复发送');
+  assert.equal(replies[0].ok, true);
+  // 记录已被并发 flush 成功送走。ack 报 delivered:false 的话，页面会按「还在
+  // 排队等重试」处理——而成功送达不广播任何事件，没有第二条消息来纠正它，
+  // 用户手动重试就会在服务端排出重复任务。
+  assert.equal(replies[0].delivered, true, '被并发 flush 送达也得如实报 delivered:true');
+  assert.equal(replies[0].dropped, undefined);
+  assert.deepEqual(postedMessages, [], '成功送达不该有任何广播');
+  assert.deepEqual(lines, []);
+});
+
+test('queue: 并发 flush 里被 4xx 拒掉的请求，ack 也要带上 dropped 的结局', async () => {
+  const { sw, postedMessages, triggerMessage } = createSwMock();
+  installReiSW(sw);
+  const concurrent = armConcurrentFlush(sw, triggerMessage);
+
+  const fetchStub = stubFetch(() => ({ ok: false, status: 401 }));
+  let replies;
+  await captureErrors(async () => {
+    replies = await triggerMessage({ type: ENQUEUE_REQUEST, request: QUEUED_REQUEST });
+  });
+  fetchStub.restore();
+
+  assert.equal(concurrent.runs, 1);
+  assert.equal(fetchStub.calls.length, 1);
+  const ack = replies[0];
+  assert.equal(ack.ok, true);
+  assert.equal(ack.delivered, false);
+  assert.equal(ack.dropped, true, '被并发 flush 判了永久拒绝，ack 不能只说「没送达」');
+  assert.equal(ack.status, 401);
+  // 广播照旧只有并发那轮结算时发出的一条。
+  assert.equal(postedMessages.filter((m) => m.type === QUEUE_DROPPED).length, 1);
+});
+
 // --- push：去重仓库坏掉不能把整条 push 吞掉 ----------------------------------
 
 test('push: a broken dedupe store still shows the notification and runs business', async () => {

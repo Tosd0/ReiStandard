@@ -948,6 +948,26 @@ export class D1Adapter {
   }
 
   /**
+   * 把某条任务名下还没发出去的行一次删掉（取消 / 顶替时的 outbox 清理）。
+   *
+   * 判据与 discardOutboxMessages 相同：只删 delivered_at 与 acked_at 均为
+   * NULL 的行——已经推给设备 / 已 ack 的照旧留着。按 task_uuid 直删是为了不
+   * 受未 ack 积压量的影响：靠翻页扫描挑行的话，积压一大这条任务的行就落在
+   * 扫描上限之外（见 lib/outbox-store.js 的 discardUndeliveredPushesForTask）。
+   *
+   * @param {string} userId
+   * @param {string} taskUuid
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async discardUndeliveredOutboxForTask(userId, taskUuid) {
+    const res = await this._db.prepare(
+      `DELETE FROM message_outbox
+       WHERE user_id = ? AND task_uuid = ? AND delivered_at IS NULL AND acked_at IS NULL`
+    ).bind(userId, taskUuid).run();
+    return res.meta.changes || 0;
+  }
+
+  /**
    * 未 ack 的行（id 升序，游标翻页）。payload 仍是密文，解密在 handler。
    *
    * @param {string} userId

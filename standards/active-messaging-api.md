@@ -308,7 +308,7 @@ createInstantHandler({
 | Business | `messageSubtype` | 任意字符串 | 调用方（自由命名） |
 | Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` | 包（固定枚举） |
 
-外加 `source: 'instant' | 'scheduled'` —— 路由来源（`amsg-instant` 输出恒为 `'instant'`；`amsg-server` 任何输出恒为 `'scheduled'`）。`messageType: 'instant'` 必配 `source: 'instant'`；其余三种 `messageType` 必配 `source: 'scheduled'`。
+外加 `source: 'instant' | 'scheduled'` —— 路由来源（`amsg-instant` 输出恒为 `'instant'`；`amsg-server` 按 `messageType` 推导：`instant` 配 `'instant'`，其余配 `'scheduled'`）。`messageType: 'instant'` 必配 `source: 'instant'`；其余三种 `messageType` 必配 `source: 'scheduled'`。
 
 `messageKind` 是**字面量类型判别器**：TS 端 `switch (push.messageKind)` 即可窄化到具体子类型；JS 端用 `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` 守卫函数。
 

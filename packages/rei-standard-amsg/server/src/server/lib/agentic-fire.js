@@ -127,7 +127,12 @@ import {
   resolveLlmCredential as resolveLlmCredentialFromStore,
   supportsLlmCredentialsStore,
 } from './llm-credentials-store.js';
-import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import {
+  appendPushesToOutbox,
+  discardUndeliveredPushes,
+  discardUndeliveredPushesForTask,
+  markPushesDelivered,
+} from './outbox-store.js';
 import { shouldSendPush } from './push-policy.js';
 import { DeploymentConfigError, isTaskCancelledError, markPermanent, NonRetryableError, sendTaggedPush } from './errors.js';
 import { validateTaskPayloadSize } from './validation.js';
@@ -332,6 +337,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     occurrenceMs,
     webpush: ctx.webpush,
     now: nowFn,
+    // run-tick 在投递 ctx 上挂的取消信号（与 guardWebpushWithLease 读的是同一
+    // 个租约状态），emitResult 不发推送的那条路要靠它拦下已取消任务的落行。
+    isCancelled: typeof ctx.isTaskCancelled === 'function' ? ctx.isTaskCancelled : null,
   });
 
   const maxScheduledTasksPerFire =
@@ -618,6 +626,13 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       );
     }
     const cancelled = await ctx.db.deleteTaskByUuid(uuid, task.user_id);
+    if (cancelled) {
+      // 与 DELETE /cancel-message 同一收尾：那条任务此前投递到一半失败过的话，
+      // 没发出去的分段还躺在 outbox 里等重试，行删了它们不会跟着走——不撤掉的
+      // 话客户端下一次 GET /outbox 照样把已取消任务的内容补收回去。
+      // best-effort：清不掉不翻掉这次取消（行已经删了）。
+      await discardUndeliveredPushesForTask({ db: ctx.db, userId: task.user_id, taskUuid: uuid });
+    }
     return { cancelled: !!cancelled };
   };
 

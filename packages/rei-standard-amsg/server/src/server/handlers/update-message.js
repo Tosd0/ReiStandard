@@ -8,7 +8,7 @@
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize, taskPayloadByteLength } from '../lib/validation.js';
-import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs } from '../lib/llm-credentials-store.js';
+import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs, hasChatCredRef } from '../lib/llm-credentials-store.js';
 
 /**
  * 行级列名 → 对应的请求字段名。
@@ -229,6 +229,23 @@ export function createUpdateMessageHandler(ctx) {
     }
 
     const existingData = JSON.parse(await decryptFromStorage(existingTask.encrypted_payload, userKey));
+
+    // 任务已存 credRefs.chat 时，内联三件套的「凭据刷新」打回。fire 时的解析
+    // 以凭据表那行为准（见 lib/llm-credentials-store.js 的
+    // resolveFireCredentials），内联只是表行缺失时的兜底——这里改内联再回 200
+    // 的话，调用方以为轮换成功，之后每次触发用的仍是表里的旧 Key，也就永远不
+    // 会去改真正生效的那份。请求里带新 credRefs 的组合不在此列（改的就是引用
+    // 本身；credRefs 与内联同传的组合在上面已经被拒）。
+    if (
+      (updates.apiUrl || updates.apiKey || updates.primaryModel) &&
+      hasChatCredRef(existingData)
+    ) {
+      return { status: 409, body: { success: false, error: {
+        code: 'TASK_USES_CRED_REFS',
+        message: '任务已通过 credRefs.chat 引用凭据，触发时以凭据表为准，内联 apiUrl / apiKey / primaryModel 的更新不会生效。换 Key 请用 PUT /llm-credentials 覆盖对应凭据，或在本次请求里改用 credRefs 指向新凭据',
+        details: { invalidFields: ['apiUrl', 'apiKey', 'primaryModel'].filter((name) => updates[name]) }
+      } } };
+    }
 
     // When the caller switches prompt source (completePrompt ↔ messages),
     // null out the other so storage stays one-of (matches schedule-message
