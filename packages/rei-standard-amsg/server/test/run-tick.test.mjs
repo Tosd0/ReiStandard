@@ -1397,6 +1397,132 @@ test('投递期间被取消：没发出去的那几条从 outbox 里撤掉，补
   assert.ok(unacked[0].delivered_at, '留下的那条是真发出去过的');
 });
 
+// 取消发生在 LLM 还在跑的时候：DELETE 那侧清 outbox 时行还没落进去（投递侧是
+// 生成完才 appendPushesToOutbox），之后落进去的行只能由投递侧在发现「行已被取
+// 消」时自己撤。思考过程那条行按策略只落行、不推送（delivered_at 一直是空
+// 的），正是每次都会留下、又必然从 GET /outbox 复活的那种。
+async function cancelAfterDeliveryLeavesNoUndelivered(recurrenceType) {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const uuid = `cancel-late-outbox-${recurrenceType}`;
+  await seed(adapter, {
+    uuid, recurrenceType, nextSendAt: recentDue(),
+    payload: {
+      messageType: 'prompted', completePrompt: 'p',
+      apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'sk-f', primaryModel: 'm'
+    }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return { choices: [{ message: { content: '回答。', reasoning_content: '先想想' } }] };
+    }
+  });
+
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  let markSending;
+  const sending = new Promise((resolve) => { markSending = resolve; });
+  const sent = [];
+  const webpush = {
+    async sendNotification(_subscription, payload) {
+      sent.push(JSON.parse(payload));
+      markSending();
+      await gate;
+    }
+  };
+
+  let res;
+  try {
+    // 心跳关掉：走的是「收尾写库匹配不到行」那条路（cancelled_after_delivery）。
+    const tick = runScheduledTick({
+      db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 0
+    });
+    await sending;
+    // 正文推到一半（整批行已落进 outbox），用户这时候点了取消。
+    assert.equal(await adapter.deleteTaskByUuid(uuid, USER), true);
+    openGate();
+    res = await tick;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_after_delivery']);
+  assert.equal(sent.some((push) => push.messageKind === 'reasoning'), false, '有收件箱时思考过程本来就不推送');
+
+  const unacked = await adapter.listUnackedOutbox(USER, 0, 50);
+  assert.equal(
+    unacked.filter((row) => row.delivered_at == null).length, 0,
+    '取消的任务不能留下等补收的行——思考过程那条会从 GET /outbox 复活'
+  );
+  assert.equal(unacked.length, 1, '已经推出去的正文行照旧留着让客户端 ack');
+}
+
+test('推送发完才发现被取消（一次性）：这条任务没发出去的 outbox 行跟着撤掉', async () => {
+  await cancelAfterDeliveryLeavesNoUndelivered('none');
+});
+
+test('推送发完才发现被取消（循环）：推进排期扑空的那条路同样清 outbox', async () => {
+  await cancelAfterDeliveryLeavesNoUndelivered('daily');
+});
+
+// emitResult 不发推送的那条路（notification.show:false）没有 webpush 那道取消
+// 拦截，取消信号要靠 run-tick 挂在投递 ctx 上的 isTaskCancelled 一路传进
+// result-emitter——这条链断在哪一环，取消后的结果都会静静落行、从 GET /outbox
+// 复活。
+test('取消撞上 emitResult(show:false)：不落行、抛 TASK_CANCELLED', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'cancel-emit-quiet', recurrenceType: 'none', nextSendAt: recentDue(),
+    payload: {
+      messageType: 'prompted', completePrompt: 'p',
+      apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'sk-f', primaryModel: 'm'
+    }
+  });
+
+  let renewMisses = 0;
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'renewTaskLease') {
+        return async (...args) => {
+          const renewed = await target.renewTaskLease(...args);
+          if (!renewed) renewMisses++;
+          return renewed;
+        };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  let thrown = null;
+  const hooks = {
+    onBeforeFire: async (fireCtx) => {
+      // fire 正跑着，用户点了取消；等心跳把信号带进来。
+      assert.equal(await adapter.deleteTaskByUuid('cancel-emit-quiet', USER), true);
+      await waitUntil(() => renewMisses > 0, '续租一直没扑空，取消信号没传到投递侧');
+      try {
+        await fireCtx.emitResult({ resultKind: 'ledger', notification: { show: false } });
+      } catch (error) {
+        thrown = error;
+      }
+      return { skip: true };
+    },
+    onLLMOutput: async () => ({ decision: 'skip-push' }),
+  };
+
+  const res = await runScheduledTick({
+    db, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(), hooks, leaseHeartbeatMs: 10
+  });
+
+  assert.equal(thrown && thrown.code, 'TASK_CANCELLED', 'show:false 不走推送，取消信号也得拦得住');
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_after_delivery']);
+  assert.deepEqual(await adapter.listUnackedOutbox(USER, 0, 50), [], '取消后的结果不能留在收件箱等补收');
+});
+
 // 冻结的 webpush 对象：宿主按常见写法传 Object.freeze({ sendNotification })。
 // 取消检查那一层要是用 Proxy 包，get trap 返回包装函数会踩 Proxy 不变式当场抛
 // TypeError——那个部署下每一条定时消息都发不出去，还照常走 2/4/6 分钟的梯子。

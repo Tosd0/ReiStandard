@@ -37,6 +37,7 @@ import {
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
   DEFAULT_MULTIPART_TTL_MS,
   MULTIPART_MESSAGE_KIND,
+  assertChunkBytesFitPushLimit,
   buildMultipartPushPayloads,
 } from './multipart.js';
 
@@ -752,13 +753,19 @@ function resolveRuntimeMultipartOptions(ctx) {
     }
   }
 
-  return {
+  const resolved = {
     enabled,
     maxChunkBytes: positiveIntegerOrDefault(maxChunkBytes, DEFAULT_MULTIPART_CHUNK_BYTES),
     ttlMs: positiveIntegerOrDefault(config.ttlMs, DEFAULT_MULTIPART_TTL_MS),
     maxChunks: positiveIntegerOrDefault(config.maxChunks, DEFAULT_MULTIPART_MAX_CHUNKS),
     maxTotalBytes: positiveIntegerOrDefault(config.maxTotalBytes, DEFAULT_MULTIPART_MAX_TOTAL_BYTES),
   };
+  // createInstantHandler 的配置解析已经做过同一道校验；这里再拦一次，是给
+  // 直接调 processInstantMessage / sendPushWithMaybeBlob、自己攒 ctx 的调用
+  // 方兜底——maxChunkBytes 配超上限时，切出的每一片都会被推送服务拒收（见
+  // multipart.js），该在这里吵着失败，不该报成一条对不上号的推送错误。
+  assertChunkBytesFitPushLimit(resolved);
+  return resolved;
 }
 
 async function sendMultipartPushes(pushPayload, args) {

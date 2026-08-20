@@ -762,6 +762,8 @@ createInstantHandler({
 });
 ```
 
+`maxChunkBytes` 只用来**收窄**，有上限：每片原文经 base64url 膨胀 4/3、再套上分片信封后，必须仍装得进单条 push 的明文上限（约 3993 字节），换算下来原文一片最多约 2800 字节。配超了 `createInstantHandler` 当场抛错（错误信息带当前配置下允许的最大值），不会切出一批推送服务收不了的分片。
+
 `reasoningChunkBytes` 还保留为迁移期别名：
 
 ```js

@@ -126,6 +126,24 @@ test('refSources 的 [Symbol.iterator] 是「读」就抛的 getter → 仍是�
   assert.equal(adapter.map.size, 2);
 });
 
+test('minAgeMs 传成 NaN/null 等非「非负有限数字」→ 抛 TypeError，不静默关阀（NaN 让 `now - ts < minAgeMs` 恒 false，刚 put 的图会穿过新鲜豁免被删——正是这道阀要堵的竞态窗口；宿主 cfg.hours*3600000 而 cfg.hours 是 undefined 就会算出 NaN）', async () => {
+  for (const bad of [NaN, null, Infinity, -1, '0']) {
+    const { store, adapter } = await seed(1); // 刚 put、无引用：豁免一失效就会被删
+    await assert.rejects(
+      () => store.gc({ refSources: [], minAgeMs: bad }),
+      { name: 'TypeError', message: /minAgeMs/ },
+      `minAgeMs=${String(bad)} 应当抛 TypeError`,
+    );
+    assert.equal(adapter.map.size, 1);
+  }
+});
+
+test('now 传成 NaN → 同款抛 TypeError（now 是 NaN 时 now - ts 也是 NaN，新鲜豁免同样恒不命中）', async () => {
+  const { store, adapter } = await seed(1);
+  await assert.rejects(() => store.gc({ refSources: [], now: NaN }), { name: 'TypeError', message: /now/ });
+  assert.equal(adapter.map.size, 1);
+});
+
 test('默认新鲜豁免窗口是 72h：71h 内不删，73h 之后删', async () => {
   const { store, adapter } = await seed(1);
   const H = 3600 * 1000;

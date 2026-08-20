@@ -21,6 +21,12 @@ function storeSize(connection, storeName) {
   return data ? data.records.size : 0;
 }
 
+/** 某个仓库里有没有这个 key。仓库是整个文件共享的，盯单条比数总行数稳。 */
+function storeHas(connection, storeName, key) {
+  const data = connection && connection._meta && connection._meta.stores.get(storeName);
+  return !!data && data.records.has(key);
+}
+
 const { installReiSW, REI_SW_EVENT } = await import('../src/index.js');
 
 function createSwMock() {
@@ -611,4 +617,122 @@ test('multipart: a delivered id is never reported expired by the TTL sweep', asy
     [],
     '已经交付的 id 不能被清扫报成过期',
   );
+});
+
+/** 把「写 done 墓碑」这一步打断（restore 刚重读完全部分片，紧接着的第一笔写最容易撞上配额）。 */
+function breakDoneStoreWrites(conn) {
+  const realTransaction = conn.transaction;
+  conn.transaction = function patchedTransaction(storeName, mode) {
+    if (storeName === MULTIPART_DONE_STORE && mode === 'readwrite') {
+      throw new FakeDOMException('quota exceeded', 'QuotaExceededError');
+    }
+    return realTransaction.call(this, storeName, mode);
+  };
+  return () => { conn.transaction = realTransaction; };
+}
+
+test('multipart: done 墓碑写不进去时，TTL 清扫也不能把已交付的消息报成丢了', async () => {
+  const { sw, postedMessages, triggerPush } = createSwMock();
+  // pending 记录 120ms 后过期；cleanupIntervalMs = 0 → 每条 push 都顺手扫一遍。
+  const PENDING_TTL_MS = 120;
+  const business = install(sw, { ttlMs: PENDING_TTL_MS });
+
+  const original = {
+    messageKind: 'content',
+    messageId: 'msg_mp_done_write_failed',
+    message: 'v'.repeat(200),
+  };
+  const parts = buildMultipartPayloads(original, { id: 'mp_done_write_failed', maxChunkBytes: 80 });
+
+  for (const part of parts.slice(0, -1)) {
+    await triggerPush(part);
+  }
+
+  // 最后一片到达时收尾的第一步「写 done 墓碑」失败：重组成功、消息照常交付，
+  // 但持久墓碑没写成，pending 记录和分片也留了下来（删它们排在写墓碑之后）。
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  const restore = breakDoneStoreWrites(conn);
+  let lines;
+  try {
+    ({ lines } = await captureErrors(() => triggerPush(parts[parts.length - 1])));
+  } finally {
+    restore();
+  }
+
+  assert.ok(
+    lines.some((line) => line.includes('multipart cleanup after a completed restore failed')),
+    `这条测试要的就是「墓碑写失败」，没打断到就白测了：${JSON.stringify(lines)}`,
+  );
+  assert.equal(business.length, 1, '数据拼回来了，消息照常交付');
+  assert.deepEqual(expiredEvents(postedMessages), []);
+
+  // 等残留的 pending 记录过期，再拿一条无关的 push 触发清扫。持久墓碑没写成，
+  // 清扫只能靠内存里留下的结论认出「这条已经交付过了」。
+  await sleep(PENDING_TTL_MS + 30);
+  await captureErrors(() => triggerPush({
+    messageKind: 'content',
+    messageId: 'msg_mp_done_write_failed_sweep',
+    message: 'trigger cleanup',
+  }));
+
+  assert.equal(business.length, 2, '无关的那条 push 照常交付');
+  assert.deepEqual(
+    expiredEvents(postedMessages),
+    [],
+    '用户已经读过的消息，不能因为墓碑那笔写失败就被清扫报成没收到',
+  );
+  // 清扫本身要真的跑到并清掉残留——不然上面那条断言只是「清扫没跑」的假阴性。
+  assert.equal(
+    storeHas(conn, MULTIPART_PENDING_STORE, 'mp_done_write_failed'), false,
+    '残留的 pending 照常被清扫清掉',
+  );
+  assert.equal(
+    storeHas(conn, MULTIPART_CHUNK_STORE, 'mp_done_write_failed_1'), false,
+    '残留的分片也一起清掉',
+  );
+});
+
+test('multipart: 墓碑写失败后，重投的旧分片不能把已交付的消息再投一次', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  const business = [];
+  const PENDING_TTL_MS = 120;
+  // 去重关掉：墓碑「重投旧分片不再触发业务事件」的承诺要自己站得住，不能靠
+  // 上层 messageId 去重兜底（宿主可以合法关掉去重）。
+  installReiSW(sw, {
+    dedupe: { enabled: false },
+    multipart: { cleanupIntervalMs: 0, ttlMs: PENDING_TTL_MS },
+    onBusinessPayload: (payload) => { business.push(payload); },
+  });
+
+  const original = {
+    messageKind: 'content',
+    messageId: 'msg_mp_redelivered',
+    message: 'u'.repeat(200),
+  };
+  const parts = buildMultipartPayloads(original, { id: 'mp_redelivered', maxChunkBytes: 80 });
+
+  for (const part of parts.slice(0, -1)) {
+    await triggerPush(part);
+  }
+
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  const restore = breakDoneStoreWrites(conn);
+  try {
+    await captureErrors(() => triggerPush(parts[parts.length - 1]));
+  } finally {
+    restore();
+  }
+  assert.equal(business.length, 1, '第一次照常交付');
+
+  // pending 过期后，推送服务把整条消息的分片重投一遍。第一片到达时清扫顺手把
+  // 残留的 pending 和分片清掉——之后要是没有任何结论挡着，剩下的重投分片会把
+  // 这条消息从零重新拼齐、再交付一次。
+  await sleep(PENDING_TTL_MS + 30);
+  await captureErrors(async () => {
+    for (const part of parts) await triggerPush(part);
+  });
+
+  assert.equal(business.length, 1, '重投不能把同一条消息再交付一次');
+  assert.equal(notifications.length, 1, '通知也只该弹第一次那一条');
+  assert.deepEqual(expiredEvents(postedMessages), [], '交付过的消息更不能被报成丢了');
 });

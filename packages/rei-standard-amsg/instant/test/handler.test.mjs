@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   createInstantHandler,
+  sendPushWithMaybeBlob,
   validateInstantPayload,
 } from '../src/index.js';
 import {
@@ -633,6 +634,65 @@ describe('createInstantHandler — happy path', () => {
     assert.equal(res.status, 401);
     const body = await res.json();
     assert.equal(body.error.code, 'UNAUTHORIZED');
+  });
+});
+
+// ─── multipart.maxChunkBytes 上限 ──────────────────────────────────────
+//
+// 这个旋钮只用于把切片收窄到跟接收端对齐，但原来只校验「正整数」：配大（比如
+// 3000）时每个分片拼上 multipart 信封就超过单条 push 的明文上限（约 3993 字
+// 节），真实推送服务每次都拒收——reasoning / 长内容在那条部署上永久不可投递，
+// 而测试桩不管大小照单全收，本地完全看不出来。所以必须在配置解析阶段就吵着
+// 失败，报错还得把当前配置下的最大可用值说出来。
+
+describe('createInstantHandler — multipart.maxChunkBytes 上限', () => {
+  it('配超上限 → createInstantHandler 当场抛，报错带当前配置下的最大值', () => {
+    let thrown;
+    try {
+      createInstantHandler({ vapid, multipart: { maxChunkBytes: 3000 } });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, '超限配置必须在配置解析阶段就抛出来');
+    assert.match(thrown.message, /maxChunkBytes = 3000/);
+    assert.match(thrown.message, /最大 \d+/, '错误信息要把当前配置下的上限说出来');
+
+    // 报错里给的最大值必须真的能用——多 1 字节就不行。
+    const maxAllowed = Number(thrown.message.match(/最大 (\d+)/)[1]);
+    assert.ok(Number.isInteger(maxAllowed) && maxAllowed > 0);
+    createInstantHandler({ vapid, multipart: { maxChunkBytes: maxAllowed } });
+    assert.throws(
+      () => createInstantHandler({ vapid, multipart: { maxChunkBytes: maxAllowed + 1 } }),
+      /maxChunkBytes/
+    );
+  });
+
+  it('deprecated 别名 reasoningChunkBytes 走同一道校验', () => {
+    assert.throws(
+      () => createInstantHandler({ vapid, reasoningChunkBytes: 3000 }),
+      /maxChunkBytes = 3000/
+    );
+  });
+
+  it('默认值与合法收窄值不受影响', () => {
+    createInstantHandler({ vapid });
+    createInstantHandler({ vapid, multipart: { maxChunkBytes: 1800 } });
+    createInstantHandler({ vapid, multipart: { maxChunkBytes: 900, maxChunks: 32, ttlMs: 120_000 } });
+  });
+
+  it('直接调 sendPushWithMaybeBlob（自己攒 ctx）同样被拦下，一片都不发出', async () => {
+    const router = llmRouter('unused.');
+    const oversized = { messageKind: 'reasoning', reasoningContent: 'x'.repeat(5000) };
+    await assert.rejects(
+      () => sendPushWithMaybeBlob(
+        oversized,
+        { pushSubscription: subKit.subscription },
+        { vapid, fetch: router.fetch, multipart: { maxChunkBytes: 3000 } },
+        'sess-chunk-limit'
+      ),
+      /maxChunkBytes = 3000/
+    );
+    assert.equal(router.pushCalls.length, 0, '配置错误时一片都不该发出去');
   });
 });
 

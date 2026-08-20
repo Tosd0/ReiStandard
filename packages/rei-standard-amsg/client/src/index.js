@@ -1424,6 +1424,10 @@ export class ReiClient {
    * 删掉服务端登记的凭据。`{ credIds: [...] }` 删指定那几行（角色删除时清
    * 它名下的），`{ all: true }` 全删（「清空云端数据」）。
    *
+   * 两种删法互斥：`all: true` 和 `credIds` 同时传直接抛 TypeError、不发请求
+   * （跟服务端对这种 body 的 400 同一口径）。SDK 不替调用方猜是哪种意图——
+   * 猜错的代价是把用户所有凭据行全删掉。
+   *
    * 删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，不会静默
    * 消失；重新登记同名 credId 即恢复。
    *
@@ -1435,6 +1439,11 @@ export class ReiClient {
     const credIds = opts && opts.credIds;
     if (!wantsAll && (!Array.isArray(credIds) || credIds.length === 0)) {
       throw new TypeError('[rei-standard-amsg-client] pass { credIds: [...] } or { all: true }');
+    }
+    // 与服务端的 400 守卫同一条件（credIds 只要出现就算，空数组也是）：
+    // 歧义输入在本地就拦下，不擅自选一种解释发出去。
+    if (wantsAll && credIds !== undefined) {
+      throw new TypeError('[rei-standard-amsg-client] all 与 credIds 不能同时出现');
     }
     const body = wantsAll ? { all: true } : { credIds };
     const encrypted = await this._encrypt(JSON.stringify(body));

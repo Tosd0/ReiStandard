@@ -121,6 +121,8 @@ describe('ctx.emitResult', () => {
     assert.equal(pushes[0].taskUuid, 'u7');
     assert.equal(pushes[0].recurrenceType, 'daily');
     assert.equal(pushes[0].occurrenceMs, OCCURRENCE_MS);
+    // source 跟着 messageType 走（auto → scheduled）
+    assert.equal(pushes[0].source, 'scheduled');
     // 默认弹一下：跑完了就该叫人回来看
     assert.equal(pushes[0].notification.show, 'always');
 
@@ -133,6 +135,24 @@ describe('ctx.emitResult', () => {
 
     assert.equal(returned.messageId, `msg_task_7@${OCCURRENCE_MS}_result_0`);
     assert.equal(returned.pushed, true);
+  });
+
+  test('in-server instant 的 fire 里发结果：source 跟着 messageType 走', async () => {
+    // 标准的配对规则：messageType 'instant' 必配 source 'instant'。写死
+    // 'scheduled' 会凑出一对非法组合，客户端按 source 分流时走岔。
+    const { adapter, ctx, pushes } = await bootstrap();
+    const task = await makeTask({ messageType: 'instant' });
+    const hooks = emittingHooks(async (fireCtx) => {
+      await fireCtx.emitResult({ resultKind: 'fire-pack' });
+    });
+
+    const result = await processSingleMessage(task, { ...ctx, hooks });
+    assert.equal(result.success, true);
+
+    assert.equal(pushes[0].messageType, 'instant');
+    assert.equal(pushes[0].source, 'instant');
+    const outbox = await readOutbox(adapter);
+    assert.equal(outbox[0].push.source, 'instant', '收件箱里的那份是同一条');
   });
 
   test('宿主自定义通知：标题正文照用，说了别弹就干脆不推', async () => {
@@ -226,6 +246,35 @@ describe('ctx.emitResult', () => {
 
     assert.equal(thrown && thrown.code, 'TASK_CANCELLED', '取消这个信号照旧往上抛');
     assert.deepEqual(await readOutbox(adapter), [], '落进去的那一行也撤掉了');
+  });
+
+  test('show:false + 任务已被取消：不落行、抛 TASK_CANCELLED', async () => {
+    // 取消的检查点原来只有推送前那一道（guardWebpushWithLease 的 throw），而
+    // show:false 的结果不发推送——取消信号要靠 ctx.isTaskCancelled 这条显式读
+    // 法拦住，否则取消后的结果静静落行，客户端下一次 GET /outbox 又拉回去。
+    const { adapter, ctx } = await bootstrap();
+    let cancelled = false;
+    let before;
+    let thrown = null;
+    const hooks = emittingHooks(async (fireCtx) => {
+      // 取消前照常：行落得进去。
+      before = await fireCtx.emitResult({ resultKind: 'ledger', notification: { show: false } });
+      // 用户点了取消，心跳把信号带进来（run-tick 挂的 isTaskCancelled）。
+      cancelled = true;
+      try {
+        await fireCtx.emitResult({ resultKind: 'ledger', notification: { show: false } });
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    await processSingleMessage(await makeTask(), { ...ctx, hooks, isTaskCancelled: () => cancelled });
+
+    assert.equal(before.pushed, false);
+    assert.equal(thrown && thrown.code, 'TASK_CANCELLED', 'show:false 不走推送，取消信号也得拦得住');
+    const outbox = await readOutbox(adapter);
+    assert.equal(outbox.length, 1, '取消后的那条不能留在收件箱等补收');
+    assert.equal(outbox[0].push.resultKind, 'ledger');
   });
 
   test('同一次触发重跑：messageId 不变，收件箱不会补出第二条', async () => {

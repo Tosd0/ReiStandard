@@ -460,7 +460,7 @@ export async function enqueueRequestToSW(requestPayload) {
 
 - `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到 outbox，并立即尝试发送
 - `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送
-- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果（`ok` / `error` / `queueId`）。点对点，一次入队一条
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果。点对点，一次入队一条。`ok: true` 表示已入队；`delivered: true` 表示这条已经真的发出去了（自己入队触发的冲刷、或恰好并发在跑的另一轮冲刷发的都算）；`delivered: false` 且没有 `dropped` 表示还在队列里等下次冲刷；被服务端 4xx 永久拒掉时带 `dropped: true` / `status` / `error`
 - `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
 
 `QUEUE_DROPPED` 单独占一个 type，是因为它跟 `QUEUE_RESULT` 的收信人不是一回事：它是广播，可能来自后台 `sync` 冲刷、说的也可能是另一条早就排在队列里的旧请求。页面等自己那条入队回执时，不会被它打岔。

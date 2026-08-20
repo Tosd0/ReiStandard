@@ -117,6 +117,19 @@ const multipartLocks = new Map();
  * 时候再去写一条 done 记录，多半也是白写。
  */
 const rejectedMultipartIds = new Map();
+/**
+ * 持久 done 墓碑没写进去时的内存兜底：id → 墓碑本该活到的时刻。
+ *
+ * 收尾的第一步是往 IndexedDB 写 done 墓碑（见 settleMultipartId），TTL 清扫和
+ * 后续分片全靠它认出「这条已有结论」。这一笔写恰恰容易失败——restore 刚重读完
+ * 一整条消息的分片，紧接着的第一笔写最容易撞上配额。写不进去时把同样的结论留
+ * 在这张表里：SW 存活期内，清扫不会对一条已经送达的消息广播 MULTIPART_EXPIRED，
+ * 推送服务重投的旧分片也不会把它重新拼一遍再投一次。
+ *
+ * SW 重启后内存证据会丢——那时持久墓碑本来也没写成，误报一次是权衡后接受的
+ * 残余风险。
+ */
+const memoryFallbackMultipartDone = new Map();
 const dedupeDbCache = new Map();
 
 // SW ↔ 页面 postMessage 常量（REI_AMSG_POSTMESSAGE_TYPE / REI_SW_EVENT /
@@ -1262,6 +1275,10 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
   // 对失败那片的重投能把这条消息照常拼齐投出来，页面却已经挂上了「收不到」。
   if (multipartIdAlreadyRejected(normalized.id)) return null;
 
+  // 持久墓碑写失败时留下的内存结论也算「已 settled」：不挡的话，推送服务重投
+  // 的旧分片能把一条已经交付过的消息重新拼齐、再投一次。
+  if (multipartDoneInMemory(normalized.id)) return null;
+
   const done = await readMultipartDone(normalized.id);
   if (done && done.expiresAt > Date.now()) return null;
   if (done) await deleteMultipartDone(normalized.id);
@@ -1386,18 +1403,52 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
  *
  * 墓碑比重组窗口活得久（两倍），推送服务重投旧分片时也不会再触发一次业务事件。
  *
+ * 持久墓碑本身写失败时，同样的结论会先落进内存兜底表（见
+ * {@link memoryFallbackMultipartDone}）再把错误往上抛：调用方各自的失败处理不变，
+ * 但「已有结论」这件事在 SW 存活期内不丢。
+ *
  * @param {{ id: string, ttlMs?: number }} record
  * @param {number} total - 要清掉的分片数（冲突时取两边的较大值，别漏删）
  * @param {{ ttlMs: number }} options
  */
 async function settleMultipartId(record, total, options) {
   const ttlMs = positiveIntegerOrDefault(record.ttlMs, options.ttlMs);
-  await writeMultipartDone({
-    id: record.id,
-    expiresAt: Date.now() + Math.max(ttlMs * 2, ttlMs + 1),
-  });
+  const expiresAt = Date.now() + Math.max(ttlMs * 2, ttlMs + 1);
+  try {
+    await writeMultipartDone({ id: record.id, expiresAt });
+  } catch (error) {
+    rememberMultipartDoneInMemory(record.id, expiresAt);
+    throw error;
+  }
   await deleteMultipartPending(record.id);
   await deleteMultipartChunks(record.id, total);
+}
+
+/**
+ * 把「这个 id 已有结论」记进内存兜底表，顺手清掉表里已过期的记录——这张表只在
+ * 持久墓碑写失败时长，扫一遍比挂定时器省事（同 pruneRejectedMultipartIds）。
+ */
+function rememberMultipartDoneInMemory(id, expiresAt) {
+  const now = Date.now();
+  for (const [key, value] of memoryFallbackMultipartDone) {
+    if (value <= now) memoryFallbackMultipartDone.delete(key);
+  }
+  memoryFallbackMultipartDone.set(id, expiresAt);
+}
+
+/**
+ * 内存兜底表里有没有这个 id 的有效结论。顺手把自己这条过期记录清掉
+ * （同 multipartIdAlreadyRejected）。
+ *
+ * @param {string} id
+ * @param {number} [now]
+ */
+function multipartDoneInMemory(id, now = Date.now()) {
+  const expiresAt = memoryFallbackMultipartDone.get(id);
+  if (expiresAt === undefined) return false;
+  if (expiresAt > now) return true;
+  memoryFallbackMultipartDone.delete(id);
+  return false;
 }
 
 /**
@@ -1510,9 +1561,13 @@ async function maybeCleanupMultipart(sw, ctx) {
  *
  * 当场判废那条路（见 rejectMultipartChunk）的结论只记在内存里，一样算数：页面
  * 早就收到过一次「这条收不了」，清扫再补一次只是同一句话说两遍。
+ *
+ * 持久墓碑写失败时留下的内存结论（见 memoryFallbackMultipartDone）同样算数：
+ * 那条消息多半已经还原、交付过了，缺的只是墓碑那笔写。
  */
 async function multipartIdAlreadySettled(id, now) {
   if (multipartIdAlreadyRejected(id, now)) return true;
+  if (multipartDoneInMemory(id, now)) return true;
   const done = await readMultipartDone(id);
   return !!done && done.expiresAt > now;
 }
@@ -1587,10 +1642,27 @@ async function dispatchMultipartExpired(sw, record, reason = MULTIPART_FAILURE_R
 
 
 
+/**
+ * 正在等入队回执的 queueId → 这条记录的最终结局。
+ *
+ * enqueueAndFlush 从 add 到自己那轮 flush 去 list 之间隔着异步等待
+ * （registerFlushSync 的 IPC），这条记录可能已经被并发在跑的另一轮 flush
+ * （刚注册的 Background Sync、或别的窗口发的 FLUSH_QUEUE）发出去并从队列里
+ * 删掉——而那轮 flush 的结局只写进它自己的 outcomes。所以入队方先在这张表里
+ * 登记，任何一轮 flush 结算这条记录时都把结局交回来（见 settleQueueOutcome）。
+ * 表项由入队方在回执发出后自己清掉，长度就是同时在等回执的入队条数。
+ *
+ * 记录的删除只发生在同一个 SW 全局作用域里（同一 registration 同时只有一个
+ * 活着的 SW 实例），所以内存表足够接住所有并发 flush。
+ */
+const pendingQueueAckOutcomes = new Map();
+
 async function enqueueAndFlush(sw, event, requestPayload) {
+  let queueId;
   try {
     const request = normalizeQueuedRequest(requestPayload);
-    const queueId = await addQueuedRequest(request);
+    queueId = await addQueuedRequest(request);
+    pendingQueueAckOutcomes.set(queueId, undefined);
 
     await registerFlushSync(sw);
     const outcomes = await flushQueuedRequests(sw);
@@ -1598,7 +1670,10 @@ async function enqueueAndFlush(sw, event, requestPayload) {
     // `ok: true` 只表示「已入队」，不表示「已发出去」——立即冲刷可能刚好把
     // 这条发成功了、也可能被服务端 4xx 永久拒掉（记录随即被删，不会再发）。
     // 老调用方只看 `ok`，行为不变；要分辨这三种结局的读下面这几个机读字段。
-    const outcome = outcomes.get(queueId);
+    // 结局优先读自己这轮 flush 的 outcomes；自己这轮没轮到它、却有并发 flush
+    // 替它结算了的，从登记表里拿——否则「被并发 flush 送达」会被误报成
+    // 「还在队列里等重试」，而成功送达不广播任何事件，页面永远等不来纠正。
+    const outcome = outcomes.get(queueId) || pendingQueueAckOutcomes.get(queueId);
     const ack = {
       type: REI_SW_MESSAGE_TYPE.QUEUE_RESULT,
       ok: true,
@@ -1617,6 +1692,8 @@ async function enqueueAndFlush(sw, event, requestPayload) {
       ok: false,
       error: error instanceof Error ? error.message : 'Failed to queue request'
     });
+  } finally {
+    if (queueId !== undefined) pendingQueueAckOutcomes.delete(queueId);
   }
 }
 
@@ -1704,7 +1781,7 @@ async function flushQueuedRequests(sw) {
     await removeQueuedRequest(queuedRequest.id);
 
     if (outcome.state === 'dropped') {
-      outcomes.set(queuedRequest.id, {
+      settleQueueOutcome(outcomes, queuedRequest.id, {
         delivered: false,
         dropped: true,
         status: outcome.status,
@@ -1714,10 +1791,22 @@ async function flushQueuedRequests(sw) {
       continue;
     }
 
-    outcomes.set(queuedRequest.id, { delivered: true });
+    settleQueueOutcome(outcomes, queuedRequest.id, { delivered: true });
   }
 
   return outcomes;
+}
+
+/**
+ * 记下一条队列请求的最终结局：写进本轮 flush 自己的 outcomes；有入队方正在等
+ * 这条的回执时（见 pendingQueueAckOutcomes），同时交给它——它自己那轮 flush
+ * 再去 list 已经看不到这条记录了。
+ */
+function settleQueueOutcome(outcomes, queueId, outcome) {
+  outcomes.set(queueId, outcome);
+  if (pendingQueueAckOutcomes.has(queueId)) {
+    pendingQueueAckOutcomes.set(queueId, outcome);
+  }
 }
 
 /**

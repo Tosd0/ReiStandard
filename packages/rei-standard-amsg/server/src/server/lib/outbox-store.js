@@ -135,24 +135,29 @@ export async function discardUndeliveredPushes({ db, userId, pushes, sentIds }) 
   });
 }
 
-// 按任务清 outbox 时的扫描参数。适配器只提供「按用户翻页列未 ack 行」这一种
-// 读法，所以得翻一遍挑出属于这条任务的行；页大小与 GET /outbox 同量级。行数上
-// 限是防呆——outbox 只留最近四周的推送（tick 顺手清），正常远到不了。
+// 回退扫描（适配器没有按任务删除的读法）时的翻页参数。页大小与 GET /outbox
+// 同量级。行数上限是防呆——outbox 只留最近四周的推送（tick 顺手清），正常远到
+// 不了；真到了（cleanupOutbox 不运行的部署形态）会漏撤并打日志，见下。
 const OUTBOX_SCAN_PAGE_SIZE = 100;
 const OUTBOX_SCAN_MAX_ROWS = 5000;
 
 /**
  * 把某条任务名下「还没发出去的」行从 outbox 撤掉。
  *
- * 用在取消 / 顶替只碰了任务行的那两条路上（`DELETE /message` 与
- * `supersedesUuid`）：任务此前投递到一半失败过的话，没发出去的那几段还躺在
- * outbox 里等重试，任务行删掉它们也不会跟着走。不撤的话客户端下一次
- * `GET /outbox` 照样把它们补收回去——用户看到的就是「取消接口回了成功，消息还
- * 是来了」。
+ * 用在取消 / 顶替之后的每条收尾路上（`DELETE /message`、`supersedesUuid`、
+ * fire 内的 cancelTask、投递侧发现行已被取消）：任务此前投递到一半失败过的话，
+ * 没发出去的那几段还躺在 outbox 里等重试，任务行删掉它们也不会跟着走。不撤的
+ * 话客户端下一次 `GET /outbox` 照样把它们补收回去——用户看到的就是「取消接口回
+ * 了成功，消息还是来了」。
  *
  * 判据与 discardUndeliveredPushes 一致：只撤 delivered_at 为 null 的行。已经推
  * 给设备的那几条撤不回来，行留着让客户端照常 ack——取消的意思是「别再发后面
  * 的」，不是「把已经收到的从收件箱里抹掉」。
+ *
+ * 优先走适配器的按任务删除（discardUndeliveredOutboxForTask）：一个来回，且不
+ * 受未 ack 积压量的影响。没有这个方法的适配器（宿主自带的旧实现）退回翻页扫
+ * 描——被取消任务的行通常是最新的，积压超过扫描上限时正好扫不到它们，所以扫到
+ * 上限还没扫完必须吵出来，不能装作清干净了。
  *
  * 同样是 best-effort：适配器缺读/删任一侧就静默跳过，出错只记日志。取消 / 顶
  * 替本身已经生效了，不该因为账本没清干净被翻成失败。
@@ -163,16 +168,33 @@ const OUTBOX_SCAN_MAX_ROWS = 5000;
  * @param {string} args.taskUuid - 被取消 / 被顶替的任务 uuid
  */
 export async function discardUndeliveredPushesForTask({ db, userId, taskUuid }) {
-  if (!db || typeof db.listUnackedOutbox !== 'function' || typeof db.discardOutboxMessages !== 'function') return;
-  if (!taskUuid) return;
+  if (!db || !taskUuid) return;
+
+  if (typeof db.discardUndeliveredOutboxForTask === 'function') {
+    try {
+      await db.discardUndeliveredOutboxForTask(userId, taskUuid);
+    } catch (error) {
+      console.warn('[amsg-server] outbox 按任务撤回未投递的行失败（已忽略）:', error && error.message);
+    }
+    return;
+  }
+
+  if (typeof db.listUnackedOutbox !== 'function' || typeof db.discardOutboxMessages !== 'function') return;
 
   const messageIds = [];
+  // 「未 ack 的行都看过了」才为 true。扫到上限、或游标不动（适配器没按
+  // `id > sinceId` 翻页）时保持 false——那两种情况都可能有属于这条任务的行没被
+  // 看到。
+  let exhausted = false;
   try {
     let cursor = 0;
     let scanned = 0;
     while (scanned < OUTBOX_SCAN_MAX_ROWS) {
       const rows = await db.listUnackedOutbox(userId, cursor, OUTBOX_SCAN_PAGE_SIZE);
-      if (!rows || rows.length === 0) break;
+      if (!rows || rows.length === 0) {
+        exhausted = true;
+        break;
+      }
       scanned += rows.length;
       let nextCursor = cursor;
       for (const row of rows) {
@@ -185,11 +207,22 @@ export async function discardUndeliveredPushesForTask({ db, userId, taskUuid }) 
       // 游标没往前走说明适配器没按 `id > sinceId` 翻页，再翻就是死循环。
       if (nextCursor <= cursor) break;
       cursor = nextCursor;
-      if (rows.length < OUTBOX_SCAN_PAGE_SIZE) break;
+      if (rows.length < OUTBOX_SCAN_PAGE_SIZE) {
+        exhausted = true;
+        break;
+      }
     }
   } catch (error) {
     console.warn('[amsg-server] outbox 查未投递的行失败（已忽略）:', error && error.message);
     return;
+  }
+
+  if (!exhausted) {
+    console.warn(
+      `[amsg-server] outbox 扫描到 ${OUTBOX_SCAN_MAX_ROWS} 行上限仍未扫完，`
+      + `任务 ${taskUuid} 可能还有未投递的行没撤掉（被取消任务的行通常是最新的，正好在上限之外）。`
+      + '给适配器实现 discardUndeliveredOutboxForTask 可绕开这个上限。'
+    );
   }
 
   await discardPushesFromOutbox({ db, userId, messageIds });

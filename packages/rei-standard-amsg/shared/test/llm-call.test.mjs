@@ -214,6 +214,23 @@ test('callLlm: 响应体被截断时，截断点之前的 code 照样能拿到',
   assert.ok(!error.message.includes('{'), `说明里不该出现裸 JSON：${error.message}`);
 });
 
+test('callLlm: Anthropic 信封被截断时，providerCode 取里层的 type 而不是最外层的判别字段', async () => {
+  // Anthropic 风格的信封最外层就有一个 "type":"error"，它只说「这是一条错误」，
+  // 真正的类别在 error.type 上——完整 parse 那条路也只读里层。截断走 salvage
+  // 时最外层那个不该抢先变成 providerCode，否则靠 providerCode 停止重试鉴权
+  // 失败的接入方拿到的是没法判的 'error'。
+  const body = JSON.stringify({
+    type: 'error',
+    error: { type: 'authentication_error', message: 'invalid x-api-key' },
+    request: { echoed: ECHOED_PROMPT },
+  });
+  const error = await callAndCatch(streamingUpstream({ status: 401, statusText: 'Unauthorized', body }));
+
+  assert.equal(error.providerCode, 'authentication_error');
+  assert.match(error.message, /invalid x-api-key/);
+  assert.equal(error.llmStatus, 401);
+});
+
 test('callLlm: 截断的 JSON 里一个字段都捞不到时，也不外传裸 JSON', async () => {
   const body = JSON.stringify({ echoed_request: ECHOED_PROMPT });
   const error = await callAndCatch(streamingUpstream({ status: 502, statusText: 'Bad Gateway', body }));
@@ -251,6 +268,15 @@ test('callLlm: 上游把 Key 抄回来时会遮掉', async () => {
     body: JSON.stringify({ error: { message: 'bad header: Bearer abcdefghijklmnop' } }),
   }));
   assert.match(bearer.message, /Bearer \[redacted\]/);
+
+  // 自建网关发的 Key 常常全小写、按短横线分段、前缀不认识，跟模型 ID 同形。
+  const gatewayKey = 'mycorp-aaaabbbbcccc-ddddeeeeffff';
+  const gateway = await callAndCatch(upstream({
+    status: 401,
+    body: JSON.stringify({ error: { message: `Incorrect API key provided: ${gatewayKey}` } }),
+  }));
+  assert.ok(!gateway.message.includes(gatewayKey), `错误消息里不该出现原始 Key：${gateway.message}`);
+  assert.match(gateway.message, /\[redacted\]/);
 });
 
 test('callLlm: 超长的上游说明会截断', async () => {

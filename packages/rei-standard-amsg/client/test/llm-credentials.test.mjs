@@ -112,6 +112,25 @@ test('deleteLlmCredentials() 加密 body：credIds 与 all 两种形态', async 
   await assert.rejects(() => client.deleteLlmCredentials({ credIds: [] }), TypeError);
 });
 
+test('deleteLlmCredentials() all 与 credIds 同时传：点名歧义直接抛，不发请求', async () => {
+  const client = await makeInitializedClient();
+
+  // 回归守卫：以前这种歧义输入会被静默按 { all: true } 全删发出去。
+  const { captured } = await capture(async () => {
+    await assert.rejects(
+      () => client.deleteLlmCredentials({ all: true, credIds: [CRED.credId] }),
+      { name: 'TypeError', message: /all 与 credIds 不能同时出现/ }
+    );
+    // credIds 只要出现就算同时传（空数组也是），跟服务端 400 守卫同一条件。
+    await assert.rejects(
+      () => client.deleteLlmCredentials({ all: true, credIds: [] }),
+      { name: 'TypeError', message: /all 与 credIds 不能同时出现/ }
+    );
+  }, { success: true, data: { deleted: 999 } });
+
+  assert.equal(captured.length, 0);
+});
+
 test('scheduleMessage() 透传 credRefs（不加工不过滤）', async () => {
   const client = await makeInitializedClient();
   const payload = {

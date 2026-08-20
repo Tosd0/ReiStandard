@@ -105,6 +105,8 @@ export function toNodeHandler(fetchHandler, options = {}) {
         res.destroy(err);
         return;
       }
+      // 一个字节都还没发出去（配置/请求阶段炸了，或响应流在首字节前就失败），
+      // 还来得及回一个能读的信封。
       res.statusCode = 500;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(
@@ -214,22 +216,41 @@ function isPrematureClose(err) {
  * 销毁会 cancel 上游那个 ReadableStream —— instant 的 SSE 分支收到 cancel 就停
  * keepalive 定时器、把剩下的消息切到 Web Push 兜底，不会留下一个没人读的流。
  *
+ * 但进 pipeline 之前要先探一次首块：pipeline 无论因为什么失败都会先把 res 销
+ * 毁，销毁完就只剩断连一条路了。流在首字节前就失败（start / 首次 pull 里懒加
+ * 载资源没起来之类）时，客户端一个字节都没收到，断连没有任何信息量——这一档
+ * 该像其他阶段的故障一样回一个干净的 500 JSON 信封。所以首块由这里手动读：读
+ * 失败时 res 还一个字节都没沾，把错误抛给外层的信封兜底；读到了才开始动 res。
+ * 客户端不会因此多等——Node 本来就攒着响应头，等第一个字节一起发。
+ *
  * 非流式的 JSON 响应走同一条路：字节一样，只是改由 chunked 传输编码发出。
  */
 async function writeFetchResponseToNode(response, res) {
+  // 先探首块，探完才动 res。首字节前就失败的流在这里 reject，直接冲出去。
+  let first = null;
+  if (response.body) {
+    const reader = response.body.getReader();
+    first = await reader.read();
+    reader.releaseLock();
+  }
+
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
     res.setHeader(name, value);
   });
 
-  // 204 / 304 这类没有 body 的响应，`response.body` 是 null。
-  if (!response.body) {
+  // 204 / 304 这类没有 body 的响应（`response.body` 是 null），以及一个字节
+  // 都没吐就正常关掉的空流。
+  if (!first || first.done) {
     res.end();
     return;
   }
 
   const { Readable, pipeline } = await loadStreamHelpers();
   try {
+    // 首块已经在手里，直接写掉（响应头随它一起发出）；剩下的照旧交给
+    // pipeline。写出首块之后再失败就回不了头了，维持下面的断连语义。
+    res.write(first.value);
     await pipeline(Readable.fromWeb(response.body), res);
   } catch (err) {
     if (isPeerGone(err)) return;

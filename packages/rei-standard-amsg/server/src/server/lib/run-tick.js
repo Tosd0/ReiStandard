@@ -69,6 +69,7 @@ import { buildHookTask, occurrenceSuffix } from './agentic-fire.js';
 import { createStateAccessors } from './state-accessors.js';
 import { planClientStateCleanup } from './client-state-store.js';
 import { createResultEmitter } from './result-emitter.js';
+import { discardUndeliveredPushesForTask } from './outbox-store.js';
 import { nextFutureOccurrence, planNextOccurrence } from './recurrence.js';
 
 // 占位租期（一次性长租约的老行为）：要盖住最慢的一次投递。老链路单次 LLM
@@ -672,14 +673,20 @@ async function deliverTasks(ctx, tasks) {
    * 这里一个字段都不写——行已经不在了，写回去只会把一条用户已经取消的任务复
    * 活。既不算成功也不算失败：算成功的话「回了取消成功却照样发出去」在 tick
    * summary 里完全看不出来，算失败又会让接入方以为该去查投递链路。
+   *
+   * 顺手把这条任务名下还没发出去的 outbox 行撤掉（best-effort）：取消发生在本
+   * 次投递落行**之前**的话，取消那侧的清理扫不到这批行——它们是之后才落进去
+   * 的（思考过程那条行按策略只落行不推送，delivered_at 一直是空的），这里不撤
+   * 的话客户端下一次 `GET /outbox` 照样把已取消任务的内容补收回去。
    */
-  function recordCancelled(task, status) {
+  async function recordCancelled(task, status) {
     results.cancelledTasks.push({
       taskId: task.id,
       reason: '任务在投递期间被取消或顶替',
       status
     });
     console.warn(`[amsg-server] 任务 ${task.id} 在投递期间被取消或顶替（${status}）`);
+    await discardUndeliveredPushesForTask({ db, userId: task.user_id, taskUuid: task.uuid });
   }
 
   /**
@@ -991,7 +998,8 @@ async function deliverTasks(ctx, tasks) {
             ? `sess_task_${task.id}${occurrenceSuffix(task)}`
             : `sess_stale_${task.uuid || ''}`,
           occurrenceMs,
-          webpush: ctx.webpush
+          webpush: ctx.webpush,
+          isCancelled: () => lease.lost
         });
 
         // 循环任务快进（fast_forwarded）与一次性任务作废（expired）的收尾
@@ -1048,14 +1056,22 @@ async function deliverTasks(ctx, tasks) {
     try {
       // 预扫描解好的 payload 一并递过去，投递侧不再解第二遍。
       // webpush 套一层取消检查（见 guardWebpushWithLease）：投递期间任务被取消
-      // 的话，推送在发出去之前就被拦下。
+      // 的话，推送在发出去之前就被拦下。isTaskCancelled 是同一个信号的显式读
+      // 法，给不走推送的出口用（emitResult 的 show:false 路，见
+      // lib/result-emitter.js）——那条路不碰 webpush，光靠推送前的拦截罩不到它。
       sendResult = await processSingleMessage(
-        task, { ...ctx, db, masterKey, webpush: guardWebpushWithLease(ctx.webpush, lease) }, masterKey,
+        task,
+        {
+          ...ctx, db, masterKey,
+          webpush: guardWebpushWithLease(ctx.webpush, lease),
+          isTaskCancelled: () => lease.lost,
+        },
+        masterKey,
         { userKey, payload: decryptedPayload }
       );
     } catch (error) {
       if (lease.lost) {
-        recordCancelled(task, 'cancelled_mid_delivery');
+        await recordCancelled(task, 'cancelled_mid_delivery');
         return;
       }
       // 兜底分支：processSingleMessage 自己把整个流程包在 try/catch 里，失败
@@ -1074,7 +1090,7 @@ async function deliverTasks(ctx, tasks) {
       // 取消是拦下来的，不是发失败——按失败走会给一条已经不存在的行排重试，
       // 也会把这件事混进 failedTasks 里。
       if (lease.lost) {
-        recordCancelled(task, 'cancelled_mid_delivery');
+        await recordCancelled(task, 'cancelled_mid_delivery');
         return;
       }
       await handleDeliveryFailure(
@@ -1105,7 +1121,7 @@ async function deliverTasks(ctx, tasks) {
         // 行删掉之后租约当然也续不上了，跟收尾写库一样先标一下（见 markLeaseReleased）。
         markLeaseReleased(task.id);
         if (rowVanished(await db.deleteTaskById(task.id))) {
-          recordCancelled(task, 'cancelled_after_delivery');
+          await recordCancelled(task, 'cancelled_after_delivery');
           return;
         }
         results.deletedOnceOffTasks++;
@@ -1130,7 +1146,7 @@ async function deliverTasks(ctx, tasks) {
           ...(clearedPayload ? { encrypted_payload: clearedPayload } : {})
         });
         if (rowVanished(updated)) {
-          recordCancelled(task, 'cancelled_after_delivery');
+          await recordCancelled(task, 'cancelled_after_delivery');
           return;
         }
         results.updatedRecurringTasks++;

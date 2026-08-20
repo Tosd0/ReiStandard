@@ -400,6 +400,32 @@ describe('fire ctx cancelTask / renewTask', () => {
     assert.match(String(selfCancelError), /当前正在 fire/);
   });
 
+  test('cancelTask 取消的任务：outbox 里没发出去的分段跟着撤掉（与 DELETE /cancel-message 同一收尾）', async () => {
+    const { adapter } = await freshAdapter();
+    const otherUuid = '13131313-2424-4343-8565-676767676767';
+    await seed(adapter, { uuid: otherUuid, nextSendAt: new Date(Date.now() + 3600_000).toISOString() });
+    // 那条任务此前投递到一半失败过：一段推出去了，剩下的还躺在 outbox 里等重试。
+    const now = Date.now();
+    await adapter.appendOutboxMessages(USER, [
+      { message_id: 'b-sent', task_uuid: otherUuid, session_id: 's', payload: 'cipher', created_at: now },
+      { message_id: 'b-pending', task_uuid: otherUuid, session_id: 's', payload: 'cipher', created_at: now },
+    ]);
+    await adapter.markOutboxDelivered(USER, ['b-sent'], now);
+
+    const res = await fireCtxOf(adapter, async (ctx) => {
+      assert.deepEqual(await ctx.cancelTask(otherUuid), { cancelled: true });
+    });
+    assert.equal(res.successCount, 1);
+    assert.equal(await adapter.getTaskByUuid(otherUuid, USER), null);
+
+    const rows = await adapter.listUnackedOutbox(USER, 0, 50);
+    assert.deepEqual(
+      rows.map((r) => r.message_id),
+      ['b-sent'],
+      '没发出去的分段要跟着撤掉（否则 GET /outbox 会把已取消任务的内容补收回去）；已推出去的留着 ack'
+    );
+  });
+
   test('renewTask 改到新时刻（payload 的 firstSendTime 跟着改），太近的时刻被拒', async () => {
     const { adapter } = await freshAdapter();
     const otherUuid = '21212121-4343-4656-8878-808080808080';

@@ -38,7 +38,7 @@
 
 import { buildResultPush } from '@rei-standard/amsg-shared';
 
-import { DeploymentConfigError, isTaskCancelledError, sendTaggedPush } from './errors.js';
+import { DeploymentConfigError, TASK_CANCELLED_CODE, isTaskCancelledError, sendTaggedPush } from './errors.js';
 import {
   supportsOutbox,
   toOutboxRows,
@@ -76,15 +76,29 @@ import { resolvePushSubscription } from './push-subscription-store.js';
  * @param {number|null} args.occurrenceMs
  * @param {{ sendNotification: Function }|null} args.webpush
  * @param {() => number} [args.now] - 取当前时刻（测试可注入假时钟）
+ * @param {(() => boolean)|null} [args.isCancelled] - 「这条任务是否已在投递期间
+ *   被取消 / 顶替」（run-tick 的租约心跳信号）。推送那条路的取消检查在
+ *   webpush 那层（guardWebpushWithLease），但 `notification.show: false` 的结
+ *   果不发推送，只有这个显式读法能拦得住它——不给的话那条路上没有任何取消检
+ *   查点。
  * @returns {ResultEmitter}
  */
 export function createResultEmitter({
-  db, task, userKey, decryptedPayload, messageIdBase, sessionId, occurrenceMs, webpush, now,
+  db, task, userKey, decryptedPayload, messageIdBase, sessionId, occurrenceMs, webpush, now, isCancelled,
 }) {
   const nowFn = typeof now === 'function' ? now : Date.now;
   // 本次 fire 已经发出去几条结果。缺省 messageId 按它编号，所以同一次触发重
   // 跑时第 n 条结果拿到的还是同一个 id。
   let emitted = 0;
+
+  // 取消检查点（有信号才查）。抛的错误形状与 guardWebpushWithLease 一致：调
+  // 用方（agentic 循环、run-tick）都按 isTaskCancelledError 认它。
+  const assertNotCancelled = () => {
+    if (typeof isCancelled !== 'function' || !isCancelled()) return;
+    const error = new Error('任务在投递期间被取消或顶替，结果已中止');
+    error.code = TASK_CANCELLED_CODE;
+    throw error;
+  };
 
   const emitResult = async (payload) => {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -100,9 +114,13 @@ export function createResultEmitter({
     }
 
     const seq = emitted++;
+    // source 由 messageType 推导（与 message-processor 的聊天推送同一判据）：
+    // 标准里 messageType: 'instant' 必配 source: 'instant'，写死 'scheduled'
+    // 会在 in-server instant 的 fire 里凑出一对非法组合。
+    const messageType = decryptedPayload.messageType || 'auto';
     const push = buildResultPush({
-      messageType: decryptedPayload.messageType || 'auto',
-      source: 'scheduled',
+      messageType,
+      source: messageType === 'instant' ? 'instant' : 'scheduled',
       messageId: `${messageIdBase}_result_${seq}`,
       sessionId,
       ...payload,
@@ -117,6 +135,10 @@ export function createResultEmitter({
       occurrenceMs,
     });
 
+    // 已经知道被取消就别落行了——取消那侧的清理已经跑过，这时落进去的行没人
+    // 会再撤。
+    assertNotCancelled();
+
     // 先落行再推送，与推送链路同序：落进去的必须是发出去的同一份内容。
     await db.appendOutboxMessages(task.user_id, await toOutboxRows([push], userKey, nowFn()));
 
@@ -125,14 +147,18 @@ export function createResultEmitter({
     // 是走到这里的前提（上面那句失败会直接抛），所以不用再判 outboxed。
     let pushed;
     try {
+      // 落行的 await 期间取消信号可能刚立起来。推送那条路由 sendResultPush
+      // （guardWebpushWithLease）兜着，不推送的那条路只有这一个检查点。
+      assertNotCancelled();
       pushed = shouldSendPush(push, { outboxed: true })
         ? await sendResultPush({ db, task, userKey, decryptedPayload, webpush, push })
         : false;
     } catch (error) {
-      // 走到这里只有一种可能：推送前发现这条任务已经被取消 / 顶替（见
-      // sendResultPush）。取消动作发生在这一行落库之前，所以它清不到这一行，
-      // 得由这里自己撤——不撤的话客户端下次补收照样把它拉回去，用户看到的就是
-      // 「取消接口回了成功，东西还是来了」。与聊天分段那条路同一个处置。
+      // 走到这里只有一种可能：这条任务已经被取消 / 顶替（上面的检查点，或
+      // sendResultPush 推送前的拦截）。取消动作发生在这一行落库之前，所以它清
+      // 不到这一行，得由这里自己撤——不撤的话客户端下次补收照样把它拉回去，用
+      // 户看到的就是「取消接口回了成功，东西还是来了」。与聊天分段那条路同一
+      // 个处置。
       await discardUndeliveredPushes({ db, userId: task.user_id, pushes: [push], sentIds: [] });
       throw error;
     }

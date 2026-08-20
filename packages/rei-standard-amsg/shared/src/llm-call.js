@@ -442,7 +442,13 @@ function salvageJsonStringFields(raw) {
   const found = {};
   for (const match of raw.matchAll(JSON_STRING_FIELD)) {
     // 同名字段只认第一个：错误信封在最前面，后面重复出现的多半来自被回显的请求。
-    if (found[match[1]] === undefined) found[match[1]] = unescapeJsonString(match[2]);
+    if (found[match[1]] !== undefined) continue;
+    const value = unescapeJsonString(match[2]);
+    // Anthropic 信封最外层的 `"type":"error"` 是「这是一条错误」的判别字段，
+    // 不是错误类别（完整 parse 那条路也只读 error 里面的 type）。跳过它，
+    // 里层真正的 `"type":"authentication_error"` 才轮得上。
+    if (match[1] === 'type' && value === 'error') continue;
+    found[match[1]] = value;
   }
   return {
     message: firstNonEmptyString(found.message, found.detail),
@@ -530,18 +536,38 @@ function alternationCount(segment) {
   return (segment.match(/[a-z]+|[0-9]+/g) || []).length;
 }
 
+/** MoE 尺寸段（`8x7b` / `8x22b`）：真实模型名里唯一「字母数字来回切三次以上」的形状。 */
+const MOE_SIZE_SEGMENT = /^\d+x\d+b$/;
+
+/** 全由 hex 字符组成的段。纯数字（日期段 `20241022`）也算，靠累计长度阈值区分。 */
+const HEX_SEGMENT = /^[0-9a-f]+$/;
+
 /**
- * 这个 token 是不是「只可能是模型名」。
+ * 连续 hex 段累计超过这个长度就当密钥材料。模型名里最长的 hex 形状是日期
+ *（`2024-07-18` 拆成段累计 8 个字符），密钥的 hex 段是成串出现的
+ *（`aaaabbbbcccc-ddddeeeeffff` 累计 24 个）。
+ */
+const HEX_RUN_MAX_CHARS = 15;
+
+/**
+ * 这个 token 是不是「像模型名」。拿不准时宁可误遮：漏放一个 Key 就是把凭据写
+ * 进明文列并回给浏览器，误遮一个冷门模型名只是报错里少了个名字。
  *
  * 光看 {@link MODEL_ID_LIKE} 的形状会把 Key 一起放行：中转发的
- * `sk-550e8400-e29b-41d4-a716-446655440000`、`key-1a2b3c4d5e6f-7a8b9c0d1e2f`
- * 全小写、每段都不超过 12 个字符，跟模型 ID 完全同形。所以形状之外还要过三道：
+ * `sk-550e8400-e29b-41d4-a716-446655440000`、`mycorp-aaaabbbbcccc-ddddeeeeffff`
+ * 全小写、每段都不超过 12 个字符，跟模型 ID 完全同形。所以形状之外还要过四道：
  *
  *   - 公认的凭据前缀后面接什么都不豁免；
  *   - uuid 形状永远不是模型名；
- *   - 出现「随机段」（字母数字来回切三次以上）就不是模型名。`mixtral-8x7b`
- *     里的版本段也来回切，但真实模型名里这种段最多一个、而且很短，Key 的随机
- *     段则是成串的长 hex。
+ *   - 连续 hex 段累计超过 {@link HEX_RUN_MAX_CHARS} 个字符就不是模型名——
+ *     全小写 Key 的随机段基本都落在 hex 字母表里，而字母数字不来回切的
+ *     （`aaaabbbbcccc`）光靠下一条认不出来；
+ *   - 出现「随机段」（字母数字来回切三次以上）就不是模型名，只有 `8x7b` 这种
+ *     MoE 尺寸段例外——`al7b` 这类同样短的随机段不再搭它的便车。
+ *
+ * 这几道挡的是已知的 Key 形状，不是「凡是 Key 都能认出来」：跟真实模型名
+ * 同形的串（全小写非 hex 的词段拼起来）单看形状分不开，那种只能靠上面的
+ * 凭据前缀名单兜。
  *
  * @param {string} token
  * @returns {boolean}
@@ -554,9 +580,19 @@ function looksLikeModelId(token) {
   const segments = token.split(/[.-]/);
   if (CREDENTIAL_PREFIX_SEGMENTS.has(segments[0])) return false;
 
-  const randomLooking = segments.filter((segment) => alternationCount(segment) >= 3);
-  if (randomLooking.length === 0) return true;
-  return randomLooking.length === 1 && randomLooking[0].length <= 5;
+  let hexRunChars = 0;
+  for (const segment of segments) {
+    if (HEX_SEGMENT.test(segment)) {
+      hexRunChars += segment.length;
+      if (hexRunChars > HEX_RUN_MAX_CHARS) return false;
+    } else {
+      hexRunChars = 0;
+    }
+  }
+
+  return segments.every(
+    (segment) => alternationCount(segment) < 3 || MOE_SIZE_SEGMENT.test(segment)
+  );
 }
 
 /**

@@ -207,7 +207,8 @@ describe('取消 / 顶替时清 outbox', () => {
     await seedTask(adapter, TARGET_UUID);
     const bare = new Proxy(adapter, {
       get(target, prop) {
-        if (prop === 'listUnackedOutbox' || prop === 'discardOutboxMessages') return undefined;
+        if (prop === 'listUnackedOutbox' || prop === 'discardOutboxMessages'
+          || prop === 'discardUndeliveredOutboxForTask') return undefined;
         const value = target[prop];
         return typeof value === 'function' ? value.bind(target) : value;
       }
@@ -222,6 +223,110 @@ describe('取消 / 顶替时清 outbox', () => {
     assert.equal(res.status, 200);
     // 只是没清 outbox，任务行确实删掉了。
     assert.equal(await adapter.getTaskByUuid(TARGET_UUID, USER), null);
+  });
+
+  // ── 未 ack 积压很大时的两条路 ────────────────────────────────────────────
+  //
+  // 老的清理靠「按用户翻页扫全部未 ack 行、在 JS 里挑 task_uuid」，扫描有 5000
+  // 行的硬上限。cleanupOutbox 不运行的部署形态（宿主用 runTask 直跑）积压会超过
+  // 它，而被取消任务的行是最新的，正好落在上限之外——预算全烧在旧行上，一行都
+  // 没撤，DELETE 还回 200。
+
+  /** 往 outbox 里灌 count 行别的任务的陈年未投递积压（payload 不参与断言）。 */
+  async function seedBacklog(adapter, count) {
+    const now = Date.now();
+    await adapter.appendOutboxMessages(USER, Array.from({ length: count }, (_, i) => ({
+      message_id: `backlog-${i}`,
+      task_uuid: OTHER_UUID,
+      session_id: 'sess_backlog',
+      message_index: null,
+      total_messages: null,
+      payload: 'cipher',
+      created_at: now,
+    })));
+  }
+
+  test('积压超过扫描上限：适配器按任务直删，目标行不再藏在积压后面', async () => {
+    const { d1, worker, env, adapter } = await bootstrap();
+    await seedTask(adapter, TARGET_UUID);
+    await seedBacklog(adapter, 5000);
+    // 目标任务的未投递分段排在最后——翻页扫描的预算烧光也轮不到它。
+    await seedOutbox(adapter, [{ messageId: 'target-tail', taskUuid: TARGET_UUID }]);
+
+    const res = await worker.fetch(new Request(`https://w.dev/cancel-message?id=${TARGET_UUID}`, {
+      method: 'DELETE', headers: { 'X-User-Id': USER }
+    }), env);
+    assert.equal(res.status, 200);
+
+    assert.equal(outboxRows(d1, TARGET_UUID).length, 0, '目标任务的未投递行必须撤掉，不管积压多大');
+  });
+
+  test('旧适配器（没有按任务直删）：回退扫描照样撤掉未投递的分段', async () => {
+    const { d1, adapter } = await bootstrap();
+    await seedTask(adapter, TARGET_UUID);
+    await seedOutbox(adapter, [
+      { messageId: 'seg-sent', taskUuid: TARGET_UUID, delivered: true },
+      { messageId: 'seg-pending', taskUuid: TARGET_UUID },
+      { messageId: 'other-1', taskUuid: OTHER_UUID },
+    ]);
+
+    const legacy = new Proxy(adapter, {
+      get(target, prop) {
+        if (prop === 'discardUndeliveredOutboxForTask') return undefined;
+        const value = target[prop];
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    const worker = createSingleUserCloudflareWorker(() => ({
+      db: legacy, masterKey: MASTER_KEY, vapid: VAPID, webpush: { async sendNotification() {} }
+    }));
+
+    const res = await worker.fetch(new Request(`https://w.dev/cancel-message?id=${TARGET_UUID}`, {
+      method: 'DELETE', headers: { 'X-User-Id': USER }
+    }), { DB: d1 });
+    assert.equal(res.status, 200);
+
+    assert.deepEqual(
+      outboxRows(d1, TARGET_UUID).map((r) => r.message_id),
+      ['seg-sent'],
+      '回退扫描也要把未投递的分段撤掉'
+    );
+  });
+
+  test('旧适配器 + 积压超过扫描上限：扫到上限没扫完要吵出来，不能静默', async () => {
+    const { d1, adapter } = await bootstrap();
+    await seedTask(adapter, TARGET_UUID);
+    await seedBacklog(adapter, 5000);
+    await seedOutbox(adapter, [{ messageId: 'target-tail', taskUuid: TARGET_UUID }]);
+
+    const legacy = new Proxy(adapter, {
+      get(target, prop) {
+        if (prop === 'discardUndeliveredOutboxForTask') return undefined;
+        const value = target[prop];
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    const worker = createSingleUserCloudflareWorker(() => ({
+      db: legacy, masterKey: MASTER_KEY, vapid: VAPID, webpush: { async sendNotification() {} }
+    }));
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    let res;
+    try {
+      res = await worker.fetch(new Request(`https://w.dev/cancel-message?id=${TARGET_UUID}`, {
+        method: 'DELETE', headers: { 'X-User-Id': USER }
+      }), { DB: d1 });
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.equal(res.status, 200, '取消本身照样成功');
+
+    assert.ok(
+      warnings.some((line) => line.includes('上限') && line.includes(TARGET_UUID)),
+      `扫到上限没扫完必须点名这条任务吵出来，实际日志：${JSON.stringify(warnings)}`
+    );
   });
 });
 

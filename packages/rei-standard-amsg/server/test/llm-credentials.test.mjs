@@ -639,6 +639,63 @@ describe('PUT /update-message with credRefs', () => {
     const mixed = await putUpdate({ credRefs: { chat: CRED_ID }, apiKey: 'sk-inline' });
     assert.equal(mixed.status, 400);
   });
+
+  // 泄漏密钥轮换的场景：任务存了 credRefs.chat，客户端按「凭据刷新」用内联字段
+  // PUT。fire 时解析以凭据表那行为准，内联只是表行缺失的兜底——这次更新落了库
+  // 也不会生效。回 200 的话调用方以为轮换成功，永远不会去改真正生效的那份。
+  test('任务已存 credRefs.chat：内联凭据刷新被拒（409），存量 payload 不动', async () => {
+    const { adapter, worker, env } = await freshWorker();
+    await seedCred(adapter);
+
+    const created = await (await scheduleTask(worker, env, { credRefs: { chat: CRED_ID } })).json();
+    const uuid = created.data.uuid;
+
+    const res = await worker.fetch(
+      new Request(`https://w.dev/update-message?id=${uuid}`, {
+        method: 'PUT', headers: ENC_HEADERS,
+        body: await encBody({ apiUrl: 'https://new.example.com/v1', apiKey: 'sk-rotated', primaryModel: 'm-new' }),
+      }),
+      env
+    );
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.error.code, 'TASK_USES_CRED_REFS');
+    assert.match(body.error.message, /llm-credentials/, '错误信息要把正确的轮换入口指出来');
+
+    // 库里一个字没动：credRefs 还在，内联也没被塞进去。
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const row = await adapter.getTaskByUuid(uuid, USER);
+    const stored = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+    assert.deepEqual(stored.credRefs, { chat: CRED_ID });
+    assert.equal(stored.apiKey ?? null, null, '被拒的内联 Key 不能落库');
+  });
+
+  // 只有非 chat 引用的任务不在此列：fire 时的 chat 凭据用的就是内联那份，刷新
+  // 它是真的生效。
+  test('任务只有非 chat 的 credRefs：内联凭据刷新照常 200', async () => {
+    const { adapter, worker, env } = await freshWorker();
+    await seedCred(adapter, 'char:c1/emotion');
+
+    const created = await (await scheduleTask(worker, env, {
+      credRefs: { emotion: 'char:c1/emotion' },
+      apiUrl: 'https://old.example.com/v1', apiKey: 'sk-old', primaryModel: 'm-old',
+    })).json();
+    const uuid = created.data.uuid;
+
+    const res = await worker.fetch(
+      new Request(`https://w.dev/update-message?id=${uuid}`, {
+        method: 'PUT', headers: ENC_HEADERS,
+        body: await encBody({ apiKey: 'sk-rotated' }),
+      }),
+      env
+    );
+    assert.equal(res.status, 200, JSON.stringify(await res.clone().json()));
+
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const row = await adapter.getTaskByUuid(uuid, USER);
+    const stored = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
+    assert.equal(stored.apiKey, 'sk-rotated');
+  });
 });
 
 describe('schema 一致性', () => {
