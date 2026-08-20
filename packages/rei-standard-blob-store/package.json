@@ -1,6 +1,6 @@
 {
   "name": "@rei-standard/blob-store",
-  "version": "0.1.0-next.0",
+  "version": "0.1.0-next.1",
   "description": "ReiStandard token-based Blob storage — binary in IndexedDB, a short blobref: token in your data fields; orphan GC included",
   "repository": {
     "type": "git",
