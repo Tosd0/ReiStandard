@@ -85,6 +85,7 @@ const result = await store.gc({
 - **吐出来的必须是令牌逐字可见的明文**：某个面若压缩（如 lz-string）、加密或 URL 编码后才落盘，要先还原成明文再吐。这种情况枚举不报错、安全阀也不触发，但令牌在文本里不可见，等于这个面没扫——照样删活图。
 - **一张 blob 表只能对应一个令牌前缀**：多个 store 共用同一个 adapter（同一张表）而前缀不同时，任何一个 store 的 GC 只按自己的前缀 mark、却 sweep 整张表，会把其他前缀引用的活图全部删掉，且不触发任何安全阀。要按资产种类分类，请分开建表（不同 dbName / 不同 adapter），别分前缀。
 - **GC 进行期间别做「先删后写」式搬家**：一轮 mark 不是一致性快照。引用在持久化面之间移动（重存、跨表搬家）时若有瞬间从所有面上消失，恰好撞上扫描就会被误判成孤儿（老图没有新鲜豁免可救）。挑没有这类写入的空闲时机跑；多 tab 场景建议用 `navigator.locks` 之类保证 GC 独跑。
+- **备份导入期间别并发跑 GC**：`restore` 写回的是备份里的原 id，反解出来的是当年的老时间戳，享受不到新鲜豁免。「restore 已执行、引用面尚未落盘」的窗口里撞上一轮扫描，这些图会被当孤儿删掉。导入请等引用全部落盘后再跑 GC；反过来 GC 进行中也别开始导入。
 - **令牌在吐出的文本里要保持边界完整**：提取是按最长 `[A-Za-z0-9_]` 段截 id 的。拿令牌拼复合键（`${token}_thumb`）会让提出来的 id 比真实 id 长；分块吐大文本时把令牌从中间切开会只剩半截——两种情况真实 id 都进不了标记集。拼接请用 `-`、`?` 等字符集外的分隔符；分块请按记录/行切。SDK 在 sweep 侧有兜底（存储 id 与某个在用 id 互为前缀时不删），但它救不了恰好切在前缀边界上的情形，别拿兜底当许可。
 
 安全阀（总原则「宁可留孤儿，绝不删活图」）：任一来源抛错整轮放弃（`aborted: true`）；创建不足 72 小时（`minAgeMs` 可配）的不删，挡住「已 put、引用未落盘」的竞态；超出 `[A-Za-z0-9_]` 字符集的 id（比如存量数据直接拿 UUID 当 id，含 `-`）一律保留不删——这类 id 在文本提取时会被截断、无法安全判定引用，读写不受影响，只是想让它们参与回收得先迁移成本包生成的 id；存储 id 与某个在用 id 互为前缀的也不删——那是令牌边界出过事（复合键拼接、分块切开）的痕迹。这道豁免的命中数在结果里单独计数（`keptBoundary`）：它接近库存量时，多半是某个引用面里混进了一段杂散的令牌前缀文本（比如把 `blobref:b_` 当例子写进了会被扫描的说明文案）——提出来的短 id 是每个 SDK 生成 id 的前缀，GC 从此整轮空转，而 `deleted: 0` 和真没垃圾长得一模一样，看到 `keptBoundary` 暴涨就该去排查引用面而不是当成没垃圾。`refSources` 传错东西（单个字符串、吐非字符串的迭代器、不可迭代对象）会直接抛 `TypeError`——配置错误吵着失败，不会静默清库。
@@ -101,6 +102,7 @@ const result = await store.gc({
 | `store.prefix` | `string`（勿修改） | 当前令牌前缀 |
 | `store.isRef(value)` | `(value: unknown) → boolean` | 判断 `value` 是不是本 store 生成的令牌 |
 | `store.put(blob)` | `(blob: Blob) → Promise<string>` | 存入 Blob，返回令牌；适配器失败会上抛。入参不是 Blob（如误传 data URL 字符串）抛 `TypeError`——字符串请走 `migrateDataUrl` |
+| `store.restore(token, blob)` | `(token: string, blob: Blob) → Promise<void>` | 备份导入用：把 Blob 写回令牌原有的 id 下，业务字段里的旧令牌继续有效。`token` 必须是本 store 前缀的令牌且 id 完整落在 `[A-Za-z0-9_]` 内（字符集外的 id 写进去会成为 GC 永不能回收的存量，直接拒收），`blob` 判定与 `put` 相同——不满足抛 `TypeError`；适配器失败会上抛。同 id 重复 restore 是覆盖：同一份备份导两遍幂等。导入期间别并发跑 GC，见下面「孤儿 GC 与宿主义务」 |
 | `store.get(token)` | `(token: unknown) → Promise<Blob \| null>` | 令牌 → Blob；非令牌 / 不存在 / 读失败一律返回 `null` |
 | `store.delete(token)` | `(token: unknown) → Promise<void>` | best-effort 删除，失败静默不抛。同一令牌可能被多处引用，删之前先确认没人再用它——误删会让其他引用处变成死链；拿不准就交给上面的 GC，别手动 delete |
 | `store.resolveToDataUrl(value)` | `(value: string) → Promise<string>` | 令牌 → data URL；非令牌原样返回；图已丢或编码失败返回空串 |
