@@ -7,7 +7,8 @@
     "@rei-standard/amsg-instant": "0.10.0",
     "@rei-standard/amsg-server": "2.5.3",
     "@rei-standard/amsg-shared": "0.3.0",
-    "@rei-standard/amsg-sw": "2.3.2"
+    "@rei-standard/amsg-sw": "2.3.2",
+    "@rei-standard/blob-store": "0.0.0"
   },
   "changesets": [
     "amsg-agentic-scratch",
@@ -80,6 +81,7 @@
     "amsg-vapid-public-key",
     "amsg-webcrypto-utils-to-shared",
     "amsg-webpush-stack-to-shared",
+    "blob-store-initial",
     "license-files",
     "phase0-dts-and-hardening"
   ]
