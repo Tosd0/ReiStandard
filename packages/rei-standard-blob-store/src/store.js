@@ -6,6 +6,11 @@ import { DEFAULT_PREFIX, genId } from './token.js';
 import { dataUrlToBlob, blobToDataUrl } from './dataurl.js';
 import { runGc } from './gc.js';
 
+// 与 extractRefs 的 id 边界字符集保持一致（见 token.js；gc.js 的 ID_CHARSET 同源）。
+// restore 按它拒收字符集外的 id：这类 id 一旦写入，extractRefs 在引用面上提不全它、
+// GC 只能靠安全阀永久豁免，等于制造永不可回收的存量。
+const ID_CHARSET = /^[A-Za-z0-9_]+$/;
+
 /**
  * @typedef {Object} StorageAdapter
  * @property {(id: string) => Promise<Blob | null>} get
@@ -47,6 +52,31 @@ export function createBlobStore(options) {
       const id = genId();
       await adapter.put(id, blob);
       return prefix + id;
+    },
+
+    /**
+     * 备份导入用：把 Blob 写回令牌原有的 id 下。put 永远生成新 id，而导入要的是
+     * 「原令牌继续有效」——业务字段里存的还是旧令牌，Blob 必须回到旧 id 上，令牌身份才不丢。
+     * 同一 id 重复 restore 是覆盖，属预期语义（同一份备份导两遍幂等）。
+     * 适配器失败会上抛（调用方必须知道没写进去），与 put 同族哲学。
+     * @param {string} token 本 store 前缀的令牌，id 段须完整落在 [A-Za-z0-9_] 内
+     * @param {Blob} blob
+     * @returns {Promise<void>}
+     * @throws {TypeError} token 不是本 store 的令牌、id 为空或含字符集外字符——这是编程/
+     *   数据错误，吵着抛（字符集外的 id 会成为 GC 永不可回收的存量，见 ID_CHARSET 注释）；
+     *   blob 的鸭子判定与 put 相同，拒收非 Blob。
+     */
+    async restore(token, blob) {
+      if (!isRef(token)) {
+        throw new TypeError(`restore: 需要本 store 前缀的令牌（形如 ${prefix}<id>）`);
+      }
+      if (!ID_CHARSET.test(idOf(token))) {
+        throw new TypeError('restore: 令牌 id 须非空且完整落在 [A-Za-z0-9_] 内——字符集外的 id 引用提取不全、GC 永不能回收');
+      }
+      if (!blob || typeof blob.arrayBuffer !== 'function' || typeof blob.slice !== 'function') {
+        throw new TypeError('restore: 需要 Blob');
+      }
+      await adapter.put(idOf(token), blob);
     },
 
     /**
