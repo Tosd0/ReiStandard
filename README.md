@@ -104,7 +104,7 @@ ReiStandard/
 
 - [API 技术规范](./standards/active-messaging-api.md) — 端点、字段、错误码、鉴权
 - [Service Worker 规范](./standards/service-worker-specification.md) — SW 行为、消息协议、兼容性
-- [Blob 存储规范](./standards/blob-storage.md) — 令牌与 id 格式、适配器契约、GC 安全阀、备份互操作
+- [Blob 存储规范](./standards/blob-storage.md) — 令牌与 id 格式、适配器契约、GC 安全阀、内容查重、备份互操作
 - [手动接入示例](./examples/README.md) — 不用 SDK 包的备用路径（**滞后于最新 SDK 字段**，新接入请用包）
 - [本地测试](./docs/TEST_README.md) · [生产监控](./docs/VERCEL_TEST_DEPLOY.md)
 
