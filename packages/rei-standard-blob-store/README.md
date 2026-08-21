@@ -92,6 +92,50 @@ const result = await store.gc({
 
 调用频率不用讲究：挑个后台空闲的时候跑一次，或者干脆挂在设置页的「清理缓存」之类的手动按钮上，不需要频繁跑。时机上只有一条要求，就是上面说的——避开搬家式写入正在进行的时刻。反过来，`refSources` 的引用面清单没把握齐全时，先别开 GC——孤儿 Blob 只是多占点空间，删活图才是不可逆的。
 
+## 内容查重
+
+同一张图从好几个入口存进来过（惰性迁移、批量工具、预设导入各 `put` 各的），库里就会躺着好几份一模一样的 Blob。`store.scanContent()` 扫一遍全库、按内容哈希分组，告诉你哪些令牌指着同一份内容：
+
+```js
+const { duplicateGroups, byHash, wastedBytes, scanned, skipped, aborted } = await store.scanContent({
+  onProgress: (done, total) => setProgress(done / total),   // 可选，每处理完一条回调一次
+});
+```
+
+它是**纯只读**的：不删、不改、不写。合并引用由宿主自己做——引用面长什么样只有宿主知道。扫描要把每个 Blob 整块读出来算哈希、逐条串行，库大的时候挂在手动按钮上跑、配个进度条即可。
+
+**用法一 · 存量合并**：拿 `duplicateGroups`，把每组 `duplicates` 里的令牌在自己的引用面上改写成 `canonical`；剩下的 Blob 就没人引用了，交给上面的 GC 收。
+
+```js
+for (const { canonical, duplicates } of duplicateGroups) {
+  for (const dup of duplicates) await myDb.rewriteAllRefs(dup, canonical);   // 你自己的引用面
+}
+// 别在这里手动 delete：改写完引用，多余的 Blob 就是孤儿，下一轮 GC 自然收掉
+```
+
+`canonical` 是组内创建时间最早的那个：它存在得最久、被引用的面最广，万一漏改了一处引用，漏的那处多半还指着它，图仍然在。
+
+**用法二 · 迁移期防再生**：批量迁移开始时扫一次，把 `byHash` 当 cache；每张新图 `put` 之前先 `hashBlob` 查一下，命中就复用已有令牌，重复根本不会生出来。
+
+```js
+import { hashBlob } from '@rei-standard/blob-store';
+
+const { byHash } = await store.scanContent();
+
+async function putDeduped(blob) {
+  const hash = await hashBlob(blob);
+  const known = byHash.get(hash);
+  if (known) return known[0];        // 库里已经有这份内容了，复用它的令牌
+  const token = await store.put(blob);
+  byHash.set(hash, [token]);         // 记进 cache，同一轮迁移里的后来者也能命中
+  return token;
+}
+```
+
+**⚠️ 宿主义务**：改写引用属于「引用搬家」，与 GC 一轮进行中的 mark 互斥（同上面那条义务）——合并期间别跑 GC，GC 期间别合并。搬到一半撞上扫描，某个令牌可能瞬间从所有面上消失，被误判成孤儿删掉。
+
+结果的读法：`aborted: true` 表示 `keys()` 读不出来、整轮放弃，其余字段全是零值——别把它当成「库里没有重复」。单条 Blob 读失败或算不出哈希只跳过那一条（计入 `skipped`），整轮照常出结果。id 超出 `[A-Za-z0-9_]` 字符集的也跳过：这类 id 在引用面上提取不全，改写指向它的引用会破图（与 GC 的同款安全阀同源）。`hashBlob` 走 `crypto.subtle`，浏览器里它只在安全上下文（https / localhost）里有——拿不到会抛，不会返回个假哈希糊弄过去。顺带一提 `skipped` 值得瞄一眼：它等于全库条数、`duplicateGroups` 又是空的，通常就是这个环境压根没有 `crypto.subtle`，每条都算不出哈希——那和「真没有重复」长得一模一样。
+
 ## API 一览
 
 ### `createBlobStore` 与 store 方法
@@ -108,6 +152,7 @@ const result = await store.gc({
 | `store.resolveToDataUrl(value)` | `(value: string) → Promise<string>` | 令牌 → data URL；非令牌原样返回；图已丢或编码失败返回空串 |
 | `store.migrateDataUrl(dataUrl)` | `(dataUrl: string) → Promise<string>` | data URL → 令牌；失败回退返回原串 |
 | `store.resolveDeep(root)` | `(root: object) → Promise<void>` | 深度遍历对象树，令牌原地替换成 data URL；原地修改、无返回值 |
+| `store.scanContent(opts?)` | `(opts?: ContentScanOptions) → Promise<ContentScanResult>` | 内容查重：扫全库按内容哈希分组，找出指着同一份内容的令牌。纯只读（不删不改不写），合并引用是宿主自己的事，详见上面「内容查重」 |
 | `store.gc(opts)` | `(opts: GcOptions) → Promise<GcResult>` | 孤儿 GC，详见上面「孤儿 GC 与宿主义务」 |
 
 ### 模块导出
@@ -117,6 +162,7 @@ const result = await store.gc({
 | `createIdbAdapter` | `createIdbAdapter(dbName, { storeName? }) → StorageAdapter` | 独立 IndexedDB 适配器，没有自己数据库的项目开箱即用。一个 dbName 只有首次创建时的 storeName 生效——再配第二个 storeName 会吵着报错，要多个 store 请换 dbName |
 | `dataUrlToBlob` | `(dataUrl: string) → Blob` | data URL → Blob；非法输入抛错 |
 | `blobToDataUrl` | `(blob: Blob) → Promise<string>` | Blob → data URL |
+| `hashBlob` | `(blob: Blob) → Promise<string>` | 算 Blob 内容的 SHA-256，返回小写 hex；迁移期先查哈希再 `put` 用得上。走 `crypto.subtle`（浏览器里只在安全上下文可用），拿不到或入参不是 Blob 都会抛 |
 | `extractRefs` | `(str: string, prefix?: string) → string[]` | 从任意字符串提取全部令牌；自己拼 GC 的 `refSources` 时用得上 |
 | `DEFAULT_PREFIX` | `'blobref:'` | 默认令牌前缀常量 |
 

@@ -5,6 +5,7 @@
 import { DEFAULT_PREFIX, genId } from './token.js';
 import { dataUrlToBlob, blobToDataUrl } from './dataurl.js';
 import { runGc } from './gc.js';
+import { runContentScan } from './content-scan.js';
 
 // 与 extractRefs 的 id 边界字符集保持一致（见 token.js；gc.js 的 ID_CHARSET 同源）。
 // restore 按它拒收字符集外的 id：这类 id 一旦写入，extractRefs 在引用面上提不全它、
@@ -137,6 +138,16 @@ export function createBlobStore(options) {
     /** 深度遍历对象树，令牌原地替换成 data URL（备份导出前调用）。 */
     async resolveDeep(root) {
       return resolveDeep(store, root);
+    },
+
+    /**
+     * 内容查重：扫全库、按内容哈希分组，找出哪些令牌指着同一份内容。纯只读，语义见 content-scan.js。
+     * 合并引用由宿主自己做（引用面长什么样只有宿主知道），合并完多出来的 Blob 交给 GC 收。
+     * @param {import('./content-scan.js').ContentScanOptions} [opts]
+     * @returns {Promise<import('./content-scan.js').ContentScanResult>}
+     */
+    async scanContent(opts) {
+      return runContentScan({ adapter, prefix }, opts);
     },
 
     /**
