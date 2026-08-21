@@ -1,5 +1,26 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.11.0-next.7
+
+### Patch Changes
+
+- 65a9f91: `multipart.maxChunkBytes` 加上限校验，配错在 `createInstantHandler` 当场失败
+
+  每片原文经 base64url 膨胀 4/3、再套上分片信封后，必须仍装得进单条 push 的明文上限（约 3993 字节）。`maxChunkBytes` 配超过约 2800 字节时，切出的每一片都会被推送服务拒收——原来的下场是每次触发时 reasoning / 长内容静默丢失，只留一条跟配置对不上号的推送错误，而这个旋钮此前只校验「正整数」，没人拦着调大。
+
+  现在 `createInstantHandler` 解析 `multipart` 配置时校验这个上限（上限按分片信封的实际开销现算，不是写死的数），配超了当场抛 `TypeError`，错误信息带当前配置下允许的最大值；deprecated 别名 `reasoningChunkBytes` 走同一道校验。绕过 handler、自己攒 ctx 直接调 `processInstantMessage` / `sendPushWithMaybeBlob` 的，同一道校验在切片前拦下。这个旋钮的用途不变：只用来把切片收窄到跟接收端那份对齐，默认值与合法收窄值不受影响。
+
+- 65a9f91: Node 适配器：响应流在首字节前就失败时回干净的 500，不再断连
+
+  `toNodeHandler` / `toVercelNodeHandler` 收到的 Response 流如果在吐出第一个字节之前就出错（典型形态：`start` / 首次 `pull` 里懒加载资源失败），原来客户端看到的是一次 connection reset（`fetch()` 直接抛 `TypeError: fetch failed`），状态码和错误码一概读不到。现在这一档回 `500 { success: false, error: { code: 'ADAPTER_ERROR', message } }`，跟适配器其他阶段的故障同一个信封，服务端也照旧记一行能归因的日志。
+
+  「连接直接断开」这个行为保持不变，但只属于它该在的场景：字节已经发出去一部分、流中途才失败——响应头早已发出，追加 JSON 信封只是往流里塞垃圾，断连才能让调用方看出这是一条没收完的流。首字节前失败时客户端一个字节都没收到，断连没有任何信息量，所以收回 500 信封这档。
+
+  实现上是在进 `pipeline` 之前先手动读一次首块：`pipeline` 无论因为什么失败都会先把 `res` 销毁，销毁完就只剩断连一条路；首块读失败时 `res` 还一个字节都没沾，走的还是外层原有的 500 兜底。首块读到了才写响应头开始转发，客户端不会因此多等——Node 本来就攒着响应头等第一个字节一起发。
+
+- Updated dependencies [65a9f91]
+  - @rei-standard/amsg-shared@0.4.0-next.9
+
 ## 0.11.0-next.6
 
 ### Patch Changes
