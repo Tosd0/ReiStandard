@@ -1,5 +1,24 @@
 # Changelog — @rei-standard/amsg-sw
 
+## 2.4.0-next.7
+
+### Patch Changes
+
+- 65a9f91: 入队回执不再把「被并发冲刷送达」误报成「还在排队」
+
+  页面入队（`ENQUEUE_REQUEST`）后，SW 从落库到自己那轮冲刷去读队列之间隔着一次异步等待（Background Sync 注册）。这个空当里，这条记录可能已经被并发在跑的另一轮冲刷——刚注册的 Background Sync、或别的窗口发的 `FLUSH_QUEUE`——发出去并从队列里删掉。原来入队回执只认自己那轮冲刷的结果，这种情况下会回 `delivered: false`；按约定页面把它当「还在队列里等重试」展示，而成功送达不广播任何事件，没有第二条消息来纠正，用户手动重试就会在服务端排出重复任务。
+
+  现在任何一轮冲刷结算一条记录时，都会把结局交给正在等这条回执的入队方：被并发冲刷成功送走的如实回 `delivered: true`；被并发冲刷判了 4xx 永久拒绝的，回执也带上 `dropped: true` / `status` / `error`。回执的字段和 `ok` 的老含义都不变。
+
+- 65a9f91: multipart 的 done 墓碑写失败时，TTL 清扫不再把已交付的消息报成丢了
+
+  一条 multipart 消息收齐、还原、交付之后，收尾的第一步是往 IndexedDB 写一条 done 墓碑，TTL 清扫全靠它认出「这条已有结论」。这笔写恰恰容易失败：restore 刚重读完全部分片，紧接着的第一笔写最容易撞上一时的配额不足。原来写失败只留一条日志，残留的 pending 记录过期（默认 60 秒）后，下一条 push 触发清扫时所有窗口都会收到这条消息的 `MULTIPART_EXPIRED`（`ttl-expired`）——一条用户已经读过的消息被报成没收到。
+
+  现在持久墓碑写不进去时，同样的结论会记在内存里兜底：SW 存活期内，TTL 清扫认得「这条已经交付过了」，不再误报；推送服务重投的旧分片也不会把这条消息重新拼齐再投一次。SW 重启后内存结论会丢——那时持久墓碑本来也没写成，误报一次是权衡后接受的残余风险。
+
+- Updated dependencies [65a9f91]
+  - @rei-standard/amsg-shared@0.4.0-next.9
+
 ## 2.4.0-next.6
 
 ### Minor Changes

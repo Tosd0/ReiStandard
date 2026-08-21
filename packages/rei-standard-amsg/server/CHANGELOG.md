@@ -1,5 +1,42 @@
 # Changelog — @rei-standard/amsg-server
 
+## 2.6.0-next.24
+
+### Patch Changes
+
+- 65a9f91: 补上「取消后消息不再从收件箱复活」的四个缺口
+
+  取消 / 顶替一条任务后，它名下还没发出去的 `message_outbox` 行要跟着撤掉，否则客户端下一次 `GET /outbox` 会把已取消任务的内容补收回去。此前有四条路漏掉了这一步，这次一起补上：
+
+  **1. 取消撞上投递收尾（`cancelled_after_delivery`）也清收件箱。** 取消发生在 LLM 还在生成的时候，取消那侧的清理扫不到之后才落进收件箱的行（思考过程那条按策略只落行、不推送，正是必然留下的那种）。现在投递侧发现「行已被取消或顶替」时（`cancelled_mid_delivery` / `cancelled_after_delivery`，一次性与循环任务都算），会顺手把该任务名下未投递的行撤掉。
+
+  **2. `ctx.emitResult` 不发推送的那条路（`notification: { show: false }`）也认取消信号。** 原来取消只在推送前那一道拦截上生效，不推送的结果感知不到取消，照样落行。现在 `runScheduledTick` 的投递把取消信号一路递给结果出口：任务已被取消时 `emitResult` 抛 `TASK_CANCELLED`（与推送那条路同一个错误形状），不落行；落行的 await 期间才发现取消的，把刚落的行自己撤掉。
+
+  **3. fire 内的 `ctx.cancelTask(uuid)` 与 `DELETE /cancel-message` 同一收尾。** 取消的任务此前投递到一半失败过的话，未投递的分段还在收件箱里等重试——现在删行成功后同样把它们撤掉（best-effort，清不掉不影响取消本身）。
+
+  **4. 清理不再受未 ack 积压量限制。** 原来按任务清收件箱靠「按用户翻页扫全部未 ack 行、在 JS 里挑 `task_uuid`」，有 5000 行的扫描上限——积压超过它时，被取消任务的行（最新的那批）正好扫不到，一行都没撤还没有任何日志。适配器接口新增可选方法 `discardUndeliveredOutboxForTask(userId, taskUuid)`（内置 D1 已实现）：按任务一次直删，一个数据库来回，不受积压量影响。没有这个方法的适配器退回翻页扫描，行为与以前一致，但扫到上限没扫完时会记一条点名日志，不再静默。
+
+  判据不变：只撤 `delivered_at` 为空的行，已经推给设备的留着让客户端照常 ack。
+
+- 65a9f91: `PUT /update-message`：任务已存 `credRefs.chat` 时，内联凭据刷新改为报错
+
+  任务通过 `credRefs.chat` 引用凭据时，触发时的解析以凭据表那行为准，任务里的内联 `apiUrl` / `apiKey` / `primaryModel` 只是表行缺失时的兜底。原来对这种任务用内联字段做「凭据刷新」会返回 200 并列进 `updatedFields`，但改动不会生效——泄漏密钥轮换的场景里，客户端以为换 Key 成功，之后每次触发用的仍是表里的旧 Key。
+
+  现在这种组合返回 `409 TASK_USES_CRED_REFS`，错误信息说明换 Key 应走 `PUT /llm-credentials` 覆盖对应凭据，或在本次请求里改用 `credRefs` 指向新凭据。只带非 chat 引用（如仅 `emotion`）的任务不受影响：它的聊天凭据就是内联那份，刷新照常生效。
+
+- 65a9f91: `ctx.emitResult` 的 `source` 跟着 `messageType` 走
+
+  结果推送里的 `source` 原来写死 `'scheduled'`，in-server instant 的 fire 里发结果会产出 `{ messageType: 'instant', source: 'scheduled' }`，违反标准的配对规则（`messageType: 'instant'` 必配 `source: 'instant'`）。现在与聊天推送同一判据：`messageType` 是 `'instant'` 时 `source` 也是 `'instant'`，其余照旧 `'scheduled'`。
+
+- 65a9f91: `multipart.maxChunkBytes` 加上限校验，配错响亮失败
+
+  每片原文经 base64url 膨胀 4/3、再套上分片信封后，必须仍装得进单条 push 的明文上限（约 3993 字节）。`maxChunkBytes` 配超过约 2800 字节时，切出的每一片都会被推送服务拒收——原来的下场是每次触发时思考过程静默丢失，只留一条跟配置对不上号的推送错误。
+
+  现在发送端解析分片限额时校验这个上限（上限按分片信封的实际开销现算，不是写死的数），配超了抛 `MULTIPART_CHUNK_BYTES_TOO_LARGE` 的部署配置错误，错误信息带当前配置下允许的最大值。这类错误留在重试阶梯上，配置改好后任务自愈。这个旋钮的用途不变：只用来把切片收窄到跟 `installReiSW` 那份对齐。
+
+- Updated dependencies [65a9f91]
+  - @rei-standard/amsg-shared@0.4.0-next.9
+
 ## 2.6.0-next.23
 
 ### Patch Changes
