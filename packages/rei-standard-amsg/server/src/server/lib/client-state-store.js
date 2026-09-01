@@ -83,7 +83,9 @@ export function planClientStateCleanup(ttl, now) {
  *   - 删除：根行按精确 key 删，切片行按 key 前缀删，一个 key 的数据清干净。
  *
  * 两者都受同一套 last-write-wins 约束：`updatedAt` 比库里已有值旧的写入
- * （或删除）不生效，陈旧批次盖不掉新数据。
+ * （或删除）不生效，陈旧批次盖不掉新数据。唯一的例外是库里那行「来自未来」
+ * （`updated_at` 晚于服务端当前时刻）——那种行只可能出自跑偏的设备时钟，不当
+ * 比较基准，写入放行，详见 adapters/d1.js 的 `upsertClientState`。
  *
  * 条件写护栏：条目可带可选的 `version`（毫秒时间戳或单调递增整数）。带了它，
  * 比较用的就是这个值而不是 `updatedAt`——同一个 key 有多个写入方时（例如
@@ -102,12 +104,15 @@ export function planClientStateCleanup(ttl, now) {
  * @param {Array<{ namespace: string, key: string, value: string|null, updatedAt: number, version?: number }>} args.entries
  *   `version`（可选）：条件写护栏值，见文件头。带了它，这条的 last-write-wins
  *   比较用它（写进行的 updated_at 列）；没带照旧用 `updatedAt`。
+ * @param {() => number} [args.now] - 取服务端当前时刻（测试可注入假时钟）。适配器
+ *   拿它认出库里「来自未来」的脏行。
  * @returns {Promise<{ upserted: number, skipped: number, deleted: number, skippedEntries: Array<{ namespace: string, key: string }> }>}
  *   `upserted` / `skipped` 按逻辑条目计（切片行不计）；`deleted` 是请求删除的
  *   key 数，不代表这些 key 原本一定存在。`skippedEntries` 逐条列出被
  *   last-write-wins 拦下的 key（适配器不回 outcomes 时为空数组——分不清是哪条）。
  */
-export async function writeClientStateEntries({ db, userId, userKey, entries }) {
+export async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
+  const nowFn = typeof now === 'function' ? now : Date.now;
   const physicalRows = [];
   const cleanups = [];
   const rootRowIndexes = [];
@@ -168,7 +173,9 @@ export async function writeClientStateEntries({ db, userId, userKey, entries }) 
     return { upserted: 0, skipped: 0, deleted: 0, skippedEntries: [] };
   }
 
-  const result = await db.upsertClientState(userId, physicalRows, cleanups);
+  // 服务端自己的钟一次取定，整批共用：条件写靠它判断库里那行是不是来自未来
+  // （设备时钟跑偏留下的脏行），是就放行覆盖。
+  const result = await db.upsertClientState(userId, physicalRows, cleanups, nowFn());
   let upserted = 0;
   let skipped = 0;
   const skippedEntries = [];

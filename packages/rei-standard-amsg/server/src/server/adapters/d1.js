@@ -587,8 +587,17 @@ export class D1Adapter {
    * than the stored row (updatedAt strictly lower) is skipped; equal or
    * newer overwrites. Values arrive pre-encrypted (the handler encrypts).
    *
+   * 例外是「来自未来」的行：`updated_at` 晚于服务端当前时间的行一律放行覆盖。
+   * 比较值是客户端自己报的时间戳，设备时钟只要领先过真实时间（用户改过系统
+   * 时间、时区或日期误操作），那一刻同步上来的行就带着一个还没到的时刻；之后
+   * 这台设备发什么都比它「旧」，条件写全被无声跳过，云端那行要等真实时间追上
+   * 去才解得开——客户端删本地数据、重装都碰不到它。合法写入不可能来自未来，
+   * 所以这种行按脏数据处理：服务端的钟是可信的那一个，拿它当判据放行。一次
+   * 正常写入就把 `updated_at` 拉回现实，之后旧不盖新照常生效。
+   *
    * `cleanups` 是删除项：在同一 batch 里先于 upsert 执行，`updated_at <= ?`
-   * 条件保证陈旧批次删不动更新写入的行。两种形态——
+   * 条件保证陈旧批次删不动更新写入的行（同样对未来时间戳的行放行，否则删一条
+   * 状态时切片行留在库里成孤儿）。两种形态——
    *   - `{ namespace, keyPrefix, updatedAt }` 删 key 前缀下的所有行，用来清掉
    *     大值旧写入留下的切片行（见 lib/state-chunks.js）；
    *   - `{ namespace, key, updatedAt }` 删这一个 key，用来删整条状态（前缀会
@@ -606,17 +615,27 @@ export class D1Adapter {
    * @param {string} userId
    * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
    * @param {Array<{ namespace: string, key?: string, keyPrefix?: string, updatedAt: number }>} [cleanups]
+   * @param {number} [now] - 服务端当前时刻（epoch 毫秒），判定「这行来自未来」用的
+   *   就是它。调用方（lib/client-state-store.js）传下来，测试可以钉住一个假时钟；
+   *   自定义调用方不传时退回本机时钟。
    * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[] }>}
    *   `outcomes[i]` 对应 entries[i] 是否真的写入（changes > 0）。
    */
-  async upsertClientState(userId, entries, cleanups = []) {
+  async upsertClientState(userId, entries, cleanups = [], now = Date.now()) {
+    // 条件写的第二个分支 `client_state.updated_at > ?`（? = 服务端当前时刻）是
+    // 时钟跑偏的解锁口：库里那行标着一个还没到的时刻，它就不是可信的比较基准，
+    // 这次写入直接放行。注意这里不去钳制调用方给的时间戳（改写成
+    // `min(客户端值, 服务端 now)`）——entry 的 `version` 护栏允许是「毫秒时间戳
+    // 或单调递增版本号」两种语义，钳制会把后者压坏；改写调用方给的值也更侵入。
+    // 放行脏行已经够解开死锁：一次正常写入就把 updated_at 拉回现实，之后自愈。
     const UPSERT_SQL =
       `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (user_id, namespace, key) DO UPDATE SET
          value = excluded.value,
          updated_at = excluded.updated_at
-       WHERE excluded.updated_at >= client_state.updated_at`;
+       WHERE excluded.updated_at >= client_state.updated_at
+          OR client_state.updated_at > ?`;
     // 前缀匹配走字典序范围（`key >= prefix AND key < 上界`），不用 LIKE：
     //   - D1 把 LIKE pattern 的长度上限压到了 50 字节（SQLite 默认 50000，官方
     //     文档没写这一条）。pattern 是「key + 分隔符 + %」再加上转义字符，key
@@ -627,22 +646,28 @@ export class D1Adapter {
     //   - 范围条件能直接吃 (user_id, namespace, key) 主键索引，LIKE 和
     //     substr(key, 1, ?) = ? 都得逐行算。
     //   - 前缀里的 % _ \ 不再是通配符，转义那一层跟着一起去掉了。
+    // 两条清理同样要给未来时间戳的行开口子，否则跑偏那阵写下的切片行谁也删不
+    // 掉，根行覆盖成小值之后留一堆读不出来的孤儿。
     const CLEANUP_PREFIX_SQL =
       `DELETE FROM client_state
-       WHERE user_id = ? AND namespace = ? AND key >= ? AND key < ? AND updated_at <= ?`;
+       WHERE user_id = ? AND namespace = ? AND key >= ? AND key < ?
+         AND (updated_at <= ? OR updated_at > ?)`;
     const CLEANUP_KEY_SQL =
       `DELETE FROM client_state
-       WHERE user_id = ? AND namespace = ? AND key = ? AND updated_at <= ?`;
+       WHERE user_id = ? AND namespace = ? AND key = ?
+         AND (updated_at <= ? OR updated_at > ?)`;
 
+    // 每行都是一条独立的 prepare（不是把多行拼进一条语句），加上 now 之后单条
+    // 最多 6 个绑定参数，离 D1 单条语句 100 个参数的上限很远。
     const buildStatements = () => [
       ...cleanups.map((c) => (
         typeof c.key === 'string'
-          ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt)
+          ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now)
           : this._db.prepare(CLEANUP_PREFIX_SQL)
-            .bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt)
+            .bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt, now)
       )),
       ...entries.map((entry) =>
-        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt)
+        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt, now)
       ),
     ];
 

@@ -578,6 +578,8 @@ clientStateTtl: {
 
 一个坑说在前头：`PUT /client-state` 和 `writeState()` 的条件写护栏（entry 上的 `version`）落的就是 `updated_at` 这一列。护栏值传的是自增计数器之类的小整数时，这行的 `updated_at` 看起来就像 1970 年，第一次清理就会被扫走。要给某个命名空间配 TTL，就让它的写入方把 `version` 传成毫秒时间戳。
 
+反过来，`updated_at` 大幅领先真实时间的行（设备时钟跑偏时同步上来的）要等真实时间追过去才轮得到清理。这种行不会卡住写入——条件写认得出它来自未来，照样覆盖。
+
 `GET /capabilities` 的 features 里有 `client-state-ttl`。
 
 ## 循环任务的时区（`tzId`）
