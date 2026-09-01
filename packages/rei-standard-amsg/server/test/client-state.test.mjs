@@ -3,12 +3,17 @@ import assert from 'node:assert/strict';
 import { createTestD1, createSpyD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
-import { deriveUserEncryptionKey, encryptPayload, decryptPayload, encryptForStorage } from '../src/server/lib/encryption.js';
+import { deriveUserEncryptionKey, encryptPayload, decryptPayload, encryptForStorage, decryptFromStorage } from '../src/server/lib/encryption.js';
 import { chunkNamespaceFor, chunkKeyFor, chunkKeyPrefixFor } from '../src/server/lib/state-chunks.js';
-import { MAX_KEY_CHARS } from '../src/server/lib/client-state-store.js';
+import { MAX_KEY_CHARS, writeClientStateEntries } from '../src/server/lib/client-state-store.js';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
+
+// 测试里的「服务端当前时间」。条件写要拿它认出「来自未来」的脏行，所以时间戳
+// 必须围着它排，不能再用 100 / 200 这种小数字。
+const SERVER_NOW = 1_700_000_000_000;
+const ONE_DAY = 24 * 60 * 60 * 1000;
 
 // D1 把 SQLite 的 SQLITE_LIMIT_LIKE_PATTERN_LENGTH 压到了 50 字节（SQLite 默认
 // 50000）。超过这个长度的 LIKE / GLOB pattern 在真实 D1 上直接报
@@ -242,6 +247,108 @@ describe('D1 adapter client_state', () => {
       chunkKeyFor(`${longKey}-sibling`, 0),
       chunkKeyFor(wildSibling, 0),
     ].sort());
+  });
+
+  // 设备时钟跑偏的死锁，回归守卫。客户端报上来的 updated_at 只要领先过真实时间
+  // （用户改过系统时间、时区/日期误操作），那一刻同步上去的行就带着一个还没到的
+  // 时刻；之后这台设备每次上传都比它「旧」，条件写无声跳过，云端那行要等真实时间
+  // 追上来才解得开——删本地数据、重装 PWA 都碰不到它。合法写入不可能来自未来，
+  // 所以这种行按脏数据处理，条件写放行覆盖。
+  test('库里那行来自未来：正常时间戳的写入覆盖得掉（设备时钟跑偏不再锁死）', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+
+    // 时钟领先一天的设备同步上来的行
+    await adapter.upsertClientState(USER, [
+      { namespace: 'notes', key: 'k', value: 'from-skewed-clock', updatedAt: SERVER_NOW + ONE_DAY },
+    ], [], SERVER_NOW);
+
+    // 时间调回来之后的正常写入：拿服务端的钟一比就知道库里那行是脏的，放行覆盖
+    const r = await adapter.upsertClientState(USER, [
+      { namespace: 'notes', key: 'k', value: 'fresh', updatedAt: SERVER_NOW },
+    ], [], SERVER_NOW);
+    assert.deepEqual(r, { upserted: 1, skipped: 0, outcomes: [true] });
+    assert.deepEqual(
+      (await adapter.getClientState(USER, 'notes')).map((x) => [x.value, x.updated_at]),
+      [['fresh', SERVER_NOW]]
+    );
+  });
+
+  test('放行未来行不动摇旧不盖新：过去的行照旧拦，相同时间戳照旧覆盖', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    await adapter.upsertClientState(USER, [
+      { namespace: 'notes', key: 'k', value: 'stored', updatedAt: SERVER_NOW - 1000 },
+    ], [], SERVER_NOW);
+
+    // 库里那行是过去的、没跑偏，更旧的写入照旧被跳过
+    const stale = await adapter.upsertClientState(USER, [
+      { namespace: 'notes', key: 'k', value: 'stale', updatedAt: SERVER_NOW - 2000 },
+    ], [], SERVER_NOW);
+    assert.deepEqual(stale, { upserted: 0, skipped: 1, outcomes: [false] });
+    assert.equal((await adapter.getClientState(USER, 'notes'))[0].value, 'stored');
+
+    // 相同时间戳仍然覆盖（条件是 >=，不是 >）
+    const same = await adapter.upsertClientState(USER, [
+      { namespace: 'notes', key: 'k', value: 'same-ts', updatedAt: SERVER_NOW - 1000 },
+    ], [], SERVER_NOW);
+    assert.deepEqual(same, { upserted: 1, skipped: 0, outcomes: [true] });
+    assert.equal((await adapter.getClientState(USER, 'notes'))[0].value, 'same-ts');
+  });
+
+  test('清理 DELETE：未来时间戳的行也删得掉，不留孤儿切片', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const chunkNs = chunkNamespaceFor('n');
+    const future = SERVER_NOW + ONE_DAY;
+
+    await adapter.upsertClientState(USER, [
+      { namespace: 'n', key: 'k', value: 'root', updatedAt: future },
+      { namespace: chunkNs, key: chunkKeyFor('k', 0), value: 'c0', updatedAt: future },
+      { namespace: chunkNs, key: chunkKeyFor('k', 1), value: 'c1', updatedAt: future },
+      { namespace: chunkNs, key: chunkKeyFor('sibling', 0), value: 'sib', updatedAt: SERVER_NOW - 1000 },
+    ], [], SERVER_NOW);
+
+    // 前缀清理（切片行）和精确 key 清理（根行）两条 DELETE 都得认未来行，
+    // 否则删一条状态时切片留在库里成孤儿，读回来还是缺块。
+    await adapter.upsertClientState(USER, [], [
+      { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('k'), updatedAt: SERVER_NOW },
+      { namespace: 'n', key: 'k', updatedAt: SERVER_NOW },
+    ], SERVER_NOW);
+
+    assert.deepEqual(await adapter.getClientState(USER, 'n'), []);
+    assert.deepEqual(
+      (await adapter.getClientState(USER, chunkNs)).map((r) => r.key),
+      [chunkKeyFor('sibling', 0)],
+      '别人的切片行不该被连累'
+    );
+  });
+});
+
+describe('writeClientStateEntries 的服务端时钟护栏', () => {
+  test('未来行覆盖得掉；正常的陈旧写入照旧进 skippedEntries', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const write = (entries) => writeClientStateEntries({
+      db: adapter, userId: USER, userKey, entries, now: () => SERVER_NOW,
+    });
+
+    // 时钟领先一天的设备写上来的一行
+    await write([{ namespace: 'n', key: 'k', value: 'from-skewed-clock', updatedAt: SERVER_NOW + ONE_DAY }]);
+
+    const recovered = await write([{ namespace: 'n', key: 'k', value: 'fresh', updatedAt: SERVER_NOW }]);
+    assert.deepEqual(recovered, { upserted: 1, skipped: 0, deleted: 0, skippedEntries: [] });
+
+    // 一次正常写入之后 updated_at 回到现实，旧不盖新的保护立刻恢复
+    const stale = await write([{ namespace: 'n', key: 'k', value: 'stale', updatedAt: SERVER_NOW - 1000 }]);
+    assert.deepEqual(stale, {
+      upserted: 0, skipped: 1, deleted: 0, skippedEntries: [{ namespace: 'n', key: 'k' }],
+    });
+
+    const rows = await adapter.getClientState(USER, 'n');
+    assert.equal(rows.length, 1);
+    assert.equal(await decryptFromStorage(rows[0].value, userKey), 'fresh');
   });
 });
 

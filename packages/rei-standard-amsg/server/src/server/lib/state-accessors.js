@@ -145,7 +145,9 @@ export function createStateAccessors({ db, userId, userKey, maxStateValueBytes, 
       };
     });
 
-    return writeClientStateEntries({ db, userId, userKey, entries: normalized });
+    // 时钟一路传到底：条件写要拿服务端当前时刻认出「来自未来」的脏行，宿主注入
+    // 假时钟时这条路也得跟着走，不然 hook 侧的写入还在读本机的钟。
+    return writeClientStateEntries({ db, userId, userKey, entries: normalized, now: nowFn });
   };
 
   return { readState, writeState };

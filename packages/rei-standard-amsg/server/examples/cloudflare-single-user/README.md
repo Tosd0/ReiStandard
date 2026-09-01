@@ -114,7 +114,7 @@ await ctx.writeState('bypass', [
 ```
 
 - `value` 是字符串就整条覆盖（不是追加，序列化自己来）；`value` 为 `null` 就删掉这个 key，连带它的分块切片行一起清干净。
-- `updatedAt` 可以显式给（epoch 毫秒），不给就取当前时刻。规则和客户端同步一样是 last-write-wins：比库里已有值旧的写入或删除不生效（落在 `skipped` 里），客户端后写的数据不会被这次 fire 盖回去。
+- `updatedAt` 可以显式给（epoch 毫秒），不给就取当前时刻。规则和客户端同步一样是 last-write-wins：比库里已有值旧的写入或删除不生效（落在 `skipped` 里），客户端后写的数据不会被这次 fire 盖回去。一个例外：库里那行的 `updated_at` 晚于服务端当前时刻时（只可能出自跑偏的设备时钟），它不当比较基准，写入和删除都放行。
 - 限制与 `PUT /client-state` 同一套：单条 `value` 默认 5MB（`maxStateValueBytes` 可调）、单次 ≤ 200 条、namespace / key 不能带控制字符。不合规当场抛 `TypeError` / `RangeError`，一条也不会落库。
 - 数据库适配器不支持 `client_state` 时抛 `AGENTIC_STATE_WRITE_UNSUPPORTED`。写不进去必须让 hook 知道，否则 push 里带的引用键会指向不存在的数据。
 
