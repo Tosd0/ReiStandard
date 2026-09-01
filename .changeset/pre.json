@@ -41,6 +41,7 @@
     "amsg-server-agentic-schedule-task",
     "amsg-server-before-fire-skip",
     "amsg-server-cancel-outbox-revival",
+    "amsg-server-clamp-future-client-stamps",
     "amsg-server-client-state-clock-skew-unlock",
     "amsg-server-client-state-ttl",
     "amsg-server-client-state-version-guard",
