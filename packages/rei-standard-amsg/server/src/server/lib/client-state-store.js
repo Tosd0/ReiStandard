@@ -113,6 +113,10 @@ export function planClientStateCleanup(ttl, now) {
  */
 export async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
   const nowFn = typeof now === 'function' ? now : Date.now;
+  // 整批取一次，两处共用：下面钳护栏值的上限是它，传给适配器认「库里那行来自未来」
+  // 的判据也是它。分两次取的话，同一批里会出现「按 t1 钳自己、却拿 t2 去判别人是不是
+  // 来自未来」的错位，而且同批条目彼此的钳制基准也不一致。
+  const at = nowFn();
   const physicalRows = [];
   const cleanups = [];
   const rootRowIndexes = [];
@@ -121,7 +125,17 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
 
   for (const entry of entries) {
     // 条件写护栏：带 version 的条目按 version 比新旧（见文件头）。
-    const guardAt = Number.isInteger(entry.version) && entry.version > 0 ? entry.version : entry.updatedAt;
+    //
+    // 钳到服务端当前时刻：调用方报上来的值只在「不超过现在」的范围内可信。设备时钟
+    // 领先时不钳的话，那台设备写下的行会一直压着别人——哪怕它的内容更旧，别人也盖不
+    // 过去，而这个偏差是持续的，不像网络抖动会自己过去。钳完按到达顺序排，更接近真相。
+    //
+    // 这不动正常路径：钳制只在值大于「现在」时才生效，而正常的时间戳都落在过去，
+    // `min` 取的就是原值——慢包后到仍然拿着自己构建时刻那个较小的值，照样被拦，
+    // 「旧不盖新」一个字没变。version 那种单调递增版本号同理（要大到 1.7e12
+    // 才碰得到这条线）。
+    const rawGuardAt = Number.isInteger(entry.version) && entry.version > 0 ? entry.version : entry.updatedAt;
+    const guardAt = Math.min(rawGuardAt, at);
     // 不管写还是删，都先清掉这个 key 上一次写入留下的切片行（同一批里先删后写）。
     cleanups.push({
       namespace: chunkNamespaceFor(entry.namespace),
@@ -175,7 +189,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
 
   // 服务端自己的钟一次取定，整批共用：条件写靠它判断库里那行是不是来自未来
   // （设备时钟跑偏留下的脏行），是就放行覆盖。
-  const result = await db.upsertClientState(userId, physicalRows, cleanups, nowFn());
+  const result = await db.upsertClientState(userId, physicalRows, cleanups, at);
   let upserted = 0;
   let skipped = 0;
   const skippedEntries = [];
