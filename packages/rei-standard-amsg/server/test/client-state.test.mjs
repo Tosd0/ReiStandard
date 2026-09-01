@@ -326,21 +326,71 @@ describe('D1 adapter client_state', () => {
 });
 
 describe('writeClientStateEntries 的服务端时钟护栏', () => {
-  test('未来行覆盖得掉；正常的陈旧写入照旧进 skippedEntries', async () => {
+  const setup = async () => {
     const adapter = createD1Adapter(createTestD1());
     await adapter.initSchema();
     const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
-    const write = (entries) => writeClientStateEntries({
-      db: adapter, userId: USER, userKey, entries, now: () => SERVER_NOW,
+    const write = (entries, now = () => SERVER_NOW) => writeClientStateEntries({
+      db: adapter, userId: USER, userKey, entries, now,
     });
+    return { adapter, userKey, write };
+  };
 
-    // 时钟领先一天的设备写上来的一行
+  // 护栏值钳到服务端当前时刻。不钳的话，时钟领先的那台设备写下的行会一直压着别人
+  // ——内容更旧也盖不过去，而这个偏差是持续的，不像网络抖动会自己过去。
+  test('设备时钟领先时，落库的是服务端时刻而不是那个未来值', async () => {
+    const { adapter, write } = await setup();
+
     await write([{ namespace: 'n', key: 'k', value: 'from-skewed-clock', updatedAt: SERVER_NOW + ONE_DAY }]);
+
+    const rows = await adapter.getClientState(USER, 'n');
+    assert.equal(rows[0].updated_at, SERVER_NOW, '未来值应被钳到服务端当前时刻');
+  });
+
+  test('钳制不碰正常路径：过去的时间戳原样落库，慢包后到照旧被拦', async () => {
+    const { adapter, write } = await setup();
+
+    // 客户端时钟正常，构建时刻就是护栏值，一个字不改
+    await write([{ namespace: 'n', key: 'k', value: 'built-at-T2', updatedAt: SERVER_NOW - 2000 }]);
+    assert.equal((await adapter.getClientState(USER, 'n'))[0].updated_at, SERVER_NOW - 2000);
+
+    // 更早构建、更晚到达的那一份仍然被拦下——乱序保护不受钳制影响
+    const late = await write([{ namespace: 'n', key: 'k', value: 'built-at-T1-arrived-late', updatedAt: SERVER_NOW - 5000 }]);
+    assert.deepEqual(late, {
+      upserted: 0, skipped: 1, deleted: 0, skippedEntries: [{ namespace: 'n', key: 'k' }],
+    });
+  });
+
+  test('同一批共用一个钳制基准，不会一条一个时刻', async () => {
+    const { adapter, write } = await setup();
+    // 每次调用都往前走一秒：整批取两次以上的话，同批条目会落到不同的 updated_at
+    let tick = 0;
+    const marchingClock = () => SERVER_NOW + (tick++) * 1000;
+
+    await write([
+      { namespace: 'n', key: 'a', value: 'A', updatedAt: SERVER_NOW + ONE_DAY },
+      { namespace: 'n', key: 'b', value: 'B', updatedAt: SERVER_NOW + ONE_DAY },
+    ], marchingClock);
+
+    const stamps = (await adapter.getClientState(USER, 'n')).map((r) => r.updated_at);
+    assert.equal(new Set(stamps).size, 1, '同一批的条目必须落在同一个时刻上');
+  });
+
+  // 钳制之后这条路自己写不出未来行了，但钳制上线**之前**留下的还在库里，
+  // 放行那条得继续管用——否则那些行反而被焊死（客户端再也盖不过去）。
+  test('遗留的未来行仍然覆盖得掉，之后旧不盖新立刻恢复', async () => {
+    const { adapter, userKey, write } = await setup();
+
+    // 绕过钳制直接落一行未来的，模拟上个版本留下的脏数据
+    await adapter.upsertClientState(USER, [{
+      namespace: 'n', key: 'k',
+      value: await encryptForStorage('legacy-future-row', userKey),
+      updatedAt: SERVER_NOW + ONE_DAY,
+    }], [], SERVER_NOW + ONE_DAY + 1);
 
     const recovered = await write([{ namespace: 'n', key: 'k', value: 'fresh', updatedAt: SERVER_NOW }]);
     assert.deepEqual(recovered, { upserted: 1, skipped: 0, deleted: 0, skippedEntries: [] });
 
-    // 一次正常写入之后 updated_at 回到现实，旧不盖新的保护立刻恢复
     const stale = await write([{ namespace: 'n', key: 'k', value: 'stale', updatedAt: SERVER_NOW - 1000 }]);
     assert.deepEqual(stale, {
       upserted: 0, skipped: 1, deleted: 0, skippedEntries: [{ namespace: 'n', key: 'k' }],
