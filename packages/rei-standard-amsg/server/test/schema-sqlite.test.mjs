@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SQLITE_TABLE_SQL, SQLITE_INDEXES } from '../src/server/adapters/schema.sqlite.js';
+import {
+  SQLITE_TABLE_SQL,
+  SQLITE_INDEXES,
+  CLIENT_STATE_INDEXES,
+  MESSAGE_OUTBOX_INDEXES,
+  SQLITE_ALL_INDEXES,
+  SQLITE_REQUIRED_SCHEMA,
+} from '../src/server/adapters/schema.sqlite.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 
 const INSERT_SQL = `INSERT INTO scheduled_messages
@@ -31,6 +38,25 @@ test('SQLITE_INDEXES defines the 6 indexes incl. the critical unique guard', () 
     assert.equal(typeof index.description, 'string');
     assert.ok(index.description.length > 0, `${index.name} missing description`);
   }
+});
+
+test('client_state / message_outbox 的索引组与 SQLITE_INDEXES 同形，合集顺序固定，都不是 critical', () => {
+  assert.equal(CLIENT_STATE_INDEXES.length, 1);
+  assert.equal(MESSAGE_OUTBOX_INDEXES.length, 4);
+  assert.deepEqual(SQLITE_ALL_INDEXES, [...SQLITE_INDEXES, ...CLIENT_STATE_INDEXES, ...MESSAGE_OUTBOX_INDEXES]);
+  for (const index of [...CLIENT_STATE_INDEXES, ...MESSAGE_OUTBOX_INDEXES]) {
+    assert.match(index.sql, /CREATE INDEX IF NOT EXISTS/, `${index.name} 必须是 IF NOT EXISTS，老库重跑 initSchema 才补得上`);
+    assert.ok(index.sql.includes(index.name), `${index.name} 的 sql 里应出现同名索引`);
+    assert.equal(typeof index.description, 'string');
+    assert.ok(index.description.length > 0, `${index.name} missing description`);
+    // 缺了只是慢，不是不能用：不许把老库判成「不够用」。
+    assert.equal(index.critical, false, `${index.name} 不该是 critical`);
+  }
+  // 名字全局唯一
+  const names = SQLITE_ALL_INDEXES.map((index) => index.name);
+  assert.equal(new Set(names).size, names.length, '索引名重复');
+  // 自查清单只认 critical 的：这几个新索引一个都不该进去
+  assert.deepEqual([...SQLITE_REQUIRED_SCHEMA.indexes], ['uidx_uuid']);
 });
 
 test('schema applies cleanly on real SQLite', async () => {

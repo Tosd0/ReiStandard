@@ -107,9 +107,12 @@ export function planClientStateCleanup(ttl, now) {
  * @param {() => number} [args.now] - 取服务端当前时刻（测试可注入假时钟）。适配器
  *   拿它认出库里「来自未来」的脏行。
  * @returns {Promise<{ upserted: number, skipped: number, deleted: number, skippedEntries: Array<{ namespace: string, key: string }> }>}
- *   `upserted` / `skipped` 按逻辑条目计（切片行不计）；`deleted` 是请求删除的
- *   key 数，不代表这些 key 原本一定存在。`skippedEntries` 逐条列出被
- *   last-write-wins 拦下的 key（适配器不回 outcomes 时为空数组——分不清是哪条）。
+ *   `upserted` / `skipped` / `deleted` 按逻辑条目计（切片行不计），三者之和等于
+ *   条目数。`deleted` 是删除之后 key 已不在库里的条数——删掉了、或本来就没有，
+ *   两种都算；被 last-write-wins 拦下的删除（库里那行更新）计入 `skipped`。
+ *   `skippedEntries` 逐条列出被拦下的 key，写入与删除都在里面（适配器不回
+ *   outcomes / cleanupOutcomes 时分不清是哪条：写入按物理行计数兜底，删除一律
+ *   按「已删」计）。
  */
 export async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
   const nowFn = typeof now === 'function' ? now : Date.now;
@@ -121,7 +124,8 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
   const cleanups = [];
   const rootRowIndexes = [];
   const rootRowEntries = [];
-  let deleted = 0;
+  /** 删除条目：它的根行删除在 cleanups 里的下标，结局从适配器的 cleanupOutcomes 里取。 */
+  const deletions = [];
 
   for (const entry of entries) {
     // 条件写护栏：带 version 的条目按 version 比新旧（见文件头）。
@@ -145,12 +149,12 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
 
     if (entry.value === null) {
       // 根行按精确 key 删——用前缀会连带删掉同前缀的兄弟 key（'note' 删掉 'notes'）。
+      deletions.push({ cleanupIndex: cleanups.length, entry });
       cleanups.push({
         namespace: entry.namespace,
         key: entry.key,
         updatedAt: guardAt,
       });
-      deleted++;
       continue;
     }
 
@@ -192,6 +196,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
   const result = await db.upsertClientState(userId, physicalRows, cleanups, at);
   let upserted = 0;
   let skipped = 0;
+  let deleted = 0;
   const skippedEntries = [];
   if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
     // 逻辑计数：一条条目的 upserted/skipped 看它的根行，切片行不计数。
@@ -210,6 +215,21 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
     // 自定义 adapter 只回老形状 { upserted, skipped } 时按物理行计数兜底。
     upserted = result.upserted;
     skipped = result.skipped;
+  }
+
+  // 删除条目的结局与写入同一个规矩：库里那行比这次的护栏值新，删除就不生效，
+  // 计入 skipped 并进 skippedEntries；删掉了、或本来就没有这个 key，都算 deleted。
+  // 适配器不回 cleanupOutcomes（老形状）时分不出被拦下的那条，一律按已删计。
+  const cleanupOutcomes = Array.isArray(result.cleanupOutcomes) && result.cleanupOutcomes.length === cleanups.length
+    ? result.cleanupOutcomes
+    : null;
+  for (const { cleanupIndex, entry } of deletions) {
+    if (cleanupOutcomes && cleanupOutcomes[cleanupIndex] === false) {
+      skipped++;
+      skippedEntries.push({ namespace: entry.namespace, key: entry.key });
+    } else {
+      deleted++;
+    }
   }
   return { upserted, skipped, deleted, skippedEntries };
 }

@@ -10,13 +10,12 @@
 
 import {
   SQLITE_TABLE_SQL,
-  SQLITE_INDEXES,
+  SQLITE_ALL_INDEXES,
   SQLITE_MIGRATIONS,
   CLIENT_STATE_TABLE_SQL,
   PUSH_SUBSCRIPTION_TABLE_SQL,
   LLM_CREDENTIALS_TABLE_SQL,
-  MESSAGE_OUTBOX_TABLE_SQL,
-  MESSAGE_OUTBOX_INDEX_SQL
+  MESSAGE_OUTBOX_TABLE_SQL
 } from './schema.sqlite.js';
 // 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
 // schema.js 里的这一份，加列只改一处。
@@ -186,7 +185,6 @@ export class D1Adapter {
     await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
     await this._db.prepare(LLM_CREDENTIALS_TABLE_SQL).run();
     await this._db.prepare(MESSAGE_OUTBOX_TABLE_SQL).run();
-    await this._db.prepare(MESSAGE_OUTBOX_INDEX_SQL).run();
 
     // SQLite 的 ALTER TABLE 没有 ADD COLUMN IF NOT EXISTS，列已经在了就会
     // 报 duplicate column name。那正是「这一步不用做」的意思，跳过即可；
@@ -199,8 +197,10 @@ export class D1Adapter {
       }
     }
 
+    // 三张表的索引一起建（scheduled_messages / client_state / message_outbox）。
+    // 全是 IF NOT EXISTS，老部署重跑一次 initSchema 就把后加的索引补上了。
     const indexResults = [];
-    for (const index of SQLITE_INDEXES) {
+    for (const index of SQLITE_ALL_INDEXES) {
       try {
         await this._db.prepare(index.sql).run();
         indexResults.push({ name: index.name, status: 'success', description: index.description, critical: !!index.critical });
@@ -618,8 +618,11 @@ export class D1Adapter {
    * @param {number} [now] - 服务端当前时刻（epoch 毫秒），判定「这行来自未来」用的
    *   就是它。调用方（lib/client-state-store.js）传下来，测试可以钉住一个假时钟；
    *   自定义调用方不传时退回本机时钟。
-   * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[] }>}
+   * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[], cleanupOutcomes?: Array<boolean|null> }>}
    *   `outcomes[i]` 对应 entries[i] 是否真的写入（changes > 0）。
+   *   `cleanupOutcomes[i]` 对应 cleanups[i]（传了 cleanups 才有）：精确 key 形态
+   *   回 `true` = 这个 key 的行已经不在（删掉了，或本来就没有）、`false` = 行还在
+   *   （库里那行更新，删除被条件写拦下）；前缀形态不探测，回 `null`。
    */
   async upsertClientState(userId, entries, cleanups = [], now = Date.now()) {
     // 条件写的第二个分支 `client_state.updated_at > ?`（? = 服务端当前时刻）是
@@ -657,38 +660,67 @@ export class D1Adapter {
        WHERE user_id = ? AND namespace = ? AND key = ?
          AND (updated_at <= ? OR updated_at > ?)`;
 
+    // 精确 key 的删除后面紧跟一条探针：这个 key 的行还在不在。DELETE 的 changes
+    // 为 0 分不清「本来就没有」和「被条件写拦下」，探针分得清——删完行还在，
+    // 就是库里那行更新、这次删除没生效。主键点查，最多读一行。前缀形态（切片
+    // 行清理）不探：没人消费它的结果，每条多一条语句白花。
+    const PROBE_KEY_SQL =
+      `SELECT COUNT(*) AS n FROM client_state
+       WHERE user_id = ? AND namespace = ? AND key = ?`;
+
     // 每行都是一条独立的 prepare（不是把多行拼进一条语句），加上 now 之后单条
     // 最多 6 个绑定参数，离 D1 单条语句 100 个参数的上限很远。
-    const buildStatements = () => [
-      ...cleanups.map((c) => (
-        typeof c.key === 'string'
-          ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now)
-          : this._db.prepare(CLEANUP_PREFIX_SQL)
+    // 顺序：cleanups（精确 key 的每条后面跟一条探针）→ entries 的 upsert。
+    const statements = [];
+    /** cleanups[i] 的探针在 results 里的下标；前缀形态没有探针，记 null。 */
+    const probeIndexes = [];
+    for (const c of cleanups) {
+      if (typeof c.key === 'string') {
+        statements.push(this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now));
+        probeIndexes.push(statements.length);
+        statements.push(this._db.prepare(PROBE_KEY_SQL).bind(userId, c.namespace, c.key));
+      } else {
+        statements.push(
+          this._db.prepare(CLEANUP_PREFIX_SQL)
             .bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt, now)
-      )),
-      ...entries.map((entry) =>
+        );
+        probeIndexes.push(null);
+      }
+    }
+    const upsertStart = statements.length;
+    for (const entry of entries) {
+      statements.push(
         this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt, now)
-      ),
-    ];
+      );
+    }
 
     let results;
     if (typeof this._db.batch === 'function') {
-      results = await this._db.batch(buildStatements());
+      results = await this._db.batch(statements);
     } else {
       results = [];
-      for (const stmt of buildStatements()) {
+      for (const stmt of statements) {
         results.push(await stmt.run());
       }
     }
 
-    // cleanup 语句不计数：upserted/skipped/outcomes 只看 entries 对应的语句。
-    const outcomes = results.slice(cleanups.length).map((res) => res.meta.changes > 0);
+    // cleanup 与探针不计入 upserted/skipped/outcomes，只看 entries 对应的语句。
+    const outcomes = results.slice(upsertStart).map((res) => res.meta.changes > 0);
     let upserted = 0;
     let skipped = 0;
     for (const wrote of outcomes) {
       if (wrote) upserted++; else skipped++;
     }
-    return { upserted, skipped, outcomes };
+    const result = { upserted, skipped, outcomes };
+    if (cleanups.length > 0) {
+      // 探针查出来还有行 → 删除被拦下（false）；没行了 → 这个 key 已不在（true）。
+      result.cleanupOutcomes = probeIndexes.map((probeAt) => {
+        if (probeAt === null) return null;
+        const row = results[probeAt] && Array.isArray(results[probeAt].results) ? results[probeAt].results[0] : null;
+        return Number(row?.n ?? 0) === 0;
+      });
+    }
+    return result;
   }
 
   /**

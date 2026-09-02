@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS client_state (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, namespace, key)
 );
+-- 按命名空间过期清理（clientStateTtl）用：cron 每分钟按 namespace + updated_at
+-- 删行，主键最左列是 user_id 帮不上它，没有这个索引就是每分钟全表扫一次。
+CREATE INDEX IF NOT EXISTS idx_client_state_cleanup
+  ON client_state (namespace, updated_at);
 
 -- Web Push 订阅（/push-subscription 端点用）。一个用户一份，任务行不携带
 -- 订阅，到点投递时读这里。subscription 是密文；updated_at 是 epoch 毫秒。
@@ -100,6 +104,17 @@ CREATE TABLE IF NOT EXISTS message_outbox (
 CREATE INDEX IF NOT EXISTS idx_outbox_unacked
   ON message_outbox (user_id, id)
   WHERE acked_at IS NULL;
+-- 下面三个给 cron 每分钟跑的清理和取消任务时的撤回用。这几条 DELETE 按时间戳
+-- / 按 task_uuid 选行，表上自带的索引一个都用不上，缺了就是每分钟全表扫描，
+-- 扫过的行全算进 D1 的 rows read 额度。
+CREATE INDEX IF NOT EXISTS idx_outbox_created
+  ON message_outbox (created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_acked
+  ON message_outbox (acked_at)
+  WHERE acked_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_task_undelivered
+  ON message_outbox (user_id, task_uuid)
+  WHERE delivered_at IS NULL AND acked_at IS NULL;
 
 -- 手工建完想确认够不够用：worker.getSchemaVersion(env) 会逐条点名缺的表 / 列 /
 -- 关键索引，worker.ensureSchema(env) 直接补齐。

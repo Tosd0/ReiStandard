@@ -576,7 +576,7 @@ try {
 
 - `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
 - `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
-- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
+- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
 - `getClientState(namespace)` —— 读回一个 namespace 的全部条目（走加密响应信封，方法内解密后返回明文值）
 - `clearClientState()` —— 清空该用户所有 namespace 的云端状态（如「清除云端数据」设置项）
 - `putPushSubscription(subscription, opts?)` —— 登记 / 覆盖这个用户的 Web Push 订阅（`PUT /push-subscription`）。传 `pushManager.subscribe()` 的结果（或它的 `toJSON()`）即可，方法内部会取 `toJSON`。服务端一个用户存一份，所有定时任务到点投递时都读它——包括角色在 fire 里给自己排的、客户端根本不知道存在的那些任务。`opts.updatedAt` 是 epoch 毫秒，不传由服务端取当前时刻

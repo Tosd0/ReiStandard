@@ -100,6 +100,9 @@ export const SERVER_FEATURES = Object.freeze([
   'client-state-ttl',
   // hook ctx 带 emitResult(payload)：往客户端补一条自定义结果（落收件箱 + 推送）。
   'emit-result',
+  // PUT /client-state 的 entry 认 value: null（删掉这个 key，连切片行一起；同一套
+  // last-write-wins，被拦下的进 skippedEntries；删掉的条数在 data.deleted）。
+  'client-state-delete',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

@@ -56,6 +56,7 @@ const EXPECTED_FEATURES = [
   'gzip-request-body',
   'client-state-ttl',
   'emit-result',
+  'client-state-delete',
 ];
 
 function makeWorker(extra = {}) {

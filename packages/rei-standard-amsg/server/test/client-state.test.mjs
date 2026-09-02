@@ -149,7 +149,8 @@ describe('D1 adapter client_state', () => {
     ], [
       { namespace: chunkNs, keyPrefix: chunkKeyPrefixFor('ab'), updatedAt: 200 },
     ]);
-    assert.deepEqual(r, { upserted: 2, skipped: 0, outcomes: [true, true] });
+    // 前缀形态的 cleanup 不探测结局，cleanupOutcomes 里对应位是 null
+    assert.deepEqual(r, { upserted: 2, skipped: 0, outcomes: [true, true], cleanupOutcomes: [null] });
     assert.deepEqual(
       (await adapter.getClientState(USER, chunkNs)).map((x) => [x.key, x.value]),
       [[chunkKeyFor('ab', 0), 'new0'], [chunkKeyFor('ab', 1), 'new1']]
@@ -399,6 +400,92 @@ describe('writeClientStateEntries 的服务端时钟护栏', () => {
     const rows = await adapter.getClientState(USER, 'n');
     assert.equal(rows.length, 1);
     assert.equal(await decryptFromStorage(rows[0].value, userKey), 'fresh');
+  });
+});
+
+describe('D1 adapter client_state：精确 key 删除的结局（cleanupOutcomes）', () => {
+  test('删掉了 / 本来就没有 → true；库里那行更新、被条件写拦下 → false；前缀形态 → null', async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    await adapter.upsertClientState(USER, [
+      { namespace: 'n', key: 'old', value: 'v', updatedAt: SERVER_NOW - 5000 },
+      { namespace: 'n', key: 'fresh', value: 'v', updatedAt: SERVER_NOW - 1000 },
+    ], [], SERVER_NOW);
+
+    const r = await adapter.upsertClientState(USER, [], [
+      { namespace: 'n', key: 'old', updatedAt: SERVER_NOW - 4000 },       // 比库里新 → 删掉
+      { namespace: 'n', key: 'fresh', updatedAt: SERVER_NOW - 2000 },     // 比库里旧 → 拦下
+      { namespace: 'n', key: 'never', updatedAt: SERVER_NOW - 1000 },     // 本来就没有 → 已不在
+      { namespace: chunkNamespaceFor('n'), keyPrefix: chunkKeyPrefixFor('old'), updatedAt: SERVER_NOW - 4000 },
+    ], SERVER_NOW);
+    assert.deepEqual(r, { upserted: 0, skipped: 0, outcomes: [], cleanupOutcomes: [true, false, true, null] });
+    assert.deepEqual((await adapter.getClientState(USER, 'n')).map((x) => x.key), ['fresh']);
+  });
+
+  test('没有 batch() 的绑定走顺序执行，探针照样能读到结果', async () => {
+    const d1 = createTestD1();
+    const adapter = createD1Adapter({ prepare: d1.prepare });
+    await adapter.initSchema();
+    await adapter.upsertClientState(USER, [
+      { namespace: 'n', key: 'k', value: 'v', updatedAt: SERVER_NOW - 1000 },
+    ], [], SERVER_NOW);
+    const blocked = await adapter.upsertClientState(USER, [], [
+      { namespace: 'n', key: 'k', updatedAt: SERVER_NOW - 2000 },
+    ], SERVER_NOW);
+    assert.deepEqual(blocked.cleanupOutcomes, [false]);
+    const gone = await adapter.upsertClientState(USER, [], [
+      { namespace: 'n', key: 'k', updatedAt: SERVER_NOW },
+    ], SERVER_NOW);
+    assert.deepEqual(gone.cleanupOutcomes, [true]);
+    assert.deepEqual(await adapter.getClientState(USER, 'n'), []);
+  });
+});
+
+describe('writeClientStateEntries 的删除条目（value: null）', () => {
+  const setup = async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+    const write = (db, entries) => writeClientStateEntries({
+      db, userId: USER, userKey, entries, now: () => SERVER_NOW,
+    });
+    return { adapter, write };
+  };
+
+  test('删掉的计入 deleted；被更新的行拦下的计入 skipped 并进 skippedEntries；删不存在的 key 不算拦下', async () => {
+    const { adapter, write } = await setup();
+    await write(adapter, [
+      { namespace: 'n', key: 'gone', value: 'v', updatedAt: SERVER_NOW - 5000 },
+      { namespace: 'n', key: 'fresh', value: 'v', updatedAt: SERVER_NOW - 1000 },
+    ]);
+
+    const r = await write(adapter, [
+      { namespace: 'n', key: 'gone', value: null, updatedAt: SERVER_NOW - 4000 },
+      { namespace: 'n', key: 'fresh', value: null, updatedAt: SERVER_NOW - 2000 },
+      { namespace: 'n', key: 'never', value: null, updatedAt: SERVER_NOW - 1000 },
+      { namespace: 'n', key: 'added', value: 'w', updatedAt: SERVER_NOW - 1000 },
+    ]);
+    assert.deepEqual(r, {
+      upserted: 1, skipped: 1, deleted: 2,
+      skippedEntries: [{ namespace: 'n', key: 'fresh' }],
+    });
+    assert.deepEqual((await adapter.getClientState(USER, 'n')).map((x) => x.key), ['added', 'fresh']);
+  });
+
+  // 自定义适配器只回老形状时分不出「被拦下」，删除一律按已删计——退化成从前
+  // 的行为，而不是把所有删除都报成被拦下。
+  test('适配器不回 cleanupOutcomes 时，删除按请求数计入 deleted', async () => {
+    const { adapter, write } = await setup();
+    const legacy = {
+      async upsertClientState(...args) {
+        const { upserted, skipped } = await adapter.upsertClientState(...args);
+        return { upserted, skipped };
+      },
+    };
+    await write(legacy, [{ namespace: 'n', key: 'k', value: 'v', updatedAt: SERVER_NOW - 1000 }]);
+    const r = await write(legacy, [{ namespace: 'n', key: 'k', value: null, updatedAt: SERVER_NOW - 2000 }]);
+    assert.deepEqual(r, { upserted: 0, skipped: 0, deleted: 1, skippedEntries: [] });
+    assert.equal((await adapter.getClientState(USER, 'n')).length, 1, '陈旧的删除仍然删不动更新的行');
   });
 });
 
@@ -669,5 +756,86 @@ describe('/client-state endpoints', () => {
     }), { DB: d1b });
     assert.equal(plain.status, 400);
     assert.equal((await plain.json()).error.code, 'ENCRYPTION_REQUIRED');
+  });
+
+  // ── value: null 走删除 ──────────────────────────────────────────────────────
+  // HTTP 与 hook 的 ctx.writeState() 同一个删除语义：null 把这个 key 的行（含大值
+  // 切片行）删干净，GET 读不到；客户端不用再写空串留壳。
+
+  test('PUT value:null 删掉这一条：GET 读不到，大值的切片行一起走，响应带 deleted', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const adapter = createD1Adapter(d1);
+    const chunkNs = chunkNamespaceFor('n');
+
+    await putState(worker, env, [
+      { namespace: 'n', key: 'small', value: 'v', updatedAt: 100 },
+      { namespace: 'n', key: 'big', value: '记'.repeat(120_000), updatedAt: 100 },
+      { namespace: 'n', key: 'keep', value: 'stay', updatedAt: 100 },
+    ]);
+    assert.equal((await adapter.getClientState(USER, chunkNs)).length, 2, '大值应先被切成两片');
+
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'small', value: null, updatedAt: 200 },
+      { namespace: 'n', key: 'big', value: null, updatedAt: 200 },
+    ]);
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).data, { upserted: 0, skipped: 0, deleted: 2 });
+
+    const entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => [e.key, e.value]), [['keep', 'stay']]);
+    assert.deepEqual(await adapter.getClientState(USER, chunkNs), [], '切片行不该残留');
+    assert.deepEqual((await adapter.getClientState(USER, 'n')).map((r) => r.key), ['keep'], '根行真的没了，不是留了空壳');
+  });
+
+  test('PUT value:null 也守 last-write-wins：旧 updatedAt 的删除被拦下进 skippedEntries，行还在', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+    await putState(worker, env, [{ namespace: 'n', key: 'k', value: 'fresh', updatedAt: 500 }]);
+    const stale = await putState(worker, env, [{ namespace: 'n', key: 'k', value: null, updatedAt: 100 }]);
+    assert.equal(stale.status, 200);
+    // 没删掉任何东西，响应里也就没有 deleted 字段
+    assert.deepEqual((await stale.json()).data, { upserted: 0, skipped: 1, skippedEntries: [{ namespace: 'n', key: 'k' }] });
+
+    const entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => [e.key, e.value]), [['k', 'fresh']]);
+  });
+
+  test('删除与覆盖写同批；删不存在的 key 算成功；value 是数字仍拒 INVALID_STATE_VALUE', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+
+    await putState(worker, env, [{ namespace: 'n', key: 'k1', value: 'v', updatedAt: 100 }]);
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'k1', value: null, updatedAt: 200 },
+      { namespace: 'n', key: 'k2', value: 'new', updatedAt: 200 },
+      { namespace: 'n', key: 'ghost', value: null, updatedAt: 200 },
+      { namespace: 'n', key: 'bad', value: 42, updatedAt: 200 },
+    ]);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.data.upserted, 1);
+    assert.equal(body.data.skipped, 0);
+    assert.equal(body.data.deleted, 2, '删掉的 k1 与本来就没有的 ghost 都算');
+    assert.equal(body.data.skippedEntries, undefined);
+    assert.deepEqual(body.data.rejected.map((r) => [r.index, r.key, r.code]), [[3, 'bad', 'INVALID_STATE_VALUE']]);
+
+    const entries = await getEntries(worker, env, 'n');
+    assert.deepEqual(entries.map((e) => [e.key, e.value]), [['k2', 'new']]);
+  });
+
+  test('GET /capabilities 里有 client-state-delete，前端靠它探测 null 删除', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const res = await worker.fetch(new Request('https://w.dev/capabilities', { method: 'GET' }), { DB: d1 });
+    assert.equal(res.status, 200);
+    assert.ok((await res.json()).features.includes('client-state-delete'));
   });
 });
