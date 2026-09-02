@@ -18,8 +18,16 @@ export function createTestD1() {
         return stmt;
       },
       async run() {
-        const info = db.prepare(sql).run(...bound);
-        return { success: true, meta: { changes: info.changes, last_row_id: Number(info.lastInsertRowid) } };
+        const prepared = db.prepare(sql);
+        // D1 的 run() 对会返回行的语句（SELECT）同样给 results，所以适配器可以往
+        // batch 里夹一条探针 SELECT。better-sqlite3 的 run() 遇到这种语句会抛错，
+        // 这里按 D1 的样子改走 all()。
+        if (prepared.reader) {
+          const rows = prepared.all(...bound);
+          return { success: true, results: rows, meta: { changes: 0, last_row_id: 0 } };
+        }
+        const info = prepared.run(...bound);
+        return { success: true, results: [], meta: { changes: info.changes, last_row_id: Number(info.lastInsertRowid) } };
       },
       async first() {
         const row = db.prepare(sql).get(...bound);

@@ -14,7 +14,10 @@
  *   PUT    /client-state                 batch upsert, last-write-wins on updatedAt
  *                                        （entry 可带 version / builtAt 护栏，按内容
  *                                        新旧而非请求先后比较；被拦下的 key 在
- *                                        data.skippedEntries 里逐条回报）
+ *                                        data.skippedEntries 里逐条回报。entry 的
+ *                                        value 传 null = 删掉这个 key，连切片行一起，
+ *                                        同一套 last-write-wins；删掉的条数在
+ *                                        data.deleted）
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
  *   DELETE /client-state                 wipe every entry of this user
  *
@@ -86,12 +89,17 @@ function validateEntry(entry, index, maxValueBytes) {
   if (INTERNAL_STATE_CHAR_RE.test(entry.key)) {
     return rejectEntry(entry, index, 'INVALID_STATE_KEY', `entries[${index}].key 不能包含控制字符（\\u0000-\\u001f 为库内部保留）`);
   }
-  if (typeof entry.value !== 'string') {
-    return rejectEntry(entry, index, 'INVALID_STATE_VALUE', `entries[${index}].value 必须是字符串（宿主自行序列化）`);
+  // value 两种形态：字符串 = 覆盖写；null = 删掉这个 key（与 hook 侧 ctx.writeState
+  // 同一个语义，落库共用 lib/client-state-store.js）。别的类型一律拒。null 没有
+  // 内容，大小校验与加密都不适用。
+  if (entry.value !== null && typeof entry.value !== 'string') {
+    return rejectEntry(entry, index, 'INVALID_STATE_VALUE', `entries[${index}].value 必须是字符串（宿主自行序列化），或 null 表示删除`);
   }
-  const bytes = stateValueBytes(entry.value);
-  if (bytes > maxValueBytes) {
-    return rejectEntry(entry, index, 'STATE_VALUE_TOO_LARGE', `entries[${index}].value 超过单条总上限`, { bytes, maxBytes: maxValueBytes });
+  if (typeof entry.value === 'string') {
+    const bytes = stateValueBytes(entry.value);
+    if (bytes > maxValueBytes) {
+      return rejectEntry(entry, index, 'STATE_VALUE_TOO_LARGE', `entries[${index}].value 超过单条总上限`, { bytes, maxBytes: maxValueBytes });
+    }
   }
   if (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0) {
     return rejectEntry(entry, index, 'INVALID_STATE_UPDATED_AT', `entries[${index}].updatedAt 必须是正整数（epoch 毫秒）`);
@@ -167,13 +175,16 @@ export function createClientStateHandler(ctx) {
       return err(501, 'CLIENT_STATE_NOT_SUPPORTED', '当前数据库适配器不支持 client_state');
     }
 
-    // 落库（加密 + 大值分块 + 旧切片清理）与 hook 的 ctx.writeState() 共用
-    // lib/client-state-store.js。这条路径只写不删，所以 deleted 恒为 0。
-    const { upserted, skipped, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
+    // 落库（加密 + 大值分块 + 旧切片清理 + value:null 的删除）与 hook 的
+    // ctx.writeState() 共用 lib/client-state-store.js。
+    const { upserted, skipped, deleted, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
 
     const data = { upserted, skipped };
+    // 有 key 被删掉才带 deleted：不含删除的请求，响应形状与从前一字不差。
+    if (deleted > 0) data.deleted = deleted;
     // 被 last-write-wins（含 version 护栏）拦下的 key 逐条回报：带护栏的写入
-    // 方要靠它区分「写进去了」和「库里已有更新的数据、这次被忽略」。
+    // 方要靠它区分「写进去了」和「库里已有更新的数据、这次被忽略」。删除被
+    // 拦下的也在这里（库里那行比这次的 updatedAt 新，行留着没删）。
     if (skippedEntries.length > 0) data.skippedEntries = skippedEntries;
     if (rejected.length > 0) data.rejected = rejected;
     return { status: 200, body: { success: true, data } };

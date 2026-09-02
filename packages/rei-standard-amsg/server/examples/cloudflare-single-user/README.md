@@ -99,6 +99,8 @@ await client.ackOutbox(entries.map((e) => e.messageId));   // 先落库成功再
 
 `value` 是任意字符串（想存对象就自己 `JSON.stringify`），落库前用 per-user key 加密。鉴权和加密头跟其它端点完全一样。
 
+`value` 传 `null` 表示删掉这个 key（大值的切片行一起走），和 hook 侧 `ctx.writeState()` 的删除是同一个语义。删除同样受 last-write-wins 约束：库里那行的时间戳比这条的 `updatedAt` 新就不删，这个 key 进 `data.skippedEntries`；删掉的条数在响应的 `data.deleted` 里（没有删除条目的请求不带这个字段）。删一个本来就不存在的 key 算成功。`GET /capabilities` 的 features 里有 `client-state-delete`。
+
 大值不用自己切：超过 200KB 的 `value` 由 worker 切片跨行存储，读取（`GET` 和 hooks 的 `ctx.readState()`）拿到的是拼好的原值，客户端无感。批量上传里某条超限/非法只拒它自己，其余照常入库——有拒绝时响应带 `data.rejected`（逐条给 `index / namespace / key / code / message`），全部成功时响应形状不变。namespace / key 里不能带控制字符（`\u0000`-`\u001f`，库内部保留）。
 
 ### 从 hooks 里写：`ctx.writeState(namespace, entries)`

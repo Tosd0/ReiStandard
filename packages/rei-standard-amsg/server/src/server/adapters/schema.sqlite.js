@@ -132,6 +132,26 @@ export const CLIENT_STATE_TABLE_SQL = `
   )
 `;
 
+// client_state 的索引。条目形状与 SQLITE_INDEXES 相同，initSchema 一起建。
+//
+// 这几张表上的例行清理是 cron 每分钟跑一遍的：一条语句走不了索引就是每分钟
+// 全表扫一次，扫过的行全算进 D1 的 rows read，表稍微涨一点免费额度就见底。
+// 所以每一条按时间戳删行的语句都得有自己的索引，缺了只是慢（critical: false），
+// 但慢到把额度扫穿之后整个 worker 都不响应。
+export const CLIENT_STATE_INDEXES = [
+  {
+    name: 'idx_client_state_cleanup',
+    // 服务 cleanupClientState 的
+    //   DELETE FROM client_state WHERE namespace = ? AND updated_at < ?
+    // 主键 (user_id, namespace, key) 最左列是 user_id，按 namespace 起头的条件
+    // 吃不到它。
+    sql: `CREATE INDEX IF NOT EXISTS idx_client_state_cleanup
+          ON client_state (namespace, updated_at)`,
+    description: 'TTL cleanup index (cleanupClientState by namespace + updated_at)',
+    critical: false
+  }
+];
+
 // push_subscriptions: 一个用户一份 Web Push 订阅，任务行不再各自携带。
 // 用户清站点数据 / 重装 PWA / 推送服务轮换 endpoint 之后，客户端覆盖这一行
 // 就够了，不用把每条任务翻出来逐行刷（角色自排的任务客户端根本不知道存在，
@@ -194,11 +214,61 @@ export const MESSAGE_OUTBOX_TABLE_SQL = `
   )
 `;
 
-export const MESSAGE_OUTBOX_INDEX_SQL = `
-  CREATE INDEX IF NOT EXISTS idx_outbox_unacked
-    ON message_outbox (user_id, id)
-    WHERE acked_at IS NULL
-`;
+// message_outbox 的索引。表上自带的只有主键 id 和 UNIQUE (user_id, message_id)，
+// 按时间戳 / 按任务删行的语句都得另配索引，理由见 CLIENT_STATE_INDEXES 头上那段。
+export const MESSAGE_OUTBOX_INDEXES = [
+  {
+    name: 'idx_outbox_unacked',
+    // 服务 listUnackedOutbox 的
+    //   SELECT … WHERE user_id = ? AND acked_at IS NULL AND id > ? ORDER BY id
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_unacked
+          ON message_outbox (user_id, id)
+          WHERE acked_at IS NULL`,
+    description: 'Unacked outbox paging index (GET /outbox)',
+    critical: false
+  },
+  {
+    name: 'idx_outbox_created',
+    // 服务 cleanupOutbox 的
+    //   DELETE FROM message_outbox WHERE created_at < ?
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_created
+          ON message_outbox (created_at)`,
+    description: 'Outbox retention cleanup index (cleanupOutbox by created_at)',
+    critical: false
+  },
+  {
+    name: 'idx_outbox_acked',
+    // 服务 cleanupOutbox 的
+    //   DELETE FROM message_outbox WHERE acked_at IS NOT NULL AND acked_at < ?
+    // 部分索引只收已 ack 的行：未 ack 的那部分本来就不是这条语句的目标，
+    // idx_outbox_unacked 的 WHERE 条件与它正好互补。
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_acked
+          ON message_outbox (acked_at)
+          WHERE acked_at IS NOT NULL`,
+    description: 'Acked outbox cleanup index (cleanupOutbox by acked_at)',
+    critical: false
+  },
+  {
+    name: 'idx_outbox_task_undelivered',
+    // 服务 discardUndeliveredOutboxForTask 的
+    //   DELETE FROM message_outbox
+    //   WHERE user_id = ? AND task_uuid = ? AND delivered_at IS NULL AND acked_at IS NULL
+    // 没有它这条只能靶着 user_id 走 (user_id, message_id) 或 idx_outbox_unacked，
+    // 单用户部署下 user_id 对每一行都成立，等于把整个未 ack 积压扫一遍。
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_task_undelivered
+          ON message_outbox (user_id, task_uuid)
+          WHERE delivered_at IS NULL AND acked_at IS NULL`,
+    description: 'Undelivered-by-task discard index (cancel / supersede)',
+    critical: false
+  }
+];
+
+/** 三张表的索引合在一起，initSchema 按这份顺序逐条建。 */
+export const SQLITE_ALL_INDEXES = [
+  ...SQLITE_INDEXES,
+  ...CLIENT_STATE_INDEXES,
+  ...MESSAGE_OUTBOX_INDEXES
+];
 
 // ── schema 自查用的「这一版需要什么」 ─────────────────────────────────────
 //
@@ -264,5 +334,5 @@ export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
     describeTable(LLM_CREDENTIALS_TABLE_SQL),
     describeTable(MESSAGE_OUTBOX_TABLE_SQL)
   ])),
-  indexes: Object.freeze(SQLITE_INDEXES.filter((index) => index.critical).map((index) => index.name))
+  indexes: Object.freeze(SQLITE_ALL_INDEXES.filter((index) => index.critical).map((index) => index.name))
 });
