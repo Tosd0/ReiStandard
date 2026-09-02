@@ -1138,10 +1138,14 @@ export class ReiClient {
    * `data.rejected: [{ index, namespace, key, code, message }]`; when all
    * entries are accepted the response shape is unchanged (no `rejected`).
    *
-   * @param {Array<{ namespace: string, key: string, value: string, updatedAt: number }>} entries
+   * @param {Array<{ namespace: string, key: string, value: string | null, updatedAt: number }>} entries
    *   - `value`: pre-serialized string (the SDK does not stringify it for you).
+   *     `null` 表示删掉这个 key（连大值的切片行一起），同样按 `updatedAt`
+   *     last-write-wins，被拦下的进 `data.skippedEntries`。server 特性位
+   *     `client-state-delete` 起认（`getCapabilities()` 探测）；老 server 会按
+   *     `INVALID_STATE_VALUE` 逐条拒掉 null 条目，其余条目照常入库。
    *   - `updatedAt`: epoch milliseconds.
-   * @returns {Promise<Object>} `{ success, data?: { upserted, skipped, rejected? }, error? }`
+   * @returns {Promise<Object>} `{ success, data?: { upserted, skipped, deleted?, skippedEntries?, rejected? }, error? }`
    */
   async putClientState(entries) {
     if (!Array.isArray(entries) || entries.length === 0) {
