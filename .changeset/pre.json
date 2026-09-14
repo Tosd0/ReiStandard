@@ -28,6 +28,7 @@
     "amsg-instant-auth-exports",
     "amsg-instant-multipart-chunk-cap",
     "amsg-instant-stream-first-byte-500",
+    "amsg-llm-200-error-body",
     "amsg-llm-and-instant-error-details",
     "amsg-llm-call-to-shared",
     "amsg-llm-credentials",
