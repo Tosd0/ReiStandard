@@ -60,17 +60,27 @@ const UPSTREAM_ERROR_BODY_MAX_BYTES = 16 * 1024;
  *   requireContent defaults to true (legacy single-shot behavior:
  *   throw when the response carries no content). Tool rounds legitimately
  *   return no content (pure tool_calls), so agentic loops pass
- *   `{ requireContent: false }`.
+ *   `{ requireContent: false }`. It only decides whether an empty
+ *   `content` counts as a failure; a 2xx body that is not a chat
+ *   completion at all throws either way (see @throws).
  *   timeoutMs defaults to 300000 (the legacy per-call ceiling).
  *   fetch defaults to `globalThis.fetch` (resolved at call time so test
  *   stubs on the global still take effect).
  *   stream / forwardTools are forwarded to {@link buildLlmRequestBody}.
  * @returns {Promise<{ response: unknown, content: string }>}
- * @throws {Error} 上游回非 2xx 时抛，错误上带机读标注（见
+ * @throws {Error} 上游答复了、但没给出能用的结果时抛，错误上带机读标注（见
  *   {@link buildUpstreamError}）：`code` = `'LLM_CALL_FAILED'`、`llmStatus` =
  *   上游的 HTTP 状态码、`providerCode` = provider 自己的错误码（拿得到才有）。
- *   这三个字段只在上游确实答复了的时候出现——网络直接炸、超时、响应体不是
- *   合法 JSON 时不会有，接入方据此也能分清「上游拒了」和「根本没连上」。
+ *   两种情况：
+ *   - 上游回非 2xx；
+ *   - 上游回 2xx，但响应体解析不成 JSON，或者没有非空的 `choices` 数组（中转站
+ *     把报错塞进 200 响应体就是这样）。这时 `llmStatus` 就是那个 2xx，而且不管
+ *     requireContent 取什么都抛。
+ *   这三个字段只在上游确实答复了的时候出现——网络直接炸、超时的时候不会有，接入
+ *   方据此也能分清「上游拒了」和「根本没连上」。
+ *   `choices` 在、只是 content 为空（纯 tool_calls、被内容审核拦下）是合法的空
+ *   生成，requireContent 为 false 时照常返回；为 true 时抛的那条错误不带上面这些
+ *   标注。
  */
 export async function callLlm(payload, options = {}) {
   const requireContent = options.requireContent !== false;
@@ -115,8 +125,35 @@ export async function callLlm(payload, options = {}) {
     );
   }
 
-  const aiData = await aiResponse.json();
-  const rawContent = aiData?.choices?.[0]?.message?.content;
+  // 2xx 不等于拿到了 chat completion：不少中转站出错时照样回 200，响应体里装的
+  // 是 `{"error":{…}}`、没有 choices；反代返回的 HTML 页面也可能是 200。这些都
+  // 按上游报错抛出去，不看 requireContent——它管的是「content 为空算不算错」，
+  // 不管「响应格式坏了算不算错」。放过去的话下游拿到的是一个空输出，会当成「模型
+  // 这轮没说话」跳过，任务被当成功消费，失败原因一个字都不留。
+  // ok 为真却没带 status 的只可能是假响应，按 200 记。
+  const okStatus = Number.isInteger(aiResponse.status) ? aiResponse.status : 200;
+  const body = await readCompletionBody(aiResponse);
+
+  if (!body.parsed) {
+    throw buildUpstreamError(
+      `AI API error: HTTP ${okStatus} but body is not valid JSON. ` +
+      `Request URL: ${normalizedApiUrl}`,
+      okStatus,
+      describeUnparsableBody(body.raw)
+    );
+  }
+
+  const aiData = body.data;
+  if (!isChatCompletionShape(aiData)) {
+    throw buildUpstreamError(
+      `AI API error: HTTP ${okStatus} but body is not a chat completion (no choices). ` +
+      `Request URL: ${normalizedApiUrl}`,
+      okStatus,
+      describeNonCompletionBody(aiData)
+    );
+  }
+
+  const rawContent = aiData.choices[0]?.message?.content;
   if (requireContent && (typeof rawContent !== 'string' || !rawContent.trim())) {
     throw new Error('AI API error: response missing choices[0].message.content');
   }
@@ -310,13 +347,12 @@ function buildUpstreamError(summary, status, detail) {
  *     判类别靠 `type`
  *   - Gemini：`{ error: { code: 400, message, status: 'INVALID_ARGUMENT' } }`
  *     —— 这里的 `code` 就是 HTTP 状态码的复读，机读的类别在 `status` 上
+ *   - 国内中转常见的 `{ code, msg }`
  *   - 自建中转 / 反代出问题时干脆不是 JSON：HTML 错误页、纯文本
  *
- * 所以按「先找最精确的，找不到退一层」的顺序取，认不出来就退回响应体原文——
- * 一句没解析出来的原文也比一句都没有强。
- *
- * code 只认字符串：实测里数字 code 基本就是 HTTP 状态码本身（Gemini 就是这
- * 样），那个数字已经在 `llmStatus` 里了，取字符串码才有增量信息。
+ * 所以按「先找最精确的，找不到退一层」的顺序取（见
+ * {@link extractErrorEnvelopeDetail}），认不出来就退回响应体原文——一句没解析
+ * 出来的原文也比一句都没有强。
  *
  * 读响应体本身也可能失败（连接读到一半断了、调用方喂的是没有 `text()` 的假
  * 响应），这时只当作「没拿到细节」：真正要报的是那条 HTTP 失败，不能被读
@@ -354,6 +390,25 @@ async function readUpstreamErrorDetail(response) {
     return { message: clampDetail(raw), code: '' };
   }
 
+  // 是 JSON 但字段一个都不认识时，退回原文。
+  return extractErrorEnvelopeDetail(body, { fallbackMessage: raw });
+}
+
+/**
+ * 从已经解析好的错误信封里取「人能看懂的原因」和「机器能判的码」。认得的形状
+ * 见 {@link readUpstreamErrorDetail}。
+ *
+ * code 默认只认字符串：非 2xx 的响应体里，数字 code 基本就是 HTTP 状态码本身
+ *（Gemini 就是这样），那个数字已经在 `llmStatus` 里了，取字符串码才有增量信息。
+ * 2xx 却装着报错的响应体不一样，`llmStatus` 是 200，响应体里的 `401` 才是真实
+ * 原因，这时传 `keepNumericCode`：找不到字符串码就把数字码转成字符串留下。
+ *
+ * @param {unknown} body - 已经解析好的响应体
+ * @param {{ fallbackMessage?: string, keepNumericCode?: boolean }} [options]
+ *   fallbackMessage —— 一个说明字段都认不出时用的话，默认空串。
+ * @returns {{ message: string, code: string }} 拿不到的字段是空串
+ */
+function extractErrorEnvelopeDetail(body, { fallbackMessage = '', keepNumericCode = false } = {}) {
   const envelope = body && typeof body === 'object' ? body : {};
   const inner = envelope.error && typeof envelope.error === 'object' ? envelope.error : {};
 
@@ -361,17 +416,144 @@ async function readUpstreamErrorDetail(response) {
     inner.message,                                          // OpenAI / Anthropic / Gemini
     typeof envelope.error === 'string' ? envelope.error : '', // `{ error: "unauthorized" }`
     envelope.message,                                        // 一批中转把 message 放最外层
+    envelope.msg,                                            // 国内中转的 `{ code, msg }`
     envelope.detail                                          // FastAPI 风格的自建中转
-  ) || raw;                                                  // 是 JSON 但字段一个都不认识
+  ) || fallbackMessage;
 
   const code = firstNonEmptyString(
     inner.code,    // OpenAI：invalid_api_key / insufficient_quota / context_length_exceeded
     inner.status,  // Gemini：INVALID_ARGUMENT / RESOURCE_EXHAUSTED
     inner.type,    // Anthropic：invalid_request_error / overloaded_error
     envelope.code
-  );
+  ) || (keepNumericCode ? firstIntegerString(inner.code, envelope.code) : '');
 
   return { message: clampDetail(message), code: clampCode(code) };
+}
+
+// ─── 2xx 响应体解析 ─────────────────────────────────────────────────────
+
+/** 2xx 响应体是空的时说的话。 */
+const EMPTY_BODY_NOTE = 'response body is empty';
+
+/** 2xx 却不是 chat completion、又认不出报错字段时，最多列这么多个顶层字段名。 */
+const NON_COMPLETION_KEYS_MAX = 10;
+
+/**
+ * 读 2xx 的响应体，只读一次。
+ *
+ * 先按原文读、再自己 parse（真 Response 的 `json()` 做的也就是这两步），原文留
+ * 着：解析不成 JSON 时原文是唯一的线索，而流已经读完了，没法再读第二遍。成功的
+ * 响应体不设读取上限，正文就是要用的东西，不能像错误体那样只读开头。
+ *
+ * 没有 `text()` 的假响应（经 options.fetch 注入的桩常常只实现了 `json()`）退回
+ * `json()`，这时拿不到原文。只有 SyntaxError 算「不是 JSON」，其余异常（连接读
+ * 到一半断了、超时）原样往外抛——那是没连上，不是上游答复了一个坏响应。
+ *
+ * @param {Response} response
+ * @returns {Promise<{ parsed: true, data: unknown } | { parsed: false, raw: string|null }>}
+ *   `raw` 为 null 表示拿不到原文
+ */
+async function readCompletionBody(response) {
+  if (typeof response.text === 'function') {
+    const raw = await response.text();
+    try {
+      return { parsed: true, data: JSON.parse(raw) };
+    } catch {
+      return { parsed: false, raw: typeof raw === 'string' ? raw : null };
+    }
+  }
+
+  try {
+    return { parsed: true, data: await response.json() };
+  } catch (error) {
+    if (error && /** @type {any} */ (error).name === 'SyntaxError') return { parsed: false, raw: null };
+    throw error;
+  }
+}
+
+/**
+ * @param {unknown} data
+ * @returns {boolean} 有非空的 `choices` 数组
+ */
+function isChatCompletionShape(data) {
+  return !!data
+    && typeof data === 'object'
+    && Array.isArray(/** @type {any} */ (data).choices)
+    && /** @type {any} */ (data).choices.length > 0;
+}
+
+/**
+ * 2xx 响应体解析不成 JSON → 错误说明。
+ *
+ * 反代的 HTML 页面、纯文本跟非 2xx 一样原文照抄（脱敏、截断），那就是唯一的
+ * 线索。
+ *
+ * SSE 流例外，只给一句固定说明、**不回显原文**：库里的 LLM 调用都是非流式的，
+ * 2xx 回来一段 `data: {…"delta":{"content":…}}`，只可能是中转站无视了
+ * `stream: false`。这时原文就是模型生成的聊天正文，而这句话会落进 server 的
+ * last_error 明文列——跟 {@link describeNonCompletionBody} 只列字段名是同一个理由。
+ *
+ * 流的第一行不一定是 `data:`：可能是注释保活行（OpenRouter 的
+ * `: OPENROUTER PROCESSING`），也可能是 `id:` / `retry:` 字段，正文在后面几行。
+ * 所以开头是注释、或者任意一行的行首是 SSE 字段，都当成流。误判的方向是安全的：
+ * 一段恰好有一行以 `id:` 开头的纯文本报错，只是少了原文说明。
+ *
+ * @param {string|null} raw - 响应体原文；null 表示拿不到
+ * @returns {{ message: string, code: string }}
+ */
+function describeUnparsableBody(raw) {
+  if (raw === null) return { message: '', code: '' };
+  const trimmed = raw.trim();
+  if (!trimmed) return { message: EMPTY_BODY_NOTE, code: '' };
+  if (looksLikeSseStream(trimmed)) return { message: SSE_BODY_NOTE, code: '' };
+  return { message: clampDetail(raw), code: '' };
+}
+
+/**
+ * @param {string} trimmed - 去掉首尾空白的响应体原文
+ * @returns {boolean} 开头是 SSE 注释行，或者有一行的行首是 SSE 字段
+ */
+function looksLikeSseStream(trimmed) {
+  return trimmed.startsWith(':') || SSE_FIELD_LINE.test(trimmed);
+}
+
+/** 行首是 SSE 字段（`data:` / `event:` / `id:` / `retry:`）的一行，不分大小写、逐行匹配。 */
+const SSE_FIELD_LINE = /^(?:data|event|id|retry):/im;
+
+/** 2xx 响应体是 SSE 流时说的话。原文是生成的正文，不回显。 */
+const SSE_BODY_NOTE = 'response body looks like an SSE stream (the endpoint ignored stream: false)';
+
+/**
+ * 2xx 响应体是 JSON、但不是 chat completion → 错误说明。
+ *
+ * 认得出报错字段（中转站把报错塞进 200 的那种）就跟非 2xx 一样取原话和错误码，
+ * 数字错误码也留下，理由见 {@link extractErrorEnvelopeDetail}。
+ *
+ * 一个报错字段都认不出时**不回显原文**，只列顶层字段名。这种响应多半本身是成功
+ * 的，只是形状不对（apiUrl 指到了 Anthropic 原生 /v1/messages 这类端点），里面
+ * 装着生成出来的正文；而这句话会落进 server 的 last_error 明文列。看出「这是哪
+ * 家的格式」，有字段名就够了。
+ *
+ * @param {unknown} data - 已经解析好的响应体
+ * @returns {{ message: string, code: string }}
+ */
+function describeNonCompletionBody(data) {
+  const detail = extractErrorEnvelopeDetail(data, { keepNumericCode: true });
+  if (detail.message || detail.code) return detail;
+
+  let shape;
+  if (Array.isArray(data)) {
+    shape = 'response body is a JSON array';
+  } else if (data && typeof data === 'object') {
+    const keys = Object.keys(data);
+    shape = keys.length === 0
+      ? 'response body is an empty object'
+      : `top-level keys: ${keys.slice(0, NON_COMPLETION_KEYS_MAX).join(', ')}` +
+        (keys.length > NON_COMPLETION_KEYS_MAX ? ', …' : '');
+  } else {
+    shape = `response body is ${data === null ? 'null' : `a JSON ${typeof data}`}`;
+  }
+  return { message: clampDetail(shape), code: '' };
 }
 
 /**
@@ -631,6 +813,17 @@ export function redactCredentials(text) {
 function firstNonEmptyString(...values) {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value;
+  }
+  return '';
+}
+
+/**
+ * @param {...unknown} values
+ * @returns {string} 第一个整数转成的字符串，全都不是就返回空串
+ */
+function firstIntegerString(...values) {
+  for (const value of values) {
+    if (Number.isInteger(value)) return String(value);
   }
   return '';
 }
