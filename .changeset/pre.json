@@ -54,6 +54,7 @@
     "amsg-server-d1-internal-table-skip",
     "amsg-server-emit-result-source",
     "amsg-server-expose-capabilities",
+    "amsg-server-fine-grained-cleanup",
     "amsg-server-fire-settled",
     "amsg-server-gzip-request-body",
     "amsg-server-hook-contract-identity",
