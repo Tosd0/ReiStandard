@@ -120,6 +120,20 @@
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
+ * @property {(userId: string, opts?: { limit?: number, foldPrefix?: string|null }) => Promise<Array<{ namespace: string, entry_count: number, byte_size: number, updated_at: number }>>} [listClientStateNamespaces]
+ *   （可选；单用户/D1）这个用户名下有哪些命名空间，各自几条 / 占多少字节 / 最后
+ *   更新是什么时候。按 namespace 升序，最多 `limit` 条（调用方自己判断有没有被截断：
+ *   多要一条，回来的比 limit 多就说明还有）。
+ *   `foldPrefix` 是大值分块那个保留命名空间的前缀（见 lib/state-chunks.js）：以它
+ *   开头的行不单独列，字节数与最后更新时刻折算进去掉前缀后的原命名空间，条目数不
+ *   折算（切片是一个逻辑条目的几段）。折算必须在取 `limit` 之前做——保留命名空间以
+ *   \u001f 开头，排在所有正常命名空间前面，先截断再折算会把额度全吃掉。
+ *   不实现 → `GET /client-state/namespaces` 返回 501。
+ * @property {(userId: string, namespaces: string[]) => Promise<number>} [deleteClientStateNamespaces]
+ *   （可选；单用户/D1）把这几个命名空间下这个用户的行一次删光，要在同一个事务里。
+ *   调用方传的是「原命名空间 + 它的切片保留命名空间」两个：只删前者会把大值的切片
+ *   行留成孤儿。返回删掉的行数合计。不实现 → `DELETE /client-state?namespace=` 返回
+ *   501（不带 namespace 的整表全清仍走 clearClientState，不受影响）。
  * @property {(targets: Array<{ namespace: string, updatedBefore: number }>) => Promise<number>} [cleanupClientState]
  *   （可选；单用户/D1）按命名空间清掉 `updated_at` 早于 `updatedBefore`（epoch 毫秒）
  *   的行，不限用户。宿主配了 `clientStateTtl` 时 runScheduledTick 每跳顺手调；
@@ -148,6 +162,14 @@
  *   方法）。按 cred_id 排序。
  * @property {(userId: string, credIds: string[]|null) => Promise<number>} [deleteLlmCredentials]
  *   删凭据：数组删指定那几行，null 删全部。返回删掉的行数。
+ * @property {(userId: string, credIdPrefix: string) => Promise<number>} [deleteLlmCredentialsByPrefix]
+ *   （可选）按 cred_id 前缀删（宿主按角色清理：`char:<charId>/` 一把清掉该角色
+ *   名下的几行）。返回删掉的行数。这一个单独可选，不在下面那组「四个要么都实现」
+ *   里——不实现时 `DELETE /llm-credentials` 的 `credIdPrefix` 入参返回 501，另外
+ *   两种入参（`credIds` / `all`）照常。
+ *   实现时别用 LIKE：D1 把 LIKE / GLOB 的 pattern 压到 50 字节，`char:<uuid>/`
+ *   就已经 42 字节了，稍长一点整条语句报 `pattern too complex`。走字典序范围
+ *   （`cred_id >= 前缀 AND cred_id < 上界`）没有长度上限，见 adapters/d1.js。
  *
  *   llm_credentials 四个方法要么都实现、要么都不实现：缺任何一个，
  *   `PUT/GET/DELETE /llm-credentials` 返回 501，带 `credRefs` 的
@@ -192,6 +214,13 @@
  *   跳过。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
  *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
+ * @property {(userId: string, messageIds: string[]|null) => Promise<number>} [deleteOutboxMessages]
+ *   （可选；单用户/D1）主动删行：数组删指定那几条，null 删这个用户的全部
+ *   （`DELETE /outbox`）。与 `discardOutboxMessages` 分工不同——那个只撤还没发出
+ *   去的行（取消 / 顶替的收尾），这个不看 delivered_at / acked_at，是宿主对完账
+ *   之后的清理口。不实现 → `DELETE /outbox` 返回 501。
+ *   数组形态要按 D1 的 100 个绑定参数上限切批（`user_id` 占 1 个 → 一批最多 99
+ *   个 id），切开的几条仍要在一个事务里。
  * @property {(opts: { ackedBeforeMs?: number, allBeforeMs?: number }) => Promise<number>} [cleanupOutbox]
  *   （可选；单用户/D1）outbox 例行清理（runScheduledTick 每跳顺手调）。
  *

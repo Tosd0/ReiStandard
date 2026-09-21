@@ -37,9 +37,23 @@ const SEP = '\u001f';
 const CHUNK_NS_PREFIX = `${SEP}amsg-chunks${SEP}`;
 const ROOT_MARKER_PREFIX = `${SEP}amsg-chunked${SEP}v1${SEP}`;
 
+/**
+ * 切片行所在保留 namespace 的固定前缀（`\u001famsg-chunks\u001f`）。
+ *
+ * 露出来是给「按前缀折算统计」那类调用方用的（见 handlers/client-state-namespaces.js）：
+ * 保留 namespace 对宿主是不存在的东西，统计要把它折回原 namespace。适配器不
+ * import 这一份——分块是 lib 层的事，前缀由调用方传下去。
+ */
+export const CHUNK_NAMESPACE_PREFIX = CHUNK_NS_PREFIX;
+
 /** 某个用户 namespace 的切片行所在的保留 namespace。 */
 export function chunkNamespaceFor(namespace) {
   return CHUNK_NS_PREFIX + namespace;
+}
+
+/** 这个 namespace 是不是库内部的切片保留 namespace。 */
+export function isChunkNamespace(namespace) {
+  return typeof namespace === 'string' && namespace.startsWith(CHUNK_NS_PREFIX);
 }
 
 /** 第 index 片的存储 key。 */

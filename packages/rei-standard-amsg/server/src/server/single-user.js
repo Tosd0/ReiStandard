@@ -53,6 +53,7 @@ import { createMessagesHandler } from './handlers/messages.js';
 import { createGetMessageHandler } from './handlers/get-message.js';
 import { createVapidPublicKeyHandler } from './handlers/vapid-public-key.js';
 import { createClientStateHandler } from './handlers/client-state.js';
+import { createClientStateNamespacesHandler } from './handlers/client-state-namespaces.js';
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createLlmCredentialsHandler } from './handlers/llm-credentials.js';
 import { createCapabilitiesHandler } from './handlers/capabilities.js';
@@ -108,6 +109,7 @@ export function createSingleUserServer(config) {
       getMessage: createGetMessageHandler(ctx),
       vapidPublicKey: createVapidPublicKeyHandler(ctx),
       clientState: createClientStateHandler(ctx),
+      clientStateNamespaces: createClientStateNamespacesHandler(ctx),
       pushSubscription: createPushSubscriptionHandler(ctx),
       llmCredentials: createLlmCredentialsHandler(ctx),
       capabilities: createCapabilitiesHandler(ctx),

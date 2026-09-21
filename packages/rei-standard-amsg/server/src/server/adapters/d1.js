@@ -780,6 +780,109 @@ export class D1Adapter {
     return res.meta.changes || 0;
   }
 
+  /**
+   * 这个用户名下有哪些命名空间，各自几条、占多少字节、最后更新是什么时候
+   * （宿主对账「云端到底存了什么」用）。
+   *
+   * `foldPrefix` 传进来的是大值分块那个保留命名空间的前缀（见
+   * lib/state-chunks.js）：以它开头的行不单独成一个命名空间，而是折算进
+   * 去掉前缀之后的那个原命名空间——保留命名空间是库的存储实现细节，宿主眼里
+   * 那些切片行就是原命名空间占掉的地方。折算口径：
+   *   - `byte_size` / `updated_at` 算进去（存储确实占着、写入确实发生过）；
+   *   - `entry_count` 不算（切片是一个逻辑条目的几段，不是几个条目）。
+   * 不传 `foldPrefix` = 不折算，保留命名空间按普通命名空间原样列出来。
+   *
+   * 前缀由调用方传、不由适配器自己知道：分块是 lib 层的约定，适配器只照着折。
+   *
+   * 折算写在 SQL 里而不是取回来在 JS 里合，是因为有 `limit`：保留命名空间以
+   * \u001f 开头，BINARY 排序下排在所有正常命名空间前面，先取 limit 条再折算
+   * 的话额度会被切片命名空间吃光，正常命名空间一条都露不出来。
+   *
+   * `LENGTH(CAST(value AS BLOB))` 数的是字节不是字符——TEXT 上的 `LENGTH()`
+   * 按字符算，密文虽然是 ASCII 十六进制、两者相同，但换个存法就悄悄差一截。
+   *
+   * 这条语句要把该用户的 client_state 全扫一遍（GROUP BY 本来就得看每一行），
+   * 所以没为它单独加索引：它是宿主按需点开的对账口，不在 cron 路径上。别把它
+   * 塞进每分钟跑的东西里（理由见 adapters/schema.sqlite.js 的 CLIENT_STATE_INDEXES）。
+   *
+   * @param {string} userId
+   * @param {{ limit?: number, foldPrefix?: string|null }} [opts]
+   * @returns {Promise<Array<{ namespace: string, entry_count: number, byte_size: number, updated_at: number }>>}
+   *   按 namespace 升序，最多 `limit` 条。
+   */
+  async listClientStateNamespaces(userId, { limit = 200, foldPrefix = null } = {}) {
+    const stmt = foldPrefix
+      ? this._db.prepare(
+        `SELECT
+           CASE WHEN substr(namespace, 1, ?) = ? THEN substr(namespace, ?) ELSE namespace END AS ns,
+           SUM(CASE WHEN substr(namespace, 1, ?) = ? THEN 0 ELSE 1 END) AS entry_count,
+           SUM(LENGTH(CAST(value AS BLOB))) AS byte_size,
+           MAX(updated_at) AS updated_at
+         FROM client_state
+         WHERE user_id = ?
+         GROUP BY ns
+         ORDER BY ns ASC
+         LIMIT ?`
+      ).bind(
+        foldPrefix.length, foldPrefix, foldPrefix.length + 1,
+        foldPrefix.length, foldPrefix,
+        userId, limit
+      )
+      : this._db.prepare(
+        `SELECT
+           namespace AS ns,
+           COUNT(*) AS entry_count,
+           SUM(LENGTH(CAST(value AS BLOB))) AS byte_size,
+           MAX(updated_at) AS updated_at
+         FROM client_state
+         WHERE user_id = ?
+         GROUP BY namespace
+         ORDER BY namespace ASC
+         LIMIT ?`
+      ).bind(userId, limit);
+
+    const res = await stmt.all();
+    return (res.results || []).map((row) => ({
+      namespace: row.ns,
+      entry_count: Number(row.entry_count || 0),
+      byte_size: Number(row.byte_size || 0),
+      updated_at: Number(row.updated_at || 0),
+    }));
+  }
+
+  /**
+   * 把这几个命名空间下这个用户的行一次删光（一次 batch = 一次事务）。
+   *
+   * 调用方传的是「原命名空间 + 它的切片保留命名空间」两个（见
+   * lib/state-chunks.js 的 chunkNamespaceFor）：只删前者的话，大值那几行切片
+   * 留在库里成孤儿——读不出来、也不会被别的路径清掉。哪些命名空间算一组由调
+   * 用方决定，适配器只负责它们在同一个事务里删完。
+   *
+   * 条件是 `user_id = ? AND namespace = ?`，吃的是主键
+   * (user_id, namespace, key) 的前两列，不扫表。
+   *
+   * @param {string} userId
+   * @param {string[]} namespaces
+   * @returns {Promise<number>} 删掉的行数合计（含切片行）
+   */
+  async deleteClientStateNamespaces(userId, namespaces) {
+    if (!namespaces || namespaces.length === 0) return 0;
+    const SQL = 'DELETE FROM client_state WHERE user_id = ? AND namespace = ?';
+    const statements = namespaces.map((namespace) => this._db.prepare(SQL).bind(userId, namespace));
+    if (statements.length === 1) {
+      const res = await statements[0].run();
+      return res.meta.changes || 0;
+    }
+    let results;
+    if (typeof this._db.batch === 'function') {
+      results = await this._db.batch(statements);
+    } else {
+      results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+    }
+    return results.reduce((n, res) => n + (res.meta.changes || 0), 0);
+  }
+
   // ── push_subscriptions (user-level Web Push subscription) ──────────────
 
   /**
@@ -922,6 +1025,40 @@ export class D1Adapter {
     );
   }
 
+  /**
+   * 按 cred_id 前缀删这个用户的凭据（宿主按角色清理：`char:<charId>/` 一把清
+   * 掉该角色名下的 chat / instant / emotion 几行）。
+   *
+   * **不用 LIKE。** 两条 D1 的限制在这儿各埋一个雷：
+   *   - LIKE / GLOB 的 pattern 在 D1 上最长 50 字节（SQLite 默认 50000，官方文
+   *     档没写这一条）。`char:<uuid>/` 就是 42 字节，前缀里再多点东西、或者
+   *     cred_id 用上契约允许的 128 字符，pattern 当场超限，整条语句报
+   *     `LIKE or GLOB pattern too complex`——本地 better-sqlite3 上永远复现不
+   *     了，只有真实 D1 才炸。
+   *   - 退一步「先 SELECT 出匹配的 cred_id 再按 id 批量删」也不是好路：单条语
+   *     句最多 100 个绑定参数，得自己切批，还平白多一个来回和一个「查完到删完
+   *     之间又写进来一行」的窗口。
+   * 走字典序范围（`cred_id >= 前缀 AND cred_id < 上界`）两条都绕开了：没有长度
+   * 上限，前缀里的 `%` `_` `\` 只是普通字符，一条语句三个绑定参数，而且直接吃
+   * (user_id, cred_id) 主键索引。上界算法见本文件顶部的 prefixRangeEnd。
+   *
+   * 前缀没有字典序上界时（prefixRangeEnd 返回空串，实际用不到——见那个函数的
+   * 说明）范围条件一行都匹配不上，删 0 行。宁可少删，也不能把别人的行带走。
+   *
+   * @param {string} userId
+   * @param {string} credIdPrefix - 非空前缀，空串由上层拒掉（空前缀 = 删全部，
+   *   那是 `deleteLlmCredentials(userId, null)` 的活儿，不能从这个口误伤进来）
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async deleteLlmCredentialsByPrefix(userId, credIdPrefix) {
+    if (typeof credIdPrefix !== 'string' || credIdPrefix.length === 0) return 0;
+    const res = await this._db.prepare(
+      `DELETE FROM llm_credentials
+       WHERE user_id = ? AND cred_id >= ? AND cred_id < ?`
+    ).bind(userId, credIdPrefix, prefixRangeEnd(credIdPrefix)).run();
+    return res.meta.changes || 0;
+  }
+
   // ── message_outbox（服务端消息收件箱，客户端 ack）────────────────────────
 
   /**
@@ -1060,6 +1197,37 @@ export class D1Adapter {
         `UPDATE message_outbox SET acked_at = ?
          WHERE user_id = ? AND acked_at IS NULL AND message_id IN (${placeholders})`,
       [ackedAt, userId],
+      messageIds
+    );
+  }
+
+  /**
+   * 主动删 outbox 的行：数组删指定那几条，传 null 删这个用户的全部。
+   *
+   * 跟 `discardOutboxMessages` 是两件事：那个只撤「还没发出去的」，是取消 / 顶
+   * 替时的收尾；这个不看 delivered_at / acked_at，是宿主的清理口（对完账之后
+   * 把某几条、或者整个收件箱清掉）。在此之前 message_outbox 只能等 cron 的
+   * TTL（已签收 7 天 / 任何行 28 天）自己老化。
+   *
+   * 数组形态走 `_runInClauseWrite`：D1 单条语句最多 100 个绑定参数，`user_id`
+   * 占掉 1 个，所以一批最多 99 个 id，多了自动切批、整组仍在一个事务里（切开
+   * 之后「只删掉前 99 个」那种中间态比原问题更难查）。
+   *
+   * @param {string} userId
+   * @param {string[]|null} messageIds - null = 这个用户的全部
+   * @returns {Promise<number>} 删掉的行数
+   */
+  async deleteOutboxMessages(userId, messageIds = null) {
+    if (messageIds !== null && (!messageIds || messageIds.length === 0)) return 0;
+    if (messageIds === null) {
+      const res = await this._db.prepare(
+        'DELETE FROM message_outbox WHERE user_id = ?'
+      ).bind(userId).run();
+      return res.meta.changes || 0;
+    }
+    return this._runInClauseWrite(
+      (placeholders) => `DELETE FROM message_outbox WHERE user_id = ? AND message_id IN (${placeholders})`,
+      [userId],
       messageIds
     );
   }

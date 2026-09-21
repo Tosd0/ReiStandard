@@ -18,15 +18,26 @@
  *   GET  /capabilities      → { serverVersion, features }（特性探测；老部署无此路由 → 404）
  *   PUT  /client-state      → batch upsert client state (last-write-wins on updatedAt)
  *   GET  /client-state      → read one namespace's entries (?namespace=<ns>)
+ *   GET  /client-state/namespaces → 云端有哪些命名空间 + 每个几条 / 占多少字节 /
+ *                             最后更新是什么时候（加密信封；大值切片的保留命名空间
+ *                             折算进原命名空间，不单独列）
  *   DELETE /client-state    → wipe this user's client state
+ *   DELETE /client-state?namespace=<ns> → 只清这一个命名空间（连它的大值切片行一起）
  *   PUT    /push-subscription → 登记 / 覆盖这个用户的 Web Push 订阅
  *   GET    /push-subscription → { exists, updatedAt, endpoint }
  *   DELETE /push-subscription → 删掉这个用户的订阅
  *   PUT    /llm-credentials  → 批量登记 / 覆盖 LLM 凭据（任务 payload 的 credRefs 引用它们）
  *   GET    /llm-credentials  → 对账清单 { credentials: [{ credId, updatedAt }] }（永不回凭据本体）
- *   DELETE /llm-credentials  → 删除（{ credIds } 或 { all: true }）
+ *   DELETE /llm-credentials  → 删除（{ credIds } / { all: true } / { credIdPrefix }，三选一）
  *   GET  /outbox?since=<cursor> → 拉未 ack 的服务端消息（补收的事实来源）
  *   POST /outbox/ack        → 确认收到 { messageIds }
+ *   DELETE /outbox          → 主动删收件箱的行（{ messageIds } 或 { all: true }）
+ *
+ * 路由是 `endsWith` 匹配、不是精确相等（外面再包一层前缀挂载的宿主也能路由到），
+ * 所以新加路径不能是任何一条既有路径的尾缀，否则先判到的那条会把它吃掉——
+ * `/messages` 与 `/message` 就是靠「复数末尾是 s」才互不吃单的。
+ * `/client-state/namespaces` 不以 `/client-state` 结尾，`DELETE /outbox` 与
+ * `POST /outbox/ack` 方法不同，两条都不会误撞。
  *
  * CORS is opt-in: pass `cors: { origin }` in the config (a fixed origin, '*', or
  * an (origin) => allowedOrigin function) to answer OPTIONS preflights and echo
@@ -417,14 +428,22 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         result = await server.handlers.capabilities.GET(url, headers);
       } else if (method === 'PUT' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.PUT(headers, body);
+      } else if (method === 'GET' && pathname.endsWith('/client-state/namespaces')) {
+        // 放在 '/client-state' 那条前面只是为了读起来顺：'/client-state/namespaces'
+        // 末尾是 'namespaces'，本来就不会被那条 endsWith 吃掉。
+        result = await server.handlers.clientStateNamespaces.GET(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/client-state')) {
         result = await server.handlers.clientState.GET(url, headers);
       } else if (method === 'DELETE' && pathname.endsWith('/client-state')) {
+        // 带 ?namespace= 只清那一个命名空间，不带仍是整表全清（见 handlers/client-state.js）。
         result = await server.handlers.clientState.DELETE(url, headers);
       } else if (method === 'GET' && pathname.endsWith('/outbox')) {
         result = await server.handlers.outbox.GET(url, headers);
       } else if (method === 'POST' && pathname.endsWith('/outbox/ack')) {
         result = await server.handlers.outbox.POST(headers, body);
+      } else if (method === 'DELETE' && pathname.endsWith('/outbox')) {
+        // DELETE 带加密 body（{ messageIds } 或 { all: true }），与 /outbox/ack 同一套信封。
+        result = await server.handlers.outbox.DELETE(url, headers, body);
       } else if (method === 'PUT' && pathname.endsWith('/push-subscription')) {
         result = await server.handlers.pushSubscription.PUT(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/push-subscription')) {

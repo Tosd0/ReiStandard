@@ -8,7 +8,12 @@
  *
  *   PUT    /llm-credentials   批量登记 / 覆盖（body 加密：{ credentials: [{ credId, value }] }）
  *   GET    /llm-credentials   对账清单 { credentials: [{ credId, updatedAt }] }
- *   DELETE /llm-credentials   删除（body 加密：{ credIds: [...] } 或 { all: true }）
+ *   DELETE /llm-credentials   删除（body 加密：{ credIds: [...] } / { all: true } /
+ *                             { credIdPrefix: 'char:<charId>/' }，三选一）
+ *
+ * 按前缀删是给「按角色清理」用的：一个角色名下通常有 chat / instant / emotion
+ * 几行，客户端按约定命名成 `char:<charId>/<purpose>`，清理时不用先把 credId 一
+ * 个个查出来再点名删。
  *
  * GET 永不回凭据本体——一个字段都不回（对齐 task-projection 的白名单哲学）；
  * 客户端要判断的是「云端有哪些、新旧如何」，credId + updatedAt 就够对上了。
@@ -21,6 +26,7 @@
 import { deriveUserEncryptionKey, decryptPayload } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
 import {
+  CRED_ID_MAX_LENGTH,
   CRED_PUT_BATCH_MAX,
   CRED_ROWS_PER_USER_MAX,
   isValidCredId,
@@ -170,23 +176,50 @@ export function createLlmCredentialsHandler(ctx) {
     }
     if (!isPlainObject(payload)) return err(400, 'INVALID_PAYLOAD_FORMAT', '解密后的数据必须是 JSON 对象');
 
+    // 三种入参互斥，一次只能给一种：全清、点名几条、按前缀。混着传的话「到底
+    // 按哪个删」只能靠实现顺序猜，删错了又收不回来。
     const wantsAll = payload.all === true;
     const credIds = payload.credIds;
-    if (!wantsAll && (!Array.isArray(credIds) || credIds.length === 0)) {
-      return err(400, 'INVALID_PARAMETERS', '要么 { all: true }，要么 credIds 非空数组', { invalidFields: ['credIds'] });
+    const credIdPrefix = payload.credIdPrefix;
+    const given = [
+      wantsAll ? 'all' : null,
+      credIds !== undefined ? 'credIds' : null,
+      credIdPrefix !== undefined ? 'credIdPrefix' : null,
+    ].filter(Boolean);
+    if (given.length === 0) {
+      return err(400, 'INVALID_PARAMETERS', '要么 { all: true }，要么 credIds 非空数组，要么 credIdPrefix 前缀', { invalidFields: ['credIds', 'credIdPrefix'] });
     }
-    if (wantsAll && credIds !== undefined) {
-      return err(400, 'INVALID_PARAMETERS', 'all 与 credIds 不能同时出现', { invalidFields: ['all', 'credIds'] });
+    if (given.length > 1) {
+      return err(400, 'INVALID_PARAMETERS', `all / credIds / credIdPrefix 一次只能给一个（这次给了 ${given.join(' + ')}）`, { invalidFields: given });
     }
-    if (!wantsAll) {
+    if (credIds !== undefined) {
+      if (!Array.isArray(credIds) || credIds.length === 0) {
+        return err(400, 'INVALID_PARAMETERS', 'credIds 必须是非空数组', { invalidFields: ['credIds'] });
+      }
       for (let i = 0; i < credIds.length; i++) {
         if (!isValidCredId(credIds[i])) {
           return err(400, 'INVALID_PARAMETERS', `credIds[${i}] 不是合法 cred_id`, { invalidFields: [`credIds[${i}]`] });
         }
       }
     }
+    if (credIdPrefix !== undefined) {
+      // 校验口径跟 cred_id 本身一样（1–128 字符、不含控制字符）：前缀是 cred_id
+      // 的开头一截，长度和字符集不该比它宽。空串会命中所有行，得当参数错误拒掉，
+      // 不能悄悄变成「全清」。
+      if (!isValidCredId(credIdPrefix)) {
+        return err(400, 'INVALID_PARAMETERS', `credIdPrefix 必须是 1–${CRED_ID_MAX_LENGTH} 字符、不含控制字符的字符串（要全清用 { all: true }）`, { invalidFields: ['credIdPrefix'] });
+      }
+    }
 
     if (!supportsLlmCredentialsStore(db)) return UNSUPPORTED;
+
+    if (credIdPrefix !== undefined) {
+      if (typeof db.deleteLlmCredentialsByPrefix !== 'function') {
+        return err(501, 'LLM_CREDENTIALS_PREFIX_DELETE_NOT_SUPPORTED', '当前数据库适配器不支持按前缀删除凭据');
+      }
+      const deleted = await db.deleteLlmCredentialsByPrefix(userId, credIdPrefix);
+      return { status: 200, body: { success: true, data: { deleted } } };
+    }
 
     const deleted = await db.deleteLlmCredentials(userId, wantsAll ? null : [...new Set(credIds)]);
     return { status: 200, body: { success: true, data: { deleted } } };

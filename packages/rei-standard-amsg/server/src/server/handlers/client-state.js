@@ -20,6 +20,11 @@
  *                                        data.deleted）
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
  *   DELETE /client-state                 wipe every entry of this user
+ *   DELETE /client-state?namespace=<ns>  只清这一个命名空间（连它的大值切片行一起），
+ *                                        返回 data.deleted = 删掉的行数
+ *
+ * 「云端有哪些命名空间」是另一个端点：`GET /client-state/namespaces`
+ * （见 handlers/client-state-namespaces.js）。
  *
  * 单条 value 超过 200KB 时由服务端透明分块（见 lib/state-chunks.js）：写入时
  * 切片跨行存储，GET / readState 返回拼好的原值，客户端与 hook 作者无感。
@@ -230,6 +235,27 @@ export function createClientStateHandler(ctx) {
     const gate = requireUserId(headers);
     if (gate.error) return gate.error;
     const { userId } = gate;
+
+    // 带 namespace 查询参数 = 只清这一个命名空间；不带 = 整表全清（一直以来的
+    // 行为，老调用方一个字节都不用改）。
+    const namespace = new URL(url, 'https://dummy').searchParams.get('namespace');
+    if (namespace !== null) {
+      if (!namespace.trim()) {
+        return err(400, 'INVALID_STATE_NAMESPACE', 'namespace 传了就不能是空的（要整表全清就别带这个参数）');
+      }
+      if (INTERNAL_STATE_CHAR_RE.test(namespace)) {
+        // 控制字符是库内部保留的（切片保留命名空间就以 \u001f 开头）。挡在这里
+        // 是为了别让调用方绕过折算规则直接点名去删一个存储实现细节。
+        return err(400, 'INVALID_STATE_NAMESPACE', 'namespace 不能包含控制字符（\\u0000-\\u001f 为库内部保留）');
+      }
+      if (typeof db.deleteClientStateNamespaces !== 'function') {
+        return err(501, 'CLIENT_STATE_NAMESPACE_DELETE_NOT_SUPPORTED', '当前数据库适配器不支持按命名空间删除 client_state');
+      }
+      // 原命名空间和它的切片保留命名空间一起删，同一个事务：只删前者的话，大值
+      // 那几行切片留在库里成孤儿——读不出来，也没有别的路径会去清它们。
+      const deleted = await db.deleteClientStateNamespaces(userId, [namespace, chunkNamespaceFor(namespace)]);
+      return { status: 200, body: { success: true, data: { deleted, namespace } } };
+    }
 
     if (typeof db.clearClientState !== 'function') {
       return err(501, 'CLIENT_STATE_NOT_SUPPORTED', '当前数据库适配器不支持 client_state');

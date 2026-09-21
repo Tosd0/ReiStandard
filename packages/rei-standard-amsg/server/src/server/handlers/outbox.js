@@ -3,8 +3,10 @@
  *
  * 服务端消息收件箱的客户端侧两个口：
  *
- *   GET  /outbox?since=<cursor>[&limit=<n>]  拉未 ack 的消息（id 升序，游标翻页）
- *   POST /outbox/ack { messageIds }           确认收到（幂等）
+ *   GET    /outbox?since=<cursor>[&limit=<n>]      拉未 ack 的消息（id 升序，游标翻页）
+ *   POST   /outbox/ack { messageIds }              确认收到（幂等）
+ *   DELETE /outbox { messageIds } / { all: true }  主动删行（对完账之后的清理口；
+ *                                                  在此之前只能等 cron 的 TTL 老化）
  *
  * 服务端发出的每条 push 在发送前都先落进 message_outbox（见
  * lib/outbox-store.js），所以「哪些消息没送到」是从这里查出来的事实：
@@ -32,6 +34,8 @@ export const MAX_OUTBOX_PAGE_SIZE = 100;
 export const DEFAULT_OUTBOX_PAGE_SIZE = 50;
 // 一次 ack 的条数上限（与拉取页大小同数量级，客户端按页 ack 用不到更多）。
 export const MAX_OUTBOX_ACK_IDS = 200;
+// 一次删的条数上限。跟 ack 同一个数：删也是按页操作，一页的量就够。
+export const MAX_OUTBOX_DELETE_IDS = 200;
 
 function err(status, code, message, details) {
   const error = details === undefined ? { code, message } : { code, message, details };
@@ -152,5 +156,72 @@ export function createOutboxHandler(ctx) {
     return { status: 200, body: { success: true, data: { acked } } };
   }
 
-  return { GET, POST };
+  /**
+   * DELETE /outbox  —— body 加密：{ messageIds: [...] } 或 { all: true }
+   *
+   * 主动清收件箱。在此之前 message_outbox 只能靠 cron 的 TTL（已签收 7 天 / 任
+   * 何行 28 天）自己老化，宿主对完账想立刻把某几条、或者整箱清掉是没有口子的。
+   *
+   * 跟 ack 的区别是「行还在不在」：ack 之后行留着（等 TTL），`GET /outbox` 不再
+   * 返回它；删是把行本身拿掉。删掉的行再也补收不回来，所以这个口只该在宿主确认
+   * 对完账之后调。
+   */
+  async function DELETE(url, headers, body) {
+    const tenantResult = await ctx.tenantManager.resolveTenant(headers);
+    if (!tenantResult.ok) return tenantResult.error;
+    const { db, masterKey } = tenantResult.context;
+
+    if (getHeader(headers, 'x-payload-encrypted') !== 'true') {
+      return err(400, 'ENCRYPTION_REQUIRED', '请求体必须加密');
+    }
+    const gate = requireUserId(headers);
+    if (gate.error) return gate.error;
+    const { userId } = gate;
+    if (getHeader(headers, 'x-encryption-version') !== '1') {
+      return err(400, 'UNSUPPORTED_ENCRYPTION_VERSION', '加密版本不支持');
+    }
+
+    const parsedBody = parseEncryptedBody(body);
+    if (!parsedBody.ok) return { status: 400, body: { success: false, error: parsedBody.error } };
+
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
+    let payload;
+    try {
+      payload = await decryptPayload(parsedBody.data, userKey);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return err(400, 'INVALID_PAYLOAD_FORMAT', '解密后的数据不是有效 JSON');
+      }
+      return err(400, 'DECRYPTION_FAILED', '请求体解密失败');
+    }
+    if (!isPlainObject(payload)) return err(400, 'INVALID_PAYLOAD_FORMAT', '解密后的数据必须是 JSON 对象');
+
+    // 两种入参互斥（同 DELETE /llm-credentials 的口径）：混着传只能靠实现顺序猜
+    // 按哪个删，而删掉的行补收不回来。
+    const wantsAll = payload.all === true;
+    const messageIds = payload.messageIds;
+    if (wantsAll && messageIds !== undefined) {
+      return err(400, 'INVALID_OUTBOX_DELETE', 'all 与 messageIds 不能同时出现');
+    }
+    if (!wantsAll) {
+      if (!Array.isArray(messageIds) || messageIds.length === 0) {
+        return err(400, 'INVALID_OUTBOX_DELETE', '要么 { all: true }，要么 messageIds 非空数组');
+      }
+      if (messageIds.length > MAX_OUTBOX_DELETE_IDS) {
+        return err(400, 'TOO_MANY_OUTBOX_DELETE_IDS', `单次最多删 ${MAX_OUTBOX_DELETE_IDS} 条`, { count: messageIds.length });
+      }
+      if (!messageIds.every((id) => typeof id === 'string' && id.trim())) {
+        return err(400, 'INVALID_OUTBOX_DELETE', 'messageIds 的每一项必须是非空字符串');
+      }
+    }
+
+    if (typeof db.deleteOutboxMessages !== 'function') {
+      return err(501, 'OUTBOX_DELETE_NOT_SUPPORTED', '当前数据库适配器不支持删除 message_outbox 的行');
+    }
+
+    const deleted = await db.deleteOutboxMessages(userId, wantsAll ? null : [...new Set(messageIds)]);
+    return { status: 200, body: { success: true, data: { deleted } } };
+  }
+
+  return { GET, POST, DELETE };
 }

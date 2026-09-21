@@ -275,7 +275,7 @@ LLM API 凭据（`apiUrl` / `apiKey` / `primaryModel`）有两种给法：
 |---|---|
 | `PUT /llm-credentials` | 批量登记 / 覆盖。body =（加密后的）`{ credentials: [{ credId, value: { apiUrl, apiKey, primaryModel } }] }`，一批 ≤100 条，单用户 ≤500 行 |
 | `GET /llm-credentials` | 对账清单 `{ credentials: [{ credId, updatedAt }] }`。**凭据本体永远不回传** |
-| `DELETE /llm-credentials` | 删除。body =（加密后的）`{ credIds: [...] }` 或 `{ all: true }` |
+| `DELETE /llm-credentials` | 删除。body =（加密后的）`{ credIds: [...] }` / `{ all: true }` / `{ credIdPrefix: 'char:<charId>/' }`，**三选一**，混着传返回 400 |
 
 客户端侧对应 `client.putLlmCredentials(credentials)` / `listLlmCredentials()` / `deleteLlmCredentials(opts)`。
 
@@ -581,6 +581,28 @@ clientStateTtl: {
 反过来，`updated_at` 大幅领先真实时间的行（设备时钟跑偏时同步上来的）要等真实时间追过去才轮得到清理。这种行不会卡住写入——条件写认得出它来自未来，照样覆盖。
 
 `GET /capabilities` 的 features 里有 `client-state-ttl`。
+
+## 清理云端数据：先对账，再按角色删
+
+整表全清（`DELETE /client-state` 不带参数、`DELETE /llm-credentials { all: true }`）之外，还有一组按名字来的口子，给「这个角色本地已经删了，云端那份也该走」这类收尾用。
+
+| 端点 | 语义 |
+|---|---|
+| `GET /client-state/namespaces[?limit=<n>]` | 云端有哪些命名空间：`{ namespaces: [{ namespace, entryCount, byteSize, updatedAt }], truncated, limit }`（加密信封）。默认最多 200 条，被截断时 `truncated: true` |
+| `DELETE /client-state?namespace=<ns>` | 只清这一个命名空间，连它的大值切片行一起。返回 `{ deleted, namespace }`；不带 `namespace` 参数仍是整表全清 |
+| `DELETE /llm-credentials { credIdPrefix }` | 按 `cred_id` 前缀删。一个角色名下通常有 `char:<charId>/chat`、`/instant`、`/emotion` 几行，前缀一把清掉 |
+| `DELETE /outbox` | 主动删收件箱的行：body =（加密后的）`{ messageIds: [...] }`（一次 ≤200 条）或 `{ all: true }`。在此之前只能等 cron 的 TTL 老化 |
+
+用法就是三步：拉一份 `GET /client-state/namespaces`，跟本地清单对一遍，本地已经没有的逐个 `DELETE /client-state?namespace=`。
+
+几件容易踩的事：
+
+- **命名空间清单里没有保留命名空间。** 单条 value 超过 200KB 时库会把它切片存进一个内部命名空间，那是存储实现细节。统计把它折算进原命名空间：`byteSize` 和 `updatedAt` 算进去，`entryCount` 不算（切片是一个逻辑条目的几段）。按命名空间删也是连切片行一起删，不会留下读不出来的孤儿。
+- **`byteSize` 是存储字节，不是原文字节。** 值落库前都加密过，这个数比明文大一截——它回答的是「这个命名空间在云端占多大地方」。
+- **清单有上限。** `truncated: true` 时手上这份不是全集，别拿它反推「本地有、云端没有 = 可以删」。
+- **`DELETE /outbox` 和 ack 是两回事。** ack 之后行还在（等 TTL 老化），只是不再被 `GET /outbox` 返回；删是把行拿掉，补收不回来——只在确认对完账之后用。
+- **`credIdPrefix` 按字典序前缀匹配，不是通配符。** 前缀里的 `%` `_` `\` 都只是普通字符。
+- 三条新端点各有自己的 feature 名：`client-state-namespaces`、`client-state-delete-namespace`、`llm-credentials-delete-prefix`、`outbox-delete`。老 worker 上探不到就走降级路径（例如退回整表全清，或者先提示用户更新后端）。内置适配器里只有 D1 实现，pg / neon 上这几条返回 501。
 
 ## 循环任务的时区（`tzId`）
 
