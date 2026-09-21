@@ -27,7 +27,7 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/capabilities`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/client-state/namespaces`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /messages` 是列表，`GET /message?id=<uuid>` 是单条。单条比列表多给一个**完整的 `metadata`**：`PUT /update-message` 对 `metadata` 是整体替换，只改其中一个键就得先把完整那份读回来。列表不带整份 metadata——一页最多 100 条，每条都驮着它会把响应撑得很大。
@@ -95,7 +95,9 @@ await client.ackOutbox(entries.map((e) => e.messageId));   // 先落库成功再
 |------|------|
 | `PUT /client-state` | 批量 upsert。body =（加密后的）`{ entries: [{ namespace, key, value, updatedAt }] }`。`updatedAt` 是 epoch 毫秒，旧于库内的条目跳过（last-write-wins）；单条 `value` 默认最大 5MB（工厂配置 `maxStateValueBytes` 可调），单次 ≤ 200 条 |
 | `GET /client-state?namespace=<ns>` | 取一个 namespace 的全部条目（解密后返回，响应加密） |
+| `GET /client-state/namespaces[?limit=<n>]` | 云端有哪些 namespace：`{ namespaces: [{ namespace, entryCount, byteSize, updatedAt }], truncated, limit }`（响应加密）。默认最多 200 条，被截断时 `truncated: true`。大值切片所在的内部 namespace 折算进原 namespace，不单独列 |
 | `DELETE /client-state` | 清空该用户的全部状态（设置页做「清除云端状态」按钮用） |
+| `DELETE /client-state?namespace=<ns>` | 只清这一个 namespace（连它的大值切片行一起），返回 `{ deleted, namespace }`。跟上面一行是同一个端点，带不带参数决定粒度 |
 
 `value` 是任意字符串（想存对象就自己 `JSON.stringify`），落库前用 per-user key 加密。鉴权和加密头跟其它端点完全一样。
 

@@ -57,6 +57,10 @@ const EXPECTED_FEATURES = [
   'client-state-ttl',
   'emit-result',
   'client-state-delete',
+  'client-state-namespaces',
+  'client-state-delete-namespace',
+  'llm-credentials-delete-prefix',
+  'outbox-delete',
 ];
 
 function makeWorker(extra = {}) {

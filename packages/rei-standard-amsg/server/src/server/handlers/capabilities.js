@@ -103,6 +103,18 @@ export const SERVER_FEATURES = Object.freeze([
   // PUT /client-state 的 entry 认 value: null（删掉这个 key，连切片行一起；同一套
   // last-write-wins，被拦下的进 skippedEntries；删掉的条数在 data.deleted）。
   'client-state-delete',
+  // GET /client-state/namespaces：云端有哪些命名空间 + 每个几条 / 占多少字节 /
+  // 最后更新是什么时候（大值切片的保留命名空间折算进原命名空间，不单独列）。
+  'client-state-namespaces',
+  // DELETE /client-state?namespace=<ns>：只清这一个命名空间（连它的切片行一起）。
+  // 不带参数仍是整表全清。
+  'client-state-delete-namespace',
+  // DELETE /llm-credentials 认 credIdPrefix：按 cred_id 前缀删（`char:<charId>/`
+  // 一把清掉一个角色名下的几行）。
+  'llm-credentials-delete-prefix',
+  // DELETE /outbox：主动删收件箱的行（{ messageIds } 或 { all: true }），不再只能
+  // 等 cron 的 TTL 老化。
+  'outbox-delete',
 ]);
 
 export function createCapabilitiesHandler(ctx) {
