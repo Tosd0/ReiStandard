@@ -40,7 +40,12 @@ import { callLlm } from './llm.js';
 import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
-import { appendPushesToOutbox, discardUndeliveredPushes, markPushesDelivered } from './outbox-store.js';
+import {
+  appendPushesToOutbox,
+  discardUndeliveredPushes,
+  findCommittedBatch,
+  markPushesDelivered,
+} from './outbox-store.js';
 import { shouldSendPush } from './push-policy.js';
 import {
   buildErrorExtra,
@@ -48,6 +53,7 @@ import {
   isNonRetryableError,
   isPermanentDeliveryFailure,
   isTaskCancelledError,
+  markUnrecoverablePartialDelivery,
   readPushStatusCode,
   sanitizeErrorSummary,
   sendTaggedPush,
@@ -335,17 +341,91 @@ function positiveIntegerOr(value, fallback) {
  */
 
 /**
+ * 重投这次触发已经落定的那一批（只推送，不生成）。
+ *
+ * 前一跳生成成功、整批落进了 outbox，推送却失败了（推送服务 5xx 之类），任务
+ * 走了重试。重试这一跳不再调 LLM、也不再调任何 fire-time hook（onBeforeFire /
+ * onLLMOutput / onAfterSend / onFireSettled 都不调——这一跳没有新的生成，宿主要
+ * 的回执前一跳已经给过，那一跳的回执上 `outboxed: true` 就是在说「剩下的库会补
+ * 推，不会重新生成」），只把还没送到的几条按原样再推一遍：
+ *
+ *   - 已经推出去的（delivered）和客户端已经 ack 的不再推；
+ *   - 到了客户端不弹通知的那些照旧不推（与首次投递同一份 push-policy，批次既然
+ *     落进了 outbox，就按「有收件箱」来判）；
+ *   - 推的是 outbox 里那一份原文：messageId / timestamp / 正文都跟首次一模一
+ *     样，客户端补收拿到的、推送收到的、首次推到一半已经收到的，全是同一份。
+ *
+ * 推送再失败就照常抛出去，由调用方走既有的重试 / 终审逻辑——下一跳还是来这里补
+ * 推，照样不生成。
+ *
+ * @param {Object} task
+ * @param {ProcessorContext} ctx
+ * @param {CryptoKey|string} userKey
+ * @param {Object} decryptedPayload
+ * @param {{ entries: import('./outbox-store.js').CommittedBatchEntry[] }} batch
+ * @returns {Promise<{ success: true, messagesSent: number, redelivered: true, pushedCount: number }>}
+ */
+async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, batch) {
+  const pending = batch.entries
+    .filter(entry => !entry.delivered && !entry.acked && shouldSendPush(entry.push, { outboxed: true }))
+    .map(entry => entry.push);
+  const messagesSent = batch.entries.length;
+  if (pending.length === 0) {
+    return { success: true, messagesSent, redelivered: true, pushedCount: 0 };
+  }
+
+  if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
+    throw new Error('VAPID configuration missing - push notifications cannot be sent');
+  }
+  const pushSubscription = await resolvePushSubscription({
+    db: ctx.db,
+    userId: task.user_id,
+    userKey,
+    legacyFallback: decryptedPayload.pushSubscription ?? null,
+  });
+
+  const sentIds = [];
+  let cancelled = false;
+  try {
+    for (let i = 0; i < pending.length; i++) {
+      await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(pending[i]));
+      sentIds.push(pending[i].messageId);
+      if (i < pending.length - 1) await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS);
+    }
+  } catch (error) {
+    cancelled = isTaskCancelledError(error);
+    throw error;
+  } finally {
+    await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
+    if (cancelled) {
+      // 与首次投递同一个处置：取消只拦住了推送，剩下的行不撤掉，客户端下次
+      // GET /outbox 会照样把已取消任务的内容补收回去。
+      await discardUndeliveredPushes({ db: ctx.db, userId: task.user_id, pushes: pending, sentIds });
+    }
+  }
+  return { success: true, messagesSent, redelivered: true, pushedCount: sentIds.length };
+}
+
+/**
  * Process a single database task row: decrypt → generate content → push.
+ *
+ * 重试同一次触发时（`options.resumeCommittedBatch`），先看这次触发的整批是不是
+ * 已经落进了 outbox：落进去了就只补推送、不再生成（见 redeliverCommittedBatch），
+ * 返回值带 `redelivered: true`。
  *
  * @param {import('../adapters/interface.js').TaskRow} task
  * @param {ProcessorContext} ctx
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @returns {Promise<{ success: boolean, messagesSent: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean }>}
+ * @param {{ resumeCommittedBatch?: boolean }} [options] - resumeCommittedBatch：这
+ *   一跳是不是同一次触发的重试（是才去 outbox 里找落定的批次，首次触发不多花这
+ *   次查询）。不传时按 `task.retry_count > 0` 判断——定时任务的重试计数就记在
+ *   这一列上；processMessagesByUuid 的请求内重试不改这一列，由它显式传。
+ * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean }>}
  *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
  */
-export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
+export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null, options = {}) {
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
@@ -356,6 +436,22 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       || await deriveUserEncryptionKey(task.user_id, masterKey);
     const decryptedPayload = (predecrypted && predecrypted.payload)
       || JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
+
+    // 同一次触发的重试：内容已经落定的话只补推送。放在所有生成路径（agentic 与
+    // 冻结 prompt）之前，两条路落进 outbox 的批次都认。
+    const resumeCommittedBatch = options && typeof options.resumeCommittedBatch === 'boolean'
+      ? options.resumeCommittedBatch
+      : (task.retry_count || 0) > 0;
+    if (resumeCommittedBatch) {
+      const committed = await findCommittedBatch({
+        db: ctx.db,
+        userId: task.user_id,
+        userKey,
+        taskUuid: task.uuid,
+        occurrenceMs: occurrenceMsOf(task),
+      });
+      if (committed) return await redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, committed);
+    }
 
     // Fire-time hooks: when the host configured onBeforeFire and the task
     // needs the LLM, offer the agentic path first. onBeforeFire → null
@@ -419,20 +515,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // length cap + RegExp compilability upstream.
     const messages = splitMessageIntoSentences(messageContent, decryptedPayload.splitPattern ?? null);
 
-    if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-      throw new Error('VAPID configuration missing - push notifications cannot be sent');
-    }
-
-    // 订阅是用户级的一份，投递时现读（任务行不携带它）。取不到就抛，走既有
-    // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。升级前创建的
-    // 任务把订阅冻结在 payload 里，用户级存储没有时兜底用那一份，存量任务
-    // 不必等用户重新登记。
-    const pushSubscription = await resolvePushSubscription({
-      db: ctx.db,
-      userId: task.user_id,
-      userKey,
-      legacyFallback: decryptedPayload.pushSubscription ?? null
-    });
     // sessionId is shared across the optional ReasoningPush and every
     // ContentPush from this LLM round. Pin it to (task id + 名义触发时刻)
     // when available (scheduled tasks) so retries of the same occurrence
@@ -510,6 +592,24 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     const pushesToSend = reasoningPush ? [reasoningPush, ...contentPushes] : contentPushes;
     const outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
 
+    // VAPID 与订阅排在落行之后：内容已经生成好了，之后哪一步失败都只该重试投递，
+    // 而「只重试投递」的前提是这一批已经落定在 outbox 里（见
+    // redeliverCommittedBatch）。
+    if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
+      throw new Error('VAPID configuration missing - push notifications cannot be sent');
+    }
+
+    // 订阅是用户级的一份，投递时现读（任务行不携带它）。取不到就抛，走既有
+    // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。升级前创建的
+    // 任务把订阅冻结在 payload 里，用户级存储没有时兜底用那一份，存量任务
+    // 不必等用户重新登记。
+    const pushSubscription = await resolvePushSubscription({
+      db: ctx.db,
+      userId: task.user_id,
+      userKey,
+      legacyFallback: decryptedPayload.pushSubscription ?? null
+    });
+
     // 到了客户端不会弹通知的那些不推，只留在 outbox 里等客户端补拉（见
     // lib/push-policy.js）。思考过程正是这一类：SW 那边它本来就是静默送给页面
     // 的，推过去等于白违约一次 `userVisibleOnly` 的约定，而内容在 outbox 里一
@@ -546,7 +646,10 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       }
     } catch (error) {
       cancelledMidBurst = isTaskCancelledError(error);
-      throw error;
+      // 这一批落进了 outbox 的话，重试只补推送（见 redeliverCommittedBatch）；没
+      // 落进去、又已经推出去几条的，重试只能重新生成，客户端会拼出两份内容——就
+      // 地判终审（思考过程那条推出去了也算：它是这次生成的一部分）。
+      throw markUnrecoverablePartialDelivery(error, { outboxed, pushedCount: sentIds.length });
     } finally {
       // 半途失败也把已发出的段标掉：delivered_at 为 null 的行就是客户端要补
       // 收的那部分，标多标少都会让补收失真。
@@ -636,7 +739,12 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       return { success: false, error: { code: 'TASK_NOT_FOUND', message: '任务不存在或已处理' } };
     }
 
-    const result = await processSingleMessage(task, ctx, masterKey);
+    // 请求内的重试不动任务行的 retry_count，「这是不是同一次触发的重试」得由这
+    // 里显式告诉 processSingleMessage：上一轮生成成功、只是推送失败的话，这一轮
+    // 只补推送，不再把 LLM 跑一遍。
+    const result = await processSingleMessage(task, ctx, masterKey, null, {
+      resumeCommittedBatch: retryCount > 0 || (task.retry_count || 0) > 0,
+    });
 
     if (!result.success) {
       // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮

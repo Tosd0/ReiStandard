@@ -62,6 +62,9 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  *   即可）。一条 push 装不下的思考过程要切片发，切多大、最多几片、重组窗口多长由
  *   接收端说了算——发送端不知道这份配置的话，切出来的分片到了那边会被逐片拒收，
  *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
+ * @property {number} [maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试
+ *   几次（默认 3，0 = 第一次失败就终审）。只管 `/send-notifications` 的退避阶梯；
+ *   `messageType: 'instant'` 的请求内重试不受它影响。
  */
 
 /**
@@ -139,6 +142,9 @@ export async function createReiServer(config) {
     // schedule-message 里就地投递、定时消息走 send-notifications 的 tick，两条路
     // 都从这个 ctx 展开，所以配一次两边都认。
     multipart: config.multipart || null,
+    // 定时任务投递失败后的重试次数上限（默认 3），send-notifications 展开 ctx
+    // 时带进 runScheduledTick。
+    maxDeliveryRetries: config.maxDeliveryRetries,
     tenant: {
       initSecret
     },
@@ -173,6 +179,7 @@ export {
   DEFAULT_CLAIM_LEASE_MS,
   DEFAULT_LEASE_HEARTBEAT_MS,
   DEFAULT_HEARTBEAT_LEASE_TTL_MS,
+  DEFAULT_MAX_DELIVERY_RETRIES,
   sanitizeErrorSummary,
 } from './lib/run-tick.js';
 // hook 侧标注「重试也好不了」的失败：run-tick 收到即直接终审处置，不进退避

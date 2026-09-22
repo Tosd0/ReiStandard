@@ -13,12 +13,35 @@
  * `requireContent` 默认 true、`timeoutMs` 默认 300000（agentic 循环传
  * 剩余墙钟预算，见 lib/agentic-fire.js）。
  *
+ * server 侧只多做一件事：上游明确拒了这次请求（401 / 403 / 400 …）时，给
+ * 抛出来的错误标上 `permanent: true`，投递侧据此一跳终审、不再把整条生成重跑
+ * 几遍（口径见 lib/errors.js 的 isPermanentLlmFailure）。标在这里而不是
+ * shared：amsg-instant 也用那份 callLlm，它有自己的失败语义。
+ *
  * `buildAiRequestBody` 是 shared `buildLlmRequestBody` 的 server 侧
  * 别名（历史导出名，测试与文档都钉着它）。
  */
 
+import { callLlm as callSharedLlm } from '@rei-standard/amsg-shared';
+import { markPermanentIfLlmRejected } from './errors.js';
+
+/**
+ * 与 shared 的 callLlm 同签名、同返回值；失败时抛出的错误若是「上游拒了、重试
+ * 也不会好」的那一类，会多带 `permanent: true`。
+ *
+ * @param {Object} payload
+ * @param {Object} [options]
+ * @returns {Promise<{ response: unknown, content: string }>}
+ */
+export async function callLlm(payload, options) {
+  try {
+    return await callSharedLlm(payload, options);
+  } catch (error) {
+    throw markPermanentIfLlmRejected(error);
+  }
+}
+
 export {
-  callLlm,
   buildLlmRequestBody as buildAiRequestBody,
   normalizeAiApiUrl,
 } from '@rei-standard/amsg-shared';

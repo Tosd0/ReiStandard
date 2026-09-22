@@ -389,8 +389,8 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 
 | hook | 什么时候调 | 载荷 |
 |---|---|---|
-| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, scratch, readState, writeState, emitResult }` |
-| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, pushedCount, total, iterations, error, scratch, readState, writeState, emitResult }` |
+| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
+| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, sentCount, pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
 | `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
 
 三个 hook 都自带 `readState` / `writeState` / `emitResult`，作用于当前用户，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
@@ -407,6 +407,20 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 | `skipped` | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`） |
 | `failed` | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数 |
 | `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管，它后面发没发出去不体现在这里 |
+
+**用量记账**看这三个字段，两个 hook 都带，`onFireSettled` 的每种结局（发完、跳过、失败）都带——失败也花了钱：
+
+| 字段 | 是什么 |
+|---|---|
+| `usage` | 最后一轮 LLM 响应的 `usage` 原样（没跑到 LLM → `null`） |
+| `usageTotal` | 本次 fire 所有 LLM 轮次加起来，形状固定 `{ prompt_tokens, completion_tokens, total_tokens }`。各家 usage 形状不齐时尽量相加：没有 `prompt_tokens` / `completion_tokens` 就认 `input_tokens` / `output_tokens`，某一轮没报 `total_tokens` 就拿那一轮的 prompt + completion 补上；一项所有轮次都没报过就是 `null`，所有轮次都没报 usage（或没跑到 LLM）时整个是 `null` |
+| `llmCalls` | 本次 fire 实际发出的 LLM 请求数，失败的那一次也算；没跑到 LLM → `0` |
+
+`status: 'not-handled'`（交还给冻结 prompt 老链路）时 `llmCalls` 是 `0`：老链路那一次生成发生在收尾之后，不归 fire hook 管。
+
+`outboxed` 说的是 finish 的这一批有没有整批落进收件箱（没走到 finish → `false`）。`true` 时客户端补收一定拿得到全部 `total` 段；推送没发完的那部分，库在任务重试时**只补推送、不重新生成**，补推那一跳也不再调任何 hook（包括这两个）。所以 `status: 'failed'` 而 `outboxed: true` 的意思是「内容已经生成并落定，只是推送没发完」，而不是「这条消息没了」。详见[投递失败怎么重试](#投递失败怎么重试)。
+
+`error.permanent === true` 表示这次失败一跳终审、不会再重试（hook 抛的 `NonRetryableError`、LLM 上游明确拒了这次请求、没落进收件箱的批次推到一半失败）。反过来不成立：推送服务回 404 / 410 / 413、订阅没登记这几种也是一跳终审，但判定在投递侧，错误对象上不带 `permanent`。
 
 跟 `onAfterSend` 的分工：`onAfterSend` 只走「有 push 要发」这条路，所以 hook 判断这次不用说话、或者链路中途抛错时它不会被调到——「开始时占点什么、结束时放掉」的写法要挂 `onFireSettled`（fire 里已经用 `ctx.scheduleTask` 建出来的任务，不记账就成了只活在数据库里的幽灵任务；fire 开头拿的锁，没有可靠释放点就只能等 TTL）。正常发完时两个都会调，`onAfterSend` 在前。`scratch` 是同一个引用。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。
 
@@ -641,6 +655,54 @@ await client.scheduleMessage({
 
 投递失败的退避记在 `retry_after` 上，租约同时放掉。两件事分两列记：`lease_until` 只表示「这条正在跑」，`retry_after` 表示「这条没在跑，在等重试」。挤在一列的话，下面的分组串行会把一条正在退避、其实闲着的任务当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。
 
+## 投递失败怎么重试
+
+定时任务投递失败后按 2 / 4 / 6 分钟退避，默认再试 **3 次**。用完之后一次性任务标 `failed`，循环任务只作废本次（排期推进到下一次、重试计数归零）。次数可以调低：
+
+```js
+createSingleUserCloudflareWorker((env) => ({ …, maxDeliveryRetries: 1 }));  // 0 = 第一次失败就终审
+```
+
+`createSingleUserServer` / `createReiServer` 的 config、直接调 `runScheduledTick` 的 ctx 也认同名字段，默认值导出为 `DEFAULT_MAX_DELIVERY_RETRIES`。它只管定时任务这条退避阶梯；`messageType: 'instant'` 在请求里当场投递的那条路有自己的三轮重试，不受它影响。宿主要是自己按「重试次数到 3」判断终态的，调低之后记得跟着改。
+
+### 一跳终审、不再重试的失败
+
+每重试一次都可能把整条生成（`onBeforeFire` 里宿主的计费调用、每一轮 LLM）重跑一遍，所以重试也好不了的失败不进退避阶梯：
+
+| 失败 | 怎么认出来 |
+|---|---|
+| hook 契约违约、hook 抛 `NonRetryableError` | 错误带 `permanent: true`，见[hook 契约违约算确定性失败](#hook-契约违约算确定性失败) |
+| LLM 上游明确拒了这次请求：400 / 401 / 402 / 403 / 404 / 405 / 413 / 422 | 错误带 `code: 'LLM_CALL_FAILED'`、`llmStatus`，并且 `permanent: true` |
+| 推送订阅没登记、推送服务回 404 / 410（订阅没了）/ 413（内容太大） | 失败记录里的 `errorCode` / `pushStatus` |
+| 没落进收件箱的一批推到一半失败 | 见下面「没有收件箱时」 |
+
+LLM 这一条只认上游**答复了、并且拒了**的那几种状态码：Key 错了、余额不足、模型名写错、请求体不合法，隔两分钟再发一遍还是同一个结果。下面这些照旧重试：408 / 409 / 425 / 429、所有 5xx、网络直接炸了或超时（没有 `llmStatus`）、中转站回 200 却在响应体里装着报错（真实原因说不准），以及上面没列出来的其余 4xx。
+
+`permanent: true` 是在 LLM 调用抛错的那一刻就标好的，所以 `onFireSettled` / `onAfterSend` 拿到的 `error.permanent` 与投递侧的处置一致，宿主可以据此判断「这是终态，该告诉用户了」。
+
+### 生成成功之后推送失败：只补推送
+
+一次触发的整批 push 在发出去之前会先落进收件箱。落进去了，这次触发的内容就定了——之后推送再失败（推送服务 5xx 之类），任务照常进退避阶梯，但重试那一跳**不再调 LLM，也不调任何 fire-time hook**，只把这一批里还没送到的几条原样再推一遍：
+
+- 已经推出去的、客户端已经 ack 的不再推；到了客户端不弹通知的那些照旧不推。
+- 推的就是收件箱里那一份：`messageId`、时间戳、正文都跟第一次一模一样。客户端补收拿到的、重推收到的、第一次推到一半已经收到的，是同一份内容。
+- 客户端在两次重试之间已经把整批补收并 ack 了的话，这一跳什么都不用推，直接算成功。
+- 补推再失败就继续退避，下一跳还是只补推；重试用完照常终审，内容仍在收件箱里等客户端补收。
+- 落收件箱排在查 VAPID / 推送订阅之前：生成之后读订阅那一下超时、VAPID 暂时没配齐，同样只补推送。订阅压根没登记的照旧一跳终审，但这次的内容已经在收件箱里，客户端上线补收得到。
+
+冻结 prompt 老链路和 fire-time hook 链路都是这样。tick 汇总的 `details.redeliveredTasks`（`{ taskId, pushedCount }`）列出这一跳里只补推、没有重新生成的任务。
+
+重试那一跳靠适配器的 `listOutboxForTask` 找这次触发落定的那一批（内置 D1 有；没实现的自定义适配器退回翻页扫描未 ack 的行，读不到已 ack 的行，客户端恰好在两次重试之间 ack 了整批的话会重新生成一份）。
+
+### 没有收件箱时
+
+这一批没落进收件箱（多租户线的 pg / neon 适配器没有收件箱，或者这一次落行失败）时，推送是它唯一的腿，重试只能把整条内容重新生成一遍。库按设备上已经有没有东西来分：
+
+- **一条都没推出去**：照旧重试，重试时重新生成。会多花一次生成，但客户端只见过重新生成的那一份——没有收件箱兜着，这是唯一能把消息送到的办法。
+- **已经推出去了几条**：一跳终审（错误标 `permanent: true`），没推出去的那几段就此放弃。重新生成的话，设备上会是前半截来自第一次、后半截来自第二次的两份内容。
+
+`GET /capabilities` 的 features 里对应 `llm-permanent-errors`、`redeliver-committed-batch`、`hook-usage-total`、`max-delivery-retries`。
+
 ## 同一分组的任务不并发（`serializeBy`）
 
 同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互不知情的消息；宿主在 hook 里维护的「我刚才说过什么」台账通常是读进内存 → 改 → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条。
@@ -786,6 +848,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `createAdapter` / `createD1Adapter` — pg·neon / Cloudflare D1 数据库适配器
 - `runScheduledTick` — 手动触发一轮到期任务投递（自定义 cron 宿主、要调 `claimLeaseMs` 时用）
 - `runTask` — 只跑指定那一条任务（与 cron 同一条投递链）
+- `DEFAULT_MAX_DELIVERY_RETRIES` — 投递失败的默认重试次数（3），config 的 `maxDeliveryRetries` 不配时用它
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION` — 表结构自查与补齐
 - `summarizeErrorCause` — 把异常压成响应体里 `error.cause` 那个形状（自己包一层路由、想回同样形状时用同一份）
 - `NonRetryableError` / `isNonRetryableError` — hook 侧标注「重试也好不了」的失败
@@ -800,7 +863,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 
 `@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
 
-- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick` / `runTask`
+- `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick` / `runTask` / `DEFAULT_MAX_DELIVERY_RETRIES`
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION`
 - `summarizeErrorCause` / `NonRetryableError` / `isNonRetryableError`
 - `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`

@@ -32,6 +32,8 @@ export {
   // 单任务入口：宿主想让某一条任务立刻跑起来（而不是触发一次全量扫描）时用
   // 它。见 lib/run-tick.js。
   runTask,
+  // 投递失败重试次数的默认值（config 的 maxDeliveryRetries 不配时用它）。
+  DEFAULT_MAX_DELIVERY_RETRIES,
 } from './lib/run-tick.js';
 // Schema 自查 / 补齐：升级后老部署的表没跟上时，cron 会每分钟静默挂在缺的那
 // 一列上。见 lib/schema-version.js。

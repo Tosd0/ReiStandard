@@ -118,6 +118,36 @@ export function isTaskCancelledError(error) {
     && /** @type {any} */ (error).code === TASK_CANCELLED_CODE;
 }
 
+/**
+ * 推送半途失败、而这一批**没有**落进 outbox 时，这次失败还能不能重试（就地标
+ * 注，原样返回传入的错误）。
+ *
+ * 落进了 outbox 的批次重试时只补推送、不重新生成（见 lib/message-processor.js
+ * 的 redeliverCommittedBatch）。没落进去的（适配器没有 outbox，或者这一批落行
+ * 失败）没有这条退路：重试只能把整条内容重新生成一遍。那样做安不安全，看设备上
+ * 已经有没有这次触发的东西：
+ *
+ *   - 一条都没推出去 → 客户端什么都没收到，重新生成的那一份就是它唯一见到的一
+ *     份。照旧重试（会多花一次生成——没有收件箱兜着的时候，这是唯一能把消息送
+ *     到的办法）；
+ *   - 已经推出去了几条 → 重新生成的内容跟设备上那几条不是同一份，客户端会看到
+ *     前半截来自第一次生成、后半截来自第二次。所以就地判终审（标 permanent）：
+ *     一次性任务标 failed、循环任务作废本次 occurrence，没推出去的那几段就此
+ *     放弃。
+ *
+ * 取消（TASK_CANCELLED）不归这里管，照旧按取消收尾。
+ *
+ * @template T
+ * @param {T} error - 推送那一步抛的错误
+ * @param {{ outboxed: boolean, pushedCount: number }} state - 这一批落没落进
+ *   outbox、已经推出去了几条
+ * @returns {T}
+ */
+export function markUnrecoverablePartialDelivery(error, { outboxed, pushedCount }) {
+  if (outboxed || !(pushedCount > 0) || isTaskCancelledError(error)) return error;
+  return markPermanent(error);
+}
+
 // ─── 「重试也好不了」的判定 ──────────────────────────────────────────────
 //
 // 定时任务（run-tick 的退避阶梯）和 instant 任务（processMessagesByUuid 的
@@ -156,11 +186,83 @@ const PERMANENT_ERROR_CODES = new Set([
 ]);
 
 /**
- * 这次投递失败要不要判成永久性的（不再重试）。四个来源：
+ * shared 的 callLlm 在「上游答复了、但没给出能用的结果」时挂在错误上的 code，
+ * 同时挂 `llmStatus`（上游回的 HTTP 状态码）。网络直接炸、超时的错误没有这两个
+ * 字段。
+ */
+const LLM_CALL_FAILED_CODE = 'LLM_CALL_FAILED';
+
+/**
+ * LLM 上游回的 HTTP 状态码里，「请求本身有问题、原样重试也不会好」的那些：
+ *
+ * | 状态码 | 常见原因 |
+ * |---|---|
+ * | 400 | 请求体不合法、上下文超长、参数不认 |
+ * | 401 / 403 | Key 错了、过期了、没权限 |
+ * | 402 | 余额不足 |
+ * | 404 / 405 | 模型名写错、apiUrl 没指到 chat 端点 |
+ * | 413 | 请求体过大 |
+ * | 422 | 参数校验不过 |
+ *
+ * 重试一次要把整条生成（onBeforeFire 里宿主的计费调用、前几轮已经成功的 LLM
+ * 轮次）从头再跑一遍，这些错误重试几次都是同一个结果，只是白花钱。所以一跳就
+ * 终审：一次性任务标 failed，循环任务作废本次 occurrence。
+ *
+ * 不在这张表里的都照旧重试，包括：
+ *   - 408 / 409 / 425 / 429：超时、冲突、太早、限流，过一会儿通常就好；
+ *   - 所有 5xx：上游自己的故障；
+ *   - 没有 llmStatus 的失败（网络炸了、超时）；
+ *   - 2xx 却装着报错的响应体（中转站把上游报错塞进 200 回来，真实原因说不准）；
+ *   - 其余没列出来的 4xx：认不准的一律按老行为重试，宁可多试几轮，也不把一条
+ *     本来能送达的消息判死。
+ */
+const PERMANENT_LLM_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 422]);
+
+/**
+ * 这个错误是不是「LLM 上游明确拒了这次请求、重试也不会好」。判据见
+ * {@link PERMANENT_LLM_STATUSES}。
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isPermanentLlmFailure(error) {
+  if (!error || typeof error !== 'object') return false;
+  const { code, llmStatus } = /** @type {any} */ (error);
+  return code === LLM_CALL_FAILED_CODE
+    && Number.isInteger(llmStatus)
+    && PERMANENT_LLM_STATUSES.has(llmStatus);
+}
+
+/**
+ * 按 {@link isPermanentLlmFailure} 的口径就地给 LLM 错误标上 `permanent: true`
+ * （原样返回传入的错误）。
+ *
+ * 标在错误对象上而不是只在投递侧判：fire-time hook（`onFireSettled` /
+ * `onAfterSend`）拿到的就是这个对象，宿主用 `error.permanent === true` 判断
+ * 「这是终态、该告诉用户了」。只在投递侧判的话，hook 看到的是一个没有
+ * `permanent` 的错误，任务却已经被判死了。
+ *
+ * 唯一的调用点是 lib/llm.js 的 callLlm（server 侧所有 LLM 调用都走它），别在
+ * 别处各自判。
+ *
+ * @template T
+ * @param {T} error
+ * @returns {T}
+ */
+export function markPermanentIfLlmRejected(error) {
+  return isPermanentLlmFailure(error) ? markPermanent(error) : error;
+}
+
+/**
+ * 这次投递失败要不要判成永久性的（不再重试）。五个来源：
  *   - 已知的永久性错误码（见 {@link PERMANENT_ERROR_CODES}）；
  *   - hook 侧抛出的 NonRetryableError（`permanent`，见 {@link NonRetryableError}）——
  *     fire_pack 缺失、解析失败这类重试必然同败的错，隔两分钟再试三次只是让用户
  *     多白等十二分钟，还把情绪评估之类的计费重跑三遍；
+ *   - LLM 上游明确拒了这次请求（401 / 403 / 400 …，见
+ *     {@link PERMANENT_LLM_STATUSES}）。这一条同样经由 `permanent` 传进来：错
+ *     误在 lib/llm.js 抛出的那一刻就标好了（见 {@link markPermanentIfLlmRejected}），
+ *     hook 看到的和这里判的是同一个结论；
  *   - 推送服务判了这条订阅的死刑（见 {@link TERMINAL_PUSH_STATUSES}）；
  *   - 推送服务说这条 payload 太大（见 {@link PUSH_PAYLOAD_TOO_LARGE_STATUS}）。
  *

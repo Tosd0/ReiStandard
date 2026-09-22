@@ -212,6 +212,14 @@
  *   时，`DELETE /message` 和 supersedesUuid 顶替这两条路靠翻这份名单找出该任务
  *   名下还没发出去的行，缺任一字段就挑不出来，那两条路上的 outbox 清理会静默
  *   跳过。
+ * @property {(userId: string, taskUuid: string, options?: { sinceMs?: number, limit?: number }) => Promise<Array<Object>>} [listOutboxForTask]
+ *   （可选；单用户/D1）某条任务名下 `created_at >= sinceMs` 的行，**不论投递 /
+ *   ack 状态**，行上要带 `message_index`、`total_messages`、`payload`、
+ *   `created_at`、`delivered_at`、`acked_at`。生成成功之后推送失败、任务走重试
+ *   时，重试那一跳靠它找到这次触发已经落定的那一批，只补推送、不重新生成（见
+ *   lib/outbox-store.js 的 findCommittedBatch）。不实现 → 退回
+ *   listUnackedOutbox 的翻页扫描，读不到已 ack 的行：客户端恰好在两次重试之间
+ *   把整批 ack 了的话，那一跳会重新生成一份。
  * @property {(userId: string, messageIds: string[], ackedAt: number) => Promise<number>} [ackOutboxMessages]
  *   （可选；单用户/D1）客户端确认收到（POST /outbox/ack，幂等）。
  * @property {(userId: string, messageIds: string[]|null) => Promise<number>} [deleteOutboxMessages]
