@@ -115,6 +115,16 @@ export const SERVER_FEATURES = Object.freeze([
   // DELETE /outbox：主动删收件箱的行（{ messageIds } 或 { all: true }），不再只能
   // 等 cron 的 TTL 老化。
   'outbox-delete',
+  // LLM 上游明确拒了请求（400 / 401 / 402 / 403 / 404 / 405 / 413 / 422）一跳终
+  // 审，不再重试；fire hook 拿到的 error 上带 permanent: true。
+  'llm-permanent-errors',
+  // 生成成功、整批落进收件箱之后推送才失败的，重试只补推送、不重新生成；
+  // onAfterSend / onFireSettled 的载荷带 outboxed。
+  'redeliver-committed-batch',
+  // onAfterSend / onFireSettled 的载荷带整次 fire 的 usageTotal 与 llmCalls。
+  'hook-usage-total',
+  // 工厂配置认 maxDeliveryRetries（投递失败的重试次数上限，默认 3）。
+  'max-delivery-retries',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

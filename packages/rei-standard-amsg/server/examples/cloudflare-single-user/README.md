@@ -304,7 +304,8 @@ export default createSingleUserCloudflareWorker((env) => ({
     ]);
   },
   async onAfterSend(info) {
-    // info: { task, sentCount, total, error, scratch, readState, writeState }
+    // info: { task, sentCount, pushedCount, total, error, usage, usageTotal,
+    //         llmCalls, outboxed, scratch, readState, writeState }
     // scratch 与本次 fire 的 onBeforeFire / onLLMOutput 是同一个引用
   },
 }));
@@ -322,7 +323,8 @@ export default createSingleUserCloudflareWorker((env) => ({
 export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   async onFireSettled(info) {
-    // info: { task, status, skipReason, sentCount, total, iterations, error,
+    // info: { task, status, skipReason, sentCount, pushedCount, total, iterations,
+    //         error, metadata, usage, usageTotal, llmCalls, outboxed,
     //         scratch, readState, writeState }
     if (info.scratch.scheduledFollowUp) {
       // fire 里用 ctx.scheduleTask 建出来的任务已经真的写进库了，不管这次有没
@@ -344,6 +346,12 @@ export default createSingleUserCloudflareWorker((env) => ({
 | `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管 |
 
 跟 `onAfterSend` 的分工：`onAfterSend` 只走「有 push 要发」这条路，`onFireSettled` 什么结局都到。正常发完时两个都会调，`onAfterSend` 在前。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。同样是 best-effort，自身抛错只记日志。
+
+记账和失败通知常用的几个字段：
+
+- `usageTotal` / `llmCalls`：整次 fire 所有 LLM 轮次的 token 合计、实际发了几次 LLM 请求（失败的那次也算）。失败结局一样带，「失败也花了钱」照样记得上。`usage` 仍是最后一轮的原样。
+- `error.permanent === true`：这次失败一跳终审、不会再重试（LLM 上游拒了请求，比如 Key 失效、余额不足；hook 抛了 `NonRetryableError`）。该提示用户就在这时提示，别等重试。
+- `outboxed === true` 且 `status === 'failed'`：内容已经生成并落进收件箱，只是推送没发完。客户端补收拿得到全部 `total` 段，库重试时只补推送、不重新生成，补推那一跳不会再调这两个 hook——所以「这次说了什么」可以按 `total` 段记，不用等重试。
 
 ## 同一个角色的任务不要撞在一起（serializeBy）
 

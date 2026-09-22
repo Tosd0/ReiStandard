@@ -1162,6 +1162,39 @@ export class D1Adapter {
   }
 
   /**
+   * 某条任务名下、某个时刻之后落的行，**不论投递 / ack 状态**（payload 仍是密文）。
+   *
+   * 给「生成成功之后推送失败、重试只补推送」那条路用（见 lib/outbox-store.js 的
+   * findCommittedBatch）：重试那一跳先来这里看这次触发的整批是不是已经落定了。
+   * 已 ack 的行也要读——客户端在两次重试之间把整批补收并 ack 了，同样说明这次
+   * 触发的内容已经生成过，不该再生成一份。
+   *
+   * `+user_id` 的一元加号是故意的：它让这一项不参与选索引，查询改走
+   * idx_outbox_created 按 created_at 收窄。否则 SQLite 会挑 (user_id, message_id)
+   * 的唯一约束索引，单用户部署下 user_id 对每一行都成立，等于把整个收件箱扫一遍
+   * （D1 按扫过的行数计费）。idx_outbox_created 不在时照样查得出来，只是退回扫表。
+   *
+   * @param {string} userId
+   * @param {string} taskUuid
+   * @param {{ sinceMs?: number, limit?: number }} [options] - sinceMs：只要
+   *   created_at ≥ 它的行（epoch 毫秒）；limit：最多读几行（默认 500）
+   * @returns {Promise<Array<{ id: number, message_id: string, task_uuid: string|null,
+   *   session_id: string|null, message_index: number|null, total_messages: number|null,
+   *   payload: string, created_at: number, delivered_at: number|null, acked_at: number|null }>>}
+   */
+  async listOutboxForTask(userId, taskUuid, { sinceMs = 0, limit = 500 } = {}) {
+    const res = await this._db.prepare(
+      `SELECT id, message_id, task_uuid, session_id, message_index, total_messages, payload,
+              created_at, delivered_at, acked_at
+       FROM message_outbox
+       WHERE +user_id = ? AND task_uuid = ? AND created_at >= ?
+       ORDER BY created_at, id
+       LIMIT ?`
+    ).bind(userId, taskUuid, sinceMs, limit).all();
+    return res.results || [];
+  }
+
+  /**
    * 未 ack 的行（id 升序，游标翻页）。payload 仍是密文，解密在 handler。
    *
    * @param {string} userId

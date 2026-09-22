@@ -25,8 +25,11 @@
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
  * @param {number} [config.maxScheduledTasksPerFire] - 一次 fire 里 hook 用 ctx.scheduleTask() 最多能建几条后续任务（默认 2，0 表示不许自排）。
+ * @param {number} [config.maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试几次（默认 3，0 = 第一次失败就终审）。
+ *   只管 runScheduledTick 的退避阶梯：返回的 ctx 交给 runScheduledTick 时带上它；instant 的请求内重试不受影响。
  * @param {function} [config.onAfterSend] - 推送发出（或发挂）之后的可选 hook：
- *   ({ task, sentCount, total, error, scratch, readState, writeState }) =>
+ *   ({ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls,
+ *   outboxed, scratch, readState, writeState }) =>
  *   void|Promise。task 是任务行本身（并发投递时靠它区分回执属于哪条任务）；
  *   scratch 是本次 fire 的便签对象，与 onBeforeFire / onLLMOutput 拿到的是同
  *   一个引用；readState / writeState 是 client_state 的读写口。全部成功
@@ -34,8 +37,9 @@
  *   上抛之前调用完。hook 自身抛错只记日志，不影响主流程（见
  *   lib/agentic-fire.js）。
  * @param {function} [config.onFireSettled] - 一次 fire 收尾的可选 hook：
- *   ({ task, status, skipReason, sentCount, total, iterations, error,
- *   scratch, readState, writeState }) => void|Promise。onBeforeFire 被调用过
+ *   ({ task, status, skipReason, sentCount, pushedCount, total, iterations,
+ *   error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState,
+ *   writeState }) => void|Promise。onBeforeFire 被调用过
  *   就一定会调一次，无论这次是发完（status 'sent'）、跳过（'skipped'）、抛错
  *   （'failed'）还是交还给冻结 prompt 老链路（'not-handled'）。onAfterSend 只
  *   走「有 push 要发」那条路，「开始时占点什么、结束时放掉」的写法挂这个才不
@@ -94,7 +98,10 @@ export function createSingleUserServer(config) {
     // notifyFireSettled）。
     onFireSettled: config.onFireSettled,
     // hook 的 ctx.scheduleTask() 单次 fire 建任务的条数上限（默认 2）。
-    maxScheduledTasksPerFire: config.maxScheduledTasksPerFire
+    maxScheduledTasksPerFire: config.maxScheduledTasksPerFire,
+    // 定时任务投递失败后的重试次数上限（默认 3）。handlers 用不到，宿主拿这个
+    // ctx 去调 runScheduledTick 时它跟着走。
+    maxDeliveryRetries: config.maxDeliveryRetries
   };
 
   return {

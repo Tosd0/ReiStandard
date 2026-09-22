@@ -53,6 +53,9 @@
  *   ctx.clientStateTtl?：client_state 的按命名空间过期清理，形状是
  *   `{ 命名空间: 天数 }`。不配 = 一个都不清（默认行为不变）。见
  *   cleanupExpiredClientState。
+ *   ctx.maxDeliveryRetries?：一次触发投递失败后最多再重试几次（默认
+ *   DEFAULT_MAX_DELIVERY_RETRIES = 3，0 = 不重试、第一次失败就终审）。用完之后
+ *   一次性任务标 failed、循环任务作废本次 occurrence。见 handleDeliveryFailure。
  * @returns {Promise<Object>} summary { totalTasks, successCount, failedCount, processedAt, executionTime, details }
  */
 
@@ -97,6 +100,12 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 本身也被拖过了这个时长的除外：那说明停摆发生在重试窗口里，内容一样旧。
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
+
+// 一次触发投递失败后最多再重试几次（退避 2 / 4 / 6 分钟）。宿主可用
+// ctx.maxDeliveryRetries 调低（0 = 不重试）。重试不一定重新生成：内容已经落进
+// outbox 的，重试只补推送（见 lib/message-processor.js 的 redeliverCommittedBatch）；
+// 生成本身失败的才会把整条生成再跑一遍，每跑一遍都花钱。
+export const DEFAULT_MAX_DELIVERY_RETRIES = 3;
 
 // 「重试也好不了」的判定（永久性错误码、终态推送状态码、payload 超限）住在
 // lib/errors.js —— 定时任务的退避阶梯和 instant 任务的三轮重试用同一份口径。
@@ -230,6 +239,12 @@ function guardWebpushWithLease(webpush, lease) {
 
 function resolveStaleAfterMs(ctx) {
   return positiveNumber(ctx.staleAfterMs) || STALE_AFTER_MS;
+}
+
+/** ctx.maxDeliveryRetries 取非负整数，别的值（没配、负数、小数）一律用默认值。 */
+function resolveMaxDeliveryRetries(ctx) {
+  const value = ctx.maxDeliveryRetries;
+  return Number.isInteger(value) && value >= 0 ? value : DEFAULT_MAX_DELIVERY_RETRIES;
 }
 
 /**
@@ -405,6 +420,7 @@ async function deliverTasks(ctx, tasks) {
   const masterKey = ctx.masterKey;
   const claimLeaseMs = resolveClaimLeaseMs(ctx);
   const staleAfterMs = resolveStaleAfterMs(ctx);
+  const maxDeliveryRetries = resolveMaxDeliveryRetries(ctx);
   const serializeBy = typeof ctx.serializeBy === 'function' ? ctx.serializeBy : null;
 
   // 心跳续租可用吗？三个条件：适配器支持占位、支持续租、宿主没显式关掉。
@@ -431,6 +447,7 @@ async function deliverTasks(ctx, tasks) {
     staleTasks: [],
     cancelledTasks: [],
     reasoningSkippedTasks: [],
+    redeliveredTasks: [],
     failedTasks: []
   };
 
@@ -785,7 +802,8 @@ async function deliverTasks(ctx, tasks) {
   }
 
   /**
-   * 投递失败的处置。重试没用完时安排退避重试；用完时一次性任务标 'failed'
+   * 投递失败的处置。重试（maxDeliveryRetries 次，默认 3）没用完时安排退避重
+   * 试；用完时一次性任务标 'failed'
    * 终态，循环任务只作废本次 occurrence（推进到下个周期、重试归零）——循环
    * 任务永远不进终态，一次雷暴不该让每日消息从此消失。
    *
@@ -814,7 +832,7 @@ async function deliverTasks(ctx, tasks) {
     // 不写出去的话下游只知道「失败了」，不知道该让用户重建订阅还是裁短内容。
     const errorExtra = buildErrorExtra(errorCode, pushStatus);
     try {
-      if (permanent || task.retry_count >= 3) {
+      if (permanent || task.retry_count >= maxDeliveryRetries) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
         if (isRecurringType(recurrenceType)) {
           const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
@@ -1067,7 +1085,10 @@ async function deliverTasks(ctx, tasks) {
           isTaskCancelled: () => lease.lost,
         },
         masterKey,
-        { userKey, payload: decryptedPayload }
+        { userKey, payload: decryptedPayload },
+        // 重试计数就记在这一列上：大于 0 说明这是同一次触发的重试，内容已经落
+        // 进 outbox 的话只补推送、不再生成（见 redeliverCommittedBatch）。
+        { resumeCommittedBatch: (task.retry_count || 0) > 0 }
       );
     } catch (error) {
       if (lease.lost) {
@@ -1098,6 +1119,12 @@ async function deliverTasks(ctx, tasks) {
         { errorCode: sendResult.errorCode || null, permanent: sendResult.permanent === true, pushStatus: sendResult.pushStatusCode }
       );
       return;
+    }
+
+    // 这一跳没有生成，只把上一跳已经落定的那批补推了一遍。记下来，汇总里才分得
+    // 清「重试成功」到底是补推成功还是重新生成成功。
+    if (sendResult.redelivered) {
+      results.redeliveredTasks.push({ taskId: task.id, pushedCount: sendResult.pushedCount || 0 });
     }
 
     // 正文送到了，只有那条思考过程没发出去（超限、被推送服务拒收……）。这条任务
@@ -1220,6 +1247,10 @@ async function deliverTasks(ctx, tasks) {
       // 正文送到了、只有思考过程没发出去的任务（{ taskId, reason }）。这些任务
       // 照常计入 successCount——列在这里只是让「这次没有思考过程」看得见。
       reasoningSkippedTasks: results.reasoningSkippedTasks,
+      // 重试那一跳只补推送、没有重新生成的任务（{ taskId, pushedCount }）：上一跳
+      // 内容已经落进 outbox，只是推送没发完。照常计入 successCount。
+      // pushedCount 为 0 说明剩下的段客户端已经补收并 ack 了，这一跳什么都不用推。
+      redeliveredTasks: results.redeliveredTasks,
       failedTasks: results.failedTasks
     }
   };

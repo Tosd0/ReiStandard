@@ -61,6 +61,10 @@ const EXPECTED_FEATURES = [
   'client-state-delete-namespace',
   'llm-credentials-delete-prefix',
   'outbox-delete',
+  'llm-permanent-errors',
+  'redeliver-committed-batch',
+  'hook-usage-total',
+  'max-delivery-retries',
 ];
 
 function makeWorker(extra = {}) {

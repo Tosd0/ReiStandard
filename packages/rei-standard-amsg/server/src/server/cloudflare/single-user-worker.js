@@ -65,6 +65,9 @@
  * `serializeBy`；一次 fire 无论什么结局都想收到回执，就配 `onFireSettled`。
  * 两个都不配时行为与以前完全一致。
  *
+ * 投递失败默认再重试 3 次（退避 2 / 4 / 6 分钟），`maxDeliveryRetries` 可以调低
+ * （0 = 第一次失败就终审）。内容已经落进收件箱的，重试只补推送、不重新生成。
+ *
  * 页面那边给 `installReiSW` 传了 `multipart`（分片重组的限额）的话，同一份原样
  * 传进这里的 config：一条 push 装不下的思考过程要切片发，切多大、最多几片、重组
  * 窗口多长由接收端说了算，发送端不知道就会发出一批对面收不了的分片。
@@ -311,14 +314,19 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       //（action 'fast_forwarded'）都会调（凭据字段不透传；best-effort，
       // 见 lib/run-tick.js）。
       onStaleSkip: cfg.onStaleSkip,
-      // 推送发出（或发挂）之后的 hook：{ task, sentCount, total, error,
-      // scratch, readState, writeState }（best-effort，见 lib/agentic-fire.js）。
+      // 推送发出（或发挂）之后的 hook：{ task, sentCount, pushedCount, total,
+      // error, usage, usageTotal, llmCalls, outboxed, scratch, readState,
+      // writeState }（best-effort，见 lib/agentic-fire.js）。
       onAfterSend: cfg.onAfterSend,
-      // 一次 fire 收尾的 hook：{ task, status, skipReason, sentCount, total,
-      // iterations, error, scratch, readState, writeState }。发完 / 跳过 /
+      // 一次 fire 收尾的 hook：{ task, status, skipReason, sentCount,
+      // pushedCount, total, iterations, error, metadata, usage, usageTotal,
+      // llmCalls, outboxed, scratch, readState, writeState }。发完 / 跳过 /
       // 抛错都会调，宿主用它做「开始时占点什么、结束时放掉」那类收尾
       //（best-effort，见 lib/agentic-fire.js）。
       onFireSettled: cfg.onFireSettled,
+      // 一次触发投递失败后最多再重试几次（默认 3，0 = 第一次失败就终审；见
+      // lib/run-tick.js 的 DEFAULT_MAX_DELIVERY_RETRIES）。
+      maxDeliveryRetries: cfg.maxDeliveryRetries,
       // 分组串行：(task) => 分组标识 | null。同一分组的任务同时只跑一条，
       // 跨跳也算（见 lib/run-tick.js）。不配 = 全并发，与以前一致。
       serializeBy: cfg.serializeBy,
