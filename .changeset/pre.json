@@ -75,6 +75,7 @@
     "amsg-server-schedule-immediate-supersede",
     "amsg-server-settle-metadata-usage-exports",
     "amsg-server-single-user-cloudflare",
+    "amsg-server-spend-guards",
     "amsg-server-stale-guard-after-send",
     "amsg-server-task-lifecycle",
     "amsg-server-tick-claim",
