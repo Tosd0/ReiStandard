@@ -736,3 +736,53 @@ test('multipart: 墓碑写失败后，重投的旧分片不能把已交付的消
   assert.equal(notifications.length, 1, '通知也只该弹第一次那一条');
   assert.deepEqual(expiredEvents(postedMessages), [], '交付过的消息更不能被报成丢了');
 });
+
+test('multipart: 墓碑写失败也不能把放弃的原因盖成「存储故障」', async () => {
+  const { sw, notifications, postedMessages, triggerPush } = createSwMock();
+  const business = install(sw);
+
+  const original = { messageKind: 'content', messageId: 'msg_mp_conflict_done_failed', message: 'x'.repeat(300) };
+  const wide = buildMultipartPayloads(original, { id: 'mp_conflict_done_failed', maxChunkBytes: 120 });
+  const narrow = buildMultipartPayloads(original, { id: 'mp_conflict_done_failed', maxChunkBytes: 40 });
+  assert.notEqual(wide.length, narrow.length, '同一个 id 要有两份不同的 total 才谈得上冲突');
+
+  await triggerPush(wide[0]);
+  assert.equal(postedMessages.length, 0, '第一片正常落库，什么都不该广播');
+
+  // 第二片自相矛盾，走「放弃这条 id」那条路；同时把收尾的第一步（写 done 墓碑）
+  // 打断。页面要的是「发送端发了冲突分片」这个诊断，不能因为收尾那笔写顺带挂了
+  // 就被改写成笼统的存储故障。
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  const restore = breakDoneStoreWrites(conn);
+  let lines;
+  try {
+    ({ lines } = await captureErrors(() => triggerPush(narrow[1])));
+  } finally {
+    restore();
+  }
+
+  assert.equal(notifications.length, 0);
+  assert.equal(business.length, 0);
+  assert.ok(
+    lines.some((line) => line.includes('multipart chunks disagree on total/encoding')),
+    `冲突本身要留下能归因的日志：${JSON.stringify(lines)}`,
+  );
+  // 这条测试要的就是「收尾那笔写挂掉」，没打断到的话下面全是假阳性。
+  assert.ok(
+    lines.some((line) => line.includes('quota exceeded')),
+    `没打断到 done 墓碑那笔写，这条测试白测了：${JSON.stringify(lines)}`,
+  );
+
+  const expired = expiredEvents(postedMessages);
+  assert.equal(expired.length, 1, '收尾失败不能让页面收到两条 MULTIPART_EXPIRED');
+  assert.equal(expired[0].id, 'mp_conflict_done_failed');
+  assert.equal(
+    expired[0].reason, 'chunk-conflict',
+    '报的得是这条路本来的原因，不是外层兜底的 storage-failed',
+  );
+
+  assert.ok(
+    lines.some((line) => line.includes('multipart cleanup while giving up (chunk-conflict) failed')),
+    `收尾挂掉这件事本身不能被吞掉，得留下能归因的日志：${JSON.stringify(lines)}`,
+  );
+});
