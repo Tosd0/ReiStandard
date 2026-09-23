@@ -555,6 +555,39 @@ describe('推送 5xx 一次后恢复：重试只补推送，不重新生成', ()
     assert.equal(llm.calls.length, 1);
     assert.deepEqual(webpush.received.map((p) => p.message), ['甲1。', '乙1。']);
   });
+
+  test('用户在重试窗口里改了任务：补推那一跳照样只补推送', async () => {
+    const adapter = await makeAdapter();
+    await seedTask(adapter, { uuid: 'edited', payload: LLM_PAYLOAD });
+    const webpush = scriptedWebpush([1]);   // 第一条推送 503，之后恢复
+    const ctx = tickCtx(adapter, webpush);
+    const llm = stubLlm();
+    try {
+      const first = await runScheduledTick(ctx);
+      assert.equal(first.failedCount, 1, '第一跳推送失败，这一批已经落进 outbox');
+
+      // 用户这时改了个跟投递无关的字段（联系人名字）。PUT /update-message 落到
+      // 行上的就是下面这几样：新密文 + 重试计数清零 + 退避放掉（见
+      // handlers/update-message.js）。计数清零是它该做的——修好 apiKey 的任务不
+      // 该背着旧账——但这次触发的内容已经落定了，不能因此重新生成一遍。
+      const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+      const edited = await encryptForStorage(
+        JSON.stringify({ recurrenceType: 'none', ...LLM_PAYLOAD, contactName: '改过的名字' }),
+        userKey
+      );
+      await adapter.updateTaskByUuid('edited', USER, edited, { retry_count: 0, retry_after: null });
+
+      const second = await runScheduledTick(ctx);
+      assert.equal(second.successCount, 1);
+      assert.equal(second.details.redeliveredTasks.length, 1);
+    } finally {
+      llm.restore();
+    }
+    assert.equal(llm.calls.length, 1, '改过任务也不该把这次触发重新生成一遍');
+    // 设备上只有第一次生成的那一份，不会冒出第二份内容。
+    assert.deepEqual(webpush.received.map((p) => p.message), ['甲1。', '乙1。']);
+    assert.equal((await outboxOf(adapter, 'edited')).length, 2, 'outbox 里只有这一批');
+  });
 });
 
 describe('没落进 outbox 的批次（没有收件箱 / 落行失败）', () => {

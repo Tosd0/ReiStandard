@@ -9,7 +9,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_MULTIPART_TTL_MS } from '@rei-standard/amsg-shared';
+import { buildMultipartPushPayloads, DEFAULT_MULTIPART_TTL_MS, MESSAGE_KIND } from '@rei-standard/amsg-shared';
 import { processSingleMessage } from '../src/server/lib/message-processor.js';
 import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from '../src/server/lib/webpush-webcrypto.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
@@ -178,6 +178,41 @@ describe('maxChunkBytes 的上限校验', () => {
     for (const { push } of chunks) {
       const { bytes, withinLimit } = measurePushPayload(JSON.stringify(push));
       assert.ok(withinLimit, `分片信封 ${bytes} 字节，超过单条 push 的 ${MAX_PUSH_PAYLOAD_BYTES} 字节上限`);
+    }
+  });
+
+  it('错误信息给出的最大值：每一种 messageKind 都装得下', async () => {
+    // 分片信封里原样带着原消息的 messageKind，名字越长信封越大。校验量开销用
+    // 的探针只有一种 kind，要是挑的不是最长的那个，照着错误信息里的最大值去配
+    // 的人，content / reasoning 的分片发得出去，tool_request 这类长名字的分片
+    // 每一片都超出上限、被推送服务整批拒收。
+    const { result } = await deliverWithClock({
+      reasoningChars: 20_000,
+      multipart: { maxChunkBytes: 3000 },
+    });
+    const maxAllowed = Number(/最大 (\d+)/.exec(result.error || '')?.[1]);
+    assert.ok(Number.isInteger(maxAllowed) && maxAllowed > 0, `错误信息里没读到最大值：${result.error}`);
+
+    // 切满 100 片，让 index / total 都占到 3 位数——分片默认最多 128 片，位数
+    // 正是校验按最坏情况预留的那部分，只切一片量不出真正的上限。
+    const CHUNKS = 100;
+    for (const kind of Object.values(MESSAGE_KIND)) {
+      const chunks = buildMultipartPushPayloads(
+        { messageKind: kind },
+        {
+          serializedPayload: 'x'.repeat(maxAllowed * CHUNKS),
+          maxChunkBytes: maxAllowed,
+          ttlMs: DEFAULT_MULTIPART_TTL_MS,
+        }
+      );
+      assert.equal(chunks.length, CHUNKS);
+      const worst = chunks[chunks.length - 1];
+      const { bytes, withinLimit } = measurePushPayload(JSON.stringify(worst));
+      assert.ok(
+        withinLimit,
+        `messageKind=${kind} 按放行的最大值 ${maxAllowed} 切出来的信封 ${bytes} 字节，`
+        + `超过单条 push 的 ${MAX_PUSH_PAYLOAD_BYTES} 字节上限`
+      );
     }
   });
 });

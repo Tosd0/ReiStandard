@@ -18,12 +18,9 @@
 //（mark 只认本 store 前缀、sweep 扫整张表，多前缀共表会互删活图）；GC 一轮进行中
 // 引用不得在面间搬家（mark 不是一致性快照，瞬间从所有面消失就会被误判孤儿）。
 
-import { extractRefs, parseIdTimestamp } from './token.js';
+import { extractRefs, isIdCharset, parseIdTimestamp } from './token.js';
 
 const DEFAULT_MIN_AGE_MS = 72 * 3600 * 1000;
-
-// 与 extractRefs 的 id 边界字符集保持一致（见 token.js）
-const ID_CHARSET = /^[A-Za-z0-9_]+$/;
 
 /**
  * @typedef {Object} GcOptions
@@ -98,7 +95,7 @@ export async function runGc({ adapter, prefix }, opts) {
   // 串行删除是刻意的——GC 是后台活儿，并行只会压满 IDB。
   for (const id of ids) {
     if (used.has(id)) { kept++; continue; }
-    if (!ID_CHARSET.test(id)) { kept++; continue; } // 安全阀 5：mark 不可能命中的 id，无引用不构成证据
+    if (!isIdCharset(id)) { kept++; continue; } // 安全阀 5：mark 不可能命中的 id，无引用不构成证据
     const ts = parseIdTimestamp(id, now);
     if (ts !== null && now - ts < minAgeMs) { kept++; continue; }
     // 安全阀 6：与某个在用 id 互为前缀 = 令牌边界出过事（复合键拼接 / 分块切开）的痕迹，不删。

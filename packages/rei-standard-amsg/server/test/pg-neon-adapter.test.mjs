@@ -222,6 +222,53 @@ async function d1TaskSelectColumns() {
   return taskSelectColumns(adapter, () => calls.at(-1).sql);
 }
 
+for (const backend of BACKENDS) {
+  test(`${backend.name}: updateTaskByUuid 改排期时带租约门，只改正文时不带`, async () => {
+    // 投递收尾会按它领取时看到的排期推进下一次，投递期间写进去的新时刻随后就被
+    // 盖掉。所以改排期这一下要在 SQL 里挡住（回 null 让调用方知道），正文这类
+    // 字段不挡——收尾本来就不覆盖它们。
+    const { adapter, calls } = backend.make(() => [{ uuid: 'u', updated_at: 'now' }]);
+
+    await adapter.updateTaskByUuid('u', 'user-1', 'cipher', { next_send_at: '2027-01-01T00:00:00.000Z' });
+    assert.match(
+      flat(calls.at(-1).text),
+      /lease_until IS NULL OR lease_until <= NOW\(\)/i,
+      '改排期必须带租约门'
+    );
+
+    await adapter.updateTaskByUuid('u', 'user-1', 'cipher', { retry_count: 0 });
+    assert.doesNotMatch(flat(calls.at(-1).text), /lease_until/i, '不改排期的写入不该被租约挡住');
+  });
+}
+
+for (const backend of BACKENDS) {
+  test(`${backend.name}: createTaskSuperseding 删旧 + 建新落在同一条语句里`, async () => {
+    // 分成两次查询的话，建新失败时旧任务已经删掉，接口却回失败——客户端以为旧
+    // 任务还在，其实已经没了。一条语句里的数据修改型 CTE 是一个隐式事务，
+    // INSERT 抛错时 DELETE 跟着回滚。
+    const { adapter, calls } = backend.make(() => [{
+      id: 5, uuid: 'new-uuid', next_send_at: '2026-01-01T00:00:00.000Z',
+      status: 'pending', created_at: '2026-01-01T00:00:00.000Z', superseded: true
+    }]);
+
+    const row = await adapter.createTaskSuperseding({
+      user_id: 'u-1',
+      uuid: 'new-uuid',
+      encrypted_payload: 'cipher',
+      next_send_at: '2026-01-01T00:00:00.000Z',
+      message_type: 'fixed'
+    }, 'old-uuid');
+
+    assert.equal(calls.length, 1, '删旧和建新必须在同一条语句里，不能各发一次');
+    const { text, params } = calls[0];
+    assert.match(flat(text), /DELETE FROM scheduled_messages/i);
+    assert.match(flat(text), /INSERT INTO scheduled_messages/i);
+    assert.deepEqual(params, ['u-1', 'new-uuid', 'cipher', '2026-01-01T00:00:00.000Z', 'fixed', 'old-uuid']);
+    assert.equal(row.superseded, true);
+    assert.equal(row.id, 5);
+  });
+}
+
 test('投递链路和读接口各自的列集，三个适配器逐字一致', async () => {
   const pg = recordingPg(countAwareRows);
   const neon = recordingNeon(countAwareRows);

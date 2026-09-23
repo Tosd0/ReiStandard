@@ -11,7 +11,7 @@ export {
   buildMultipartPushPayloads,
 } from '@rei-standard/amsg-shared';
 
-import { buildMultipartPushPayloads } from '@rei-standard/amsg-shared';
+import { buildMultipartPushPayloads, MESSAGE_KIND } from '@rei-standard/amsg-shared';
 
 // ─── maxChunkBytes 的上限校验 ──────────────────────────────────────────
 //
@@ -35,6 +35,14 @@ const MAX_PUSH_PAYLOAD_BYTES = WEB_PUSH_MAX_BODY_BYTES - WEB_PUSH_ENCRYPTION_OVE
 const PROBE_BYTE_ENCODER = new TextEncoder();
 
 /**
+ * 真实取值里最长的 messageKind。分片信封把原消息的 messageKind 原样写进
+ * `originalMessageKind`，所以信封开销的最坏情况由最长的那个取值决定；从 shared
+ * 的枚举里现取，以后加了更长的类型能自动跟上。
+ */
+const LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND)
+  .reduce((longest, kind) => (kind.length > longest.length ? kind : longest), '');
+
+/**
  * n 字节编成 base64url（不带 padding）后的字符数。
  *
  * @param {number} n
@@ -54,9 +62,9 @@ function base64UrlLength(n) {
  * 到每次投递才炸。
  *
  * 上限不写死成常量，而是现算：拿真实的 buildMultipartPushPayloads 造一片最小
- * 探针量出信封开销（id / createdAt 等定宽字段取的就是真实值），再把 index /
- * total 的位数按 maxChunks 补足到最坏情况——shared 那边信封格式变了，这里跟着
- * 变，不会留下一个过时的魔数。
+ * 探针量出信封开销（id / createdAt 等定宽字段取的就是真实值，messageKind 取真实
+ * 取值里最长的那个），再把 index / total 的位数按 maxChunks 补足到最坏情况——
+ * shared 那边信封格式变了，这里跟着变，不会留下一个过时的魔数。
  *
  * @param {{ maxChunkBytes: number, maxChunks: number, ttlMs: number }} resolved
  */
@@ -64,7 +72,7 @@ export function assertChunkBytesFitPushLimit({ maxChunkBytes, maxChunks, ttlMs }
   // 最小探针：3 字节原文 → base64url 后恰好 4 字符，信封开销 = 总长 - 4。
   const PROBE_CHUNK_BYTES = 3;
   const [probe] = buildMultipartPushPayloads(
-    { messageKind: 'reasoning' },
+    { messageKind: LONGEST_MESSAGE_KIND },
     { serializedPayload: 'x'.repeat(PROBE_CHUNK_BYTES), maxChunkBytes: PROBE_CHUNK_BYTES, ttlMs }
   );
   // index / total 在真实批次里最多到 maxChunks（探针里各只有 1 位）。

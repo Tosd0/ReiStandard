@@ -210,6 +210,50 @@ describe('schedule-message immediate / supersede', () => {
     assert.equal((await res2.json()).data.superseded, false);
   });
 
+  test('supersedesUuid：适配器没有原子形态时，建新失败也不能把旧任务白删', async () => {
+    // 自定义适配器（没实现 createTaskSuperseding）走两步退路。建新这一步撞了
+    // uuid，接口回 409 让客户端换个 uuid 重来——这时旧任务必须还在，客户端才有
+    // 东西可顶替。反过来「先删后建」的话，失败的请求会把旧任务顺手带走。
+    const d1 = createTestD1();
+    const worker = createSingleUserCloudflareWorker((env) => {
+      const base = createD1Adapter(env.DB);
+      return {
+        db: new Proxy(base, {
+          get(target, prop) {
+            if (prop === 'createTaskSuperseding') return undefined;
+            if (prop === 'createTask') {
+              return async () => { throw new Error('duplicate key value violates unique constraint'); };
+            }
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }),
+        masterKey: MASTER_KEY,
+        vapid: VAPID,
+        webpush: { async sendNotification() {} },
+      };
+    });
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const adapter = createD1Adapter(d1);
+    const oldUuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee77';
+    await seed(adapter, { uuid: oldUuid, nextSendAt: new Date(Date.now() + 3600_000).toISOString() });
+
+    const res = await worker.fetch(new Request('https://w.dev/schedule-message', {
+      method: 'POST', headers: ENC_HEADERS,
+      body: await encBody({
+        contactName: 'Rei', messageType: 'fixed', userMessage: 'v2',
+        firstSendTime: new Date(Date.now() + 3600_000).toISOString(),
+        uuid: '77777777-6666-4555-8444-333333333332',
+        supersedesUuid: oldUuid
+      })
+    }), env);
+
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.code, 'TASK_UUID_CONFLICT');
+    assert.ok(await adapter.getTaskByUuid(oldUuid, USER), '请求失败了，旧任务得还在');
+  });
+
   test('supersedesUuid 撞新任务自己的 uuid 被拒', async () => {
     const d1 = createTestD1();
     const worker = makeWorker();
@@ -443,6 +487,31 @@ describe('fire ctx cancelTask / renewTask', () => {
     const row = await adapter.getTaskByUuid(otherUuid, USER);
     assert.equal(row.next_send_at, newAt);
     assert.match(String(tooSoonError), /至少要比现在晚/);
+  });
+
+  test('renewTask 碰上正在投递的那条任务：报 in_flight，不假装改成功', async () => {
+    // 两条任务差不多同时到点，其中一条的 hook 去给另一条改期，而那一条此刻正被
+    // 一次投递占着（租约还没到期）。硬写进去的新时刻会被那次投递的收尾按它自己
+    // 领取时的排期盖掉，所以这里根本不写，直接如实回报。
+    const { adapter } = await freshAdapter();
+    const busyUuid = '31313131-4242-4535-8626-717171717171';
+    const busyAt = new Date(Date.now() + 3600_000).toISOString();
+    await seed(adapter, { uuid: busyUuid, nextSendAt: busyAt });
+    const busyRow = await adapter.getTaskByUuid(busyUuid, USER);
+    await adapter.updateTaskById(busyRow.id, { lease_until: new Date(Date.now() + 90_000).toISOString() });
+
+    const res = await fireCtxOf(adapter, async (ctx) => {
+      assert.deepEqual(
+        await ctx.renewTask(busyUuid, new Date(Date.now() + 2 * 3600_000).toISOString()),
+        { renewed: false, reason: 'in_flight' }
+      );
+    });
+    assert.equal(res.successCount, 1);
+    assert.equal(
+      (await adapter.getTaskByUuid(busyUuid, USER)).next_send_at,
+      busyAt,
+      '排期一个字都不该动'
+    );
   });
 });
 

@@ -1294,8 +1294,9 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
       '[rei-standard-amsg-sw] multipart reassembly window elapsed; giving up on this multipart id:',
       { id: existing.id, total: existing.total, receivedCount: existing.receivedCount }
     );
-    await settleMultipartId(existing, existing.total, options);
-    await dispatchMultipartExpired(sw, existing);
+    await giveUpMultipartId(
+      sw, existing, existing.total, options, MULTIPART_FAILURE_REASON.TTL_EXPIRED
+    );
     return null;
   }
 
@@ -1321,8 +1322,13 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
         incoming: { total: normalized.total, encoding: normalized.encoding },
       }
     );
-    await settleMultipartId(base, Math.max(base.total, normalized.total), options);
-    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.CHUNK_CONFLICT);
+    await giveUpMultipartId(
+      sw,
+      base,
+      Math.max(base.total, normalized.total),
+      options,
+      MULTIPART_FAILURE_REASON.CHUNK_CONFLICT
+    );
     return null;
   }
 
@@ -1344,8 +1350,9 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
         maxTotalBytes: options.maxTotalBytes,
       }
     );
-    await settleMultipartId(base, base.total, options);
-    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED);
+    await giveUpMultipartId(
+      sw, base, base.total, options, MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED
+    );
     return null;
   }
 
@@ -1370,8 +1377,9 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
       '[rei-standard-amsg-sw] multipart restore failed; giving up on this multipart id:',
       error
     );
-    await settleMultipartId(base, base.total, options);
-    await dispatchMultipartExpired(sw, base, MULTIPART_FAILURE_REASON.RESTORE_FAILED);
+    await giveUpMultipartId(
+      sw, base, base.total, options, MULTIPART_FAILURE_REASON.RESTORE_FAILED
+    );
     return null;
   }
 
@@ -1386,6 +1394,34 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
     );
   }
   return restored;
+}
+
+/**
+ * 中途放弃一条 multipart id 的统一出口：先收尾（见 {@link settleMultipartId}），
+ * 再按 `reason` 告诉页面这条为什么不用再等了。
+ *
+ * 收尾里的持久墓碑那笔写可能失败，这里把它按住不外抛：那时候「这个 id 已有结
+ * 论」已经记进了内存兜底表，后面的分片和推送服务的重投照样收不进来，缺的只是
+ * 墓碑那笔写。让错误往上冒的话，外层兜底（见 acceptMultipartChunkSafely）会接
+ * 手，把页面收到的原因改写成笼统的 STORAGE_FAILED —— 宿主拿这个原因做诊断，就
+ * 分不出到底是发送端一直发冲突分片、还是存储真的挂了。
+ *
+ * @param {ServiceWorkerGlobalScope} sw
+ * @param {{ id: string, total?: number, ttlMs?: number }} record
+ * @param {number} total - 要清掉的分片数（冲突时取两边的较大值，别漏删）
+ * @param {{ ttlMs: number }} options
+ * @param {string} reason - {@link MULTIPART_FAILURE_REASON} 之一，走到这一步的那条路。
+ */
+async function giveUpMultipartId(sw, record, total, options, reason) {
+  try {
+    await settleMultipartId(record, total, options);
+  } catch (error) {
+    console.error(
+      `[rei-standard-amsg-sw] multipart cleanup while giving up (${reason}) failed:`,
+      error
+    );
+  }
+  await dispatchMultipartExpired(sw, record, reason);
 }
 
 /**
@@ -1404,8 +1440,10 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
  * 墓碑比重组窗口活得久（两倍），推送服务重投旧分片时也不会再触发一次业务事件。
  *
  * 持久墓碑本身写失败时，同样的结论会先落进内存兜底表（见
- * {@link memoryFallbackMultipartDone}）再把错误往上抛：调用方各自的失败处理不变，
- * 但「已有结论」这件事在 SW 存活期内不丢。
+ * {@link memoryFallbackMultipartDone}）再把错误往上抛：「已有结论」这件事在 SW
+ * 存活期内不丢，剩下的交给调用方决定。现在的两个调用方都是把错误按住、只留一
+ * 条日志——还原成功那条照常把消息交付出去，放弃那条照常广播自己的原因（见
+ * {@link giveUpMultipartId}）。
  *
  * @param {{ id: string, ttlMs?: number }} record
  * @param {number} total - 要清掉的分片数（冲突时取两边的较大值，别漏删）

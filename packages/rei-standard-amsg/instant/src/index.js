@@ -936,11 +936,34 @@ function isVapidConfigValid(vapid) {
 }
 
 /**
+ * X-Client-Token 校验的唯一实现：presence 检查 + 常时比较。
+ *
+ * handler 内部（verifyClientToken）和导出给宿主的 validateClientAuth 都走这里，
+ * 两条路径的 401 响应体因此不会各自漂。期望值收的是编码好的字节，handler 在
+ * 启动时编一次就够，不用每个请求再编一遍。
+ *
+ * @param {Request} request
+ * @param {Uint8Array} expectedBytes - 期望的 token，UTF-8 字节
+ * @returns {Object | null} 校验不过返回 401 响应体，通过返回 null
+ */
+function checkClientToken(request, expectedBytes) {
+  const received = getHeader(request, 'x-client-token');
+  if (!received) {
+    return { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' } };
+  }
+  if (!timingSafeEqualBytes(utf8(received), expectedBytes)) {
+    return { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' } };
+  }
+  return null;
+}
+
+/**
  * X-Client-Token 的独立校验口（导出）。
  *
- * createInstantHandler 内部走的就是这一套（presence 检查 + 常时比较）。导出
- * 是给「在同一个 worker 里挂自己路由」的宿主用的：那些路由的鉴权语义应该和
- * 本 handler 完全一致，宿主此前只能照抄内部实现——抄的那份不会跟着上游修。
+ * createInstantHandler 内部走的就是这一套（presence 检查 + 常时比较），两边共用
+ * 同一份 checkClientToken。导出是给「在同一个 worker 里挂自己路由」的宿主用的：
+ * 那些路由的鉴权语义应该和本 handler 完全一致，宿主此前只能照抄内部实现——抄的
+ * 那份不会跟着上游修。
  *
  * @param {Request} request
  * @param {string} expectedToken - 部署配置里的共享密钥（AMSG_CLIENT_TOKEN）
@@ -952,40 +975,13 @@ function isVapidConfigValid(vapid) {
 export function validateClientAuth(request, expectedToken) {
   const expected = expectedToken ? String(expectedToken) : '';
   if (!expected) return { ok: true };
-  const received = getHeader(request, 'x-client-token');
-  if (!received) {
-    return {
-      ok: false,
-      status: 401,
-      body: { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' } }
-    };
-  }
-  if (!timingSafeEqualBytes(utf8(received), utf8(expected))) {
-    return {
-      ok: false,
-      status: 401,
-      body: { success: false, error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' } }
-    };
-  }
-  return { ok: true };
+  const failureBody = checkClientToken(request, utf8(expected));
+  return failureBody ? { ok: false, status: 401, body: failureBody } : { ok: true };
 }
 
 function verifyClientToken(request, expectedBytes, respond) {
-  const received = getHeader(request, 'x-client-token');
-  if (!received) {
-    return respond(401, {
-      success: false,
-      error: { code: 'INVALID_CLIENT_TOKEN', message: '缺少 X-Client-Token' }
-    });
-  }
-  const receivedBytes = utf8(received);
-  if (!timingSafeEqualBytes(receivedBytes, expectedBytes)) {
-    return respond(401, {
-      success: false,
-      error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token 无效' }
-    });
-  }
-  return null;
+  const failureBody = checkClientToken(request, expectedBytes);
+  return failureBody ? respond(401, failureBody) : null;
 }
 
 async function verifyBearerToken(request, signingKey, respond) {

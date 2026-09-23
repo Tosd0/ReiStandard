@@ -28,6 +28,7 @@ import {
   buildReasoningPush,
   readReasoningContent,
   stripReasoningTags,
+  MESSAGE_KIND,
   DEFAULT_MULTIPART_CHUNK_BYTES,
   DEFAULT_MULTIPART_MAX_CHUNKS,
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
@@ -286,7 +287,7 @@ function assertChunkBytesFitPushLimit({ maxChunkBytes, maxChunks, ttlMs }) {
   // 最小探针：3 字节原文 → base64url 后恰好 4 字符，信封开销 = 总长 - 4。
   const PROBE_CHUNK_BYTES = 3;
   const [probe] = buildMultipartPushPayloads(
-    { messageKind: 'reasoning' },
+    { messageKind: longestMessageKind() },
     { serializedPayload: 'x'.repeat(PROBE_CHUNK_BYTES), maxChunkBytes: PROBE_CHUNK_BYTES, ttlMs }
   );
   // index / total 在真实批次里最多到 maxChunks（探针里各只有 1 位）。
@@ -317,6 +318,17 @@ function assertChunkBytesFitPushLimit({ maxChunkBytes, maxChunks, ttlMs }) {
  */
 function base64UrlLength(n) {
   return Math.ceil(n * 4 / 3);
+}
+
+/**
+ * 取值最长的那个 messageKind。分片信封里原样带着原消息的 kind，探针得按最长的
+ * 那个量，否则 kind 短的类型量出来的开销偏小，把 maxChunkBytes 配在上限边上时
+ * 只有长 kind 的那几类会被推送服务整批拒收。
+ *
+ * @returns {string}
+ */
+function longestMessageKind() {
+  return Object.values(MESSAGE_KIND).reduce((a, b) => (b.length > a.length ? b : a));
 }
 
 /**
@@ -409,23 +421,18 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
 /**
  * Process a single database task row: decrypt → generate content → push.
  *
- * 重试同一次触发时（`options.resumeCommittedBatch`），先看这次触发的整批是不是
- * 已经落进了 outbox：落进去了就只补推送、不再生成（见 redeliverCommittedBatch），
- * 返回值带 `redelivered: true`。
+ * 每次投递都先看这次触发的整批是不是已经落进了 outbox：落进去了就只补推送、
+ * 不再生成（见 redeliverCommittedBatch），返回值带 `redelivered: true`。
  *
  * @param {import('../adapters/interface.js').TaskRow} task
  * @param {ProcessorContext} ctx
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @param {{ resumeCommittedBatch?: boolean }} [options] - resumeCommittedBatch：这
- *   一跳是不是同一次触发的重试（是才去 outbox 里找落定的批次，首次触发不多花这
- *   次查询）。不传时按 `task.retry_count > 0` 判断——定时任务的重试计数就记在
- *   这一列上；processMessagesByUuid 的请求内重试不改这一列，由它显式传。
  * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean }>}
  *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
  */
-export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null, options = {}) {
+export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
@@ -437,21 +444,22 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     const decryptedPayload = (predecrypted && predecrypted.payload)
       || JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
-    // 同一次触发的重试：内容已经落定的话只补推送。放在所有生成路径（agentic 与
-    // 冻结 prompt）之前，两条路落进 outbox 的批次都认。
-    const resumeCommittedBatch = options && typeof options.resumeCommittedBatch === 'boolean'
-      ? options.resumeCommittedBatch
-      : (task.retry_count || 0) > 0;
-    if (resumeCommittedBatch) {
-      const committed = await findCommittedBatch({
-        db: ctx.db,
-        userId: task.user_id,
-        userKey,
-        taskUuid: task.uuid,
-        occurrenceMs: occurrenceMsOf(task),
-      });
-      if (committed) return await redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, committed);
-    }
+    // 内容已经落定的话只补推送。放在所有生成路径（agentic 与冻结 prompt）之前，
+    // 两条路落进 outbox 的批次都认。
+    //
+    // 每次投递都查，不按「这是不是重试」预判：重试计数会被 PUT /update-message
+    // 和 renewTask 清零（那是它们该做的——修好 apiKey 的任务不该背着旧账），一
+    // 旦拿它当「这次触发已经有内容了」的标记，用户在重试窗口里改一下任务，这次
+    // 触发就会重新生成一整条，旧那批还躺在 outbox 里等客户端收，同一时刻冒出两
+    // 份内容，LLM 的钱也白花一次。首次触发这一查是空的，多一次索引查询而已。
+    const committed = await findCommittedBatch({
+      db: ctx.db,
+      userId: task.user_id,
+      userKey,
+      taskUuid: task.uuid,
+      occurrenceMs: occurrenceMsOf(task),
+    });
+    if (committed) return await redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, committed);
 
     // Fire-time hooks: when the host configured onBeforeFire and the task
     // needs the LLM, offer the agentic path first. onBeforeFire → null
@@ -739,12 +747,9 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       return { success: false, error: { code: 'TASK_NOT_FOUND', message: '任务不存在或已处理' } };
     }
 
-    // 请求内的重试不动任务行的 retry_count，「这是不是同一次触发的重试」得由这
-    // 里显式告诉 processSingleMessage：上一轮生成成功、只是推送失败的话，这一轮
-    // 只补推送，不再把 LLM 跑一遍。
-    const result = await processSingleMessage(task, ctx, masterKey, null, {
-      resumeCommittedBatch: retryCount > 0 || (task.retry_count || 0) > 0,
-    });
+    // 上一轮生成成功、只是推送失败的话，processSingleMessage 会认出这次触发已
+    // 经落定的批次，这一轮只补推送、不再把 LLM 跑一遍。
+    const result = await processSingleMessage(task, ctx, masterKey, null);
 
     if (!result.success) {
       // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮

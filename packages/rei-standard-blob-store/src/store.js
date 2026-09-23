@@ -2,15 +2,10 @@
 // 本模块完全不碰 IndexedDB。错误哲学：读失败 null、删失败吞、put 失败上抛
 //（调用方必须知道图没存进去）、迁移失败回退原串。
 
-import { DEFAULT_PREFIX, genId } from './token.js';
+import { DEFAULT_PREFIX, genId, isIdCharset } from './token.js';
 import { dataUrlToBlob, blobToDataUrl } from './dataurl.js';
 import { runGc } from './gc.js';
 import { runContentScan } from './content-scan.js';
-
-// 与 extractRefs 的 id 边界字符集保持一致（见 token.js；gc.js 的 ID_CHARSET 同源）。
-// restore 按它拒收字符集外的 id：这类 id 一旦写入，extractRefs 在引用面上提不全它、
-// GC 只能靠安全阀永久豁免，等于制造永不可回收的存量。
-const ID_CHARSET = /^[A-Za-z0-9_]+$/;
 
 /**
  * @typedef {Object} StorageAdapter
@@ -64,14 +59,16 @@ export function createBlobStore(options) {
      * @param {Blob} blob
      * @returns {Promise<void>}
      * @throws {TypeError} token 不是本 store 的令牌、id 为空或含字符集外字符——这是编程/
-     *   数据错误，吵着抛（字符集外的 id 会成为 GC 永不可回收的存量，见 ID_CHARSET 注释）；
+     *   数据错误，吵着抛（字符集外的 id 会成为 GC 永不可回收的存量，见 token.js 的 isIdCharset）；
      *   blob 的鸭子判定与 put 相同，拒收非 Blob。
      */
     async restore(token, blob) {
       if (!isRef(token)) {
         throw new TypeError(`restore: 需要本 store 前缀的令牌（形如 ${prefix}<id>）`);
       }
-      if (!ID_CHARSET.test(idOf(token))) {
+      // 字符集外的 id 一旦写进去，extractRefs 在引用面上提不全它、GC 只能靠安全阀永久豁免，
+      // 等于亲手制造永不可回收的存量，所以在入口拦掉。
+      if (!isIdCharset(idOf(token))) {
         throw new TypeError('restore: 令牌 id 须非空且完整落在 [A-Za-z0-9_] 内——字符集外的 id 引用提取不全、GC 永不能回收');
       }
       if (!blob || typeof blob.arrayBuffer !== 'function' || typeof blob.slice !== 'function') {

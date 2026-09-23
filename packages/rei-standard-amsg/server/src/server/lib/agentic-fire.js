@@ -660,8 +660,11 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    * @param {string} uuid
    * @param {string} nextSendAt - ISO 8601
    * @returns {Promise<{ renewed: true, uuid: string, nextSendAt: string }
-   *   | { renewed: false, reason: 'not_found' }>} not_found = 行不存在或已不是
-   *   pending（宿主自己决定要不要转头 scheduleTask 一条新的）。
+   *   | { renewed: false, reason: 'not_found' | 'in_flight' }>}
+   *   not_found = 行不存在或已不是 pending（宿主自己决定要不要转头 scheduleTask
+   *   一条新的）；in_flight = 那条任务此刻正被一次投递占着，排期没改动——它正要
+   *   发出去，收尾会按自己那份排期推进，硬改进去也留不住。宿主想推迟的那次已经
+   *   在路上了，通常没什么好补救的；真要顺延下一次，等这次发完再调一遍。
    */
   const renewTask = async (uuid, nextSendAt) => {
     if (typeof uuid !== 'string' || !uuid.trim()) {
@@ -702,7 +705,11 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       retry_count: 0,
       ...(typeof ctx.db.claimTask === 'function' ? { retry_after: null } : {}),
     });
-    if (!updated) return { renewed: false, reason: 'not_found' };
+    if (!updated) {
+      // 行还在、还是 pending 的话，改不动的原因是它正被一次投递占着。
+      const stillPending = await ctx.db.getTaskByUuid(uuid, task.user_id);
+      return { renewed: false, reason: stillPending ? 'in_flight' : 'not_found' };
+    }
     return { renewed: true, uuid, nextSendAt: nextSendAtIso };
   };
 

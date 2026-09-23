@@ -1,11 +1,15 @@
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { MESSAGE_KIND } from '@rei-standard/amsg-shared';
+
 import {
   createInstantHandler,
   sendPushWithMaybeBlob,
   validateInstantPayload,
+  validateClientAuth,
 } from '../src/index.js';
+import { assertChunkBytesFitPushLimit, buildMultipartPushPayloads } from '../src/multipart.js';
 import {
   generateTestVapid,
   generateTestSubscription,
@@ -513,6 +517,42 @@ describe('createInstantHandler — clientToken', () => {
     assert.equal(doneReceived, true);
     await waitForPushCalls(router, 1);
   });
+
+  // 导出 validateClientAuth 是为了让宿主的鉴权跟着上游一起改，所以它和 handler
+  // 内部那条路径必须给出一模一样的 401 —— 谁单独改了都算回归。
+  it('validateClientAuth 与 handler 内部路径给出同一个 401 响应体', async () => {
+    const clientToken = 'shared-secret-xyz';
+    const handler = createInstantHandler({ vapid, clientToken });
+
+    for (const { name, headers } of [
+      { name: '缺头', headers: {} },
+      { name: '头不匹配', headers: { 'x-client-token': 'wrong-token' } },
+    ]) {
+      const handlerRes = await handler(makeRequest({ body: makeValidPayload(), headers }));
+      assert.equal(handlerRes.status, 401, name);
+      const handlerBody = await handlerRes.json();
+
+      const exported = validateClientAuth(makeRequest({ body: makeValidPayload(), headers }), clientToken);
+      assert.equal(exported.ok, false, name);
+      assert.equal(exported.status, handlerRes.status, name);
+      assert.deepEqual(exported.body, handlerBody, `${name}：两条路径的 401 响应体必须完全一致`);
+    }
+  });
+
+  it('validateClientAuth 没配共享密钥时一律放行（与 handler 的开放模式一致）', () => {
+    const request = makeRequest({ body: makeValidPayload() });
+    for (const expected of [undefined, null, '']) {
+      assert.deepEqual(validateClientAuth(request, expected), { ok: true });
+    }
+    // 配了密钥 + 头匹配也放行，且不返回多余字段。
+    assert.deepEqual(
+      validateClientAuth(
+        makeRequest({ body: makeValidPayload(), headers: { 'x-client-token': 'shared-secret-xyz' } }),
+        'shared-secret-xyz'
+      ),
+      { ok: true }
+    );
+  });
 });
 
 // ─── Handler: happy path & push delivery ──────────────────────────────
@@ -678,6 +718,46 @@ describe('createInstantHandler — multipart.maxChunkBytes 上限', () => {
     createInstantHandler({ vapid });
     createInstantHandler({ vapid, multipart: { maxChunkBytes: 1800 } });
     createInstantHandler({ vapid, multipart: { maxChunkBytes: 900, maxChunks: 32, ttlMs: 120_000 } });
+  });
+
+  it('校验放行的最大值：最长 messageKind 切出来的分片信封仍在单条 push 明文上限内', () => {
+    // 推送服务限的是加密后 body 4096 字节，aes128gcm 固定开销 103 字节，明文
+    // 只剩 3993 字节（推导见 src/multipart.js）。校验放行一个值，就等于对部署
+    // 承诺「这个值切出来的每一片都发得出去」——对最长的 messageKind 也得成立。
+    const MAX_PUSH_PAYLOAD_BYTES = 4096 - 103;
+    const maxChunks = 10;
+    const ttlMs = 60_000;
+
+    // 当前配置下的最大值由校验自己说了算：故意配超，从报错里读出来。
+    let thrown;
+    try {
+      assertChunkBytesFitPushLimit({ maxChunkBytes: MAX_PUSH_PAYLOAD_BYTES, maxChunks, ttlMs });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, '配到明文上限必然超限');
+    const maxAllowed = Number(thrown.message.match(/最大 (\d+)/)[1]);
+    assert.ok(Number.isInteger(maxAllowed) && maxAllowed > 0);
+    assertChunkBytesFitPushLimit({ maxChunkBytes: maxAllowed, maxChunks, ttlMs });
+
+    // 最坏的一片：originalMessageKind 取最长的取值，index / total 都满位。
+    const longestKind = Object.values(MESSAGE_KIND)
+      .reduce((longest, kind) => (kind.length > longest.length ? kind : longest), '');
+    const parts = buildMultipartPushPayloads(
+      { messageKind: longestKind },
+      { serializedPayload: 'x'.repeat(maxAllowed * maxChunks), maxChunkBytes: maxAllowed, ttlMs }
+    );
+    assert.equal(parts.length, maxChunks, 'index / total 要真的走到 maxChunks 的位数');
+
+    const encoder = new TextEncoder();
+    for (const part of parts) {
+      const envelopeBytes = encoder.encode(JSON.stringify(part)).byteLength;
+      assert.ok(
+        envelopeBytes <= MAX_PUSH_PAYLOAD_BYTES,
+        `messageKind=${longestKind} 第 ${part.multipart.index} 片信封 ${envelopeBytes} 字节，`
+        + `超过单条 push 明文上限 ${MAX_PUSH_PAYLOAD_BYTES} 字节`
+      );
+    }
   });
 
   it('直接调 sendPushWithMaybeBlob（自己攒 ctx）同样被拦下，一片都不发出', async () => {
