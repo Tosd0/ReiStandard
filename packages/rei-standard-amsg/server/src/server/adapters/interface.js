@@ -189,8 +189,10 @@
  *   它把「为什么失败」透给已失败的行；不实现时退回 getTaskStatus（409 里就
  *   没有 lastError）。
  * @property {(params: InsertTaskParams, supersedesUuid: string) => Promise<TaskRow & { superseded: boolean }>} [createTaskSuperseding]
- *   （可选）建新任务的同一事务里取消旧的那条（POST /schedule-message 的
- *   supersedesUuid）。不实现时 handler 退回「先删再建」两步（失去原子性）。
+ *   （可选）建新任务的同时取消旧的那条，两件事一起成败（POST /schedule-message
+ *   的 supersedesUuid）。内置的 D1 / pg / neon 都实现了。不实现时 handler 退回
+ *   两步：先建新、后删旧——删旧失败最坏是两条都留着，客户端重试一次就能收拾，
+ *   而反过来（先删后建）建新失败就把旧任务白删了，找不回来。
  * @property {(userId: string, rows: Array<Object>) => Promise<number>} [appendOutboxMessages]
  *   （可选；单用户/D1）push 发送前把整批落进 message_outbox（密文 payload），
  *   (user_id, message_id) 冲突时更新未 ack 的行、不动已 ack 的。

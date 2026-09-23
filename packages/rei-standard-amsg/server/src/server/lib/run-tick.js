@@ -1085,10 +1085,7 @@ async function deliverTasks(ctx, tasks) {
           isTaskCancelled: () => lease.lost,
         },
         masterKey,
-        { userKey, payload: decryptedPayload },
-        // 重试计数就记在这一列上：大于 0 说明这是同一次触发的重试，内容已经落
-        // 进 outbox 的话只补推送、不再生成（见 redeliverCommittedBatch）。
-        { resumeCommittedBatch: (task.retry_count || 0) > 0 }
+        { userKey, payload: decryptedPayload }
       );
     } catch (error) {
       if (lease.lost) {

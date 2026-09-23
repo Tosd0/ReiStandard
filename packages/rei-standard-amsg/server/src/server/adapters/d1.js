@@ -384,6 +384,15 @@ export class D1Adapter {
     return this._db.prepare('SELECT * FROM scheduled_messages WHERE id = ?').bind(taskId).first();
   }
 
+  /**
+   * 按 uuid 改一条 pending 任务（PUT /update-message、fire hook 的 renewTask）。
+   *
+   * 改排期（extraFields 里带 next_send_at）时多一道租约门：这条任务正被一次投递
+   * 占着的话不改，返回 null。投递收尾会按自己领取时看到的排期推进下一次（一次性
+   * 任务干脆标成已发送），这期间写进去的新时刻随后就被盖掉，接口却已经回了成功
+   * ——用户以为改期生效了，实际什么都没留下。正文这类字段不受这道门约束：它们
+   * 只影响以后的触发，收尾那边本来就不会覆盖（见 run-tick 的收尾守卫）。
+   */
   async updateTaskByUuid(uuid, userId, encryptedPayload, extraFields) {
     const now = this._now();
     const sets = ['encrypted_payload = ?', 'updated_at = ?'];
@@ -399,9 +408,15 @@ export class D1Adapter {
     }
     values.push(uuid, userId);
 
+    let leaseGate = '';
+    if (extraFields && Object.prototype.hasOwnProperty.call(extraFields, 'next_send_at')) {
+      leaseGate = ' AND (lease_until IS NULL OR lease_until <= ?)';
+      values.push(now);
+    }
+
     const res = await this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(', ')}
-       WHERE uuid = ? AND user_id = ? AND status = 'pending'`
+       WHERE uuid = ? AND user_id = ? AND status = 'pending'${leaseGate}`
     ).bind(...values).run();
 
     if (!res.meta.changes) return null;

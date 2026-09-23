@@ -114,6 +114,53 @@ export async function renewTaskLease(query, taskId, leaseUntil) {
 }
 
 /**
+ * 建新任务的同时把被顶替的旧任务删掉（POST /schedule-message 带
+ * supersedesUuid 时走这条）。
+ *
+ * 删旧和建新必须一起成败：分成两次查询的话，建新那步失败（uuid 撞了、连接
+ * 一时抖了）时旧任务已经删掉了，接口却回失败——客户端以为旧任务还在，实际
+ * 上它已经没了，没有任何办法找回来。
+ *
+ * 一条语句解决，不用显式事务：数据修改型 CTE 里的 DELETE 一定会执行到底，
+ * 而 INSERT 抛错时整条语句一起回滚（pg 与 neon 的 HTTP 驱动都是单语句一个
+ * 隐式事务，用法完全一致）。superseded 由 DELETE 到底删没删到行推出来。
+ *
+ * @param {PgQuery} query
+ * @param {{ user_id: string, uuid: string, encrypted_payload: string,
+ *   next_send_at: string|Date, message_type: string }} params - 新任务
+ * @param {string} supersedesUuid - 要顶替掉的旧任务 uuid（同一个用户名下）
+ * @returns {Promise<{ id: number, uuid: string, next_send_at: any, status: string,
+ *   created_at: any, superseded: boolean }|null>}
+ */
+export async function createTaskSuperseding(query, params, supersedesUuid) {
+  const rows = await query(
+    `WITH deleted AS (
+       DELETE FROM scheduled_messages
+        WHERE uuid = $6 AND user_id = $1
+       RETURNING id
+     ), inserted AS (
+       INSERT INTO scheduled_messages
+         (user_id, uuid, encrypted_payload, next_send_at, message_type, status, retry_count, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'pending', 0, NOW(), NOW())
+       RETURNING id, uuid, next_send_at, status, created_at
+     )
+     SELECT inserted.*, (SELECT count(*) FROM deleted) > 0 AS superseded
+       FROM inserted`,
+    [
+      params.user_id,
+      params.uuid,
+      params.encrypted_payload,
+      params.next_send_at,
+      params.message_type,
+      supersedesUuid,
+    ]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return { ...row, superseded: row.superseded === true };
+}
+
+/**
  * 状态 + 失败摘要（GET /message 用它把「为什么失败」透给已失败的行）。
  *
  * @param {PgQuery} query

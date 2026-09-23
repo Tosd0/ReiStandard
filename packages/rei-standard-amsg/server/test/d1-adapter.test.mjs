@@ -74,6 +74,32 @@ test('updateTaskByUuid updates only pending rows and returns {uuid, updated_at}'
   assert.equal(await adapter.updateTaskByUuid('missing', USER, 'enc2'), null);
 });
 
+test('updateTaskByUuid：任务正被投递占着时改不动排期，正文照改', async () => {
+  // 投递收尾会按自己领取时看到的排期推进下一次，这期间写进去的新时刻随后就被
+  // 盖掉——接口回了成功，用户的改期却什么也没留下。所以改排期这一下直接不做，
+  // 让调用方知道。正文只影响以后的触发，收尾不覆盖它，照常放行。
+  const { adapter, db } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'busy', next_send_at: '2026-01-01T00:00:00.000Z' }));
+  await adapter.updateTaskById(row.id, { lease_until: new Date(Date.now() + 90_000).toISOString() });
+
+  assert.equal(
+    await adapter.updateTaskByUuid('busy', USER, 'enc-new', { next_send_at: '2027-01-01T00:00:00.000Z' }),
+    null,
+    '正在投递时不接受改排期'
+  );
+  assert.equal(readRow(db, 'busy').next_send_at, '2026-01-01T00:00:00.000Z');
+
+  assert.ok(
+    await adapter.updateTaskByUuid('busy', USER, 'enc-content-only'),
+    '只改正文不受租约影响'
+  );
+
+  // 租约过期（投递那边没了）之后照常能改。
+  await adapter.updateTaskById(row.id, { lease_until: new Date(Date.now() - 1000).toISOString() });
+  assert.ok(await adapter.updateTaskByUuid('busy', USER, 'enc3', { next_send_at: '2027-01-01T00:00:00.000Z' }));
+  assert.equal(readRow(db, 'busy').next_send_at, '2027-01-01T00:00:00.000Z');
+});
+
 // lease_until 是占位用的内部列，适配器的取任务方法不返回它，测试直接读行。
 function readRow(db, uuid) {
   return db._raw.prepare('SELECT next_send_at, lease_until FROM scheduled_messages WHERE uuid = ?').get(uuid);

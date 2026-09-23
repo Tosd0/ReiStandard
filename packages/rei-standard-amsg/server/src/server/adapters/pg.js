@@ -130,6 +130,11 @@ export class PgAdapter {
     return rows[0] || null;
   }
 
+  // 建新任务 + 删掉被顶替的旧任务，一条语句一起成败（SQL 与语义见 pg-shared.js）。
+  async createTaskSuperseding(params, supersedesUuid) {
+    return pgShared.createTaskSuperseding((text, args) => this._query(text, args), params, supersedesUuid);
+  }
+
   async getTaskByUuid(uuid, userId) {
     const rows = await this._query(
       `SELECT ${TASK_DETAIL_COLUMNS}
@@ -191,6 +196,15 @@ export class PgAdapter {
     return rows[0] || null;
   }
 
+  /**
+   * 按 uuid 改一条 pending 任务（PUT /update-message、fire hook 的 renewTask）。
+   *
+   * 改排期（extraFields 里带 next_send_at）时多一道租约门：这条任务正被一次投递
+   * 占着的话不改，返回 null。投递收尾会按自己领取时看到的排期推进下一次（一次性
+   * 任务干脆标成已发送），这期间写进去的新时刻随后就被盖掉，接口却已经回了成功
+   * ——用户以为改期生效了，实际什么都没留下。正文这类字段不受这道门约束：它们
+   * 只影响以后的触发，收尾那边本来就不会覆盖（见 run-tick 的收尾守卫）。
+   */
   async updateTaskByUuid(uuid, userId, encryptedPayload, extraFields) {
     const sets = ['encrypted_payload = $1', 'updated_at = NOW()'];
     const values = [encryptedPayload];
@@ -208,9 +222,13 @@ export class PgAdapter {
     }
 
     values.push(uuid, userId);
+    // 改排期时多一道租约门（语义见方法头注释）。
+    const leaseGate = extraFields && Object.prototype.hasOwnProperty.call(extraFields, 'next_send_at')
+      ? ' AND (lease_until IS NULL OR lease_until <= NOW())'
+      : '';
     const rows = await this._query(
       `UPDATE scheduled_messages SET ${sets.join(', ')}
-       WHERE uuid = $${idx} AND user_id = $${idx + 1} AND status = 'pending'
+       WHERE uuid = $${idx} AND user_id = $${idx + 1} AND status = 'pending'${leaseGate}
        RETURNING uuid, updated_at`,
       values
     );

@@ -136,3 +136,43 @@ test('PUT /update-message 的 updatedFields 只报真正落库的字段', async 
   assert.equal(stored.contactName, '改过的名字');
   assert.equal('contactname' in stored, false);
 });
+
+// 任务正在投递的那几十秒里用户改排期：写进去也会被这次投递的收尾盖掉（收尾按
+// 它领取时看到的排期推进下一次，一次性任务干脆标成已发送）。所以这一下要如实
+// 回报，别让客户端拿着一个「改成功了」的 200 走。
+test('PUT /update-message：任务正在投递时改排期回 409 TASK_IN_FLIGHT', async () => {
+  const { server, db } = await makeServer();
+  const uuid = await scheduleFixed(server);
+  const row = await db.getTaskByUuid(uuid, USER);
+  await db.updateTaskById(row.id, { lease_until: new Date(Date.now() + 90_000).toISOString() });
+
+  const rescheduled = await server.handlers.updateMessage.PUT(
+    `/update-message?id=${uuid}`,
+    HEADERS,
+    await encBody({ nextSendAt: '2999-06-01T00:00:00.000Z' })
+  );
+  assert.equal(rescheduled.status, 409);
+  assert.equal(rescheduled.body.error.code, 'TASK_IN_FLIGHT');
+  assert.equal(
+    (await db.getTaskByUuid(uuid, USER)).next_send_at,
+    '2999-01-01T00:00:00.000Z',
+    '排期没动'
+  );
+
+  // 只改正文不碰排期的照常成功：收尾那边本来就不会覆盖用户刚保存的正文。
+  const edited = await server.handlers.updateMessage.PUT(
+    `/update-message?id=${uuid}`,
+    HEADERS,
+    await encBody({ contactName: '投递中也能改的名字' })
+  );
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.equal((await readStoredPayload(db, uuid)).contactName, '投递中也能改的名字');
+
+  // 任务本来就不在时，报的还是原来那句「可能已被修改或删除」。
+  const missing = await server.handlers.updateMessage.PUT(
+    '/update-message?id=99999999-8888-4777-8666-555555555551',
+    HEADERS,
+    await encBody({ nextSendAt: '2999-06-01T00:00:00.000Z' })
+  );
+  assert.equal(missing.status, 404);
+});

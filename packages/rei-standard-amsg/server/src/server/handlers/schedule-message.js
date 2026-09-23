@@ -235,9 +235,14 @@ export function createScheduleMessageHandler(ctx) {
       next_send_at: effectiveSendTime,
       message_type: payload.messageType
     };
-    // supersede：建这条的同时取消旧的那条。适配器支持原子形态（删旧 + 建新落
-    // 在同一事务，见 D1 的 createTaskSuperseding）就走它；不支持的退回「先删
-    // 再建」两步——语义相同，只是失去原子性和那次省下的往返。
+    // supersede：建这条的同时取消旧的那条。适配器支持原子形态（删旧 + 建新一起
+    // 成败，见 D1 和 pg-shared 的 createTaskSuperseding）就走它，内置的三个适配
+    // 器都支持。
+    //
+    // 自定义适配器没实现的退回两步，顺序是先建新、后删旧：反过来的话建新失败
+    // （uuid 撞了、连接一时抖了）时旧任务已经删掉，接口却回失败，客户端以为旧
+    // 任务还在，其实再也找不回来了。这个顺序最坏是删旧失败、两条都留着，客户端
+    // 重试一次就能收拾干净。
     const supersedesUuid = payload.supersedesUuid || null;
     let superseded = false;
     let dbResult;
@@ -246,10 +251,10 @@ export function createScheduleMessageHandler(ctx) {
         dbResult = await db.createTaskSuperseding(createParams, supersedesUuid);
         superseded = !!(dbResult && dbResult.superseded);
       } else {
-        if (supersedesUuid) {
+        dbResult = await db.createTask(createParams);
+        if (supersedesUuid && dbResult) {
           superseded = await db.deleteTaskByUuid(supersedesUuid, userId);
         }
-        dbResult = await db.createTask(createParams);
       }
     } catch (error) {
       if (isUniqueViolation(error)) {

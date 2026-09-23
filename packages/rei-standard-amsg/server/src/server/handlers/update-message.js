@@ -325,6 +325,21 @@ export function createUpdateMessageHandler(ctx) {
     const result = await db.updateTaskByUuid(taskUuid, userId, encryptedPayload, extraFields);
 
     if (!result) {
+      // 改排期时行还在、还是 pending，那就是被一次正在跑的投递占着（见适配器
+      // updateTaskByUuid 的租约门）。这跟「任务没了」得分开说：客户端过几十秒
+      // 重试就能成，不该让用户以为任务被删了。
+      const inFlight = updates.nextSendAt
+        && typeof db.getTaskByUuid === 'function'
+        && !!(await db.getTaskByUuid(taskUuid, userId));
+      if (inFlight) {
+        return {
+          status: 409,
+          body: {
+            success: false,
+            error: { code: 'TASK_IN_FLIGHT', message: '这条任务正在投递，等这次发完再改排期' }
+          }
+        };
+      }
       return { status: 409, body: { success: false, error: { code: 'UPDATE_CONFLICT', message: '任务更新失败，任务可能已被修改或删除' } } };
     }
 
