@@ -9,10 +9,7 @@
 // 绝不把「读不到」说成「没有重复」——宿主拿着一份假的「没有重复」会以为清干净了。
 // 单条 blob 读失败或算不出哈希只跳过这一条（计入 skipped），整轮照常出结果。
 
-import { parseIdTimestamp } from './token.js';
-
-// 与 extractRefs 的 id 边界字符集保持一致（见 token.js；gc.js / store.js 的同名常量同源）
-const ID_CHARSET = /^[A-Za-z0-9_]+$/;
+import { isIdCharset, parseIdTimestamp } from './token.js';
 
 /**
  * @typedef {Object} DuplicateGroup
@@ -105,7 +102,7 @@ export async function runContentScan({ adapter, prefix }, opts) {
     try {
       // 字符集外的 id 整条跳过：extractRefs 按该字符集划边界，这类 id 在引用面上提不全，
       // 宿主没法把指向它的引用可靠地改写成 canonical，合并进去就是破图（与 gc.js 安全阀 5 同源）
-      if (!ID_CHARSET.test(id)) { skipped++; continue; }
+      if (!isIdCharset(id)) { skipped++; continue; }
       const blob = await adapter.get(id);
       // keys() 之后、读到之前被删掉了，或者适配器吐了个不是 Blob 的东西
       if (!blob || typeof blob.arrayBuffer !== 'function') { skipped++; continue; }

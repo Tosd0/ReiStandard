@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createBlobStore } from '../src/store.js';
+import { extractRefs } from '../src/token.js';
 import { memoryAdapter } from './helpers.mjs';
 
 const blobOf = (s) => new Blob([s], { type: 'text/plain' });
@@ -274,4 +275,37 @@ test('新鲜豁免先于边界歧义豁免：又新鲜又互为前缀的 id 记 
     minAgeMs: 3 * DAY,
   });
   assert.deepEqual(result, { deleted: 0, kept: 1, keptBoundary: 0, aborted: false });
+});
+
+test('id 字符集的判定在 extractRefs / restore / gc 三处同源：能被完整提取的 id 才准写入、才会被当孤儿删，提不全的一律拒收并豁免', async () => {
+  // 三处判定共用 token.js 的一份字符集。任何一处单独放宽或收紧，下面的比对就会不一致：
+  // 提不全却准写入 = 制造永不可回收的存量；提得全却被豁免 = 真孤儿永远删不掉。
+  const ids = [
+    'b_abc_0_deadbe', // SDK 生成的格式
+    'A9_z', // 字符集内的其他形状
+    '550e8400-e29b-41d4-a716-446655440000', // UUID，`-` 越界
+    'thumb.png', // `.` 越界
+    'a b', // 空格越界
+  ];
+  for (const id of ids) {
+    const token = 'blobref:' + id;
+    // 基准：把令牌放进一段文本，extractRefs 能不能把整个 id 提回来
+    const boundaryOk = extractRefs(`{"pic":"${token}"}`)[0] === token;
+
+    const adapter = memoryAdapter();
+    const store = createBlobStore({ adapter });
+    let restoreOk = true;
+    try {
+      await store.restore(token, blobOf('x'));
+    } catch (err) {
+      assert.ok(err instanceof TypeError, `restore(${id}) 应该只因字符集抛 TypeError`);
+      restoreOk = false;
+    }
+    assert.equal(restoreOk, boundaryOk, `restore 与 extractRefs 对 ${id} 的判定不一致`);
+
+    // 无人引用的老 id：字符集内的该删，字符集外的该豁免
+    adapter.map.set(id, blobOf('x'));
+    const { deleted } = await store.gc({ refSources: ['{}'], minAgeMs: 0 });
+    assert.equal(deleted === 1, boundaryOk, `gc 与 extractRefs 对 ${id} 的判定不一致`);
+  }
 });

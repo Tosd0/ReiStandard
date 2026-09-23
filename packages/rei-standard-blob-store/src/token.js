@@ -4,6 +4,11 @@
 
 export const DEFAULT_PREFIX = 'blobref:';
 
+// id 的合法字符集，全包只此一份。extractRefs 逐字符扫 ID_CHAR 来划令牌在文本里的边界，
+// 要整串判定的地方（gc / content-scan / store）走下面的 isIdCharset——两种用法同源。
+const ID_CHAR = /[A-Za-z0-9_]/;
+const ID_CHARSET = new RegExp(`^${ID_CHAR.source}+$`);
+
 let seq = 0;
 
 /**
@@ -33,6 +38,18 @@ export function parseIdTimestamp(id, now = Date.now()) {
 }
 
 /**
+ * 整个 id 是否非空且完整落在令牌字符集内。
+ * 字符集外的 id（比如存量数据直接拿带 `-` 的 UUID 当 id）在引用面上提不全——
+ * extractRefs 扫到越界字符就收尾，提出来的只是半截。所以 GC 只能豁免这类 id、
+ * content-scan 只能跳过、restore 干脆拒收，判定都落在这个函数上。
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isIdCharset(id) {
+  return ID_CHARSET.test(id);
+}
+
+/**
  * 从任意字符串提取全部令牌。prefix 之后取最长的 [A-Za-z0-9_] 段作为 id，
  * 所以 JSON 串里内嵌的令牌（后随引号）也能正确截断。
  * 返回值含前缀；喂给 parseIdTimestamp 前需先切掉前缀。
@@ -50,7 +67,7 @@ export function extractRefs(str, prefix = DEFAULT_PREFIX) {
   while ((i = str.indexOf(prefix, i)) !== -1) {
     let j = i + prefix.length;
     if (j < runEnd) j = runEnd; // i 落在上一条已扫 run 内：[j, runEnd) 都是词字符，直接续用终点
-    while (j < str.length && /[A-Za-z0-9_]/.test(str[j])) j++;
+    while (j < str.length && ID_CHAR.test(str[j])) j++;
     runEnd = j;
     if (j > i + prefix.length) refs.push(str.slice(i, j));
     // 只跳过 prefix 本身、不跳过整个 id 段：'blobref:blobref:b_x' 里第二个令牌
