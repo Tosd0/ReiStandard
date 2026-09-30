@@ -113,6 +113,7 @@
  * semantics apply.
  */
 
+import { failureRetryDecision } from './retry-policy.js';
 import {
   assertValidDecision,
   buildSessionContext,
@@ -791,6 +792,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     await notifyFireSettled(ctx, {
       task,
       status: settledStatus,
+      ...(settledStatus === 'failed' && ctx._deliveryState
+        ? failureRetryDecision(ctx._deliveryState, settledError)
+        : { willRetry: null, failureStage: null }),
       skipReason: settledStatus === 'skipped' ? progress.skipReason : null,
       sentCount: progress.sentCount,
       pushedCount: progress.pushedCount,
@@ -1259,6 +1263,7 @@ async function sendHookPushPayloads({
     }
     outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
     progress.outboxed = outboxed;
+    if (ctx._deliveryState) ctx._deliveryState.outboxed = outboxed;
 
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');

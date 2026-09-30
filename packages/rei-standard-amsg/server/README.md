@@ -703,6 +703,26 @@ LLM 这一条只认上游**答复了、并且拒了**的那几种状态码：Key
 
 `GET /capabilities` 的 features 里对应 `llm-permanent-errors`、`redeliver-committed-batch`、`hook-usage-total`、`max-delivery-retries`。
 
+## 按任务限制生成重试（`maxGenerationRetries`）
+
+用户主动触发的回复可以第一次生成失败就结束，定时任务则保留默认退避。工厂配置和 `runScheduledTick` / `runTask` 支持 `maxGenerationRetries`，值可以是非负整数，也可以是同步函数：
+
+```js
+createSingleUserCloudflareWorker((env) => ({
+  // 这里的 interactive 是宿主自己约定的 metadata，库不认识业务类型。
+  maxGenerationRetries: (task) => task.metadata?.interactive ? 0 : undefined,
+  // ...其余配置
+}));
+```
+
+回调收到与 `serializeBy` 相同的安全任务视图（含 metadata，不含 API Key 等凭据），每次尝试解析一次。返回 `undefined` 继承 `maxDeliveryRetries`（默认 3），返回 0 禁止本轮失败后重新生成；显式数值单独控制生成重试上限。不配置时行为不变，不需要修改任务 payload 或迁移数据库，已有任务也生效。所有服务端工厂和旧的 UUID 即时入口都透传这个配置。
+
+这里的“生成阶段”以**最终回复整批进入 outbox**为边界：前置 hook、模型、工具循环、组装和落库失败都使用生成上限；没有 outbox 的适配器发生推送失败时仍可能需要重新生成，因此也使用生成上限。完整批次已入 outbox 后的推送失败改用 `maxDeliveryRetries`，补投不会再次调用模型。hook 的独立 `emitResult` 不等于最终回复提交。
+
+`onFireSettled` 新增 `willRetry` 与 `failureStage`：失败时前者为本次的重试决策，后者为 `'generation'` 或 `'delivery'`；成功、跳过、未接管时两者均为 `null`。宿主可以用 `info.status === 'failed' && info.willRetry === false && !info.outboxed` 即时显示生成失败，无需修改错误对象或猜测重试次数。此回执发生在调度器写任务状态之前，`willRetry` 描述同源策略决策，不保证后续数据库写入成功；取消导致的失败不会重试。已有永久性错误判定仍然生效。
+
+策略回调抛错或返回非法值时，不调用生成 hook / 模型，以 `GENERATION_RETRY_POLICY_INVALID` 记录配置错误并沿默认投递上限退避，避免一次坏部署立即作废所有任务；此时尚未进入 fire，因此不触发 `onFireSettled`。
+
 ## 同一分组的任务不并发（`serializeBy`）
 
 同一个角色可能有好几条定时任务。撞在一起并发跑的话，用户一口气收到两条互不知情的消息；宿主在 hook 里维护的「我刚才说过什么」台账通常是读进内存 → 改 → 整份写回，两条各改各的再写回，后写的必然盖掉前面那条。

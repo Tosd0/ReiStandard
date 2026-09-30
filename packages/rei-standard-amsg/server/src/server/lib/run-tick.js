@@ -59,6 +59,8 @@
  * @returns {Promise<Object>} summary { totalTasks, successCount, failedCount, processedAt, executionTime, details }
  */
 
+import { resolveMaxDeliveryRetries } from './retry-policy.js';
+export { DEFAULT_MAX_DELIVERY_RETRIES } from './retry-policy.js';
 import { hmacSha256, bytesToBase64Url, utf8 } from './webcrypto-utils.js';
 import {
   buildErrorExtra,
@@ -100,12 +102,6 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 本身也被拖过了这个时长的除外：那说明停摆发生在重试窗口里，内容一样旧。
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
-
-// 一次触发投递失败后最多再重试几次（退避 2 / 4 / 6 分钟）。宿主可用
-// ctx.maxDeliveryRetries 调低（0 = 不重试）。重试不一定重新生成：内容已经落进
-// outbox 的，重试只补推送（见 lib/message-processor.js 的 redeliverCommittedBatch）；
-// 生成本身失败的才会把整条生成再跑一遍，每跑一遍都花钱。
-export const DEFAULT_MAX_DELIVERY_RETRIES = 3;
 
 // 「重试也好不了」的判定（永久性错误码、终态推送状态码、payload 超限）住在
 // lib/errors.js —— 定时任务的退避阶梯和 instant 任务的三轮重试用同一份口径。
@@ -239,12 +235,6 @@ function guardWebpushWithLease(webpush, lease) {
 
 function resolveStaleAfterMs(ctx) {
   return positiveNumber(ctx.staleAfterMs) || STALE_AFTER_MS;
-}
-
-/** ctx.maxDeliveryRetries 取非负整数，别的值（没配、负数、小数）一律用默认值。 */
-function resolveMaxDeliveryRetries(ctx) {
-  const value = ctx.maxDeliveryRetries;
-  return Number.isInteger(value) && value >= 0 ? value : DEFAULT_MAX_DELIVERY_RETRIES;
 }
 
 /**
@@ -832,7 +822,7 @@ async function deliverTasks(ctx, tasks) {
     // 不写出去的话下游只知道「失败了」，不知道该让用户重建订阅还是裁短内容。
     const errorExtra = buildErrorExtra(errorCode, pushStatus);
     try {
-      if (permanent || task.retry_count >= maxDeliveryRetries) {
+      if (permanent || failure.willRetry === false || task.retry_count >= (failure.retryLimit ?? maxDeliveryRetries)) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
         if (isRecurringType(recurrenceType)) {
           const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
@@ -1113,7 +1103,7 @@ async function deliverTasks(ctx, tasks) {
       }
       await handleDeliveryFailure(
         task, sendResult.error || '消息发送失败', recurrenceType, decryptedPayload, userKey,
-        { errorCode: sendResult.errorCode || null, permanent: sendResult.permanent === true, pushStatus: sendResult.pushStatusCode }
+        { errorCode: sendResult.errorCode || null, permanent: sendResult.permanent === true, pushStatus: sendResult.pushStatusCode, willRetry: sendResult.willRetry, retryLimit: sendResult.retryLimit }
       );
       return;
     }
