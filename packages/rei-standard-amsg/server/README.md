@@ -965,3 +965,5 @@ async function executeToolCalls(calls, ctx) {
 ```
 
 取消收尾使用 `onFireSettled({ status: 'cancelled', willRetry: false, error, ... })`，不是生成失败。应用应在这里释放资源、结算已发生的用量，避免发出失败提示或把未送达内容记为已回复。取消时已经开始写入的 outbox 批次会在写完后检查信号并撤掉未投递部分；已经发到客户端的消息仍由客户端处理。应用需要记录停止的任务身份，拦住迟到推送、补收以及尚未显示的本地内容。已完成的外部副作用无法撤销；不支持 AbortSignal 的工具也需要自己在执行步骤之间检查取消。
+
+执行阶段的 `ctx.writeState`、`scheduleTask`、`cancelTask`、`renewTask` 和 `emitResult` 会拒绝取消后新发起的操作。`onFireSettled` 的 `info.writeState` 特意仍可用，供宿主释放锁、保存账单等收尾；它不能用于继续生成阶段的业务动作。已经开始的数据库写入不支持回滚，宿主仍需处理并发状态版本。

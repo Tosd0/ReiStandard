@@ -335,13 +335,17 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 
   // client_state 的读写口。实现与 `GET/PUT /client-state` 共用一份（见
   // lib/state-accessors.js），fire 级和 config 级 hook 拿到的是同一套语义。
-  const { readState, writeState } = createStateAccessors({
+  const { readState, writeState: writeSettledState } = createStateAccessors({
     db: ctx.db,
     userId: task.user_id,
     userKey,
     maxStateValueBytes: ctx.maxStateValueBytes,
     now: nowFn,
   });
+  const writeState = async (namespace, entries) => {
+    throwIfCancelled();
+    return writeSettledState(namespace, entries);
+  };
 
   // 这一次 fire 的三个身份值，整条链共用一份：sessionId 钉在（任务 id + 名义
   // 触发时刻）上，同一 occurrence 的重试复用同一个 session、不同 occurrence 各
@@ -846,7 +850,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       outboxed: progress.outboxed,
       scratch,
       readState,
-      writeState,
+      writeState: writeSettledState,
       emitResult,
     });
   }

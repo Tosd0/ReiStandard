@@ -1852,3 +1852,29 @@ test('cancellation during outbox commit removes silent results after the commit 
     assert.equal((await adapter.listUnackedOutbox(USER, 0, 100)).length, 0);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+
+test('cancelled hook cannot write more state but settlement can release resources', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'abort-write', recurrenceType: 'none', nextSendAt: recentDue(), payload: { messageType: 'auto' } });
+  let writeError;
+  const result = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(), leaseHeartbeatMs: 5,
+    hooks: {
+      onBeforeFire: async ctx => {
+        await adapter.deleteTaskByUuid('abort-write', USER);
+        await waitUntil(() => ctx.signal.aborted, 'lease cancellation was not observed');
+        try { await ctx.writeState('cancel-test', [{ key: 'late', value: 'must not persist' }]); }
+        catch (error) { writeError = error; }
+        return { skip: true };
+      },
+      onLLMOutput: () => ({ decision: 'skip-push' }),
+    },
+    onFireSettled: async info => {
+      await info.writeState('cancel-test', [{ key: 'cleanup', value: 'released' }]);
+    },
+  });
+  assert.equal(writeError?.code, 'TASK_CANCELLED');
+  assert.deepEqual((await adapter.getClientState(USER, 'cancel-test')).map(row => row.key), ['cleanup']);
+  assert.equal(result.details.cancelledTasks.length, 1);
+});
