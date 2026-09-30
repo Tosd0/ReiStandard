@@ -11,6 +11,7 @@
     "@rei-standard/blob-store": "0.0.0"
   },
   "changesets": [
+    "amsg-abort-active-fire",
     "amsg-agentic-scratch",
     "amsg-cancel-discard-and-error-detail-fixes",
     "amsg-capabilities",

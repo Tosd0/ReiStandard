@@ -1,5 +1,11 @@
 # Changelog — @rei-standard/amsg-shared
 
+## 0.4.0-next.11
+
+### Patch Changes
+
+- 160ca1b: Abort active LLM requests when task cancellation or supersession invalidates the lease. Expose signal, isCancelled and throwIfCancelled to fire hooks; stop agentic continuation and outbox delivery after cancellation, and settle cancelled fires without retries. Shared callLlm now accepts an external AbortSignal while preserving its request timeout.
+
 ## 0.4.0-next.10
 
 ### Patch Changes
