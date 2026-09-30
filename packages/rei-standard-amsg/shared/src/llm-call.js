@@ -53,6 +53,7 @@ const UPSTREAM_ERROR_BODY_MAX_BYTES = 16 * 1024;
  * @param {{
  *   requireContent?: boolean,
  *   timeoutMs?: number,
+ *   signal?: AbortSignal,
  *   fetch?: typeof globalThis.fetch,
  *   stream?: boolean,
  *   forwardTools?: boolean,
@@ -98,7 +99,9 @@ export async function callLlm(payload, options = {}) {
       'Authorization': `Bearer ${payload.apiKey}`
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(timeoutMs)
+    signal: options.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)])
+      : AbortSignal.timeout(timeoutMs)
   });
 
   if (!aiResponse.ok) {

@@ -309,6 +309,19 @@ function firstPositiveNumber(values, fallback) {
  */
 export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
+  // One cancellation identity flows through fetch, hooks and settlement.
+  const signal = ctx.signal || new AbortController().signal;
+  const isCancelled = () => signal.aborted || ctx.isTaskCancelled?.() === true;
+  const throwIfCancelled = () => {
+    if (!isCancelled()) return;
+    if (isTaskCancelledError(signal.reason)) throw signal.reason;
+    const error = new Error('Task was cancelled or superseded');
+    error.code = 'TASK_CANCELLED';
+    throw error;
+  };
+  const cancellation = { signal, isCancelled, throwIfCancelled };
+  ctx = { ...ctx, ...cancellation };
+
   if (typeof hooks.onLLMOutput !== 'function') {
     throw new DeploymentConfigError(
       'AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds',
@@ -355,7 +368,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     now: nowFn,
     // run-tick 在投递 ctx 上挂的取消信号（与 guardWebpushWithLease 读的是同一
     // 个租约状态），emitResult 不发推送的那条路要靠它拦下已取消任务的落行。
-    isCancelled: typeof ctx.isTaskCancelled === 'function' ? ctx.isTaskCancelled : null,
+    isCancelled,
   });
 
   const maxScheduledTasksPerFire =
@@ -415,6 +428,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    *   认领。行读不回来（已经不是 pending，或适配器没有 getTaskByUuid）→ `null`。
    */
   const scheduleTask = async (options) => {
+    throwIfCancelled();
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('scheduleTask(options) 需要一个对象，至少包含 { firstSendTime }');
     }
@@ -570,6 +584,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     scheduledTaskCount++;
 
     const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
+    throwIfCancelled();
 
     let created;
     try {
@@ -626,6 +641,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    *   （已发出 / 已删除）——对「用户要它别响」来说结果已达成，不算错误。
    */
   const cancelTask = async (uuid) => {
+    throwIfCancelled();
     if (typeof uuid !== 'string' || !uuid.trim()) {
       throw new TypeError('cancelTask(uuid) 需要非空字符串 uuid');
     }
@@ -641,6 +657,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
         { code: 'AGENTIC_CANCEL_UNSUPPORTED' }
       );
     }
+    throwIfCancelled();
     const cancelled = await ctx.db.deleteTaskByUuid(uuid, task.user_id);
     if (cancelled) {
       // 与 DELETE /cancel-message 同一收尾：那条任务此前投递到一半失败过的话，
@@ -668,6 +685,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    *   在路上了，通常没什么好补救的；真要顺延下一次，等这次发完再调一遍。
    */
   const renewTask = async (uuid, nextSendAt) => {
+    throwIfCancelled();
     if (typeof uuid !== 'string' || !uuid.trim()) {
       throw new TypeError('renewTask(uuid, nextSendAt) 需要非空字符串 uuid');
     }
@@ -701,6 +719,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
     const nextSendAtIso = sendAt.toISOString();
     const encrypted = await encryptForStorage(JSON.stringify({ ...payload, firstSendTime: nextSendAtIso }), userKey);
+    throwIfCancelled();
     const updated = await ctx.db.updateTaskByUuid(uuid, task.user_id, encrypted, {
       next_send_at: nextSendAtIso,
       retry_count: 0,
@@ -738,6 +757,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const scratch = {};
 
   const fireCtx = Object.freeze({
+    ...cancellation,
     task: buildHookTask(task, decryptedPayload),
     userId: task.user_id,
     readState,
@@ -781,18 +801,26 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       resolveLlmCredential, fireCtx, progress,
       sessionId, messageIdBase, occurrenceMs,
     });
+    throwIfCancelled();
     settledStatus = !outcome.handled
       ? 'not-handled'
       : (outcome.result.status === 'skipped' ? 'skipped' : 'sent');
     return outcome;
   } catch (error) {
+    if (isCancelled() && !isTaskCancelledError(error)) {
+      try { throwIfCancelled(); } catch (cancelled) { error = cancelled; }
+    }
+    if (isTaskCancelledError(error)) settledStatus = 'cancelled';
     settledError = error;
     throw error;
   } finally {
     await notifyFireSettled(ctx, {
       task,
+      ...cancellation,
       status: settledStatus,
-      ...(settledStatus === 'failed' && ctx._deliveryState
+      ...(settledStatus === 'cancelled'
+        ? { willRetry: false, failureStage: null }
+        : settledStatus === 'failed' && ctx._deliveryState
         ? failureRetryDecision(ctx._deliveryState, settledError)
         : { willRetry: null, failureStage: null }),
       skipReason: settledStatus === 'skipped' ? progress.skipReason : null,
@@ -837,7 +865,9 @@ async function runFireChain({
   resolveLlmCredential, fireCtx, progress,
   sessionId, messageIdBase, occurrenceMs,
 }) {
+  ctx.throwIfCancelled();
   const before = await hooks.onBeforeFire(fireCtx);
+  ctx.throwIfCancelled();
   if (before == null) return { handled: false };
 
   // Pre-LLM skip: the host judged this fire moot before generation (e.g. the
@@ -871,6 +901,7 @@ async function runFireChain({
   });
 
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
+    ctx.throwIfCancelled();
     if (nowFn() >= deadline) {
       throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
     }
@@ -890,7 +921,7 @@ async function runFireChain({
         messages,
         ...(normalized.tools ? { tools: normalized.tools, toolChoice: normalized.toolChoice } : {}),
       },
-      { requireContent: false, timeoutMs: roundTimeoutMs }
+      { requireContent: false, timeoutMs: roundTimeoutMs, signal: ctx.signal }
     );
 
     const assistantMessage = extractAssistantMessage(llmResponse);
@@ -899,6 +930,7 @@ async function runFireChain({
     // 逐轮累加，是整次 fire 的花费。
     progress.usage = (llmResponse && typeof llmResponse === 'object' && llmResponse.usage) || null;
     progress.usageTotal = accumulateUsage(progress.usageTotal, progress.usage);
+    ctx.throwIfCancelled();
 
     // 共享的 SessionContext（与 amsg-instant 同形状）之上，再挂任务身份、
     // 两个状态访问器和 scheduleTask：
@@ -909,6 +941,9 @@ async function runFireChain({
     //     时才知道，而那正是 onLLMOutput / executeToolCalls 的位置，
     //     onBeforeFire 早就返回了。
     const sessionCtx = Object.freeze({
+      signal: ctx.signal,
+      isCancelled: ctx.isCancelled,
+      throwIfCancelled: ctx.throwIfCancelled,
       ...buildSessionContext({
         sessionId,
         messages,
@@ -933,6 +968,7 @@ async function runFireChain({
     });
 
     const decision = await hooks.onLLMOutput(sessionCtx);
+    ctx.throwIfCancelled();
     try {
       assertValidDecision(decision, { inlineToolCalls: true });
     } catch (error) {
@@ -996,11 +1032,15 @@ async function runFireChain({
 
     let toolResults;
     try {
+      ctx.throwIfCancelled();
       toolResults = await hooks.executeToolCalls(toolCalls, sessionCtx);
+      ctx.throwIfCancelled();
       if (!Array.isArray(toolResults)) {
         throw new TypeError('executeToolCalls must resolve to an array of { tool_call_id, role: "tool", content }');
       }
     } catch (error) {
+      ctx.throwIfCancelled();
+      if (isTaskCancelledError(error)) throw error;
       // Feed the failure back as tool results and let the LLM talk its way
       // out, instead of failing the whole fire.
       toolResults = toolCalls.map((toolCall) => ({
@@ -1139,7 +1179,8 @@ async function notifyAfterSend(ctx, info) {
  * 了，但记账的代码挂在发送后，这次没发成就没人记，那条任务从此只活在数据库
  * 里；以及 fire 开头拿的锁没有可靠的释放点，一次 skip 就把资源占满整个 TTL。
  *
- * status 四种：
+ * status 五种：
+ *   - `cancelled`   —— 任务被取消/顶替；error.code 为 TASK_CANCELLED，不重试
  *   - `sent`        —— pushPayloads 全部发完（sentCount === total）
  *   - `skipped`     —— 这次不发。skipReason 区分是 onBeforeFire 直接
  *                      `{ skip: true }`（`'before-fire'`），还是模型跑完之后
@@ -1261,9 +1302,11 @@ async function sendHookPushPayloads({
       stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
       finalized.push(push);
     }
+    ctx.throwIfCancelled();
     outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: finalized });
     progress.outboxed = outboxed;
     if (ctx._deliveryState) ctx._deliveryState.outboxed = outboxed;
+    ctx.throwIfCancelled();
 
     if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
       throw new Error('VAPID configuration missing - push notifications cannot be sent');
@@ -1287,6 +1330,7 @@ async function sendHookPushPayloads({
     const lastPushIndex = willPush.lastIndexOf(true);
 
     for (let i = 0; i < total; i++) {
+      ctx.throwIfCancelled();
       if (willPush[i]) {
         await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(finalized[i]));
         pushedCount++;

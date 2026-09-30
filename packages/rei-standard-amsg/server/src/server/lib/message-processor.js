@@ -505,7 +505,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         // credRefs.chat 任务按引用现读凭据；解析结果只合进发给 callLlm 的这
         // 一个对象，不写回 decryptedPayload（那份会流向 hook / push）。
         const chatCred = await resolveFireCredentials({ db: ctx.db, userId: task.user_id, userKey, decryptedPayload });
-        const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload);
+        const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload, { signal: ctx.signal });
         messageContent = aiResult.content;
         llmResponse = aiResult.response;
       } else if (decryptedPayload.userMessage) {
@@ -516,7 +516,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
 
     } else if (decryptedPayload.messageType === 'prompted' || decryptedPayload.messageType === 'auto') {
       const chatCred = await resolveFireCredentials({ db: ctx.db, userId: task.user_id, userKey, decryptedPayload });
-      const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload);
+      const aiResult = await callLlm(chatCred ? { ...decryptedPayload, ...chatCred } : decryptedPayload, { signal: ctx.signal });
       messageContent = aiResult.content;
       llmResponse = aiResult.response;
     } else {
