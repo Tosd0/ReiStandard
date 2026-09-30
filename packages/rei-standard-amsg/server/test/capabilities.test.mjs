@@ -65,6 +65,7 @@ const EXPECTED_FEATURES = [
   'redeliver-committed-batch',
   'hook-usage-total',
   'max-delivery-retries',
+  'max-generation-retries',
 ];
 
 function makeWorker(extra = {}) {

@@ -125,6 +125,8 @@ export const SERVER_FEATURES = Object.freeze([
   'hook-usage-total',
   // 工厂配置认 maxDeliveryRetries（投递失败的重试次数上限，默认 3）。
   'max-delivery-retries',
+  // Per-task pre-commit retry limit and fire receipt retry decision.
+  'max-generation-retries',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

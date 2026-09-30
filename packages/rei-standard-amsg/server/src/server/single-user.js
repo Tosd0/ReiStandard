@@ -25,6 +25,7 @@
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
  * @param {number} [config.maxScheduledTasksPerFire] - 一次 fire 里 hook 用 ctx.scheduleTask() 最多能建几条后续任务（默认 2，0 表示不许自排）。
+ * @param {number | ((task: Object) => number | undefined)} [config.maxGenerationRetries] - Retry limit before a complete batch is committed; defaults to maxDeliveryRetries.
  * @param {number} [config.maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试几次（默认 3，0 = 第一次失败就终审）。
  *   只管 runScheduledTick 的退避阶梯：返回的 ctx 交给 runScheduledTick 时带上它；instant 的请求内重试不受影响。
  * @param {function} [config.onAfterSend] - 推送发出（或发挂）之后的可选 hook：
@@ -101,6 +102,7 @@ export function createSingleUserServer(config) {
     maxScheduledTasksPerFire: config.maxScheduledTasksPerFire,
     // 定时任务投递失败后的重试次数上限（默认 3）。handlers 用不到，宿主拿这个
     // ctx 去调 runScheduledTick 时它跟着走。
+    maxGenerationRetries: config.maxGenerationRetries,
     maxDeliveryRetries: config.maxDeliveryRetries
   };
 

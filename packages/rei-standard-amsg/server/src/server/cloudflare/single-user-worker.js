@@ -326,6 +326,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       onFireSettled: cfg.onFireSettled,
       // 一次触发投递失败后最多再重试几次（默认 3，0 = 第一次失败就终审；见
       // lib/run-tick.js 的 DEFAULT_MAX_DELIVERY_RETRIES）。
+      maxGenerationRetries: cfg.maxGenerationRetries,
       maxDeliveryRetries: cfg.maxDeliveryRetries,
       // 分组串行：(task) => 分组标识 | null。同一分组的任务同时只跑一条，
       // 跨跳也算（见 lib/run-tick.js）。不配 = 全并发，与以前一致。

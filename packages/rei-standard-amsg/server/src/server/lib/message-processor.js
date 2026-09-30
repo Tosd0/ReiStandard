@@ -21,6 +21,7 @@
  * 分片发，sw 收齐后还原。
  */
 
+import { resolveMaxDeliveryRetries, resolveMaxGenerationRetries, failureRetryDecision } from './retry-policy.js';
 import { randomUUID } from './webcrypto-utils.js';
 import {
   buildContentPush,
@@ -38,7 +39,7 @@ import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from './webpush-webcrypto.
 
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
-import { runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
+import { buildHookTask, runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
 import {
@@ -344,6 +345,8 @@ function positiveIntegerOr(value, fallback) {
 
 /**
  * @typedef {Object} ProcessorContext
+ * @property {number} [maxDeliveryRetries]
+ * @property {number | ((task: Object) => number | undefined)} [maxGenerationRetries]
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
  * @property {Object}  vapid             - { email, publicKey, privateKey }
  * @property {import('../adapters/interface.js').DbAdapter} db
@@ -429,10 +432,19 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean }>}
+ * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean, willRetry?: boolean, retryLimit?: number, failureStage?: string }>}
  *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
  */
 export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
+  const deliveryState = {
+    outboxed: false,
+    deliveryLimit: resolveMaxDeliveryRetries(ctx),
+    generationLimit: resolveMaxDeliveryRetries(ctx),
+    retryCount: task.retry_count ?? 0,
+    isCancelled: ctx.isTaskCancelled,
+  };
+  // One attempt owns this state; concurrent tasks never share their progress.
+  ctx = { ...ctx, _deliveryState: deliveryState };
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
@@ -459,7 +471,11 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       taskUuid: task.uuid,
       occurrenceMs: occurrenceMsOf(task),
     });
-    if (committed) return await redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, committed);
+    if (committed) {
+      deliveryState.outboxed = true;
+      return await redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, committed);
+    }
+    deliveryState.generationLimit = resolveMaxGenerationRetries(ctx, buildHookTask(task, decryptedPayload));
 
     // Fire-time hooks: when the host configured onBeforeFire and the task
     // needs the LLM, offer the agentic path first. onBeforeFire → null
@@ -599,6 +615,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // 之前的整条——补收走的是 HTTP，没有单条体积上限。
     const pushesToSend = reasoningPush ? [reasoningPush, ...contentPushes] : contentPushes;
     const outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
+    deliveryState.outboxed = outboxed;
 
     // VAPID 与订阅排在落行之后：内容已经生成好了，之后哪一步失败都只该重试投递，
     // 而「只重试投递」的前提是这一批已经落定在 outbox 里（见
@@ -695,7 +712,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       error: error.message,
       errorCode: error.code || null,
       pushStatusCode: readPushStatusCode(error),
-      permanent: isNonRetryableError(error)
+      permanent: isNonRetryableError(error),
+      ...failureRetryDecision(deliveryState, error)
     };
   }
 }
@@ -724,7 +742,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
     };
   }
 
-  while (retryCount <= maxRetries) {
+  while (true) {
     let task;
     try {
       task = userId
@@ -749,7 +767,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
 
     // 上一轮生成成功、只是推送失败的话，processSingleMessage 会认出这次触发已
     // 经落定的批次，这一轮只补推送、不再把 LLM 跑一遍。
-    const result = await processSingleMessage(task, ctx, masterKey, null);
+    const result = await processSingleMessage({ ...task, retry_count: retryCount }, { ...ctx, maxDeliveryRetries: maxRetries }, masterKey, null);
 
     if (!result.success) {
       // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮
@@ -762,7 +780,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
         pushStatus: result.pushStatusCode
       });
 
-      if (!permanent && retryCount < maxRetries) {
+      if (!permanent && result.willRetry !== false && retryCount < (result.retryLimit ?? maxRetries)) {
         retryCount++;
         await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
         continue;
