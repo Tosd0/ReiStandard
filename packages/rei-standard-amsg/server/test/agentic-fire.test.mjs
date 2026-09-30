@@ -406,6 +406,7 @@ describe('agentic fire loop', () => {
         'usage', 'cancelTask', 'renewTask',
         // 按 cred_id 现读一份凭据（返回新对象，不挂在 ctx 上——这里只是方法本身）
         'resolveLlmCredential',
+        'signal', 'isCancelled', 'throwIfCancelled',
       ]);
       for (const k of Object.keys(capturedSessionCtx)) {
         assert.ok(allowedSessionKeys.has(k), `unexpected sessionCtx key: ${k}`);

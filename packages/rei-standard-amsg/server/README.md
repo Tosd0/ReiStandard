@@ -940,3 +940,30 @@ VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 - [SW 包 README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md)
 - [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)
 - [Service Worker 规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/service-worker-specification.md)
+
+
+## 取消正在执行的生成与工具
+
+任务被 `DELETE /cancel-message` 取消或被新任务顶替后，租约心跳发现任务已经失效，会中断正在等待的模型请求，阻止新的模型轮次、工具阶段和推送。`leaseHeartbeatMs` 默认仍为 30000；需要及时停止的交互应用可配置为 1000（每个正在执行的任务每秒续租一次）。这是跨请求的数据库检测，延迟取决于心跳和数据库响应，不承诺瞬时中断。自定义适配器需要支持 `claimTask` / `renewTaskLease`；关掉心跳时也关掉了这条主动检测路径。
+
+`onBeforeFire`、`onLLMOutput`、`executeToolCalls` 的 context 以及 `onFireSettled` 回执新增：
+
+- `signal: AbortSignal`：传给工具内部的 `fetch`，与工具自己的超时信号合并。
+- `isCancelled(): boolean`：当前是否已收到取消信号。
+- `throwIfCancelled(): void`：已取消时抛出 `code: 'TASK_CANCELLED'` 的错误。每个副作用开始前检查，工具 catch 中也要先调用它，以免取消被转成普通工具失败后继续执行。
+
+```js
+async function executeToolCalls(calls, ctx) {
+  const results = [];
+  for (const call of calls) {
+    ctx.throwIfCancelled();
+    const response = await fetch(toolUrl(call), { signal: ctx.signal });
+    results.push({ tool_call_id: call.id, role: 'tool', content: await response.text() });
+  }
+  return results;
+}
+```
+
+取消收尾使用 `onFireSettled({ status: 'cancelled', willRetry: false, error, ... })`，不是生成失败。应用应在这里释放资源、结算已发生的用量，避免发出失败提示或把未送达内容记为已回复。取消时已经开始写入的 outbox 批次会在写完后检查信号并撤掉未投递部分；已经发到客户端的消息仍由客户端处理。应用需要记录停止的任务身份，拦住迟到推送、补收以及尚未显示的本地内容。已完成的外部副作用无法撤销；不支持 AbortSignal 的工具也需要自己在执行步骤之间检查取消。
+
+执行阶段的 `ctx.writeState`、`scheduleTask`、`cancelTask`、`renewTask` 和 `emitResult` 会拒绝取消后新发起的操作。`onFireSettled` 的 `info.writeState` 特意仍可用，供宿主释放锁、保存账单等收尾；它不能用于继续生成阶段的业务动作。已经开始的数据库写入不支持回滚，宿主仍需处理并发状态版本。

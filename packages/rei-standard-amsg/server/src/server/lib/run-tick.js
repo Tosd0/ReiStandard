@@ -477,7 +477,8 @@ async function deliverTasks(ctx, tasks) {
    * lost；同理，只有明确的 false 才算行没了，什么都不返回的自定义适配器照旧。
    */
   function startLeaseHeartbeat(task) {
-    const lease = { lost: false, released: false, stop: () => {} };
+    const controller = new AbortController();
+    const lease = { lost: false, released: false, signal: controller.signal, stop: () => {} };
     if (!heartbeatEnabled) return lease;
     let stopped = false;
     let timer = null;
@@ -499,6 +500,9 @@ async function deliverTasks(ctx, tasks) {
         // 就会在 tick 日志里看到一条正常送达的消息带着取消告警。
         if (stopped || lease.released) return;
         lease.lost = true;
+        const error = new Error('Task was cancelled or superseded');
+        error.code = TASK_CANCELLED_CODE;
+        controller.abort(error);
         console.warn(`[amsg-server] 任务 ${task.id} 的租约已失效（行被取消或顶替），剩余推送将中止`);
         return;
       }
@@ -1073,6 +1077,7 @@ async function deliverTasks(ctx, tasks) {
           ...ctx, db, masterKey,
           webpush: guardWebpushWithLease(ctx.webpush, lease),
           isTaskCancelled: () => lease.lost,
+          signal: lease.signal,
         },
         masterKey,
         { userKey, payload: decryptedPayload }

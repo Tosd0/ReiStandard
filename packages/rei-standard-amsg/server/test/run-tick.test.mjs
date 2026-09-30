@@ -1519,7 +1519,7 @@ test('取消撞上 emitResult(show:false)：不落行、抛 TASK_CANCELLED', asy
   });
 
   assert.equal(thrown && thrown.code, 'TASK_CANCELLED', 'show:false 不走推送，取消信号也得拦得住');
-  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_after_delivery']);
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['cancelled_mid_delivery']);
   assert.deepEqual(await adapter.listUnackedOutbox(USER, 0, 50), [], '取消后的结果不能留在收件箱等补收');
 });
 
@@ -1748,4 +1748,133 @@ test('正常收尾不会被心跳误报成「任务被取消」', async () => {
     warnings.filter((line) => line.includes('租约已失效')).length, 0,
     `正常收尾不该报租约失效：${JSON.stringify(warnings)}`,
   );
+});
+
+
+for (const phase of ['llm', 'before-hook', 'output-hook', 'tool', 'tool-swallow']) {
+  test(`cancellation aborts active ${phase} and never starts another round`, { timeout: 4000 }, async () => {
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    await seed(adapter, { uuid: `abort-${phase}`, recurrenceType: 'none', nextSendAt: recentDue(), payload: {
+      messageType: 'auto', apiUrl: 'https://example.com/v1/chat/completions', apiKey: 'key', primaryModel: 'test',
+    } });
+    let entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    let settle;
+    let calls = 0;
+    let observedSignal;
+    const originalFetch = globalThis.fetch;
+    const blockUntilAbort = signal => new Promise((resolve, reject) => {
+      observedSignal = signal;
+      entered();
+      // A bounded fallback makes missing signal support fail as an assertion,
+      // rather than leaving a request hanging until the test runner times out.
+      const timer = setTimeout(() => reject(new Error('request was not aborted')), 150);
+      signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    });
+    globalThis.fetch = async (_url, options) => {
+      calls++;
+      if (phase === 'llm') return blockUntilAbort(options.signal);
+      return { ok: true, json: async () => ({ choices: [{ message: { role: 'assistant', content: 'tool' } }] }) };
+    };
+    const webpush = fakeWebpush();
+    try {
+      const tick = runScheduledTick({
+        db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 5,
+        hooks: {
+          onBeforeFire: async ctx => {
+            if (phase === 'before-hook') await blockUntilAbort(ctx.signal);
+            return [{ role: 'user', content: 'hello' }];
+          },
+          onLLMOutput: async ctx => {
+            if (phase === 'output-hook') await blockUntilAbort(ctx.signal);
+            return { decision: 'tool-request', toolCalls: [{ id: 'x', type: 'function', function: { name: 'wait', arguments: '{}' } }] };
+          },
+          executeToolCalls: async (_calls, ctx) => {
+            try { await blockUntilAbort(ctx.signal); }
+            catch (error) { if (phase !== 'tool-swallow') throw error; }
+            return [];
+          },
+        },
+        onFireSettled: info => { settle = info; },
+      });
+      await started;
+      await adapter.deleteTaskByUuid(`abort-${phase}`, USER);
+      const result = await tick;
+      assert.equal(observedSignal?.aborted, true, 'active operation receives task abort');
+      assert.equal(settle.status, 'cancelled');
+      assert.equal(settle.error.code, 'TASK_CANCELLED');
+      assert.equal(settle.signal.aborted, true);
+      assert.equal(settle.isCancelled(), true);
+      assert.throws(() => settle.throwIfCancelled(), { code: 'TASK_CANCELLED' });
+      assert.equal(settle.willRetry, false);
+      assert.equal(calls, phase === 'before-hook' ? 0 : 1, 'no model continuation after cancellation');
+      assert.equal(result.failedCount, 0);
+      assert.equal(result.details.cancelledTasks.length, 1);
+      assert.equal(webpush.sent.length, 0);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+}
+
+
+test('cancellation during outbox commit removes silent results after the commit completes', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'abort-outbox', recurrenceType: 'none', nextSendAt: recentDue(), payload: {
+    messageType: 'auto', apiUrl: 'https://example.com/v1/chat/completions', apiKey: 'key', primaryModel: 'test',
+  } });
+  let signal;
+  let settle;
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'appendOutboxMessages') return async (...args) => {
+        await adapter.deleteTaskByUuid('abort-outbox', USER);
+        await waitUntil(() => signal.aborted, 'lease cancellation was not observed');
+        // The cancel endpoint can clean an empty outbox before this write lands.
+        return target.appendOutboxMessages(...args);
+      };
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'hello' } }] }) });
+  try {
+    const result = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(), leaseHeartbeatMs: 5,
+      hooks: {
+        onBeforeFire: ctx => { signal = ctx.signal; return [{ role: 'user', content: 'hi' }]; },
+        onLLMOutput: () => ({ decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'hidden', notification: { show: false } }] }),
+      },
+      onFireSettled: info => { settle = info; },
+    });
+    assert.equal(settle.status, 'cancelled');
+    assert.equal(result.successCount, 0);
+    assert.equal((await adapter.listUnackedOutbox(USER, 0, 100)).length, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('cancelled hook cannot write more state but settlement can release resources', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'abort-write', recurrenceType: 'none', nextSendAt: recentDue(), payload: { messageType: 'auto' } });
+  let writeError;
+  const result = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(), leaseHeartbeatMs: 5,
+    hooks: {
+      onBeforeFire: async ctx => {
+        await adapter.deleteTaskByUuid('abort-write', USER);
+        await waitUntil(() => ctx.signal.aborted, 'lease cancellation was not observed');
+        try { await ctx.writeState('cancel-test', [{ key: 'late', value: 'must not persist' }]); }
+        catch (error) { writeError = error; }
+        return { skip: true };
+      },
+      onLLMOutput: () => ({ decision: 'skip-push' }),
+    },
+    onFireSettled: async info => {
+      await info.writeState('cancel-test', [{ key: 'cleanup', value: 'released' }]);
+    },
+  });
+  assert.equal(writeError?.code, 'TASK_CANCELLED');
+  assert.deepEqual((await adapter.getClientState(USER, 'cancel-test')).map(row => row.key), ['cleanup']);
+  assert.equal(result.details.cancelledTasks.length, 1);
 });
