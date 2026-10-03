@@ -43,6 +43,7 @@
     "amsg-server-agentic-fire-tools",
     "amsg-server-agentic-fire",
     "amsg-server-agentic-schedule-task",
+    "amsg-server-before-fire-defer",
     "amsg-server-before-fire-skip",
     "amsg-server-cancel-outbox-revival",
     "amsg-server-clamp-future-client-stamps",
