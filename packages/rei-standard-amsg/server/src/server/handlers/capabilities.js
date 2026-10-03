@@ -127,6 +127,9 @@ export const SERVER_FEATURES = Object.freeze([
   'max-delivery-retries',
   // Per-task pre-commit retry limit and fire receipt retry decision.
   'max-generation-retries',
+  // onBeforeFire 认 { defer: { afterMs } }：这次不生成，过一会儿再来问（不占重试
+  // 次数）；onFireSettled 的 status 多一种 'deferred'，带 retryAfter。
+  'before-fire-defer',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

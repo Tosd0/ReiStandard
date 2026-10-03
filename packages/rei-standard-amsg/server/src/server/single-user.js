@@ -21,6 +21,10 @@
  * @param {Object} [config.hooks] - optional fire-time hooks (see lib/agentic-fire.js):
  *   { onBeforeFire, onLLMOutput, executeToolCalls }. When omitted, AI tasks
  *   replay the schedule-time frozen prompt (legacy behavior, unchanged).
+ * @param {(fireCtx: Object) => import('./lib/agentic-fire.js').BeforeFireResult | Promise<import('./lib/agentic-fire.js').BeforeFireResult>} [config.hooks.onBeforeFire]
+ *   返回消息数组或 `{ messages, ... }` 继续生成；`{ skip: true }` 这次不发；
+ *   `{ defer: { afterMs } }` 现在不合适、afterMs 毫秒后再来问（不占重试次数，
+ *   只在 runScheduledTick / runTask 投递时可用）；`null` 交还给冻结 prompt。
  * @param {number} [config.maxToolIterations] - factory default LLM-round cap for the agentic loop (default 5).
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。
@@ -38,11 +42,13 @@
  *   上抛之前调用完。hook 自身抛错只记日志，不影响主流程（见
  *   lib/agentic-fire.js）。
  * @param {function} [config.onFireSettled] - 一次 fire 收尾的可选 hook：
- *   ({ task, status, skipReason, sentCount, pushedCount, total, iterations,
- *   error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState,
- *   writeState }) => void|Promise。onBeforeFire 被调用过
- *   就一定会调一次，无论这次是发完（status 'sent'）、跳过（'skipped'）、抛错
- *   （'failed'）还是交还给冻结 prompt 老链路（'not-handled'）。onAfterSend 只
+ *   ({ task, status, skipReason, retryAfter, sentCount, pushedCount, total,
+ *   iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch,
+ *   readState, writeState }) => void|Promise。onBeforeFire 被调用过
+ *   就一定会调一次，无论这次是发完（status 'sent'）、跳过（'skipped'）、推迟
+ *   （'deferred'，retryAfter 是什么时候再来问）、抛错（'failed'）、被取消
+ *   （'cancelled'）还是交还给冻结 prompt 老链路（'not-handled'）。status 的
+ *   类型见 lib/agentic-fire.js 的 FireSettledStatus。onAfterSend 只
  *   走「有 push 要发」那条路，「开始时占点什么、结束时放掉」的写法挂这个才不
  *   会漏（见 lib/agentic-fire.js）。
  * @returns {{ handlers: Object, ctx: Object }}

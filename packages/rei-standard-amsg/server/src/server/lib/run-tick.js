@@ -13,6 +13,10 @@
  * 任务列表要读它、循环任务推进下一次也要拿它当基准。投递收尾时把租约放掉，
  * 这条任务立刻可以被下一跳接手。
  *
+ * retry_after 还有第二个用途：onBeforeFire 返回 `{ defer: { afterMs } }` 时，
+ * 这一列写成「什么时候再来问」，别的字段都不动（见 deliverClaimedTask 里的
+ * handleDeferred）。两种用途靠 retry_count 涨没涨分得开——推迟不涨。
+ *
  * 投递失败的退避写在另一列（retry_after）上，不跟租约挤在一起：租约的意思只
  * 有「这条正在跑」，而正在等重试的任务其实闲着——两件事共用一列的话，分组串行
  * （见下）会把一条闲着的任务当成「这个分组忙着」，同组别的任务白等一轮退避。
@@ -100,6 +104,8 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 补发一天。正在重试链上的任务（retry_count > 0）不算过期——它的 next_send_at
 // 一直是名义时刻，重试拖过一小时不等于用户错过了它——但重试时刻（retry_after）
 // 本身也被拖过了这个时长的除外：那说明停摆发生在重试窗口里，内容一样旧。
+// 被 onBeforeFire 推迟（defer）的任务同样受它管：推迟不涨 retry_count，一直推
+// 下去的任务最后在这里收场。
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
@@ -360,8 +366,11 @@ async function cleanupExpiredClientState(ctx) {
  *   - `already_settled`：行还在，但已经是 sent / failed（`status` 带上是哪
  *     个）。适配器没实现 `getTaskStatusByUuidOnly` 时这种情况并进 `not_found`。
  *   - `not_due`：还没到 `next_send_at`（`nextSendAt` 带上是什么时候）。
- *   - `retry_pending`：上次投递失败，还在退避窗口里（`retryAfter` 带上什么时
- *     候到点）。
+ *   - `retry_pending`：上次投递失败还在退避窗口里，或者上次 onBeforeFire 把
+ *     它推迟了（`{ defer }`）还没到点（`retryAfter` 带上什么时候到点）。
+ *
+ * 这一次跑的时候 onBeforeFire 返回 `{ defer }` 的话，结果是 `ran: true`，任务
+ * 列在 summary.details.deferredTasks 里；到点之前再调都回 `retry_pending`。
  *
  * @param {Object} ctx - 与 runScheduledTick 同一份 ctx
  * @param {string} uuid - 任务 uuid（pending 行）
@@ -435,6 +444,7 @@ async function deliverTasks(ctx, tasks) {
     deletedOnceOffTasks: 0,
     updatedRecurringTasks: 0,
     staleTasks: [],
+    deferredTasks: [],
     cancelledTasks: [],
     reasoningSkippedTasks: [],
     redeliveredTasks: [],
@@ -983,9 +993,9 @@ async function deliverTasks(ctx, tasks) {
     const retryAfterMs = task.retry_after ? Date.parse(task.retry_after) : NaN;
     const notOnFreshRetryChain = (task.retry_count || 0) === 0
       || (Number.isFinite(retryAfterMs) && Date.now() - retryAfterMs > staleAfterMs);
-    if (Number.isFinite(occurrenceMs)
-        && Date.now() - occurrenceMs > staleAfterMs
-        && notOnFreshRetryChain) {
+    // 过期收场本身。拆成一个函数是因为除了下面这道守卫，推迟（defer）把唤醒
+    // 时刻推过了过期线时也走它，见 handleDeferred。
+    const settleAsStale = async () => {
       try {
         // hook 的 client_state 读写口：过期跳过往往正是宿主要留一条痕迹的时
         // 候（服务停摆恢复后的第一跳，此前这个 tick 里可能一次 fire 都没跑
@@ -1061,8 +1071,59 @@ async function deliverTasks(ctx, tasks) {
         results.failedCount++;
         results.failedTasks.push({ taskId: task.id, reason: error.message || '过期任务处理失败', status: 'stale_update_failed' });
       }
+    };
+
+    if (Number.isFinite(occurrenceMs)
+        && Date.now() - occurrenceMs > staleAfterMs
+        && notOnFreshRetryChain) {
+      await settleAsStale();
       return;
     }
+
+    /**
+     * onBeforeFire 返回了 `{ defer: { afterMs } }`：这次不发，到 retryAfter 再
+     * 来问。
+     *
+     * 行上只动两个字段：`retry_after` 写成唤醒时刻（捞取条件会滤掉没到点的
+     * 行，到点自然放行），`lease_until` 置空把租约放掉。其余一概不碰——
+     * `retry_count` 不涨（这不是失败，不占重试次数）、`last_error` 不写也不清、
+     * `next_send_at` 保持名义时刻（它是这次触发的身份，也是循环推进和过期判定
+     * 的基准）、`status` 仍是 pending，循环任务不推进。这一跳既不计成功也不计
+     * 失败，记在 details.deferredTasks 里。
+     *
+     * 过期线照常管着它：唤醒时刻离名义时刻超过 staleAfterMs 的话，这次推迟
+     * 不落库，当场按过期收场（一次性任务标 failed、循环任务快进，调
+     * onStaleSkip）。对没失败过的任务，这跟「先写下推迟、下次捞起来再被上面那
+     * 道守卫判过期」是同一个结局，只是不白等一轮；对正在重试链上的任务
+     * （retry_count > 0）则是唯一的出口——上面那道守卫看的是 retry_after 新不
+     * 新，而每推迟一次都会把它刷新，光靠那道守卫的话这条任务可以被无限期推
+     * 下去。
+     *
+     * @param {string} retryAfter - 唤醒时刻（ISO），runAgenticFire 算好的
+     */
+    const handleDeferred = async (retryAfter) => {
+      const wakeMs = Date.parse(retryAfter);
+      if (Number.isFinite(occurrenceMs) && wakeMs - occurrenceMs > staleAfterMs) {
+        await settleAsStale();
+        return;
+      }
+      try {
+        const updated = await updateTaskWithLastError(task.id, {
+          retry_after: retryAfter,
+          lease_until: null
+        });
+        if (rowVanished(updated)) {
+          await recordCancelled(task, 'cancelled_mid_delivery');
+          return;
+        }
+        results.deferredTasks.push({ taskId: task.id, retryAfter });
+      } catch (error) {
+        // 推迟没写进去：行还是 pending，租约到期后下一跳会把它重新捞起来，
+        // 等于提前再问一次 onBeforeFire。
+        results.failedCount++;
+        results.failedTasks.push({ taskId: task.id, reason: error.message || '推迟写库失败', status: 'defer_update_failed' });
+      }
+    };
 
     let sendResult;
     try {
@@ -1078,6 +1139,10 @@ async function deliverTasks(ctx, tasks) {
           webpush: guardWebpushWithLease(ctx.webpush, lease),
           isTaskCancelled: () => lease.lost,
           signal: lease.signal,
+          // onBeforeFire 的 { defer } 要靠 retry_after 这一列落地，没实现
+          // claimTask 的适配器没有这一列（见 lib/agentic-fire.js 的
+          // AGENTIC_DEFER_UNSUPPORTED）。
+          _deferSupported: supportsClaim,
         },
         masterKey,
         { userKey, payload: decryptedPayload }
@@ -1096,6 +1161,17 @@ async function deliverTasks(ctx, tasks) {
         task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
         { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: null }
       );
+      return;
+    }
+
+    // 宿主说「现在不合适，过一会儿再来问」。排在失败分支前面：推迟的结果不带
+    // success，但它不是失败。
+    if (sendResult.deferred) {
+      if (lease.lost) {
+        await recordCancelled(task, 'cancelled_mid_delivery');
+        return;
+      }
+      await handleDeferred(sendResult.retryAfter);
       return;
     }
 
@@ -1232,6 +1308,9 @@ async function deliverTasks(ctx, tasks) {
       deletedOnceOffTasks: results.deletedOnceOffTasks,
       updatedRecurringTasks: results.updatedRecurringTasks,
       staleTasks: results.staleTasks,
+      // onBeforeFire 返回 { defer } 被推迟的任务（{ taskId, retryAfter }）：这一
+      // 跳没生成也没发，到 retryAfter 之后再问。不计入 successCount / failedCount。
+      deferredTasks: results.deferredTasks,
       // 投递期间行被取消 / 顶替的任务。`cancelled_mid_delivery` = 推送在发出去
       // 之前被拦下；`cancelled_after_delivery` = 推送已经发完，收尾写库才发现
       // 行没了。两种都不计入 successCount / failedCount。

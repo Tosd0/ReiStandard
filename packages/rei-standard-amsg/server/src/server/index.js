@@ -204,6 +204,8 @@ export {
   DEFAULT_TOTAL_TIMEOUT_MS,
   DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE,
   MIN_SCHEDULE_LEAD_MS,
+  // onBeforeFire 的 { defer: { afterMs } } 里 afterMs 的上限。
+  MAX_DEFER_AFTER_MS,
 } from './lib/agentic-fire.js';
 // 单用户 worker 的 CORS 允许头/方法列表（外层再包路由的宿主 import 这一份，
 // 别手抄第二份）。

@@ -371,7 +371,8 @@ function positiveIntegerOr(value, fallback) {
  *     样，客户端补收拿到的、推送收到的、首次推到一半已经收到的，全是同一份。
  *
  * 推送再失败就照常抛出去，由调用方走既有的重试 / 终审逻辑——下一跳还是来这里补
- * 推，照样不生成。
+ * 推，照样不生成。onBeforeFire 既然不调，这一跳也就不存在「推迟」（defer）：
+ * 内容已经定了，剩下的只是把它送到。
  *
  * @param {Object} task
  * @param {ProcessorContext} ctx
@@ -432,8 +433,11 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean, willRetry?: boolean, retryLimit?: number, failureStage?: string }>}
+ * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, deferred?: boolean, retryAfter?: string, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean, willRetry?: boolean, retryLimit?: number, failureStage?: string }>}
  *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
+ *   `deferred: true` 表示 onBeforeFire 把这次触发推迟了（`retryAfter` 是唤醒
+ *   时刻）：`success` 为 false 但不是失败，调用方要先看这个字段。只有 ctx 带
+ *   `_deferSupported: true`（run-tick 在适配器有 retry_after 列时给）才会出现。
  */
 export async function processSingleMessage(task, ctx, providedMasterKey, predecrypted = null) {
   const deliveryState = {
@@ -484,6 +488,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // is byte-identical. onBeforeFire → { skip: true } completes the fire
     // here as a zero-push success (no LLM call, no frozen-prompt fallback):
     // use it when the host can tell at fire time the message is moot.
+    // onBeforeFire → { defer: { afterMs } } 也在这里结束：结果带 deferred: true
+    // 和 retryAfter，没生成也没推送，由 run-tick 把行推迟到那个时刻。
     if (ctx.hooks && typeof ctx.hooks.onBeforeFire === 'function' && taskNeedsLlm(decryptedPayload)) {
       const agentic = await runAgenticFire({ task, decryptedPayload, userKey, ctx });
       if (agentic.handled) return agentic.result;
@@ -730,6 +736,9 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
  *   `reasoningError` 只在正文都发出去了、思考过程那一条没发成时出现（思考过程是
  *   附赠内容，它发不出去不算这条消息失败）。调用方拿它提示用户这次没有思考过程，
  *   不带这个字段就是整轮都送到了。
+ *
+ *   这条路是请求里当场投递，不支持 onBeforeFire 的 `{ defer }`：返回它会得到
+ *   AGENTIC_DEFER_UNSUPPORTED 的配置错误，按这里的失败流程处理。
  */
 export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, providedMasterKey) {
   let retryCount = 0;
