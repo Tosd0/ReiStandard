@@ -35,6 +35,8 @@ export {
   // 投递失败重试次数的默认值（config 的 maxDeliveryRetries 不配时用它）。
   DEFAULT_MAX_DELIVERY_RETRIES,
 } from './lib/run-tick.js';
+// onBeforeFire 的 { defer: { afterMs } } 里 afterMs 的上限。
+export { MAX_DEFER_AFTER_MS } from './lib/agentic-fire.js';
 // Schema 自查 / 补齐：升级后老部署的表没跟上时，cron 会每分钟静默挂在缺的那
 // 一列上。见 lib/schema-version.js。
 export { getSchemaVersion, ensureSchema, SCHEMA_VERSION } from './lib/schema-version.js';

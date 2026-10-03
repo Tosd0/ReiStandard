@@ -66,6 +66,7 @@ const EXPECTED_FEATURES = [
   'hook-usage-total',
   'max-delivery-retries',
   'max-generation-retries',
+  'before-fire-defer',
 ];
 
 function makeWorker(extra = {}) {

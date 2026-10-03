@@ -54,6 +54,9 @@
  * tasks replay the schedule-time frozen prompt exactly as before. See
  * lib/agentic-fire.js.
  *
+ * `onBeforeFire` 除了返回 prompt，还可以返回 `{ skip: true }`（这次不发）或
+ * `{ defer: { afterMs } }`（现在不合适，afterMs 毫秒后再来问；不占重试次数）。
+ *
  * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
  * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。投递期间租约按心跳滚动
  * 续租（默认 30s 心跳 / 90s 租约）：isolate 中途被回收时任务在 ~90 秒内就能

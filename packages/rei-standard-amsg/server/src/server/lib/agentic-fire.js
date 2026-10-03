@@ -5,6 +5,7 @@
  * the completePrompt frozen at schedule time. At fire time instead:
  *
  *   onBeforeFire(fireCtx) → fresh messages (may read client_state) | { skip: true }
+ *                         | { defer: { afterMs } }（现在不合适，过一会儿再来问）
  *     → callLlm → onLLMOutput(sessionCtx) → decision
  *         ├─ 'finish'       → push decision.pushPayloads, done
  *         ├─ 'skip-push'    → record, done (task counts as delivered)
@@ -28,10 +29,21 @@
  *
  * 收尾回执：onAfterSend 只走「有 push 要发」这条路。**只要 onBeforeFire 被
  * 调用过**，无论结局是发完、跳过（skip / skip-push）还是抛错，可选的
- * ctx.onFireSettled?.({ task, status, skipReason, sentCount, pushedCount,
- * total, iterations, error, usage, usageTotal, llmCalls, outboxed, scratch,
- * readState, writeState }) 都会被调用一次（见 notifyFireSettled）。「开始时占
+ * ctx.onFireSettled?.({ task, status, skipReason, retryAfter, sentCount,
+ * pushedCount, total, iterations, error, usage, usageTotal, llmCalls, outboxed,
+ * scratch, readState, writeState }) 都会被调用一次（见 notifyFireSettled）。
+ * 推迟（defer）也算一种结局，同样调一次。「开始时占
  * 点什么、结束时放掉」的写法挂这个才不会漏。
+ *
+ * 推迟（defer）：onBeforeFire 返回 `{ defer: { afterMs } }` 表示「现在不合适，
+ * 过 afterMs 毫秒再来问我」——比如任务到点时宿主那边正有另一件事占着同一段
+ * 对话。这次不调 LLM、不推送、不调 onLLMOutput / onAfterSend，任务行只写
+ * `retry_after = now + afterMs` 并放掉租约：`retry_count` 不涨、`last_error` 不
+ * 动、`next_send_at`（本次触发的名义时刻）不动，循环任务也不推进。到点之后
+ * cron 再把它捞起来，从 onBeforeFire 重新走一遍（可以再推迟）。它不是失败：
+ * 抛错会占一格重试、留下 last_error，推迟两样都不占。收尾回执的 status 是
+ * `deferred`，带 `retryAfter`。afterMs 的范围见 MAX_DEFER_AFTER_MS；能不能推迟
+ * 取决于投递入口，见 runFireChain 里的 AGENTIC_DEFER_UNSUPPORTED。
  *
  * 失败之后的重试：LLM 上游明确拒了这次请求（401 / 403 / 400 …）一跳终审，
  * 错误上带 `permanent: true`（见 lib/errors.js 的 isPermanentLlmFailure）。
@@ -161,6 +173,12 @@ export const DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE = 2;
 // 自排任务的最小提前量：cron 一分钟一跳，比这更近等于让下一跳立刻捡走。
 export const MIN_SCHEDULE_LEAD_MS = 60_000;
 
+// onBeforeFire 的 `{ defer: { afterMs } }` 最多能把这次触发往后推多久。推迟是
+// 给「等手头这件事结束」用的短等待；想等得更久，该改的是任务的排期。上限同时
+// 保证 now + afterMs 一定是个合法的时刻。没有下限：cron 一分钟一跳，再小的
+// afterMs 也是「到点之后的第一跳」才会被重新问到。
+export const MAX_DEFER_AFTER_MS = 24 * 60 * 60 * 1000;
+
 // 自排任务允许的类型。instant 归 POST /schedule-message 那条同步路径管。
 const SCHEDULABLE_MESSAGE_TYPES = new Set(['auto', 'prompted', 'fixed']);
 // 与 validateScheduleMessagePayload 同一套；run-tick 只认得这三种，别的值会让
@@ -249,6 +267,52 @@ export function buildHookTask(task, decryptedPayload) {
   });
 }
 
+/**
+ * onBeforeFire 的返回值。
+ *
+ * @typedef {Array<Object>
+ *   | { messages: Array<Object>, maxToolIterations?: number, totalTimeoutMs?: number, tools?: Array<Object>, toolChoice?: any }
+ *   | { skip: true }
+ *   | { defer: { afterMs: number } }
+ *   | null
+ *   | undefined} BeforeFireResult
+ *   - 消息数组 / `{ messages, ... }`：用这份 prompt 生成；
+ *   - `{ skip: true }`：这次不发，按零推送的成功收场（一次性任务删行、循环任务
+ *     推进到下一次）；
+ *   - `{ defer: { afterMs } }`：现在不合适，afterMs 毫秒后再来问。afterMs 必须
+ *     是有限正数，且不超过 MAX_DEFER_AFTER_MS（24 小时）；
+ *   - `null` / `undefined`：交还给排程时冻结的 prompt 老链路。
+ */
+
+/**
+ * 收尾回执（onFireSettled）的 status。
+ *
+ * @typedef {'sent'|'skipped'|'deferred'|'failed'|'cancelled'|'not-handled'} FireSettledStatus
+ */
+
+const BAD_BEFORE_FIRE_MESSAGE =
+  'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | { defer: { afterMs } } | null';
+
+/**
+ * 校验 `{ defer: { afterMs } }` 并取出 afterMs。形状不对、不是有限正数、或超过
+ * MAX_DEFER_AFTER_MS，都按 onBeforeFire 的契约违约处理（确定性失败，不重试）。
+ *
+ * @param {unknown} defer
+ * @returns {number} afterMs
+ */
+function readDeferAfterMs(defer) {
+  const afterMs = defer && typeof defer === 'object' ? /** @type {any} */ (defer).afterMs : undefined;
+  if (typeof afterMs !== 'number' || !Number.isFinite(afterMs) || afterMs <= 0 || afterMs > MAX_DEFER_AFTER_MS) {
+    throw markPermanent(
+      new TypeError(
+        `${BAD_BEFORE_FIRE_MESSAGE}（defer.afterMs 必须是有限正数，且不超过 ${MAX_DEFER_AFTER_MS} 毫秒）`
+      ),
+      'AGENTIC_BAD_BEFORE_FIRE'
+    );
+  }
+  return afterMs;
+}
+
 function normalizeBeforeFireResult(result) {
   if (Array.isArray(result)) {
     return { messages: result };
@@ -265,12 +329,7 @@ function normalizeBeforeFireResult(result) {
       toolChoice: result.toolChoice,
     };
   }
-  throw markPermanent(
-    new TypeError(
-      'AGENTIC_BAD_BEFORE_FIRE: onBeforeFire must return ChatMessage[] | { messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? } | { skip: true } | null'
-    ),
-    'AGENTIC_BAD_BEFORE_FIRE'
-  );
+  throw markPermanent(new TypeError(BAD_BEFORE_FIRE_MESSAGE), 'AGENTIC_BAD_BEFORE_FIRE');
 }
 
 function firstPositiveInt(values, fallback) {
@@ -295,12 +354,18 @@ function firstPositiveNumber(values, fallback) {
  * @param {Object} args.decryptedPayload - decrypted task payload (has credentials; they stop here)
  * @param {string} args.userKey - per-user storage key (for readState decryption)
  * @param {Object} args.ctx - processor ctx ({ db, webpush, vapid, hooks, maxToolIterations, totalTimeoutMs, maxScheduledTasksPerFire })
- * @returns {Promise<{ handled: false } | { handled: true, result: { success: true, messagesSent: number, status: 'finished'|'skipped', iterations: number } }>}
+ * @returns {Promise<{ handled: false }
+ *   | { handled: true, result: { success: true, messagesSent: number, status: 'finished'|'skipped', iterations: number } }
+ *   | { handled: true, result: { success: false, deferred: true, retryAfter: string, messagesSent: 0, status: 'deferred', iterations: 0 } }>}
  *   `handled: false` → caller falls back to the legacy frozen-prompt path
  *   (onBeforeFire returned null).
  *   `onBeforeFire` may also return `{ skip: true }` to complete the fire
  *   before the first LLM call → `status: 'skipped', iterations: 0`, same
  *   success handling as the post-LLM skip-push path.
+ *   `{ defer: { afterMs } }` → `status: 'deferred'`，`retryAfter` 是「什么时候
+ *   再来问」的 ISO 时刻。`success` 给 false 而不是 true：这次什么都没发，调用
+ *   方得看 `deferred` 走推迟的收尾；万一有调用方不认识这个字段，也只会把它当
+ *   成没发成，不会当成发完了把任务删掉。
  *   Failures (timeout / loop exceeded / config errors) throw — the caller's
  *   existing error handling turns them into task retry/failure.
  *
@@ -798,6 +863,8 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   // 结局默认按 failed 记：下面只要有任何一步抛出去，finally 里发出的就是这个。
   let settledStatus = 'failed';
   let settledError = null;
+  // 只有 deferred 这个结局带值：什么时候再来问（ISO 时刻）。
+  let settledRetryAfter = null;
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
@@ -806,9 +873,11 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       sessionId, messageIdBase, occurrenceMs,
     });
     throwIfCancelled();
-    settledStatus = !outcome.handled
-      ? 'not-handled'
-      : (outcome.result.status === 'skipped' ? 'skipped' : 'sent');
+    if (!outcome.handled) settledStatus = 'not-handled';
+    else if (outcome.result.status === 'deferred') {
+      settledStatus = 'deferred';
+      settledRetryAfter = outcome.result.retryAfter;
+    } else settledStatus = outcome.result.status === 'skipped' ? 'skipped' : 'sent';
     return outcome;
   } catch (error) {
     if (isCancelled() && !isTaskCancelledError(error)) {
@@ -828,6 +897,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
         ? failureRetryDecision(ctx._deliveryState, settledError)
         : { willRetry: null, failureStage: null }),
       skipReason: settledStatus === 'skipped' ? progress.skipReason : null,
+      retryAfter: settledStatus === 'deferred' ? settledRetryAfter : null,
       sentCount: progress.sentCount,
       pushedCount: progress.pushedCount,
       total: progress.total,
@@ -881,6 +951,41 @@ async function runFireChain({
   if (typeof before === 'object' && before.skip === true) {
     progress.skipReason = 'before-fire';
     return { handled: true, result: { success: true, messagesSent: 0, status: 'skipped', iterations: 0 } };
+  }
+
+  // 推迟：现在不合适，过一会儿再来问。这里只算出「什么时候再来」，写库（把
+  // retry_after 推到那个时刻、放掉租约）是 run-tick 的事。
+  if (typeof before === 'object' && !Array.isArray(before) && before.defer != null) {
+    const afterMs = readDeferAfterMs(before.defer);
+    // 推迟靠 retry_after 这一列落地，只有定时投递（runScheduledTick / runTask）
+    // 且适配器实现了 claimTask 时才有这一列可写，由 run-tick 用 ctx._deferSupported
+    // 告诉这里。别的入口都不行：
+    //   - 没实现 claimTask 的自定义适配器只能把时间写进 next_send_at，而那是
+    //     这次触发的名义时刻（宿主拿它当触发身份、循环推进拿它当基准），不能改；
+    //   - `messageType: 'instant'` 在请求里当场投递（processMessagesByUuid），
+    //     没有「过一会儿再捞起来」这回事。
+    // 这是部署 / 用法层面的问题，按配置错误报（可重试、不判终态），不悄悄当成
+    // 跳过或立刻再问。
+    if (ctx._deferSupported !== true) {
+      throw new DeploymentConfigError(
+        'AGENTIC_DEFER_UNSUPPORTED: onBeforeFire 返回了 { defer }，但这条投递路径不支持推迟——'
+        + '只有 runScheduledTick / runTask 且适配器实现了 claimTask（任务表有 retry_after 列）时可用，'
+        + '请求内当场投递的 instant 任务不可用',
+        { code: 'AGENTIC_DEFER_UNSUPPORTED' }
+      );
+    }
+    return {
+      handled: true,
+      result: {
+        success: false,
+        deferred: true,
+        // 用真实时钟：这个时刻要落进 retry_after，跟数据库捞取条件里的「现在」比。
+        retryAfter: new Date(Date.now() + afterMs).toISOString(),
+        messagesSent: 0,
+        status: 'deferred',
+        iterations: 0,
+      },
+    };
   }
 
   const normalized = normalizeBeforeFireResult(before);
@@ -1144,11 +1249,11 @@ async function notifyAfterSend(ctx, info) {
 }
 
 /**
- * ctx.onFireSettled?.({ task, status, skipReason, sentCount, pushedCount,
- * total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed,
- * scratch, readState, writeState })
+ * ctx.onFireSettled?.({ task, status, skipReason, retryAfter, sentCount,
+ * pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls,
+ * outboxed, scratch, readState, writeState })
  * —— 一次 fire 收尾的可选 hook。**onBeforeFire 被调用过，这个就一定会被调用
- * 一次**，无论这次是发完了、跳过了、还是半路抛错。
+ * 一次**，无论这次是发完了、跳过了、推迟了、还是半路抛错。
  *
  * sentCount 是这批走完了几段，pushedCount 是其中真的占用了推送通道的有几条
  * （不会弹通知的段默认只落收件箱，见 lib/push-policy.js）。
@@ -1183,12 +1288,20 @@ async function notifyAfterSend(ctx, info) {
  * 了，但记账的代码挂在发送后，这次没发成就没人记，那条任务从此只活在数据库
  * 里；以及 fire 开头拿的锁没有可靠的释放点，一次 skip 就把资源占满整个 TTL。
  *
- * status 五种：
+ * status 六种（见 FireSettledStatus）：
  *   - `cancelled`   —— 任务被取消/顶替；error.code 为 TASK_CANCELLED，不重试
  *   - `sent`        —— pushPayloads 全部发完（sentCount === total）
  *   - `skipped`     —— 这次不发。skipReason 区分是 onBeforeFire 直接
  *                      `{ skip: true }`（`'before-fire'`），还是模型跑完之后
  *                      判定不发（`'skip-push'`）
+ *   - `deferred`    —— onBeforeFire 返回了 `{ defer: { afterMs } }`：这次没
+ *                      生成也没发，任务还在，retryAfter（ISO 时刻）之后会从
+ *                      onBeforeFire 重新走一遍。到那时又是一次新的 fire，有
+ *                      自己的 scratch 和自己的一次收尾回执。retryAfter 只在这
+ *                      个结局有值，其余为 null。回执发生在写库之前：之后这次
+ *                      推迟也可能因为唤醒时刻越过了过期线而直接按过期收场
+ *                      （见 lib/run-tick.js 的 handleDeferred），那时宿主会再
+ *                      收到一次 onStaleSkip
  *   - `failed`      —— 链路抛错，error 带原始错误。部分失败也是这个：发到第
  *                      k 段挂了 → sentCount = k、total 是原本要发的段数
  *   - `not-handled` —— onBeforeFire 返回 null，这条任务交还给排程时冻结的

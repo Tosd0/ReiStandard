@@ -157,6 +157,9 @@ export default createSingleUserCloudflareWorker((env) => ({
       // 或返回 { skip: true }：这次不生成，零推送直接算成功结束（不调 LLM）。
       //   一次性任务照删、循环任务照推进到下次。适合排程后对话已有新进展、
       //   这条到点已多余的情况。
+      // 或返回 { defer: { afterMs: 30_000 } }：现在不合适，30 秒后再来问。
+      //   这次不调 LLM、不推送，任务原样留着（不占重试次数、不留报错、触发
+      //   时刻不变），到点后从 onBeforeFire 重新走一遍。afterMs 最大 24 小时。
     },
 
     // 每轮 LLM 输出后分类。ctx 形状与 @rei-standard/amsg-instant 的
@@ -317,13 +320,13 @@ export default createSingleUserCloudflareWorker((env) => ({
 
 ## 一次 fire 的收尾回执（onFireSettled）
 
-这是啥：**只要 `onBeforeFire` 被调用过**，这次 fire 无论是发完了、跳过了、还是半路抛错，都会调一次 `onFireSettled`。「开始时占点什么、结束时放掉」的写法挂这个。
+这是啥：**只要 `onBeforeFire` 被调用过**，这次 fire 无论是发完了、跳过了、推迟了、还是半路抛错，都会调一次 `onFireSettled`。「开始时占点什么、结束时放掉」的写法挂这个。
 
 ```js
 export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   async onFireSettled(info) {
-    // info: { task, status, skipReason, sentCount, pushedCount, total, iterations,
+    // info: { task, status, skipReason, retryAfter, sentCount, pushedCount, total, iterations,
     //         error, metadata, usage, usageTotal, llmCalls, outboxed,
     //         scratch, readState, writeState }
     if (info.scratch.scheduledFollowUp) {
@@ -336,12 +339,13 @@ export default createSingleUserCloudflareWorker((env) => ({
 }));
 ```
 
-`status` 四种：
+`status` 常见的几种：
 
 | status | 什么时候 |
 |---|---|
 | `sent` | pushPayloads 全部发完（`sentCount === total`） |
 | `skipped` | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`） |
+| `deferred` | `onBeforeFire` 返回了 `{ defer: { afterMs } }`：这次没生成也没发，`retryAfter`（ISO 时刻）之后再从 `onBeforeFire` 走一遍 |
 | `failed` | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数 |
 | `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管 |
 
