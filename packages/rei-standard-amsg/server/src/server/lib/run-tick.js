@@ -63,6 +63,7 @@
  * @returns {Promise<Object>} summary { totalTasks, successCount, failedCount, processedAt, executionTime, details }
  */
 
+import { captureCloudTaskGuard, createCloudGuardedAdapter, assertCloudGuard } from './cloud-data-guard.js';
 import { resolveMaxDeliveryRetries } from './retry-policy.js';
 export { DEFAULT_MAX_DELIVERY_RETRIES } from './retry-policy.js';
 import { hmacSha256, bytesToBase64Url, utf8 } from './webcrypto-utils.js';
@@ -455,6 +456,12 @@ async function deliverTasks(ctx, tasks) {
   // 也不补跑后面的，剩下的留给下一跳（cron 一分钟就再来一次），免得一跳里排
   // 出一条长长的串行链、把整跳的时间预算耗光。
   const groupsTakenThisTick = new Set();
+  // Keep the generation captured before claim through retries and all lifecycle writes.
+  const taskCloudGuards = new Map();
+  const updateLifecycleTask = (taskId, fields) => {
+    const guard = taskCloudGuards.get(taskId);
+    return guard ? db.updateTaskById(taskId, fields, guard) : db.updateTaskById(taskId, fields);
+  };
 
   // 适配器没实现 claimTask（自定义适配器）→ 退回不占位的老行为：跑得动，只是
   // 超过一跳间隔的慢任务仍可能被下一跳重复触发。
@@ -467,7 +474,10 @@ async function deliverTasks(ctx, tasks) {
     const leaseUntil = new Date(
       Date.now() + (heartbeatEnabled ? heartbeatLeaseTtlMs : claimLeaseMs)
     ).toISOString();
-    return !!(await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup));
+    const guard = taskCloudGuards.get(task.id);
+    return !!(guard
+      ? await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup, guard)
+      : await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup));
   }
 
   /**
@@ -496,9 +506,12 @@ async function deliverTasks(ctx, tasks) {
       if (stopped) return;
       let renewed;
       try {
-        renewed = await db.renewTaskLease(task.id, new Date(Date.now() + heartbeatLeaseTtlMs).toISOString());
+        const guard = taskCloudGuards.get(task.id);
+        const until = new Date(Date.now() + heartbeatLeaseTtlMs).toISOString();
+        renewed = guard ? await db.renewTaskLease(task.id, until, guard) : await db.renewTaskLease(task.id, until);
       } catch (error) {
-        console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
+        if (error?.code === 'CLOUD_OWNER_RETIRED') renewed = false;
+        else console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
       }
       if (renewed === false) {
         // 续不上有两种可能，`false` 本身分不出来：
@@ -584,24 +597,25 @@ async function deliverTasks(ctx, tasks) {
     if (fields.lease_until === null) markLeaseReleased(taskId);
 
     if (!Object.prototype.hasOwnProperty.call(fields, 'last_error')) {
-      return db.updateTaskById(taskId, fields);
+      return updateLifecycleTask(taskId, fields);
     }
     const { last_error: _lastError, ...stateFields } = fields;
-    if (adaptersWithoutLastErrorColumn.has(db)) return db.updateTaskById(taskId, stateFields);
+    if (adaptersWithoutLastErrorColumn.has(db)) return updateLifecycleTask(taskId, stateFields);
 
     let combinedError;
     try {
-      const result = await db.updateTaskById(taskId, fields);
+      const result = await updateLifecycleTask(taskId, fields);
       // 写进去了 = 这一列在。之前那次失败是瞬时的，嫌疑清零。
       lastErrorColumnSuspicions.delete(db);
       return result;
     } catch (error) {
+      if (error?.code === 'CLOUD_OWNER_RETIRED') throw error;
       combinedError = error;
     }
 
     // 退回只写状态字段。这一笔再挂就是库真出问题了，原样抛给调用方（既有路径会
     // 把它记成 retry_update_failed / stale_update_failed），一个字都不缓存。
-    const result = await db.updateTaskById(taskId, stateFields);
+    const result = await updateLifecycleTask(taskId, stateFields);
 
     // 告警第一次就说（见 warnMissingLastErrorColumn），认定要等第二次。
     warnMissingLastErrorColumn(combinedError);
@@ -938,8 +952,16 @@ async function deliverTasks(ctx, tasks) {
 
     let claimed;
     try {
+      if (decrypted.ok) {
+        const guard = await captureCloudTaskGuard(db, task.user_id, decryptedPayload, ctx.cloudData?.resolveOwner, task);
+        if (guard) taskCloudGuards.set(task.id, guard);
+      }
       claimed = await claimForThisTick(task, serializeGroup);
     } catch (error) {
+      if (error?.code === 'CLOUD_OWNER_RETIRED') {
+        await recordCancelled(task, 'owner_retired');
+        return;
+      }
       // 占位这一步就出错，说明库有问题——此时不知道别人有没有在跑这条，宁可
       // 不发。行还是 pending，下一跳会重新捞。
       results.failedCount++;
@@ -1000,8 +1022,17 @@ async function deliverTasks(ctx, tasks) {
         // hook 的 client_state 读写口：过期跳过往往正是宿主要留一条痕迹的时
         // 候（服务停摆恢复后的第一跳，此前这个 tick 里可能一次 fire 都没跑
         // 过），所以现造一份递给它，而不是让宿主自己去别处找。
+        const cloudGuard = await captureCloudTaskGuard(db, task.user_id, decryptedPayload, ctx.cloudData?.resolveOwner, task);
+        const guardedDb = createCloudGuardedAdapter(db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard: cloudGuard, userId: task.user_id });
+        const guardedWebpush = cloudGuard && ctx.webpush ? {
+          ...ctx.webpush,
+          async sendNotification(...args) {
+            await assertCloudGuard(db, task.user_id, cloudGuard);
+            return ctx.webpush.sendNotification(...args);
+          }
+        } : ctx.webpush;
         const stateAccessors = createStateAccessors({
-          db,
+          db: guardedDb,
           userId: task.user_id,
           userKey,
           maxStateValueBytes: ctx.maxStateValueBytes
@@ -1009,7 +1040,7 @@ async function deliverTasks(ctx, tasks) {
         // 结果出口也一并给：「这一条（这几条）没响」本身就常是要送回客户端
         // 的一条结果，宿主不用为这个场合另开一条回程（见 lib/result-emitter.js）。
         const { emitResult } = createResultEmitter({
-          db,
+          db: guardedDb,
           task,
           userKey,
           decryptedPayload,
@@ -1020,7 +1051,7 @@ async function deliverTasks(ctx, tasks) {
             ? `sess_task_${task.id}${occurrenceSuffix(task)}`
             : `sess_stale_${task.uuid || ''}`,
           occurrenceMs,
-          webpush: ctx.webpush,
+          webpush: guardedWebpush,
           isCancelled: () => lease.lost
         });
 
@@ -1176,6 +1207,10 @@ async function deliverTasks(ctx, tasks) {
     }
 
     if (!sendResult.success) {
+      if (sendResult.errorCode === 'CLOUD_OWNER_RETIRED') {
+        await recordCancelled(task, 'owner_retired');
+        return;
+      }
       // 取消是拦下来的，不是发失败——按失败走会给一条已经不存在的行排重试，
       // 也会把这件事混进 failedTasks 里。
       if (lease.lost) {

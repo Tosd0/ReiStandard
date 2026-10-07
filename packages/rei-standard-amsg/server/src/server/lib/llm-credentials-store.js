@@ -143,8 +143,8 @@ export function hasCredRefs(payload) {
  */
 export async function saveLlmCredentials({ db, userId, userKey, credentials }) {
   const entries = [];
-  for (const { credId, value } of credentials) {
-    entries.push({ credId, encryptedValue: await encryptForStorage(JSON.stringify(value), userKey) });
+  for (const { credId, value, owner, kind, ownerGeneration } of credentials) {
+    entries.push({ credId, owner, kind, ownerGeneration, encryptedValue: await encryptForStorage(JSON.stringify(value), userKey) });
   }
   const upserted = await db.upsertLlmCredentials(userId, entries);
   return { upserted };

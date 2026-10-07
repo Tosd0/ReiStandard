@@ -207,7 +207,7 @@ async function sendResultPush({ db, task, userKey, decryptedPayload, webpush, pu
     await sendTaggedPush(webpush, subscription, JSON.stringify(push));
     return true;
   } catch (error) {
-    if (isTaskCancelledError(error)) throw error;
+    if (isTaskCancelledError(error) || error?.code === 'CLOUD_OWNER_RETIRED') throw error;
     console.warn(
       `[amsg-server] 结果 ${push.messageId} 的推送没发出去（已落进收件箱，等客户端补收）:`,
       error && error.message

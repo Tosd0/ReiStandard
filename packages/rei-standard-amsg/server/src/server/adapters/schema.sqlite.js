@@ -270,6 +270,36 @@ export const SQLITE_ALL_INDEXES = [
   ...MESSAGE_OUTBOX_INDEXES
 ];
 
+// Internal management records hold encrypted plans, operations and owner labels.
+export const CLOUD_DATA_TABLES_SQL = [
+  `CREATE TABLE IF NOT EXISTS cloud_data_records (
+    user_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    data TEXT NOT NULL, idempotency_key TEXT, updated_at INTEGER NOT NULL, write_token TEXT,
+    lease_until INTEGER, lease_token TEXT,
+    PRIMARY KEY (user_id, kind, id), UNIQUE (user_id, kind, idempotency_key)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cloud_data_record_chunks (
+    user_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+    value TEXT NOT NULL, write_token TEXT NOT NULL,
+    PRIMARY KEY (user_id, kind, id, chunk_index)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cloud_data_owners (
+    user_id TEXT NOT NULL, owner_type TEXT NOT NULL, owner_id TEXT NOT NULL,
+    active INTEGER NOT NULL, generation INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, owner_type, owner_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cloud_resource_metadata (
+    user_id TEXT NOT NULL, resource_key TEXT NOT NULL, encrypted_value TEXT NOT NULL,
+    PRIMARY KEY (user_id, resource_key)
+  )`,
+  // The empty table is a transactional assertion: inserting 0 aborts the batch.
+  `CREATE TABLE IF NOT EXISTS cloud_guard_assertions (
+    allowed INTEGER NOT NULL DEFAULT 1 CONSTRAINT cloud_owner_guard CHECK (allowed = 1),
+    metadata_allowed INTEGER CONSTRAINT cloud_metadata_guard CHECK (metadata_allowed = 1),
+    lease_allowed INTEGER CONSTRAINT cloud_lease_guard CHECK (lease_allowed = 1)
+  )`
+];
+
 // ── schema 自查用的「这一版需要什么」 ─────────────────────────────────────
 //
 // 建表语句是 CREATE TABLE IF NOT EXISTS，已经存在的表不会被改动，所以升级后
@@ -332,7 +362,8 @@ export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
     describeTable(CLIENT_STATE_TABLE_SQL),
     describeTable(PUSH_SUBSCRIPTION_TABLE_SQL),
     describeTable(LLM_CREDENTIALS_TABLE_SQL),
-    describeTable(MESSAGE_OUTBOX_TABLE_SQL)
+    describeTable(MESSAGE_OUTBOX_TABLE_SQL),
+    ...CLOUD_DATA_TABLES_SQL.map(describeTable)
   ])),
   indexes: Object.freeze(SQLITE_ALL_INDEXES.filter((index) => index.critical).map((index) => index.name))
 });

@@ -43,6 +43,35 @@ const TEXT_ENCODER = new TextEncoder();
 /** @typedef {import('@rei-standard/amsg-shared').ToolRequestPush} ToolRequestPush */
 /** @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush */
 
+/** @typedef {{ type: string, id: string, label?: string }} CloudOwner */
+/** @typedef {'task'|'state'|'credential'|'outbox'|'subscription'} CloudResourceType */
+/** @typedef {{ source: string, code: string, message: string }} CloudDataGap */
+/** @typedef {{ id: string, type: CloudResourceType, owner: CloudOwner|null, kind: string|null, label: string, byteSize: number|null, updatedAt: number|null, status: string|null }} CloudResource */
+/** @typedef {{ resources: CloudResource[], nextCursor: string|null, complete: boolean, gaps: CloudDataGap[] }} CloudDataPage */
+/** @typedef {{ counts: Array<{type: CloudResourceType, count: number, byteSize: number|null}>, total: number, complete: boolean, gaps: CloudDataGap[] }} CloudDataSummary */
+/** @typedef {{ mode: 'purge'|'retire-owner', resourceIds?: string[], owner?: CloudOwner, types?: CloudResourceType[] }} CloudCleanupSelection */
+/** @typedef {{ id: string, mode: 'purge'|'retire-owner', owner: CloudOwner|null, resources: CloudResource[], count: number, expiresAt: number, counts: Array<{type: CloudResourceType, count: number}>, impacts: string[], complete: boolean, gaps: CloudDataGap[] }} CloudCleanupPlan */
+/** @typedef {{ id: string, planId: string, mode: 'purge'|'retire-owner', owner: CloudOwner|null, status: 'pending'|'running'|'completed'|'failed', counts: Array<{type: CloudResourceType, deleted: number, remaining: number, failed: number}>, errors: Array<{resourceId?: string, code: string, message: string}>, createdAt: number, updatedAt: number }} CloudCleanupOperation */
+/** @typedef {{ operations: CloudCleanupOperation[], complete: boolean, gaps: CloudDataGap[] }} CloudCleanupOperations */
+/** @typedef {{ owner: CloudOwner, retired: boolean, generation: number, updatedAt: number|null, complete: boolean, gaps: CloudDataGap[] }} CloudOwnerState */
+/**
+ * @template T
+ * @typedef {{ success: boolean, data?: T, error?: {code: string, message: string, details?: unknown}, encrypted?: boolean, version?: number }} CloudDataResponse
+ */
+
+const CLOUD_RESOURCE_TYPES = new Set(['task', 'state', 'credential', 'outbox', 'subscription']);
+
+function requireCloudString(value, name) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new TypeError(`[rei-standard-amsg-client] ${name} must be a non-empty string`);
+  }
+}
+
+function validateCloudOwner(owner) {
+  requireCloudString(owner?.type, 'owner.type');
+  requireCloudString(owner?.id, 'owner.id');
+}
+
 /**
  * @typedef {Object} ReiClientConfig
  * @property {string} baseUrl                            - Default base URL of the API (e.g. https://host/api/v1).
@@ -558,6 +587,10 @@ export class ReiClient {
    * `primaryModel`（冻结在任务行里），或 `credRefs: { chat: '<credId>' }` 引用
    * `putLlmCredentials()` 登记过的凭据（到点现读，换 Key 只要覆盖那一行）。
    * 两种同时给会被服务端 400。
+   *
+   * Owner-aware workers accept `owner`, `kind`, and `ownerGeneration` in the
+   * schedule payload. Missing generation means 0; after explicit owner restore,
+   * new requests must include the returned generation.
    *
    * @param {Object} payload - Schedule message payload.
    * @returns {Promise<Object>} API response body.
@@ -1108,6 +1141,164 @@ export class ReiClient {
     };
   }
 
+  // Cloud management always reads server records, never a browser-side owner list.
+
+  /**
+   * Read the entire server inventory summary on user demand. Probe the
+   * `cloud-data-management` capability before using these methods on old workers.
+   * `complete` describes source availability, independently of pagination.
+   * @returns {Promise<CloudDataResponse<CloudDataSummary>>}
+   */
+  async getCloudDataSummary() {
+    return this._cloudDataRequest('/cloud-data/summary');
+  }
+
+  /**
+   * List actual cloud resources. Follow nextCursor until null; a page with
+   * complete=false is not proof that missing resources do not exist.
+   * @param {{cursor?: string, limit?: number, owner?: CloudOwner, type?: CloudResourceType}} [opts]
+   * @returns {Promise<CloudDataResponse<CloudDataPage>>}
+   */
+  async listCloudDataResources(opts = {}) {
+    const params = new URLSearchParams();
+    if (opts.cursor !== undefined) {
+      requireCloudString(opts.cursor, 'cursor');
+      params.set('cursor', opts.cursor);
+    }
+    if (opts.limit !== undefined) {
+      if (!Number.isInteger(opts.limit) || opts.limit < 1) throw new TypeError('[rei-standard-amsg-client] limit must be a positive integer');
+      params.set('limit', String(opts.limit));
+    }
+    if (opts.type !== undefined) {
+      if (!CLOUD_RESOURCE_TYPES.has(opts.type)) throw new TypeError('[rei-standard-amsg-client] invalid resource type');
+      params.set('type', opts.type);
+    }
+    if (opts.owner !== undefined) {
+      validateCloudOwner(opts.owner);
+      params.set('ownerType', opts.owner.type);
+      params.set('ownerId', opts.owner.id);
+    }
+    const query = params.toString();
+    return this._cloudDataRequest(`/cloud-data/resources${query ? `?${query}` : ''}`);
+  }
+
+  /**
+   * Preview an explicit selection. Purge allows later normal writes; retire-owner
+   * disables the owner and includes all its resources at execution time.
+   * Never translate an empty selection into "delete everything".
+   * @param {CloudCleanupSelection} selection
+   * @returns {Promise<CloudDataResponse<CloudCleanupPlan>>}
+   */
+  async createCloudDataCleanupPlan(selection) {
+    if (!selection || !['purge', 'retire-owner'].includes(selection.mode)) {
+      throw new TypeError('[rei-standard-amsg-client] cleanup mode must be purge or retire-owner');
+    }
+    if (selection.owner !== undefined) validateCloudOwner(selection.owner);
+    if (selection.resourceIds !== undefined) {
+      if (!Array.isArray(selection.resourceIds) || !selection.resourceIds.length) throw new TypeError('[rei-standard-amsg-client] resourceIds must be a non-empty array');
+      for (const id of selection.resourceIds) requireCloudString(id, 'resourceId');
+    }
+    if (selection.types !== undefined) {
+      if (!Array.isArray(selection.types) || !selection.types.length || selection.types.some(type => !CLOUD_RESOURCE_TYPES.has(type))) {
+        throw new TypeError('[rei-standard-amsg-client] types must be a non-empty array of resource types');
+      }
+    }
+    if (selection.mode === 'retire-owner') {
+      if (!selection.owner || selection.resourceIds !== undefined || selection.types !== undefined) {
+        throw new TypeError('[rei-standard-amsg-client] retire-owner requires only an owner scope');
+      }
+    } else if (!selection.owner && !selection.resourceIds) {
+      throw new TypeError('[rei-standard-amsg-client] cleanup requires an explicit non-empty scope');
+    }
+    return this._cloudDataRequest('/cloud-data/cleanup-plans', selection);
+  }
+
+  /**
+   * Start durable server-side cleanup. Reuse the idempotency key when retrying.
+   * The returned operation may still be pending/running; only completed means done.
+   * @param {{planId: string, idempotencyKey: string}} options
+   * @returns {Promise<CloudDataResponse<CloudCleanupOperation>>}
+   */
+  async startCloudDataCleanup(options) {
+    requireCloudString(options?.planId, 'planId');
+    requireCloudString(options?.idempotencyKey, 'idempotencyKey');
+    return this._cloudDataRequest('/cloud-data/cleanup-operations', options);
+  }
+
+  /** @returns {Promise<CloudDataResponse<CloudCleanupOperations>>} */
+  async listCloudDataCleanupOperations() {
+    return this._cloudDataRequest('/cloud-data/cleanup-operations');
+  }
+
+  /**
+   * Poll saved progress without re-scanning cloud resources.
+   * @param {string} id
+   * @returns {Promise<CloudDataResponse<CloudCleanupOperation>>}
+   */
+  async getCloudDataCleanupOperation(id) {
+    requireCloudString(id, 'operation id');
+    return this._cloudDataRequest(`/cloud-data/cleanup-operations/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * Discover registered owners even after their resources and cleanup history
+   * are gone. This registry supplements inventory, never replaces it.
+   * @returns {Promise<CloudDataResponse<{owners: CloudOwnerState[], complete: boolean, gaps: CloudDataGap[]}>>}
+   */
+  async listCloudDataOwners() {
+    return this._cloudDataRequest('/cloud-data/owners');
+  }
+
+  /**
+   * @param {CloudOwner} owner
+   * @returns {Promise<CloudDataResponse<CloudOwnerState>>}
+   */
+  async getCloudDataOwner(owner) {
+    validateCloudOwner(owner);
+    const params = new URLSearchParams({ ownerType: owner.type, ownerId: owner.id });
+    return this._cloudDataRequest(`/cloud-data/owner?${params}`);
+  }
+
+  /**
+   * Explicitly re-enable a retired owner after user confirmation. Normal syncing
+   * must never call this automatically; previous-generation tasks remain invalid.
+   * @param {CloudOwner} owner
+   * @returns {Promise<CloudDataResponse<CloudOwnerState>>}
+   */
+  async restoreCloudDataOwner(owner) {
+    validateCloudOwner(owner);
+    return this._cloudDataRequest('/cloud-data/owner', { action: 'restore', owner });
+  }
+
+  /**
+   * @private
+   * @template T
+   * @param {string} path
+   * @param {Object} [payload]
+   * @returns {Promise<CloudDataResponse<T>>}
+   */
+  async _cloudDataRequest(path, payload) {
+    const headers = this._withServerToken({
+      'X-User-Id': this._userId,
+      'X-Response-Encrypted': 'true',
+      'X-Encryption-Version': '1'
+    });
+    let body;
+    if (payload !== undefined) {
+      const json = JSON.stringify(payload);
+      this._assertPayloadSize(json, 'cloudData');
+      body = JSON.stringify(await this._encrypt(json));
+      headers['Content-Type'] = 'application/json';
+      headers['X-Payload-Encrypted'] = 'true';
+    }
+    const response = await fetch(`${this._baseUrl}${path}`, {
+      method: payload === undefined ? 'GET' : 'POST', headers, body
+    });
+    const result = await response.json();
+    if (!result?.success || result.encrypted !== true) return result;
+    return { ...result, data: await this._decrypt(result.data) };
+  }
+
   // ─── Client state (single-user cloud mirror) ────────────────────
 
   /**
@@ -1138,7 +1329,7 @@ export class ReiClient {
    * `data.rejected: [{ index, namespace, key, code, message }]`; when all
    * entries are accepted the response shape is unchanged (no `rejected`).
    *
-   * @param {Array<{ namespace: string, key: string, value: string | null, updatedAt: number }>} entries
+   * @param {Array<{ namespace: string, key: string, value: string | null, updatedAt: number, owner?: CloudOwner, kind?: string, ownerGeneration?: number }>} entries
    *   - `value`: pre-serialized string (the SDK does not stringify it for you).
    *     `null` 表示删掉这个 key（连大值的切片行一起），同样按 `updatedAt`
    *     last-write-wins，被拦下的进 `data.skippedEntries`。server 特性位
@@ -1383,7 +1574,7 @@ export class ReiClient {
    * 载荷像其它接口一样加密（需要先 `init()`），服务端落库时再用 per-user
    * key 加密一次。幂等覆盖，重复调没有副作用。
    *
-   * @param {Array<{ credId: string, value: { apiUrl: string, apiKey: string, primaryModel: string } }>} credentials
+   * @param {Array<{ credId: string, value: { apiUrl: string, apiKey: string, primaryModel: string }, owner?: CloudOwner, kind?: string, ownerGeneration?: number }>} credentials
    * @returns {Promise<Object>} `{ success, data?: { upserted }, error? }`
    */
   async putLlmCredentials(credentials) {

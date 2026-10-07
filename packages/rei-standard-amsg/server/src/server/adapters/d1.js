@@ -15,7 +15,8 @@ import {
   CLIENT_STATE_TABLE_SQL,
   PUSH_SUBSCRIPTION_TABLE_SQL,
   LLM_CREDENTIALS_TABLE_SQL,
-  MESSAGE_OUTBOX_TABLE_SQL
+  MESSAGE_OUTBOX_TABLE_SQL,
+  CLOUD_DATA_TABLES_SQL
 } from './schema.sqlite.js';
 // 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
 // schema.js 里的这一份，加列只改一处。
@@ -179,12 +180,351 @@ export class D1Adapter {
     return results.reduce((n, res) => n + (res.meta.changes || 0), 0);
   }
 
+  /** A complete management implementation needs real transactional batches. */
+  get cloudDataManagement() { return typeof this._db.batch === 'function'; }
+
+  _cloudGuardPredicate(userId, guard) {
+    if (!guard?.owner || !Number.isSafeInteger(guard.generation) || guard.generation < 0) {
+      throw new Error('Invalid cloud owner guard');
+    }
+    return {
+      sql: `COALESCE((SELECT active = 1 AND generation = ? FROM cloud_data_owners
+        WHERE user_id = ? AND owner_type = ? AND owner_id = ?), ? = 0)`,
+      args: [guard.generation, userId, guard.owner.type, guard.owner.id, guard.generation]
+    };
+  }
+
+  async _cloudBatch(statements, userId, guards = [], metadata = new Map()) {
+    const assertions = guards.filter(Boolean).map((guard) => {
+      const condition = this._cloudGuardPredicate(userId, guard);
+      return this._db.prepare(`INSERT INTO cloud_guard_assertions (allowed)
+        SELECT 0 WHERE NOT (${condition.sql})`).bind(...condition.args);
+    });
+    for (const item of metadata.values()) {
+      if (Object.hasOwn(item,'expected')) assertions.push(this._db.prepare(
+        `INSERT INTO cloud_guard_assertions (metadata_allowed) SELECT 0 WHERE NOT (
+          (SELECT encrypted_value FROM cloud_resource_metadata WHERE user_id=? AND resource_key=?) IS ?)`
+      ).bind(userId,item.key,item.expected));
+    }
+    const expanded = [...assertions];
+    const indexes = [];
+    for (let i = 0; i < statements.length; i++) {
+      indexes.push(expanded.length);
+      expanded.push(statements[i]);
+      const item = metadata.get(i);
+      if (item?.value) {
+        expanded.push(this._db.prepare(`INSERT INTO cloud_resource_metadata
+          (user_id, resource_key, encrypted_value) SELECT ?, ?, ? WHERE changes() > 0
+          ON CONFLICT (user_id, resource_key) DO UPDATE SET encrypted_value = excluded.encrypted_value`
+        ).bind(userId, item.key, item.value));
+      }
+    }
+    if (expanded.length === 0) return [];
+    if (expanded.length === 1 && assertions.length === 0) return [await expanded[0].run()];
+    if ((assertions.length || expanded.length !== statements.length) && !this.cloudDataManagement) {
+      throw new Error('Cloud management requires transactional batches');
+    }
+    try {
+      let results;
+      if (this.cloudDataManagement) results = await this._db.batch(expanded);
+      else { results=[]; for (const stmt of expanded) results.push(await stmt.run()); }
+      return indexes.map((index) => results[index]);
+    } catch (error) {
+      if (/cloud_metadata_guard/.test(error.message || '')) {
+        throw Object.assign(new Error('Cloud resource ownership changed'), {code:'CLOUD_RESOURCE_CHANGED'});
+      }
+      if (/cloud_owner_guard/.test(error.message || '')) {
+        const denied = new Error('Cloud owner is retired or generation changed');
+        denied.code = 'CLOUD_OWNER_RETIRED';
+        throw denied;
+      }
+      throw error;
+    }
+  }
+
+  async getCloudResourceMetadata(userId,resourceKey) {
+    const row=await this._db.prepare('SELECT encrypted_value FROM cloud_resource_metadata WHERE user_id=? AND resource_key=?').bind(userId,resourceKey).first();
+    return row?.encrypted_value ?? null;
+  }
+
+  async listCloudResourceRows(userId) {
+    const tables = {task:'scheduled_messages', state:'client_state', credential:'llm_credentials', outbox:'message_outbox', subscription:'push_subscriptions', metadata:'cloud_resource_metadata'};
+    const result = {gaps:[]};
+    await Promise.all(Object.entries(tables).map(async ([type, table]) => {
+      try {
+        const response = await this._db.prepare(`SELECT * FROM ${table} WHERE user_id = ?`).bind(userId).all();
+        result[type] = response.results || [];
+      } catch {
+        result[type] = [];
+        result.gaps.push({source:type,code:'READ_FAILED',message:'Cloud storage source could not be read'});
+      }
+    }));
+    return result;
+  }
+
+  async _cloudRecord(row) {
+    if (!row) return null;
+    let data=row.data;
+    const marker=/^\u001famsg-record\u001f([1-9][0-9]*)$/.exec(data);
+    if (marker) {
+      const result=await this._db.prepare(`SELECT chunk_index,value FROM cloud_data_record_chunks
+        WHERE user_id=? AND kind=? AND id=? AND write_token=? ORDER BY chunk_index`
+      ).bind(row.user_id,row.kind,row.id,row.write_token).all();
+      const chunks=result.results || [];
+      if (chunks.length !== Number(marker[1]) || chunks.some((chunk,index)=>chunk.chunk_index!==index)) {
+        throw Object.assign(new Error('Cloud management record chunks are incomplete'),{code:'CLOUD_RECORD_INCOMPLETE'});
+      }
+      data=chunks.map((chunk)=>chunk.value).join('');
+    }
+    return {id:row.id,userId:row.user_id,kind:row.kind,data,updatedAt:row.updated_at};
+  }
+
+  async putCloudDataRecord(userId, kind, id, data, {idempotencyKey = null, createOnly = false, leaseToken} = {}) {
+    // Storage ciphertext is ASCII; bounded slices avoid D1's per-row size limit.
+    const slices=[];
+    if (data.length > 200*1024) for (let offset=0;offset<data.length;offset+=200*1024) slices.push(data.slice(offset,offset+200*1024));
+    const rootValue=slices.length ? '\u001famsg-record\u001f'+slices.length : data;
+    const writeToken=globalThis.crypto.randomUUID();
+    const now=Date.now();
+    const statements=[];
+    if (leaseToken !== undefined) {
+      statements.push(this._db.prepare(`UPDATE cloud_data_records SET data=?,updated_at=?,write_token=?
+        WHERE user_id=? AND kind=? AND id=? AND lease_token=? AND lease_until>?`
+      ).bind(rootValue,now,writeToken,userId,kind,id,leaseToken,now));
+    } else {
+      const conflict=idempotencyKey || createOnly ? 'DO NOTHING' : 'DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at,write_token=excluded.write_token';
+      statements.push(this._db.prepare(`INSERT INTO cloud_data_records (user_id,kind,id,data,idempotency_key,updated_at,write_token)
+        VALUES (?,?,?,?,?,?,?) ON CONFLICT ${conflict}`).bind(userId,kind,id,rootValue,idempotencyKey,now,writeToken));
+    }
+    const rootGate='EXISTS (SELECT 1 FROM cloud_data_records WHERE user_id=? AND kind=? AND id=? AND write_token=?)';
+    statements.push(this._db.prepare(`DELETE FROM cloud_data_record_chunks WHERE user_id=? AND kind=? AND id=? AND ${rootGate}`
+    ).bind(userId,kind,id,userId,kind,id,writeToken));
+    for (let index=0;index<slices.length;index++) {
+      statements.push(this._db.prepare(`INSERT INTO cloud_data_record_chunks (user_id,kind,id,chunk_index,value,write_token)
+        SELECT ?,?,?,?,?,? WHERE ${rootGate}`
+      ).bind(userId,kind,id,index,slices[index],writeToken,userId,kind,id,writeToken));
+    }
+    if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
+    const results=await this._db.batch(statements);
+    if (leaseToken !== undefined && !results[0].meta.changes) throw Object.assign(new Error('Cloud operation processing lease was lost'),{code:'CLOUD_LEASE_LOST'});
+    if (idempotencyKey) {
+      return this._cloudRecord(await this._db.prepare(`SELECT * FROM cloud_data_records WHERE user_id=? AND kind=? AND idempotency_key=?`).bind(userId,kind,idempotencyKey).first());
+    }
+    return this.getCloudDataRecord(userId,kind,id);
+  }
+
+  async getCloudDataRecord(userId, kind, id) {
+    return this._cloudRecord(await this._db.prepare('SELECT * FROM cloud_data_records WHERE user_id=? AND kind=? AND id=?').bind(userId,kind,id).first());
+  }
+
+  async getCloudDataRecordByIdempotency(userId,kind,idempotencyKey) {
+    return this._cloudRecord(await this._db.prepare('SELECT * FROM cloud_data_records WHERE user_id=? AND kind=? AND idempotency_key=?').bind(userId,kind,idempotencyKey).first());
+  }
+
+  async _cloudRecordForList(row) {
+    try { return await this._cloudRecord(row); }
+    catch (error) {
+      return {id:row.id,userId:row.user_id,kind:row.kind,data:null,
+        error:error.code==='CLOUD_RECORD_INCOMPLETE' ? error.code : 'CLOUD_RECORD_READ_FAILED',updatedAt:row.updated_at};
+    }
+  }
+
+  async listCloudDataRecords(userId, kind) {
+    const rows = await this._db.prepare('SELECT * FROM cloud_data_records WHERE user_id=? AND kind=? ORDER BY updated_at DESC, id').bind(userId,kind).all();
+    return Promise.all((rows.results || []).map((row) => this._cloudRecordForList(row)));
+  }
+
+  async listCloudDataRecordsAcrossUsers(kind) {
+    const rows = await this._db.prepare('SELECT * FROM cloud_data_records WHERE kind=? ORDER BY updated_at, id').bind(kind).all();
+    return Promise.all((rows.results || []).map((row) => this._cloudRecordForList(row)));
+  }
+
+  async claimCloudDataRecord(userId,kind,id,leaseMs,leaseToken = null) {
+    const now = Date.now();
+    const result = await this._db.prepare(`UPDATE cloud_data_records SET lease_until=?,lease_token=?
+      WHERE user_id=? AND kind=? AND id=? AND (lease_until IS NULL OR lease_until <= ?)`
+    ).bind(now + leaseMs,leaseToken,userId,kind,id,now).run();
+    return result.meta.changes > 0;
+  }
+
+  async releaseCloudDataRecord(userId,kind,id,leaseToken) {
+    const tokenGate=leaseToken === undefined ? '' : ' AND lease_token=?';
+    const params=[userId,kind,id,...(leaseToken === undefined ? [] : [leaseToken])];
+    await this._db.prepare(`UPDATE cloud_data_records SET lease_until=NULL,lease_token=NULL WHERE user_id=? AND kind=? AND id=?${tokenGate}`).bind(...params).run();
+  }
+
+  async renewCloudDataRecordLease(userId,kind,id,leaseMs,leaseToken) {
+    const now=Date.now();
+    const result=await this._db.prepare(`UPDATE cloud_data_records SET lease_until=?
+      WHERE user_id=? AND kind=? AND id=? AND lease_token=? AND lease_until>?`
+    ).bind(now+leaseMs,userId,kind,id,leaseToken,now).run();
+    return result.meta.changes > 0;
+  }
+
+  async deleteCloudDataRecord(userId,kind,id) {
+    if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
+    const results=await this._db.batch([
+      this._db.prepare('DELETE FROM cloud_data_record_chunks WHERE user_id=? AND kind=? AND id=?').bind(userId,kind,id),
+      this._db.prepare('DELETE FROM cloud_data_records WHERE user_id=? AND kind=? AND id=?').bind(userId,kind,id)
+    ]);
+    return results[1].meta.changes > 0;
+  }
+
+  async cleanupCloudDataRecords(kind,beforeMs) {
+    if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
+    const now=Date.now();
+    const results=await this._db.batch([
+      this._db.prepare(`DELETE FROM cloud_data_record_chunks AS c WHERE c.kind=? AND EXISTS
+        (SELECT 1 FROM cloud_data_records r WHERE r.user_id=c.user_id AND r.kind=c.kind AND r.id=c.id
+          AND r.updated_at < ? AND (r.lease_until IS NULL OR r.lease_until <= ?))`).bind(kind,beforeMs,now),
+      this._db.prepare(`DELETE FROM cloud_data_records WHERE kind=? AND updated_at < ?
+        AND (lease_until IS NULL OR lease_until <= ?)`).bind(kind,beforeMs,now)
+    ]);
+    return results[1].meta.changes || 0;
+  }
+
+  /** Sidecars are indexes only. Remove them only while their backing row is absent. */
+  async cleanupCloudResourceMetadata(userId = null) {
+    const targets={
+      task:`SELECT 1 FROM scheduled_messages r WHERE r.user_id=m.user_id AND r.uuid=json_extract(m.resource_key,'$[1]')`,
+      state:`SELECT 1 FROM client_state r WHERE r.user_id=m.user_id AND
+        ((r.namespace=json_extract(m.resource_key,'$[1]') AND r.key=json_extract(m.resource_key,'$[2]')) OR
+        (r.namespace=char(31)||'amsg-chunks'||char(31)||json_extract(m.resource_key,'$[1]')
+          AND r.key >= json_extract(m.resource_key,'$[2]')||char(31)
+          AND r.key < json_extract(m.resource_key,'$[2]')||char(32)))`,
+      credential:`SELECT 1 FROM llm_credentials r WHERE r.user_id=m.user_id AND r.cred_id=json_extract(m.resource_key,'$[1]')`,
+      outbox:`SELECT 1 FROM message_outbox r WHERE r.user_id=m.user_id AND r.message_id=json_extract(m.resource_key,'$[1]')`,
+      subscription:`SELECT 1 FROM push_subscriptions r WHERE r.user_id=m.user_id`
+    };
+    const statements=Object.entries(targets).map(([type,exists])=>this._db.prepare(
+      `DELETE FROM cloud_resource_metadata AS m WHERE (? IS NULL OR user_id=?) AND json_valid(resource_key)
+        AND json_extract(resource_key,'$[0]')=? AND NOT EXISTS (${exists})`
+    ).bind(userId,userId,type));
+    const results=await this._cloudBatch(statements,userId);
+    return results.reduce((sum,result)=>sum+(result.meta.changes || 0),0);
+  }
+
+  async listCloudOwners(userId) {
+    const response=await this._db.prepare('SELECT owner_type,owner_id,active,generation,updated_at FROM cloud_data_owners WHERE user_id=? ORDER BY owner_type,owner_id').bind(userId).all();
+    return (response.results || []).map((row)=>({owner:{type:row.owner_type,id:row.owner_id},active:!!row.active,generation:row.generation,updatedAt:row.updated_at}));
+  }
+
+  async getCloudOwner(userId, owner) {
+    const row = await this._db.prepare('SELECT active,generation,updated_at FROM cloud_data_owners WHERE user_id=? AND owner_type=? AND owner_id=?').bind(userId,owner.type,owner.id).first();
+    return row ? {active:!!row.active,generation:row.generation,updatedAt:row.updated_at} : {active:true,generation:0,updatedAt:null};
+  }
+
+  async setCloudOwnerActive(userId, owner, active, expectedGeneration) {
+    const statements=[];
+    if (expectedGeneration !== undefined) {
+      if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw new Error('Invalid expected owner generation');
+      statements.push(this._db.prepare(`INSERT INTO cloud_guard_assertions (allowed) SELECT 0 WHERE
+        COALESCE((SELECT generation FROM cloud_data_owners WHERE user_id=? AND owner_type=? AND owner_id=?),0) <> ?`
+      ).bind(userId,owner.type,owner.id,expectedGeneration));
+    }
+    statements.push(this._db.prepare(`INSERT INTO cloud_data_owners (user_id,owner_type,owner_id,active,generation,updated_at)
+      VALUES (?,?,?,?,1,?) ON CONFLICT (user_id,owner_type,owner_id) DO UPDATE SET
+      active=excluded.active,generation=cloud_data_owners.generation+1,updated_at=excluded.updated_at`
+    ).bind(userId,owner.type,owner.id,active ? 1 : 0,Date.now()));
+    statements.push(this._db.prepare('SELECT active,generation,updated_at FROM cloud_data_owners WHERE user_id=? AND owner_type=? AND owner_id=?').bind(userId,owner.type,owner.id));
+    try {
+      if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
+      const results=await this._db.batch(statements);
+      const row=results[results.length-1].results[0];
+      return {active:!!row.active,generation:row.generation,updatedAt:row.updated_at};
+    } catch (error) {
+      if (/cloud_owner_guard/.test(error.message || '')) throw Object.assign(new Error('Cloud owner changed; refresh before restoring'),{code:'CLOUD_OWNER_CHANGED'});
+      throw error;
+    }
+  }
+
+  async isCloudOwnerGuardValid(userId,guard) {
+    if (!guard) return true;
+    const condition = this._cloudGuardPredicate(userId,guard);
+    const row = await this._db.prepare(`SELECT ${condition.sql} AS valid`).bind(...condition.args).first();
+    return !!row?.valid;
+  }
+
+  /** Delete only the exact physical snapshot; no untrusted SQL identifiers. */
+  async deleteCloudResourceRows(userId,locators,{operationId,leaseToken} = {}) {
+    const specs = {
+      task:{table:'scheduled_messages',keys:['user_id','id'],columns:['id','user_id','uuid','encrypted_payload','message_type','next_send_at','lease_until','retry_after','serialize_group','status','retry_count','last_error','created_at','updated_at']},
+      state:{table:'client_state',keys:['user_id','namespace','key'],columns:['user_id','namespace','key','value','updated_at']},
+      credential:{table:'llm_credentials',keys:['user_id','cred_id'],columns:['user_id','cred_id','encrypted_value','created_at','updated_at']},
+      outbox:{table:'message_outbox',keys:['user_id','message_id'],columns:['id','user_id','message_id','task_uuid','session_id','message_index','total_messages','payload','created_at','delivered_at','acked_at']},
+      subscription:{table:'push_subscriptions',keys:['user_id'],columns:['user_id','subscription','updated_at']}
+    };
+    let deleted=0, changed=0;
+    for (const locator of locators) {
+      const spec=specs[locator.type];
+      if (!spec || !Array.isArray(locator.rows) || !locator.rows.length || locator.rows.some((row)=>row.user_id !== userId)) { changed++; continue; }
+      const statements=[];
+      if (operationId !== undefined) {
+        statements.push(this._db.prepare(`INSERT INTO cloud_guard_assertions (lease_allowed)
+          SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM cloud_data_records WHERE user_id=? AND kind='operation'
+            AND id=? AND lease_token=? AND lease_until >
+            CAST(strftime('%s','now') AS INTEGER)*1000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER))`
+        ).bind(userId,operationId,leaseToken ?? null));
+      }
+      if (locator.metadataKey && Object.hasOwn(locator,'encryptedMetadata')) {
+        // Ownership is part of the preview. Ignore absent metadata only when all
+        // backing rows have already disappeared (idempotent operation retry).
+        const identityChecks=locator.rows.map((row)=>({
+          sql:`EXISTS (SELECT 1 FROM ${spec.table} WHERE ${spec.keys.map((column)=>`${column} IS ?`).join(' AND ')})`,
+          args:spec.keys.map((column)=>row[column])
+        }));
+        // Split by row to keep each D1 statement below its binding limit.
+        for (const check of identityChecks) statements.push(this._db.prepare(
+          `INSERT INTO cloud_guard_assertions (allowed) SELECT 0 WHERE ${check.sql}
+           AND NOT ((SELECT encrypted_value FROM cloud_resource_metadata WHERE user_id=? AND resource_key=?) IS ?)`
+        ).bind(...check.args,userId,locator.metadataKey,locator.encryptedMetadata));
+      }
+      if (locator.type==='state' && locator.logicalState) {
+        const {namespace,key}=locator.logicalState;
+        const identities=JSON.stringify(locator.rows.map((row)=>({namespace:row.namespace,key:row.key})));
+        statements.push(this._db.prepare(`INSERT INTO cloud_guard_assertions (allowed)
+          SELECT 0 WHERE EXISTS (SELECT 1 FROM client_state r WHERE r.user_id=? AND
+            ((r.namespace=? AND r.key=?) OR (r.namespace=? AND r.key>=? AND r.key<?))
+            AND NOT EXISTS (SELECT 1 FROM json_each(?) e WHERE
+              r.namespace=json_extract(e.value,'$.namespace') AND r.key=json_extract(e.value,'$.key')))`
+        ).bind(userId,namespace,key,'\u001famsg-chunks\u001f'+namespace,key+'\u001f',key+' ',identities));
+      }
+      for (const row of locator.rows) {
+        const columns=spec.columns.filter((column)=>Object.hasOwn(row,column));
+        const predicate=columns.map((column)=>`${column} IS ?`).join(' AND ');
+        const values=columns.map((column)=>row[column]);
+        const identity=spec.keys.map((column)=>`${column} IS ?`).join(' AND ');
+        // Missing rows are already deleted; a row at the same key with changed bytes is a stale plan.
+        statements.push(this._db.prepare(`INSERT INTO cloud_guard_assertions (allowed)
+          SELECT 0 WHERE EXISTS (SELECT 1 FROM ${spec.table} WHERE ${identity})
+          AND NOT EXISTS (SELECT 1 FROM ${spec.table} WHERE ${predicate})`
+        ).bind(...spec.keys.map((column)=>row[column]),...values));
+      }
+      for (const row of locator.rows) {
+        const columns=spec.columns.filter((column)=>Object.hasOwn(row,column));
+        statements.push(this._db.prepare(`DELETE FROM ${spec.table} WHERE ${columns.map((column)=>`${column} IS ?`).join(' AND ')}`).bind(...columns.map((column)=>row[column])));
+      }
+      if (locator.metadataKey) statements.push(this._db.prepare('DELETE FROM cloud_resource_metadata WHERE user_id=? AND resource_key=?').bind(userId,locator.metadataKey));
+      try {
+        if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
+        await this._db.batch(statements);
+        deleted++;
+      } catch (error) {
+        if (/cloud_lease_guard/.test(error.message || '')) throw Object.assign(new Error('Cloud operation processing lease was lost'),{code:'CLOUD_LEASE_LOST'});
+        if (/cloud_owner_guard/.test(error.message || '')) changed++;
+        else throw error;
+      }
+    }
+    return {deleted,changed};
+  }
+
   async initSchema() {
     await this._db.prepare(SQLITE_TABLE_SQL).run();
     await this._db.prepare(CLIENT_STATE_TABLE_SQL).run();
     await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
     await this._db.prepare(LLM_CREDENTIALS_TABLE_SQL).run();
     await this._db.prepare(MESSAGE_OUTBOX_TABLE_SQL).run();
+    for (const sql of CLOUD_DATA_TABLES_SQL) await this._db.prepare(sql).run();
 
     // SQLite 的 ALTER TABLE 没有 ADD COLUMN IF NOT EXISTS，列已经在了就会
     // 报 duplicate column name。那正是「这一步不用做」的意思，跳过即可；
@@ -268,16 +608,22 @@ export class D1Adapter {
     await this._db.prepare('DROP TABLE IF EXISTS push_subscriptions').run();
     await this._db.prepare('DROP TABLE IF EXISTS llm_credentials').run();
     await this._db.prepare('DROP TABLE IF EXISTS message_outbox').run();
+    for (const table of ['cloud_data_record_chunks','cloud_data_records','cloud_data_owners','cloud_resource_metadata','cloud_guard_assertions']) {
+      await this._db.prepare(`DROP TABLE IF EXISTS ${table}`).run();
+    }
   }
 
-  async createTask(params) {
+  async createTask(params, cloudGuard = params.cloudGuard) {
     const now = this._now();
     const nextSendAt = this._iso(params.next_send_at);
-    const res = await this._db.prepare(
+    const stmt = this._db.prepare(
       `INSERT INTO scheduled_messages
         (user_id, uuid, encrypted_payload, next_send_at, message_type, status, retry_count, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)`
-    ).bind(params.user_id, params.uuid, params.encrypted_payload, nextSendAt, params.message_type, now, now).run();
+    ).bind(params.user_id, params.uuid, params.encrypted_payload, nextSendAt, params.message_type, now, now);
+    const [res] = await this._cloudBatch([stmt], params.user_id, [cloudGuard], new Map([
+      [0, { key: JSON.stringify(['task', params.uuid]), value: params.encryptedCloudMetadata, ...(Object.hasOwn(params,'expectedCloudMetadata') ? {expected:params.expectedCloudMetadata} : {}) }]
+    ]));
 
     const id = res.meta.last_row_id;
     return this._db.prepare(
@@ -297,7 +643,7 @@ export class D1Adapter {
    * @returns {Promise<Object>} createTask 的返回行 + `superseded`（旧行是否
    *   真的被删掉；false = 旧行本就不存在）
    */
-  async createTaskSuperseding(params, supersedesUuid) {
+  async createTaskSuperseding(params, supersedesUuid, cloudGuard = params.cloudGuard) {
     const now = this._now();
     const nextSendAt = this._iso(params.next_send_at);
     const statements = [
@@ -311,14 +657,9 @@ export class D1Adapter {
       ).bind(params.user_id, params.uuid, params.encrypted_payload, nextSendAt, params.message_type, now, now),
     ];
 
-    let results;
-    if (typeof this._db.batch === 'function') {
-      results = await this._db.batch(statements);
-    } else {
-      // 没有 batch() 的绑定退回顺序执行——失去原子性，但语义一致。
-      results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-    }
+    const results = await this._cloudBatch(statements, params.user_id, [cloudGuard], new Map([
+      [1, { key: JSON.stringify(['task', params.uuid]), value: params.encryptedCloudMetadata, ...(Object.hasOwn(params,'expectedCloudMetadata') ? {expected:params.expectedCloudMetadata} : {}) }]
+    ]));
 
     const superseded = (results[0].meta.changes || 0) > 0;
     const id = results[1].meta.last_row_id;
@@ -360,7 +701,7 @@ export class D1Adapter {
     return row ? { status: row.status } : null;
   }
 
-  async updateTaskById(taskId, updates) {
+  async updateTaskById(taskId, updates, cloudGuard = null) {
     const sets = [];
     const values = [];
     for (const [key, value] of Object.entries(updates)) {
@@ -377,9 +718,12 @@ export class D1Adapter {
     }
     values.push(taskId);
 
-    await this._db.prepare(
+    const statement = this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE id = ?`
-    ).bind(...values).run();
+    ).bind(...values);
+    const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
+    if (cloudGuard && !ownerUser) return null;
+    await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
 
     return this._db.prepare('SELECT * FROM scheduled_messages WHERE id = ?').bind(taskId).first();
   }
@@ -393,7 +737,7 @@ export class D1Adapter {
    * ——用户以为改期生效了，实际什么都没留下。正文这类字段不受这道门约束：它们
    * 只影响以后的触发，收尾那边本来就不会覆盖（见 run-tick 的收尾守卫）。
    */
-  async updateTaskByUuid(uuid, userId, encryptedPayload, extraFields) {
+  async updateTaskByUuid(uuid, userId, encryptedPayload, extraFields, cloudGuard = null) {
     const now = this._now();
     const sets = ['encrypted_payload = ?', 'updated_at = ?'];
     const values = [encryptedPayload, now];
@@ -414,10 +758,11 @@ export class D1Adapter {
       values.push(now);
     }
 
-    const res = await this._db.prepare(
+    const statement = this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(', ')}
        WHERE uuid = ? AND user_id = ? AND status = 'pending'${leaseGate}`
-    ).bind(...values).run();
+    ).bind(...values);
+    const [res] = await this._cloudBatch([statement], userId, [cloudGuard]);
 
     if (!res.meta.changes) return null;
     return { uuid, updated_at: now };
@@ -483,7 +828,7 @@ export class D1Adapter {
    * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、同分组
    *   有任务正在跑、排期被改过、或行已不是 pending
    */
-  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null) {
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, cloudGuard = null) {
     const expected = typeof expectedNextSendAt === 'string'
       ? expectedNextSendAt
       : this._iso(expectedNextSendAt);
@@ -514,9 +859,12 @@ export class D1Adapter {
       values.push(serializeGroup, taskId, now);
     }
 
-    const res = await this._db.prepare(
+    const statement = this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE ${where}`
-    ).bind(...values).run();
+    ).bind(...values);
+    const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
+    if (cloudGuard && !ownerUser) return false;
+    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
   }
 
@@ -529,11 +877,14 @@ export class D1Adapter {
    * @param {string|Date} leaseUntil - 新的租期末尾
    * @returns {Promise<boolean>} true = 续上了
    */
-  async renewTaskLease(taskId, leaseUntil) {
-    const res = await this._db.prepare(
+  async renewTaskLease(taskId, leaseUntil, cloudGuard = null) {
+    const statement = this._db.prepare(
       `UPDATE scheduled_messages SET lease_until = ?
        WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL`
-    ).bind(this._iso(leaseUntil), taskId).run();
+    ).bind(this._iso(leaseUntil), taskId);
+    const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
+    if (cloudGuard && !ownerUser) return false;
+    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
   }
 
@@ -639,7 +990,7 @@ export class D1Adapter {
    *   回 `true` = 这个 key 的行已经不在（删掉了，或本来就没有）、`false` = 行还在
    *   （库里那行更新，删除被条件写拦下）；前缀形态不探测，回 `null`。
    */
-  async upsertClientState(userId, entries, cleanups = [], now = Date.now()) {
+  async upsertClientState(userId, entries, cleanups = [], now = Date.now(), cloudGuard = null) {
     // 条件写的第二个分支 `client_state.updated_at > ?`（? = 服务端当前时刻）是
     // 时钟跑偏的解锁口：库里那行标着一个还没到的时刻，它就不是可信的比较基准，
     // 这次写入直接放行。注意这里不去钳制调用方给的时间戳（改写成
@@ -687,9 +1038,13 @@ export class D1Adapter {
     // 最多 6 个绑定参数，离 D1 单条语句 100 个参数的上限很远。
     // 顺序：cleanups（精确 key 的每条后面跟一条探针）→ entries 的 upsert。
     const statements = [];
+    const metadata = new Map();
     /** cleanups[i] 的探针在 results 里的下标；前缀形态没有探针，记 null。 */
     const probeIndexes = [];
     for (const c of cleanups) {
+      if (typeof c.cloudMetadataKey === 'string' && Object.hasOwn(c,'expectedCloudMetadata')) {
+        metadata.set(statements.length,{key:c.cloudMetadataKey,expected:c.expectedCloudMetadata});
+      }
       if (typeof c.key === 'string') {
         statements.push(this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now));
         probeIndexes.push(statements.length);
@@ -709,15 +1064,12 @@ export class D1Adapter {
       );
     }
 
-    let results;
-    if (typeof this._db.batch === 'function') {
-      results = await this._db.batch(statements);
-    } else {
-      results = [];
-      for (const stmt of statements) {
-        results.push(await stmt.run());
-      }
-    }
+    entries.forEach((entry,index)=>metadata.set(upsertStart+index, {
+      key: JSON.stringify(['state', entry.namespace, entry.key]), value: entry.encryptedCloudMetadata,
+      ...(Object.hasOwn(entry,'expectedCloudMetadata') ? {expected:entry.expectedCloudMetadata} : {})
+    }));
+    const results = await this._cloudBatch(statements, userId,
+      [cloudGuard, ...entries.map((entry) => entry.cloudGuard), ...cleanups.map((entry) => entry.cloudGuard)], metadata);
 
     // cleanup 与探针不计入 upserted/skipped/outcomes，只看 entries 对应的语句。
     const outcomes = results.slice(upsertStart).map((res) => res.meta.changes > 0);
@@ -953,7 +1305,7 @@ export class D1Adapter {
    * @param {Array<{ credId: string, encryptedValue: string }>} entries
    * @returns {Promise<number>} 实际写入/覆盖的行数
    */
-  async upsertLlmCredentials(userId, entries) {
+  async upsertLlmCredentials(userId, entries, cloudGuard = null) {
     if (!entries || entries.length === 0) return 0;
     const now = this._now();
     const SQL =
@@ -965,13 +1317,10 @@ export class D1Adapter {
     const statements = entries.map((entry) =>
       this._db.prepare(SQL).bind(userId, entry.credId, entry.encryptedValue, now, now)
     );
-    let results;
-    if (typeof this._db.batch === 'function') {
-      results = await this._db.batch(statements);
-    } else {
-      results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-    }
+    const metadata = new Map(entries.map((entry, index) => [index, {
+      key: JSON.stringify(['credential', entry.credId]), value: entry.encryptedCloudMetadata, ...(Object.hasOwn(entry,'expectedCloudMetadata') ? {expected:entry.expectedCloudMetadata} : {})
+    }]));
+    const results = await this._cloudBatch(statements, userId, [cloudGuard, ...entries.map((entry) => entry.cloudGuard)], metadata);
     return results.reduce((n, res) => n + ((res.meta.changes || 0) > 0 ? 1 : 0), 0);
   }
 
@@ -1087,7 +1436,7 @@ export class D1Adapter {
    *   `payload` 是整条 push JSON 的 encryptForStorage 密文。
    * @returns {Promise<number>} 实际写入/更新的行数
    */
-  async appendOutboxMessages(userId, rows) {
+  async appendOutboxMessages(userId, rows, cloudGuard = null) {
     if (!rows || rows.length === 0) return 0;
     const SQL =
       `INSERT INTO message_outbox
@@ -1104,13 +1453,10 @@ export class D1Adapter {
         r.message_index ?? null, r.total_messages ?? null, r.payload, r.created_at
       )
     );
-    let results;
-    if (typeof this._db.batch === 'function') {
-      results = await this._db.batch(statements);
-    } else {
-      results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-    }
+    const metadata = new Map(rows.map((row, index) => [index, {
+      key: JSON.stringify(['outbox', row.message_id]), value: row.encryptedCloudMetadata, ...(Object.hasOwn(row,'expectedCloudMetadata') ? {expected:row.expectedCloudMetadata} : {})
+    }]));
+    const results = await this._cloudBatch(statements, userId, [cloudGuard, ...rows.map((row) => row.cloudGuard)], metadata);
     return results.reduce((n, res) => n + ((res.meta.changes || 0) > 0 ? 1 : 0), 0);
   }
 

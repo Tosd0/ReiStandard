@@ -37,6 +37,7 @@ export async function appendPushesToOutbox({ db, userId, userKey, pushes }) {
     await db.appendOutboxMessages(userId, await toOutboxRows(pushes, userKey, Date.now()));
     return true;
   } catch (error) {
+    if (error?.code === 'CLOUD_OWNER_RETIRED') throw error;
     console.warn('[amsg-server] outbox 落行失败（不影响投递）:', error && error.message);
     return false;
   }

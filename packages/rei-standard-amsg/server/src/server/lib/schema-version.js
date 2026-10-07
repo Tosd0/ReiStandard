@@ -20,7 +20,7 @@ import { SQLITE_REQUIRED_SCHEMA } from '../adapters/schema.sqlite.js';
  * 表结构自己的版本号，只在表 / 列 / 关键索引变化时抬，与包版本各走各的。
  * 数值取自引入当前这套表结构的那条发布线。
  */
-export const SCHEMA_VERSION = '2.6.0';
+export const SCHEMA_VERSION = '2.6.0-cloud-data.1';
 
 /**
  * @typedef {Object} SchemaVersionResult

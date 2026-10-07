@@ -240,4 +240,66 @@
  *   住 Web Push。内置只有 D1 实现（与 client_state 同待遇）。
  */
 
+/**
+ * Cloud data management (optional capability; currently transactional D1 only).
+ *
+ * `cloudDataManagement === true` promises all of these methods plus atomic owner
+ * guards. A custom adapter that implements only listing must not advertise it.
+ * `listCloudResourceRows(userId)` returns physical task/state/credential/outbox/
+ * subscription rows, including acknowledged messages and orphan chunks, metadata
+ * sidecars, and `gaps` for sources that failed. No namespace or row count cap.
+ * Callers must never expose the raw return value; only the sanitized inventory.
+ *
+ * `putCloudDataRecord(userId,kind,id,data,{idempotencyKey?,createOnly?})` stores
+ * already encrypted data; an idempotency key is first-writer-wins. Without one,
+ * it updates that exact user/kind/id. Large encrypted records are transparently
+ * chunked; root, slices and lease validation share a transaction. Missing slices
+ * fail explicitly with CLOUD_RECORD_INCOMPLETE. Deletion and retention reclaim slices. Get/list return `{id,userId,kind,data,updatedAt}`.
+ * `getCloudDataRecord`, `listCloudDataRecords`, `listCloudDataRecordsAcrossUsers`
+ * are used by request handling and cron; the cross-user method is server-only.
+ * Lists isolate corrupt snapshots as `{data:null,error}` rows; exact get still
+ * rejects. `getCloudDataRecordByIdempotency` reads one indexed key without scanning
+ * unrelated records.
+ * `claimCloudDataRecord(userId,kind,id,leaseMs,leaseToken)` atomically obtains a processing
+ * lease. Renewal/release require the same token; expired workers cannot save progress
+ * (`putCloudDataRecord` option `leaseToken`) or delete resources with a stolen lease. `deleteCloudDataRecord` and
+ * `cleanupCloudDataRecords(kind,beforeMs)` implement management-data retention.
+ *
+ * `listCloudOwners(userId)` lists persistent owner fences, even after operations expire.
+ * `getCloudOwner(userId,owner)` => `{active,generation,updatedAt}`; absent owners
+ * are active generation 0. `setCloudOwnerActive` persists the new active flag and
+ * increments generation, including on explicit restoration. Its optional expectedGeneration argument
+ * compares the current generation atomically and rejects CLOUD_OWNER_CHANGED. `isCloudOwnerGuardValid`
+ * checks a guard immediately before external side effects (already sent push
+ * requests cannot be recalled).
+ *
+ * Guard shape: `{owner:{type,id},generation}`. Optional final guard arguments are
+ * accepted by createTask, createTaskSuperseding, updateTaskById, updateTaskByUuid,
+ * claimTask, renewTaskLease, upsertClientState, upsertLlmCredentials and appendOutboxMessages.
+ * State/credential/outbox entries can also carry `.cloudGuard`; task parameters
+ * can carry `.cloudGuard`. Rejected guards abort the entire write transaction and
+ * throw an error with code CLOUD_OWNER_RETIRED. Assertions and writes must share
+ * a transaction, never a read-then-write sequence.
+ *
+ * Task parameters and state/credential/outbox entries may carry
+ * `encryptedCloudMetadata` (encrypted `{owner,kind}`); it is updated atomically
+ * only if the corresponding resource mutation succeeded. The optional expectedCloudMetadata ciphertext (or null) adds an atomic sidecar
+ * comparison; a mismatch rejects CLOUD_RESOURCE_CHANGED. Deletion-only state
+ * cleanups additionally identify the logical sidecar with cloudMetadataKey.
+ * Sidecar keys are
+ * JSON.stringify([type,...identity]): task uuid, state namespace/key, credential
+ * credId, outbox messageId, subscription userId. `cleanupCloudResourceMetadata`
+ * removes orphan indexes with a same-statement backing-row existence check.
+ * Omitting userId is a server-internal cron sweep across users; HTTP callers
+ * always scope requests to the authenticated user. Owner fences are never removed.
+ *
+ * `deleteCloudResourceRows(userId,locators,{operationId,leaseToken}?)` consumes trusted inventory locators
+ * `{type,rows,metadataKey,encryptedMetadata,logicalState?}` with full physical snapshots. It compares and deletes
+ * a logical resource atomically, including chunks; changed snapshots are never
+ * deleted. Return `{deleted,changed}` counts logical resources, with already
+ * absent rows treated as idempotently deleted. The optional operation lease fence is checked in the same deletion transaction.
+ * External resource IDs must be
+ * resolved to this server-generated locator before calling the method.
+ */
+
 export {};

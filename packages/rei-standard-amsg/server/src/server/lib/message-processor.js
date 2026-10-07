@@ -37,6 +37,7 @@ import {
 } from '@rei-standard/amsg-shared';
 import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from './webpush-webcrypto.js';
 
+import { captureCloudTaskGuard, createCloudGuardedAdapter, assertCloudGuard } from './cloud-data-guard.js';
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
 import { callLlm } from './llm.js';
 import { buildHookTask, runAgenticFire, taskNeedsLlm, occurrenceSuffix, occurrenceMsOf, stampTaskIdentity } from './agentic-fire.js';
@@ -460,6 +461,22 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     const decryptedPayload = (predecrypted && predecrypted.payload)
       || JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
 
+    // Bind this invocation to the generation that was stored when its task was
+    // accepted. Restoring an owner never grants an old invocation a new lease.
+    const cloudGuard = await captureCloudTaskGuard(ctx.db, task.user_id, decryptedPayload, ctx.cloudData?.resolveOwner, task);
+    if (cloudGuard) {
+      await assertCloudGuard(ctx.db, task.user_id, cloudGuard);
+      const originalWebpush = ctx.webpush;
+      const guardedDb = createCloudGuardedAdapter(ctx.db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard: cloudGuard, userId: task.user_id });
+      ctx = { ...ctx, db: guardedDb, webpush: originalWebpush && {
+        ...originalWebpush,
+        async sendNotification(...args) {
+          await assertCloudGuard(guardedDb, task.user_id, cloudGuard);
+          return originalWebpush.sendNotification(...args);
+        },
+      }};
+    }
+
     // 内容已经落定的话只补推送。放在所有生成路径（agentic 与冻结 prompt）之前，
     // 两条路落进 outbox 的批次都认。
     //
@@ -774,11 +791,24 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       return { success: false, error: { code: 'TASK_NOT_FOUND', message: '任务不存在或已处理' } };
     }
 
-    // 上一轮生成成功、只是推送失败的话，processSingleMessage 会认出这次触发已
-    // 经落定的批次，这一轮只补推送、不再把 LLM 跑一遍。
-    const result = await processSingleMessage({ ...task, retry_count: retryCount }, { ...ctx, maxDeliveryRetries: maxRetries }, masterKey, null);
+    let attemptDb = ctx.db;
+    if (ctx.db.cloudDataManagement) {
+      try {
+        const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
+        const payload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
+        const guard = await captureCloudTaskGuard(ctx.db, task.user_id, payload, ctx.cloudData?.resolveOwner, task);
+        if (guard) attemptDb = createCloudGuardedAdapter(ctx.db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard, userId: task.user_id });
+      } catch (error) {
+        return { success: false, error: { code: error.code || 'PROCESSING_ERROR', message: error.message, retriesAttempted: retryCount } };
+      }
+    }
+    // The same captured generation protects lifecycle writes after processing.
+    const result = await processSingleMessage({ ...task, retry_count: retryCount }, { ...ctx, db: attemptDb, maxDeliveryRetries: maxRetries }, masterKey, null);
 
     if (!result.success) {
+      if (result.errorCode === 'CLOUD_OWNER_RETIRED') {
+        return { success: false, error: { code: result.errorCode, message: result.error, retriesAttempted: retryCount } };
+      }
       // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮
       // LLM 和 hook 里的计费调用。判定口径跟定时任务那条退避阶梯共用一份（见
       // lib/errors.js 的 isPermanentDeliveryFailure）——订阅压根没登记、推送服
@@ -796,7 +826,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       }
 
       try {
-        await ctx.db.updateTaskById(task.id, {
+        await attemptDb.updateTaskById(task.id, {
           status: 'failed',
           retry_count: retryCount,
           // 记录的形状跟定时任务那条路一致（同一个 buildErrorExtra）：reason
@@ -811,10 +841,13 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
           })
         });
       } catch (_updateError) {
+        if (_updateError?.code === 'CLOUD_OWNER_RETIRED') {
+          return { success: false, error: { code: _updateError.code, message: _updateError.message, retriesAttempted: retryCount } };
+        }
         // 缺 last_error 列（升级后还没重跑 /init-tenant）或别的写库问题：退掉
         // 这个字段再试一次，标 failed 不能被一条锦上添花的记录挡住。
         try {
-          await ctx.db.updateTaskById(task.id, { status: 'failed', retry_count: retryCount });
+          await attemptDb.updateTaskById(task.id, { status: 'failed', retry_count: retryCount });
         } catch (_retryError) {
           // best-effort status update; keep original processing error as primary signal
         }
@@ -835,7 +868,7 @@ export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, p
       await ctx.db.deleteTaskById(task.id);
     } catch (error) {
       try {
-        await ctx.db.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
+        await attemptDb.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
       } catch (_markSentError) {
         // best effort: avoid re-sending if storage mutation partially fails
       }

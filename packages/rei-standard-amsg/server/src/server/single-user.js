@@ -18,6 +18,7 @@
  *   即可）。一条 push 装不下的思考过程要切片发，切多大、最多几片、重组窗口多长由
  *   接收端说了算——发送端不知道这份配置的话，切出来的分片到了那边会被逐片拒收，
  *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
+ * @param {{resolveOwner?: function}} [config.cloudData] - Resource ownership resolver for cloud management.
  * @param {Object} [config.hooks] - optional fire-time hooks (see lib/agentic-fire.js):
  *   { onBeforeFire, onLLMOutput, executeToolCalls }. When omitted, AI tasks
  *   replay the schedule-time frozen prompt (legacy behavior, unchanged).
@@ -54,6 +55,7 @@
  * @returns {{ handlers: Object, ctx: Object }}
  */
 
+import { createCloudGuardedAdapter } from './lib/cloud-data-guard.js';
 import { createSingleUserContextManager } from './tenant/single-user-context.js';
 import { createSingleUserInitHandler } from './handlers/single-user-init.js';
 import { createGetUserKeyHandler } from './handlers/get-user-key.js';
@@ -68,6 +70,7 @@ import { createClientStateNamespacesHandler } from './handlers/client-state-name
 import { createPushSubscriptionHandler } from './handlers/push-subscription.js';
 import { createLlmCredentialsHandler } from './handlers/llm-credentials.js';
 import { createCapabilitiesHandler } from './handlers/capabilities.js';
+import { createCloudDataHandler } from './handlers/cloud-data.js';
 import { createOutboxHandler } from './handlers/outbox.js';
 
 export function createSingleUserServer(config) {
@@ -76,7 +79,7 @@ export function createSingleUserServer(config) {
 
   const vapid = config.vapid || {};
   const tenantManager = createSingleUserContextManager({
-    db: config.db,
+    db: createCloudGuardedAdapter(config.db, { masterKey: config.masterKey, resolveOwner: config.cloudData?.resolveOwner }),
     masterKey: config.masterKey,
     serverToken: config.serverToken
   });
@@ -109,7 +112,8 @@ export function createSingleUserServer(config) {
     // 定时任务投递失败后的重试次数上限（默认 3）。handlers 用不到，宿主拿这个
     // ctx 去调 runScheduledTick 时它跟着走。
     maxGenerationRetries: config.maxGenerationRetries,
-    maxDeliveryRetries: config.maxDeliveryRetries
+    maxDeliveryRetries: config.maxDeliveryRetries,
+    cloudData: config.cloudData
   };
 
   return {
@@ -128,7 +132,8 @@ export function createSingleUserServer(config) {
       pushSubscription: createPushSubscriptionHandler(ctx),
       llmCredentials: createLlmCredentialsHandler(ctx),
       capabilities: createCapabilitiesHandler(ctx),
-      outbox: createOutboxHandler(ctx)
+      outbox: createOutboxHandler(ctx),
+      cloudData: createCloudDataHandler(ctx)
     }
   };
 }
