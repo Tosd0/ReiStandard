@@ -141,7 +141,7 @@ export function createCapabilitiesHandler(ctx) {
     }
     return {
       status: 200,
-      body: { success: true, serverVersion: SERVER_VERSION, features: [...SERVER_FEATURES] },
+      body: { success: true, serverVersion: SERVER_VERSION, features: [...SERVER_FEATURES, ...(tenantResult.context.db.cloudDataManagement ? ['cloud-data-management'] : [])] },
     };
   }
   return { GET };

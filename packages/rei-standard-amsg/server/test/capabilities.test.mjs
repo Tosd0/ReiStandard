@@ -80,7 +80,7 @@ function makeWorker(extra = {}) {
 }
 
 describe('GET /capabilities', () => {
-  test('返回 serverVersion + 静态 features 名单', async () => {
+  test('返回 serverVersion、通用 features 和 D1 完整管理能力', async () => {
     const d1 = createTestD1();
     const worker = makeWorker();
     const res = await worker.fetch(new Request('https://w.dev/capabilities', { method: 'GET' }), { DB: d1 });
@@ -97,7 +97,7 @@ describe('GET /capabilities', () => {
     // 名单，这行当场红
     assert.deepEqual([...SERVER_FEATURES], EXPECTED_FEATURES);
     // 端点把常量原样吐出去，不过滤也不重排
-    assert.deepEqual([...body.features], [...SERVER_FEATURES]);
+    assert.deepEqual([...body.features], [...SERVER_FEATURES, 'cloud-data-management']);
   });
 
   test('serverToken 配置后：无 X-Client-Token → 401，带上 → 200', async () => {

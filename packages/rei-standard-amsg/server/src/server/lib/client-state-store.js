@@ -138,6 +138,12 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
     // `min` 取的就是原值——慢包后到仍然拿着自己构建时刻那个较小的值，照样被拦，
     // 「旧不盖新」一个字没变。version 那种单调递增版本号同理（要大到 1.7e12
     // 才碰得到这条线）。
+    // Keep ownership beside encrypted rows only until the adapter stores the
+    // encrypted metadata in the same transaction. Chunk rows share root identity.
+    const cloudFields = {
+      owner: entry.owner, kind: entry.kind, ownerGeneration: entry.ownerGeneration,
+      cloudValue: entry.value, cloudNamespace: entry.namespace, cloudKey: entry.key,
+    };
     const rawGuardAt = Number.isInteger(entry.version) && entry.version > 0 ? entry.version : entry.updatedAt;
     const guardAt = Math.min(rawGuardAt, at);
     // 不管写还是删，都先清掉这个 key 上一次写入留下的切片行（同一批里先删后写）。
@@ -145,6 +151,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
       namespace: chunkNamespaceFor(entry.namespace),
       keyPrefix: chunkKeyPrefixFor(entry.key),
       updatedAt: guardAt,
+      ...cloudFields,
     });
 
     if (entry.value === null) {
@@ -154,6 +161,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
         namespace: entry.namespace,
         key: entry.key,
         updatedAt: guardAt,
+      ...cloudFields,
       });
       continue;
     }
@@ -166,6 +174,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
         key: entry.key,
         value: await encryptForStorage(entry.value, userKey),
         updatedAt: guardAt,
+      ...cloudFields,
       });
     } else {
       const slices = splitStateValue(entry.value);
@@ -174,6 +183,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
         key: entry.key,
         value: buildChunkedRootValue(slices.length),
         updatedAt: guardAt,
+      ...cloudFields,
       });
       const encryptedSlices = await Promise.all(slices.map((slice) => encryptForStorage(slice, userKey)));
       for (let c = 0; c < encryptedSlices.length; c++) {
@@ -182,6 +192,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
           key: chunkKeyFor(entry.key, c),
           value: encryptedSlices[c],
           updatedAt: guardAt,
+      ...cloudFields,
         });
       }
     }

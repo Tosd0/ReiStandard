@@ -615,3 +615,82 @@ try {
 - [SW 包 README](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/sw/README.md)
 - [Service Worker 规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/service-worker-specification.md)
 - [API 技术规范](https://github.com/Tosd0/ReiStandard/blob/main/standards/active-messaging-api.md)
+
+## Server-owned cloud data management
+
+Check `getCapabilities()` for `cloud-data-management` before calling these
+methods. Updating the browser SDK alone does not upgrade an existing Worker.
+The server inventories actual storage records; a missing local character or
+owner must never hide a cloud resource. These calls require the normal encrypted
+client initialization and use the configured `serverToken`.
+
+```js
+const capability = await client.getCapabilities();
+if (!capability?.features.includes('cloud-data-management')) {
+  // Offer the Worker upgrade path; do not claim the legacy inventory is complete.
+  return;
+}
+
+const resources = [];
+let cursor;
+do {
+  const page = await client.listCloudDataResources({ cursor, limit: 100 });
+  if (!page.success) throw new Error(page.error?.message || 'Inventory unavailable');
+  if (!page.data.complete) {
+    // Show page.data.gaps; missing sources are unknown, not empty.
+  }
+  resources.push(...page.data.resources);
+  cursor = page.data.nextCursor || undefined;
+} while (cursor);
+
+// Only do this after the user explicitly selects a non-empty scope.
+const preview = await client.createCloudDataCleanupPlan({
+  mode: 'purge', resourceIds: selectedResourceIds,
+});
+if (!preview.success) throw new Error(preview.error?.message || 'Preview unavailable');
+// Display preview.data.resources, counts, impacts and expiresAt; ask the user
+// to confirm this concrete server preview before starting it.
+const operation = await client.startCloudDataCleanup({
+  planId: preview.data.id,
+  idempotencyKey: crypto.randomUUID(), // Persist and reuse on network retries.
+});
+```
+
+Every method returns the usual `{ success, data?, error? }` response. The SDK
+encodes query parameters, encrypts mutations and decrypts encrypted responses;
+server errors such as stale previews remain errors, not empty success results.
+Exported declaration types include `CloudResource`, `CloudDataPage`,
+`CloudDataSummary`, `CloudCleanupSelection`, `CloudCleanupPlan`,
+`CloudCleanupOperation`, `CloudCleanupOperations`, `CloudOwnerState` and the
+`CloudDataResponse<T>` envelope.
+
+| Method | Data returned / behavior |
+| --- | --- |
+| `getCloudDataSummary()` | Full counts and source `complete` / `gaps`; request on user action, not on each progress poll |
+| `listCloudDataResources({ cursor?, limit?, owner?, type? })` | `resources`, `nextCursor`, `complete`, `gaps`; follow cursors to the end |
+| `createCloudDataCleanupPlan(selection)` | Server preview with resource IDs, counts, impacts and expiration |
+| `startCloudDataCleanup({ planId, idempotencyKey })` | Durable operation; pending/running does not mean success |
+| `listCloudDataCleanupOperations()` | Recent saved operations and completeness information |
+| `getCloudDataCleanupOperation(id)` | Stored progress, per-type deleted/remaining/failed counts and errors |
+| `listCloudDataOwners()` | Discover registered owners independently of remaining resources or operation history |
+| `getCloudDataOwner({ type, id })` | Owner retirement status and generation |
+| `restoreCloudDataOwner({ type, id })` | Explicitly re-enable an owner after user action; never call from normal sync |
+
+A cleanup selection has `mode: 'purge' | 'retire-owner'`. A purge requires an
+explicit non-empty `resourceIds` or exact `owner` scope; `types` can narrow it and permits later
+normal writes. Its preview fixes the selected versions; a stale plan requires a
+new preview. `retire-owner` accepts only an exact `owner: { type, id, label? }`
+scope, disables that owner and cleans all its resources at execution time,
+including resources created after preview. Restoring an owner does not validate
+old-generation requests or tasks. Do not show retired-owner cleanup as complete
+until the server operation says `completed`.
+
+The inventory never includes credential bodies, chat content or push endpoints.
+`owner: null` means unassigned/shared/unknown; it does not mean safe to delete.
+Keep the Worker URL and user identity attached to previews and operations so
+switching accounts or deployments cannot execute a plan against another target.
+
+Owner-aware state entries, credential entries and schedule payloads accept `owner`,
+`kind` and `ownerGeneration`. Omitted generations mean zero. After explicit restore,
+persist the returned generation and attach it to newly created requests; never
+upgrade an already queued request to the current generation automatically.

@@ -173,6 +173,9 @@ export function createScheduleMessageHandler(ctx) {
       // 透传给 LLM 中转的非标准参数（thinking 之类），buildLlmRequestBody 会
       // 把它展开进请求体（核心字段优先）。
       llmExtraBody: payload.llmExtraBody ?? null,
+      owner: payload.owner,
+      kind: payload.kind,
+      ownerGeneration: payload.ownerGeneration,
       metadata: payload.metadata || {}
     };
 

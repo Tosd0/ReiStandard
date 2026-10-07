@@ -103,6 +103,7 @@ import { createD1Adapter } from '../adapters/d1.js';
 import { runScheduledTick, runTask as runTaskWithContext } from '../lib/run-tick.js';
 import { getSchemaVersion as readSchemaVersion, ensureSchema as applySchema } from '../lib/schema-version.js';
 import { summarizeErrorCause } from '../lib/errors.js';
+import { resumeCloudDataCleanups } from '../lib/cloud-data-cleanup.js';
 import { readRequestBody } from '../lib/request.js';
 
 function headersToObject(h) {
@@ -299,6 +300,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
   function buildTickContext(cfg) {
     return {
       db: cfg.db,
+      cloudData: cfg.cloudData,
       masterKey: cfg.masterKey,
       vapid: cfg.vapid || {},
       webpush: cfg.webpush,
@@ -418,7 +420,11 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       }
 
       let result;
-      if (method === 'POST' && pathname.endsWith('/init-tenant')) {
+      if (pathname.includes('/cloud-data/') && (method === 'GET' || method === 'POST')) {
+        result = method === 'GET'
+          ? await server.handlers.cloudData.GET(url, headers)
+          : await server.handlers.cloudData.POST(url, headers, body);
+      } else if (method === 'POST' && pathname.endsWith('/init-tenant')) {
         result = await server.handlers.init.POST(headers, body);
       } else if (method === 'GET' && pathname.endsWith('/get-user-key')) {
         result = await server.handlers.getUserKey.GET(url, headers);
@@ -501,6 +507,13 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       console.error('[amsg single-user] scheduled(): config build failed; skipping tick:', error && error.message);
       const cause = summarizeErrorCause(error, 'config');
       await reportError({ stage: 'config', error, cause, path: null });
+      return { ok: false, cause };
+    }
+    try {
+      await resumeCloudDataCleanups(buildTickContext(cfg));
+    } catch (error) {
+      const cause = summarizeErrorCause(error, 'cloud-cleanup');
+      await reportError({ stage: 'cloud-cleanup', error, cause, path: null });
       return { ok: false, cause };
     }
     if (!pushConfigured(cfg)) {
