@@ -72,7 +72,10 @@ then discovers and removes its resources. Subscriptions and shared data are
 not implicitly owned by a character.
 
 Operations are encrypted and persisted. The first request handles up to 25
-resources, with cron continuing later even when the browser closes. A renewable database
+resources, with cron continuing later even when the browser closes. Continuation
+requires the Worker scheduled/cron trigger to remain enabled. If the host pauses
+background tasks by removing that trigger, cleanup remains pending until the
+trigger is restored; this release does not install a separate cleanup alarm. A renewable database
 lease with a fencing token prevents expired workers from deleting resources or
 overwriting another worker’s progress. Failures remain pending with exponential
 backoff; stale previews or eight failed attempts stop with an explicit failure.
