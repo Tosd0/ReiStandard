@@ -22,6 +22,7 @@
     "amsg-client-server-token",
     "amsg-client-state-chunking",
     "amsg-client-zombie-push-endpoint",
+    "amsg-cloud-data-management",
     "amsg-credrefs-inherit-fix",
     "amsg-emit-result",
     "amsg-engines-range-align",
