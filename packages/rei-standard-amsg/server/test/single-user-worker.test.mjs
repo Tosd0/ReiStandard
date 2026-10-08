@@ -526,3 +526,51 @@ test('scheduled() 过期跳过后，GET /messages 透出 lastError', async () =>
   assert.equal(data.tasks[0].lastError.reason, 'stale');
   assert.equal(data.tasks[0].lastError.occurrence, missedAt);
 });
+
+test('scheduled() 云端清理出错时照常投递消息，出错原因另外上报', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  // 表结构停在上一版：清理要用的两张表还没补上。
+  d1._raw.exec('DROP TABLE cloud_data_work; DROP TABLE cloud_data_maintenance;');
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none'
+  }), userKey);
+  await seedPushSubscription(adapter, USER, MASTER_KEY);
+  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
+
+  let sent = 0;
+  const reported = [];
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: adapter,
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() { sent++; } }
+  }), { onError: (info) => { reported.push(info.stage); } });
+
+  const origError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await worker.scheduled({}, { DB: d1 });
+  } finally {
+    console.error = origError;
+  }
+  assert.ok(sent >= 1, '清理失败不该拦住投递');
+  assert.equal(result.ok, true);
+  assert.equal(result.cloudCleanupCause.stage, 'cloud-cleanup');
+  assert.deepEqual(reported, ['cloud-cleanup']);
+
+  // 投递这一段也没跑成时，清理的出错原因照样带在返回值上。
+  const unconfigured = createSingleUserCloudflareWorker(() => ({ db: adapter, masterKey: MASTER_KEY }));
+  console.error = () => {};
+  try {
+    result = await unconfigured.scheduled({}, { DB: d1 });
+  } finally {
+    console.error = origError;
+  }
+  assert.equal(result.ok, false);
+  assert.equal(result.cause.stage, 'config');
+  assert.equal(result.cloudCleanupCause.stage, 'cloud-cleanup');
+});

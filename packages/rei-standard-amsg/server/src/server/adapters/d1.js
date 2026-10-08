@@ -396,7 +396,8 @@ export class D1Adapter {
       WHERE w.kind='operation' AND w.next_run_at IS NOT NULL AND w.next_run_at<=?
         AND (r.lease_until IS NULL OR r.lease_until<=?)
       ORDER BY w.next_run_at LIMIT ?`).bind(now,now,limit).all();
-    return Promise.all((result.results || []).map(row => this._cloudRecordForList(row)));
+    // writeToken lets the caller reschedule only the exact version it was handed.
+    return Promise.all((result.results || []).map(async row => ({ ...await this._cloudRecordForList(row), writeToken: row.write_token })));
   }
 
   async cleanupExpiredCloudDataRecords(now = Date.now(), limit = 100) {
@@ -419,7 +420,11 @@ export class D1Adapter {
       marker = await this._db.prepare('SELECT * FROM cloud_data_maintenance WHERE name=?').bind(name).first();
     }
     if (marker.completed) return { rows: [], completed: true };
-    const result = await this._db.prepare(`SELECT rowid AS maintenance_rowid,* FROM ${table}
+    // Only operations need their content to derive a schedule; snapshots and sidecars are indexed by identity.
+    const columns = table === 'cloud_data_records'
+      ? "rowid AS maintenance_rowid,user_id,kind,id,updated_at,write_token,CASE WHEN kind='operation' THEN data END AS data"
+      : 'rowid AS maintenance_rowid';
+    const result = await this._db.prepare(`SELECT ${columns} FROM ${table}
       WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`).bind(marker.cursor,marker.upper_bound,limit).all();
     return { rows: result.results || [], upperBound: marker.upper_bound, cursor: marker.cursor, completed: false };
   }
@@ -429,12 +434,29 @@ export class D1Adapter {
       .bind(cursor,completed ? 1 : 0,name).run();
   }
 
-  async indexCloudDataRecordWork(userId,kind,id,work,expectedWriteToken = null) {
-    // Never overwrite a concurrently updated record's schedule with a legacy snapshot.
+  /**
+   * Index a whole repair batch in one statement. Never overwrites an existing schedule, and
+   * skips a record that was rewritten after the batch was read.
+   */
+  async indexCloudDataRecordWorkBatch(entries) {
+    if (!entries.length) return;
+    const rows = entries.map(({ userId,kind,id,work,writeToken }) =>
+      [userId,kind,id,work.nextRunAt ?? null,work.expiresAt ?? null,writeToken ?? null]);
     await this._db.prepare(`INSERT INTO cloud_data_work (user_id,kind,id,next_run_at,expires_at)
-      SELECT user_id,kind,id,?,? FROM cloud_data_records WHERE user_id=? AND kind=? AND id=? AND write_token IS ?
-      ON CONFLICT (user_id,kind,id) DO NOTHING`)
+      SELECT r.user_id,r.kind,r.id,json_extract(j.value,'$[3]'),json_extract(j.value,'$[4]')
+      FROM json_each(?) j JOIN cloud_data_records r ON r.user_id=json_extract(j.value,'$[0]')
+        AND r.kind=json_extract(j.value,'$[1]') AND r.id=json_extract(j.value,'$[2]')
+        AND r.write_token IS json_extract(j.value,'$[5]')
+      WHERE 1 ON CONFLICT (user_id,kind,id) DO NOTHING`).bind(JSON.stringify(rows)).run();
+  }
+
+  /** Move an indexed record's schedule, unless the record was rewritten since the caller read it. */
+  async rescheduleCloudDataRecordWork(userId,kind,id,work,expectedWriteToken = null) {
+    const result = await this._db.prepare(`UPDATE cloud_data_work SET next_run_at=?,expires_at=?
+      WHERE user_id=? AND kind=? AND id=? AND EXISTS (SELECT 1 FROM cloud_data_records r
+        WHERE r.user_id=cloud_data_work.user_id AND r.kind=cloud_data_work.kind AND r.id=cloud_data_work.id AND r.write_token IS ?)`)
       .bind(work.nextRunAt ?? null,work.expiresAt ?? null,userId,kind,id,expectedWriteToken).run();
+    return result.meta.changes > 0;
   }
 
   async readCloudMaintenanceRecord(row) { return this._cloudRecordForList(row); }

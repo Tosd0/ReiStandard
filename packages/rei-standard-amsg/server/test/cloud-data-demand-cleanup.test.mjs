@@ -229,7 +229,7 @@ test('idempotency, create-only conflicts and stale backfill cannot change the li
     await db.putCloudDataRecord('u', 'operation', 'one', 'duplicate', { createOnly: true, work: { nextRunAt: 0, expiresAt: 1 } });
     assert.deepEqual(raw._raw.prepare('SELECT next_run_at,expires_at FROM cloud_data_work').all(), [{ next_run_at: 100, expires_at: null }]);
     await db.putCloudDataRecord('u', 'operation', 'one', 'new', { work: { nextRunAt: 200, expiresAt: null } });
-    await db.indexCloudDataRecordWork('u','operation','one',{ nextRunAt: 0, expiresAt: 1 },staleToken);
+    await db.indexCloudDataRecordWorkBatch([{ userId: 'u', kind: 'operation', id: 'one', work: { nextRunAt: 0, expiresAt: 1 }, writeToken: staleToken }]);
     assert.equal(raw._raw.prepare('SELECT next_run_at FROM cloud_data_work').get().next_run_at, 200);
   } finally { raw._raw.close(); }
 });
@@ -246,4 +246,119 @@ test('due and expiry lookups narrow by execution time rather than scanning histo
       assert.ok(plan.includes(narrowing), plan);
     }
   } finally { raw._raw.close(); }
+});
+
+async function withQuietWarnings(run) {
+  const original = console.warn;
+  console.warn = () => {};
+  try { return await run(); } finally { console.warn = original; }
+}
+
+const insertLegacyRecord = (raw, kind, id, data) => raw._raw
+  .prepare('INSERT INTO cloud_data_records (user_id,kind,id,data,updated_at) VALUES (?,?,?,?,?)')
+  .run('u', kind, id, data, Date.now());
+
+test('legacy repair indexes a full batch of small records without a statement per row', async () => {
+  const { db, raw } = await fresh();
+  try {
+    const key = await deriveUserEncryptionKey('u', 'master');
+    const finished = await encryptForStorage(JSON.stringify({ id: 'x', status: 'completed', updatedAt: Date.now() }), key);
+    for (let i = 0; i < 60; i++) insertLegacyRecord(raw, 'plan', 'plan' + i, 'cipher');
+    for (let i = 0; i < 40; i++) insertLegacyRecord(raw, 'operation', 'op' + i, finished);
+    raw.calls.length = 0;
+    await resumeCloudDataCleanups({ db, masterKey: 'master' });
+    assert.equal(raw._raw.prepare('SELECT count(*) n FROM cloud_data_work').get().n, 100);
+    assert.ok(raw.calls.length <= 15, `one tick issued ${raw.calls.length} statements`);
+    const read = raw.calls.find(({ sql }) => /maintenance_rowid/.test(sql) && /FROM cloud_data_records/.test(sql));
+    assert.doesNotMatch(read.sql, /maintenance_rowid,\*/, 'snapshot ciphertext is not loaded for indexing');
+  } finally { raw._raw.close(); }
+});
+
+test('a legacy operation that cannot be read is still indexed and retried later', async () => {
+  const { db, raw } = await fresh();
+  try {
+    insertLegacyRecord(raw, 'operation', 'unreadable', 'not-ciphertext');
+    const before = Date.now();
+    await withQuietWarnings(() => resumeCloudDataCleanups({ db, masterKey: 'master' }));
+    const work = raw._raw.prepare("SELECT next_run_at,expires_at FROM cloud_data_work WHERE id='unreadable'").get();
+    assert.ok(work, 'the operation has a work index entry');
+    assert.ok(work.next_run_at > before, 'the failed attempt is retried later, not dropped');
+    assert.equal(work.expires_at, null);
+    assert.ok(await db.getCloudDataRecord('u', 'operation', 'unreadable'));
+  } finally { raw._raw.close(); }
+});
+
+test('operations that cannot be resumed move behind the ones still waiting', async () => {
+  const { db, raw } = await fresh();
+  try {
+    for (let i = 0; i < 30; i++) {
+      await db.putCloudDataRecord('u', 'operation', 'bad' + String(i).padStart(2, '0'), 'not-ciphertext', { work: { nextRunAt: i + 1, expiresAt: null } });
+    }
+    await withQuietWarnings(() => resumeCloudDataCleanups({ db, masterKey: 'master' }));
+    const waiting = (await db.listDueCloudDataOperations(Date.now(), 25)).map(row => row.id);
+    assert.deepEqual(waiting, ['bad25', 'bad26', 'bad27', 'bad28', 'bad29']);
+  } finally { raw._raw.close(); }
+});
+
+test('a due entry for a finished operation gets its expiry schedule back', async () => {
+  const { db, raw } = await fresh();
+  try {
+    const key = await deriveUserEncryptionKey('u', 'master');
+    const updatedAt = Date.now();
+    const data = await encryptForStorage(JSON.stringify({ id: 'done', status: 'completed', updatedAt }), key);
+    await db.putCloudDataRecord('u', 'operation', 'done', data, { work: { nextRunAt: 0, expiresAt: null } });
+    await resumeCloudDataCleanups({ db, masterKey: 'master' });
+    assert.deepEqual(raw._raw.prepare('SELECT next_run_at,expires_at FROM cloud_data_work').get(),
+      { next_run_at: null, expires_at: updatedAt + 30 * 86400000 });
+  } finally { raw._raw.close(); }
+});
+
+test('rescheduling leaves a record alone once it has been rewritten', async () => {
+  const { db, raw } = await fresh();
+  try {
+    await db.putCloudDataRecord('u', 'operation', 'one', 'old', { work: { nextRunAt: 1, expiresAt: null } });
+    const [stale] = await db.listDueCloudDataOperations(Date.now());
+    await db.putCloudDataRecord('u', 'operation', 'one', 'new', { work: { nextRunAt: 2, expiresAt: null } });
+    assert.equal(await db.rescheduleCloudDataRecordWork('u', 'operation', 'one', { nextRunAt: 999, expiresAt: null }, stale.writeToken), false);
+    assert.equal(raw._raw.prepare('SELECT next_run_at FROM cloud_data_work').get().next_run_at, 2);
+  } finally { raw._raw.close(); }
+});
+
+test('an adapter without a work index still gets retention from the per-tick scan', async () => {
+  const cleaned = [];
+  const deleted = [];
+  const key = await deriveUserEncryptionKey('u', 'master');
+  const old = { id: 'old', status: 'completed', updatedAt: Date.now() - 31 * 86400000 };
+  const db = {
+    cloudDataManagement: true,
+    cleanupCloudDataRecords: async (kind) => { cleaned.push(kind); },
+    listCloudDataRecordsAcrossUsers: async () => [{ id: 'old', userId: 'u', kind: 'operation', data: await encryptForStorage(JSON.stringify(old), key) }],
+    deleteCloudDataRecord: async (userId, kind, id) => { deleted.push(id); },
+  };
+  await resumeCloudDataCleanups({ db, masterKey: 'master' });
+  assert.deepEqual(cleaned, ['inventory', 'plan']);
+  assert.deepEqual(deleted, ['old']);
+});
+
+test('schema check skips triggers for an adapter that does not report them', async () => {
+  const { db, raw } = await fresh();
+  try {
+    const { getSchemaVersion } = await import('../src/server/lib/schema-version.js');
+    const withoutTriggers = { describeSchema: async () => { const { triggers, ...rest } = await db.describeSchema(); return rest; } };
+    assert.deepEqual((await getSchemaVersion(withoutTriggers)).missing, []);
+    for (const row of raw._raw.prepare("SELECT name FROM sqlite_master WHERE type='trigger'").all()) raw._raw.exec(`DROP TRIGGER ${row.name}`);
+    assert.equal((await getSchemaVersion(db)).ok, false, 'an adapter that reports triggers is still checked');
+  } finally { raw._raw.close(); }
+});
+
+test('an adapter with only part of the work index is treated as having none', async () => {
+  const cleaned = [];
+  const db = {
+    cloudDataManagement: true,
+    listDueCloudDataOperations: async () => { throw new Error('the partial index must not be used'); },
+    cleanupCloudDataRecords: async (kind) => { cleaned.push(kind); },
+    listCloudDataRecordsAcrossUsers: async () => [],
+  };
+  await resumeCloudDataCleanups({ db, masterKey: 'master' });
+  assert.deepEqual(cleaned, ['inventory', 'plan']);
 });
