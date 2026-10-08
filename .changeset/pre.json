@@ -112,6 +112,7 @@
     "blob-store-id-charset-single-source",
     "blob-store-initial",
     "blob-store-restore",
+    "cloud-maintenance-followups",
     "demand-driven-cloud-cleanup",
     "license-files",
     "phase0-dts-and-hardening"
