@@ -47,7 +47,7 @@ const TEXT_ENCODER = new TextEncoder();
 /** @typedef {'task'|'state'|'credential'|'outbox'|'subscription'} CloudResourceType */
 /** @typedef {{ source: string, code: string, message: string }} CloudDataGap */
 /** @typedef {{ id: string, type: CloudResourceType, owner: CloudOwner|null, kind: string|null, label: string, byteSize: number|null, updatedAt: number|null, status: string|null }} CloudResource */
-/** @typedef {{ resources: CloudResource[], nextCursor: string|null, complete: boolean, gaps: CloudDataGap[] }} CloudDataPage */
+/** @typedef {{ resources: CloudResource[], nextCursor: string|null, complete: boolean, gaps: CloudDataGap[], summary?: CloudDataSummary }} CloudDataPage */
 /** @typedef {{ counts: Array<{type: CloudResourceType, count: number, byteSize: number|null}>, total: number, complete: boolean, gaps: CloudDataGap[] }} CloudDataSummary */
 /** @typedef {{ mode: 'purge'|'retire-owner', resourceIds?: string[], owner?: CloudOwner, types?: CloudResourceType[] }} CloudCleanupSelection */
 /** @typedef {{ id: string, mode: 'purge'|'retire-owner', owner: CloudOwner|null, resources: CloudResource[], count: number, expiresAt: number, counts: Array<{type: CloudResourceType, count: number}>, impacts: string[], complete: boolean, gaps: CloudDataGap[] }} CloudCleanupPlan */

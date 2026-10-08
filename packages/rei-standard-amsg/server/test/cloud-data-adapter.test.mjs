@@ -101,9 +101,10 @@ test('expired management records are pruned without deleting active leases or an
 });
 
 test('metadata maintenance preserves live rows and rootless chunks while clearing orphan sidecars',async()=>{
- const {db}=await fresh();
+ const {db,raw}=await fresh();
  await db.upsertClientState('u',[{namespace:'n',key:'live',value:'x',updatedAt:1,encryptedCloudMetadata:'live-meta'}, {namespace:'n',key:'gone',value:'x',updatedAt:1,encryptedCloudMetadata:'gone-meta'}]);
  await db.upsertClientState('u',[],[{namespace:'n',key:'gone',updatedAt:2}]);
+ raw._raw.prepare('INSERT INTO cloud_resource_metadata VALUES (?,?,?)').run('u','["state","n","gone"]','gone-meta');
  assert.equal(await db.cleanupCloudResourceMetadata('u'),1);
  assert.equal((await db.listCloudResourceRows('u')).metadata[0].encrypted_value,'live-meta');
 });
@@ -228,11 +229,12 @@ test('a task heartbeat cannot extend a retired owner generation',async()=>{
 });
 
 test('global metadata maintenance reclaims deleted sidecars across users and preserves owner fences',async()=>{
- const {db}=await fresh();
+ const {db,raw}=await fresh();
  for(const user of ['u','other']) {
    await db.upsertClientState(user,[{namespace:'n',key:'gone',value:'x',updatedAt:1,encryptedCloudMetadata:'private-name'}]);
    await db.upsertClientState(user,[],[{namespace:'n',key:'gone',updatedAt:2}]);
    await db.setCloudOwnerActive(user,owner,false);
+   raw._raw.prepare('INSERT INTO cloud_resource_metadata VALUES (?,?,?)').run(user,'["state","n","gone"]','private-name');
  }
  assert.equal(await db.cleanupCloudResourceMetadata('u'),1);
  assert.equal((await db.listCloudResourceRows('other')).metadata.length,1);

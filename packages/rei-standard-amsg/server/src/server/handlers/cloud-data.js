@@ -21,6 +21,20 @@ import {
   publicOperation
 } from '../lib/cloud-data-cleanup.js';
 
+function inventorySummary(inventory) {
+  const resources = inventory.entries.map(entry => entry.resource);
+  return {
+    total: resources.length,
+    counts: CLOUD_RESOURCE_TYPES.map(type => ({
+      type,
+      count: resources.filter(resource => resource.type === type).length,
+      byteSize: resources.filter(resource => resource.type === type).reduce((sum,resource) => sum + (resource.byteSize || 0),0)
+    })),
+    complete: inventory.complete,
+    gaps: inventory.gaps
+  };
+}
+
 export function createCloudDataHandler(ctx) {
   async function run(url, headers, body, method) {
     const tenant = await ctx.tenantManager.resolveTenant(headers);
@@ -78,19 +92,7 @@ export function createCloudDataHandler(ctx) {
         const filter = { ownerType, ownerId, type };
         if (path.endsWith('/summary')) {
           const inventory = await cloudInventory(ctx, db, userId, key);
-          const resources = inventory.entries.map((e) => e.resource);
-          data = {
-            total: resources.length,
-            counts: CLOUD_RESOURCE_TYPES.map((type) => ({
-              type,
-              count: resources.filter((r) => r.type === type).length,
-              byteSize: resources
-                .filter((r) => r.type === type)
-                .reduce((sum, r) => sum + (r.byteSize || 0), 0)
-            })),
-            complete: inventory.complete,
-            gaps: inventory.gaps
-          };
+          data = inventorySummary(inventory);
         } else {
           const limit = Number(params.get('limit') || 50);
           if (!Number.isInteger(limit) || limit < 1 || limit > 200)
@@ -130,6 +132,7 @@ export function createCloudDataHandler(ctx) {
             snapshot = {
               id: crypto.randomUUID(),
               filter,
+              summary: inventorySummary(inventory),
               expiresAt: Date.now() + 15 * 60 * 1000,
               resources: inventory.entries
                 .map((e) => e.resource)
@@ -151,6 +154,7 @@ export function createCloudDataHandler(ctx) {
           }
           data = {
             resources: snapshot.resources.slice(offset, offset + limit),
+            ...(snapshot.summary ? { summary: snapshot.summary } : {}),
             nextCursor:
               offset + limit < snapshot.resources.length
                 ? `${snapshot.id}:${offset + limit}`

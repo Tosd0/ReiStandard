@@ -82,7 +82,8 @@ backoff; stale previews or eight failed attempts stop with an explicit failure.
 Completion requires a new successful inventory showing no selected remainder.
 GET polling reads the operation record only. Consumed plans are removed; expired
 plans and inventory snapshots are reclaimed by cron after one hour, completed or
-failed operation summaries after 30 days. Retired owner markers remain discoverable
+failed operation summaries after 30 days. Indexed expiry reclaim runs in batches
+of at most 100 records; active processing leases are preserved. Retired owner markers remain discoverable
 through `/cloud-data/owners`. Idempotency keys are user-scoped
 and cannot be reused for a different plan.
 
@@ -104,3 +105,38 @@ external push service, a notification cannot be recalled.
 The restore endpoint rejects an owner whose cleanup is pending/running. A
 failed cleanup can be inspected and retried by creating a fresh plan; unknown
 or unreadable resources remain available for explicit selection.
+
+## Demand-driven D1 maintenance
+
+Schema `2.6.0-cloud-data.2` adds `cloud_data_work`, `cloud_data_maintenance`, two
+partial scheduling/expiry indexes and deletion triggers. `ensureSchema` checks
+these indexes and triggers, so existing deployments install them once after an
+upgrade. The work index stores opaque identities and absolute execution/expiry
+times; resource contents, labels and operation details stay encrypted.
+
+Resource deletion removes its exact metadata sidecar in the same transaction,
+including ordinary cancellation, credentials, subscription changes and TTL
+retention. Logical state metadata remains while either the root or any of its
+chunks exists. Roots and chunks use separate full-key index probes. Cron does
+not run a global orphan-sidecar sweep.
+
+Existing sidecars and management records receive a one-time bounded repair:
+100 root rows per source per tick, with persistent rowid cursors and an initial
+upper bound. Finished repair does not restart after Worker eviction/redeployment.
+Unreadable legacy operation records remain available for inspection, rather
+than being guessed safe to delete. Concurrently changed operations are not
+rescheduled from stale repair snapshots.
+
+Normal continuation selects at most 25 due unfinished operations through the
+work index, skips future retries and active leases, and never decrypts completed
+history on each tick. Inventory/plan TTL is one hour; terminal operation TTL is
+30 days from completion/failure. Pending/running operations never expire merely
+because they are old. Existing task, state and outbox retention also deletes at
+most 100 rows per retention predicate per tick, without changing their cutoffs.
+
+`GET /cloud-data/resources` includes an optional `summary` from the same inventory
+snapshot as its pages. Clients should reuse it instead of immediately calling
+`GET /cloud-data/summary`. The standalone summary route remains available for
+older clients; cursor pages retain the original snapshot and summary. Explicit
+refresh and deletion preview still build a fresh inventory to validate actual
+resources and their versions.

@@ -27,7 +27,7 @@ test('initSchema creates table and indexes', async () => {
   const res = await adapter.initSchema(); // idempotent (IF NOT EXISTS)
   assert.equal(res.indexesFailed, 0);
   // scheduled_messages 6 + client_state 1 + message_outbox 4
-  assert.equal(res.indexesCreated, 11);
+  assert.equal(res.indexesCreated, 13);
 });
 
 test('createTask returns id/uuid/status/created_at and normalizes next_send_at', async () => {

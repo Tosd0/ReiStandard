@@ -35,6 +35,15 @@ export async function cloudInventory(ctx, db, userId, userKey) {
     resolveOwner: ctx.cloudData?.resolveOwner
   });
 }
+function operationWork(operation) {
+  if (['pending','running'].includes(operation.status)) {
+    return { nextRunAt: Number(operation.nextAttemptAt) || 0, expiresAt: null };
+  }
+  if (['completed','failed'].includes(operation.status)) {
+    return { nextRunAt: null, expiresAt: Number(operation.updatedAt) + 30 * 86400000 };
+  }
+  return { nextRunAt: null, expiresAt: null };
+}
 async function save(db, userId, key, kind, value, options) {
   return db.putCloudDataRecord(
     userId,
@@ -49,7 +58,7 @@ async function save(db, userId, key, kind, value, options) {
       }),
       key
     ),
-    options
+    { ...options, ...(kind === 'operation' ? { work: operationWork(value) } : {}) }
   );
 }
 export async function readCloudRecord(db, userId, key, kind, id) {
@@ -469,31 +478,50 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
   }
   return operation;
 }
+async function repairLegacyWorkIndex(ctx) {
+  const db = ctx.db;
+  if (typeof db.getCloudMaintenanceBatch !== 'function') return;
+  const name = 'management-work-v1';
+  const batch = await db.getCloudMaintenanceBatch(name,'cloud_data_records',100);
+  if (batch.completed) return;
+  for (const row of batch.rows) {
+    let work;
+    if (['inventory','plan'].includes(row.kind)) {
+      work = { nextRunAt: null, expiresAt: row.updated_at + 3600000 };
+    } else if (row.kind === 'operation') {
+      try {
+        const record = await db.readCloudMaintenanceRecord(row);
+        const key = await deriveUserEncryptionKey(row.user_id,ctx.masterKey);
+        work = operationWork(JSON.parse(await decryptFromStorage(record.data,key)));
+      } catch {
+        // Unreadable content remains visible through management; do not guess whether it is safe to delete.
+        console.warn('[amsg] Legacy cleanup operation could not be indexed');
+        continue;
+      }
+    } else continue;
+    await db.indexCloudDataRecordWork(row.user_id,row.kind,row.id,work,row.write_token);
+  }
+  const cursor = batch.rows.at(-1)?.maintenance_rowid ?? batch.upperBound;
+  await db.finishCloudMaintenanceBatch(name,cursor,batch.rows.length < 100 || cursor >= batch.upperBound);
+}
+
 export async function resumeCloudDataCleanups(ctx) {
   const db = ctx.db;
   if (!db?.cloudDataManagement) return;
-  const rows = await db.listCloudDataRecordsAcrossUsers('operation');
-  await db.cleanupCloudDataRecords('inventory', Date.now() - 3600000);
-  await db.cleanupCloudDataRecords('plan', Date.now() - 3600000);
-  await db.cleanupCloudResourceMetadata();
-  let processed = 0;
+  await repairLegacyWorkIndex(ctx);
+  if (typeof db.repairCloudResourceMetadata === 'function') await db.repairCloudResourceMetadata(100);
+  if (typeof db.cleanupExpiredCloudDataRecords === 'function') await db.cleanupExpiredCloudDataRecords(Date.now(),100);
+  const rows = typeof db.listDueCloudDataOperations === 'function'
+    ? await db.listDueCloudDataOperations(Date.now(),25)
+    : await db.listCloudDataRecordsAcrossUsers('operation');
   for (const row of rows) {
     try {
-      const key = await deriveUserEncryptionKey(row.userId, ctx.masterKey);
-      const operation = JSON.parse(await decryptFromStorage(row.data, key));
-      if (
-        ['completed', 'failed'].includes(operation.status) &&
-        operation.updatedAt < Date.now() - 30 * 86400000
-      ) {
-        await db.deleteCloudDataRecord(row.userId, 'operation', operation.id);
-        continue;
-      }
-      if (['pending', 'running'].includes(operation.status)) {
-        await advanceCleanup(ctx, db, row.userId, key, operation);
-        if (++processed >= 100) break;
+      const key = await deriveUserEncryptionKey(row.userId,ctx.masterKey);
+      const operation = JSON.parse(await decryptFromStorage(row.data,key));
+      if (['pending','running'].includes(operation.status)) {
+        await advanceCleanup(ctx,db,row.userId,key,operation);
       }
     } catch {
-      // Never log encrypted payloads, credentials or user-owned labels.
       console.warn('[amsg] A cloud cleanup operation could not be resumed');
     }
   }

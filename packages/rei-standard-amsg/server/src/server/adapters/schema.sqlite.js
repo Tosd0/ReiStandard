@@ -300,6 +300,61 @@ export const CLOUD_DATA_TABLES_SQL = [
   )`
 ];
 
+// Scheduling contains only opaque record identities and absolute times. Content stays encrypted.
+export const CLOUD_DATA_WORK_TABLES_SQL = [
+  `CREATE TABLE IF NOT EXISTS cloud_data_work (
+    user_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    next_run_at INTEGER, expires_at INTEGER,
+    PRIMARY KEY (user_id, kind, id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cloud_data_maintenance (
+    name TEXT PRIMARY KEY, cursor INTEGER NOT NULL, upper_bound INTEGER NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0
+  )`
+];
+CLOUD_DATA_TABLES_SQL.push(...CLOUD_DATA_WORK_TABLES_SQL);
+
+export const CLOUD_DATA_WORK_INDEXES = [
+  { name: 'idx_cloud_work_due', sql: `CREATE INDEX IF NOT EXISTS idx_cloud_work_due
+      ON cloud_data_work (kind, next_run_at) WHERE next_run_at IS NOT NULL`,
+    description: 'Only due cleanup operations', critical: true },
+  { name: 'idx_cloud_work_expiry', sql: `CREATE INDEX IF NOT EXISTS idx_cloud_work_expiry
+      ON cloud_data_work (expires_at) WHERE expires_at IS NOT NULL`,
+    description: 'Only expired management records', critical: true }
+];
+SQLITE_ALL_INDEXES.push(...CLOUD_DATA_WORK_INDEXES);
+
+// Every physical deletion, including retention and legacy APIs, cleans its exact sidecar.
+// Triggers run inside the deleting transaction; a failed batch rolls everything back.
+const chunkPrefixSql = "char(31)||'amsg-chunks'||char(31)";
+const logicalNamespaceSql = `CASE WHEN substr(OLD.namespace,1,13)=${chunkPrefixSql}
+  THEN substr(OLD.namespace,14) ELSE OLD.namespace END`;
+const logicalKeySql = `CASE WHEN substr(OLD.namespace,1,13)=${chunkPrefixSql} AND instr(OLD.key,char(31))>0
+  THEN substr(OLD.key,1,instr(OLD.key,char(31))-1) ELSE OLD.key END`;
+export const CLOUD_DATA_DELETE_TRIGGERS = [
+  ...[['scheduled_messages','task','uuid'], ['llm_credentials','credential','cred_id'],
+      ['message_outbox','outbox','message_id'], ['push_subscriptions','subscription','user_id']]
+    .map(([table,type,column]) => ({
+      name: `trg_cloud_metadata_${type}_delete`,
+      sql: `CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_${type}_delete AFTER DELETE ON ${table}
+        BEGIN DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+          AND resource_key=json_array('${type}'${column ? ',OLD.'+column : ''}); END`
+    })),
+  { name: 'trg_cloud_metadata_state_delete', sql: `CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_state_delete
+      AFTER DELETE ON client_state BEGIN
+      DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+        AND resource_key=json_array('state',${logicalNamespaceSql},${logicalKeySql})
+        AND NOT EXISTS (SELECT 1 FROM client_state r WHERE r.user_id=OLD.user_id
+          AND r.namespace=(${logicalNamespaceSql}) AND r.key=(${logicalKeySql}))
+        AND NOT EXISTS (SELECT 1 FROM client_state r WHERE r.user_id=OLD.user_id
+          AND r.namespace=${chunkPrefixSql}||(${logicalNamespaceSql})
+          AND r.key >= (${logicalKeySql})||char(31) AND r.key < (${logicalKeySql})||char(32)); END` },
+  { name: 'trg_cloud_work_delete', sql: `CREATE TRIGGER IF NOT EXISTS trg_cloud_work_delete
+      AFTER DELETE ON cloud_data_records BEGIN
+      DELETE FROM cloud_data_work WHERE user_id=OLD.user_id AND kind=OLD.kind AND id=OLD.id;
+      DELETE FROM cloud_data_record_chunks WHERE user_id=OLD.user_id AND kind=OLD.kind AND id=OLD.id; END` }
+];
+
 // ── schema 自查用的「这一版需要什么」 ─────────────────────────────────────
 //
 // 建表语句是 CREATE TABLE IF NOT EXISTS，已经存在的表不会被改动，所以升级后
@@ -354,7 +409,7 @@ function describeTable(sql) {
  * 索引只列 critical 的那几个（uidx_uuid 之类）：其余索引缺了只是慢，缺了它则
  * 是正确性问题。
  *
- * @type {{ tables: Record<string, string[]>, indexes: string[] }}
+ * @type {{ tables: Record<string, string[]>, indexes: string[], triggers: string[] }}
  */
 export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
   tables: Object.freeze(Object.fromEntries([
@@ -365,5 +420,6 @@ export const SQLITE_REQUIRED_SCHEMA = Object.freeze({
     describeTable(MESSAGE_OUTBOX_TABLE_SQL),
     ...CLOUD_DATA_TABLES_SQL.map(describeTable)
   ])),
-  indexes: Object.freeze(SQLITE_ALL_INDEXES.filter((index) => index.critical).map((index) => index.name))
+  indexes: Object.freeze(SQLITE_ALL_INDEXES.filter((index) => index.critical).map((index) => index.name)),
+  triggers: Object.freeze(CLOUD_DATA_DELETE_TRIGGERS.map((trigger) => trigger.name))
 });
