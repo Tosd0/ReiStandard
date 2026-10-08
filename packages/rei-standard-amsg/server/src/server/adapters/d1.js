@@ -16,7 +16,8 @@ import {
   PUSH_SUBSCRIPTION_TABLE_SQL,
   LLM_CREDENTIALS_TABLE_SQL,
   MESSAGE_OUTBOX_TABLE_SQL,
-  CLOUD_DATA_TABLES_SQL
+  CLOUD_DATA_TABLES_SQL,
+  CLOUD_DATA_DELETE_TRIGGERS
 } from './schema.sqlite.js';
 // 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
 // schema.js 里的这一份，加列只改一处。
@@ -279,7 +280,7 @@ export class D1Adapter {
     return {id:row.id,userId:row.user_id,kind:row.kind,data,updatedAt:row.updated_at};
   }
 
-  async putCloudDataRecord(userId, kind, id, data, {idempotencyKey = null, createOnly = false, leaseToken} = {}) {
+  async putCloudDataRecord(userId, kind, id, data, {idempotencyKey = null, createOnly = false, leaseToken, work} = {}) {
     // Storage ciphertext is ASCII; bounded slices avoid D1's per-row size limit.
     const slices=[];
     if (data.length > 200*1024) for (let offset=0;offset<data.length;offset+=200*1024) slices.push(data.slice(offset,offset+200*1024));
@@ -304,6 +305,12 @@ export class D1Adapter {
         SELECT ?,?,?,?,?,? WHERE ${rootGate}`
       ).bind(userId,kind,id,index,slices[index],writeToken,userId,kind,id,writeToken));
     }
+    const schedule = work ?? (['inventory','plan'].includes(kind)
+      ? { nextRunAt: null, expiresAt: now + 3600000 } : null);
+    if (schedule) statements.push(this._db.prepare(`INSERT INTO cloud_data_work (user_id,kind,id,next_run_at,expires_at)
+      SELECT ?,?,?,?,? WHERE ${rootGate}
+      ON CONFLICT (user_id,kind,id) DO UPDATE SET next_run_at=excluded.next_run_at,expires_at=excluded.expires_at`
+    ).bind(userId,kind,id,schedule.nextRunAt ?? null,schedule.expiresAt ?? null,userId,kind,id,writeToken));
     if (!this.cloudDataManagement) throw new Error('Cloud management requires transactional batches');
     const results=await this._db.batch(statements);
     if (leaseToken !== undefined && !results[0].meta.changes) throw Object.assign(new Error('Cloud operation processing lease was lost'),{code:'CLOUD_LEASE_LOST'});
@@ -383,25 +390,90 @@ export class D1Adapter {
     return results[1].meta.changes || 0;
   }
 
-  /** Sidecars are indexes only. Remove them only while their backing row is absent. */
-  async cleanupCloudResourceMetadata(userId = null) {
-    const targets={
-      task:`SELECT 1 FROM scheduled_messages r WHERE r.user_id=m.user_id AND r.uuid=json_extract(m.resource_key,'$[1]')`,
-      state:`SELECT 1 FROM client_state r WHERE r.user_id=m.user_id AND
-        ((r.namespace=json_extract(m.resource_key,'$[1]') AND r.key=json_extract(m.resource_key,'$[2]')) OR
-        (r.namespace=char(31)||'amsg-chunks'||char(31)||json_extract(m.resource_key,'$[1]')
+  async listDueCloudDataOperations(now = Date.now(), limit = 25) {
+    const result = await this._db.prepare(`SELECT r.* FROM cloud_data_work w JOIN cloud_data_records r
+      ON r.user_id=w.user_id AND r.kind=w.kind AND r.id=w.id
+      WHERE w.kind='operation' AND w.next_run_at IS NOT NULL AND w.next_run_at<=?
+        AND (r.lease_until IS NULL OR r.lease_until<=?)
+      ORDER BY w.next_run_at LIMIT ?`).bind(now,now,limit).all();
+    return Promise.all((result.results || []).map(row => this._cloudRecordForList(row)));
+  }
+
+  async cleanupExpiredCloudDataRecords(now = Date.now(), limit = 100) {
+    // Recheck expiry and lease in the deleting statement, inside the same batch.
+    const result = await this._db.prepare(`DELETE FROM cloud_data_records WHERE rowid IN (
+      SELECT r.rowid FROM cloud_data_work w JOIN cloud_data_records r
+      ON r.user_id=w.user_id AND r.kind=w.kind AND r.id=w.id
+      WHERE w.expires_at IS NOT NULL AND w.expires_at<=?
+        AND (r.lease_until IS NULL OR r.lease_until<=?) ORDER BY w.expires_at LIMIT ?
+    )`).bind(now,now,limit).run();
+    return result.meta.changes || 0;
+  }
+
+  async getCloudMaintenanceBatch(name, table, limit = 100) {
+    if (!['cloud_resource_metadata','cloud_data_records'].includes(table)) throw new Error('Invalid maintenance source');
+    let marker = await this._db.prepare('SELECT * FROM cloud_data_maintenance WHERE name=?').bind(name).first();
+    if (!marker) {
+      await this._db.prepare(`INSERT INTO cloud_data_maintenance (name,cursor,upper_bound,completed)
+        SELECT ?,0,COALESCE(MAX(rowid),0),0 FROM ${table} WHERE 1 ON CONFLICT (name) DO NOTHING`).bind(name).run();
+      marker = await this._db.prepare('SELECT * FROM cloud_data_maintenance WHERE name=?').bind(name).first();
+    }
+    if (marker.completed) return { rows: [], completed: true };
+    const result = await this._db.prepare(`SELECT rowid AS maintenance_rowid,* FROM ${table}
+      WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`).bind(marker.cursor,marker.upper_bound,limit).all();
+    return { rows: result.results || [], upperBound: marker.upper_bound, cursor: marker.cursor, completed: false };
+  }
+
+  async finishCloudMaintenanceBatch(name, cursor, completed) {
+    await this._db.prepare(`UPDATE cloud_data_maintenance SET cursor=MAX(cursor,?),completed=MAX(completed,?) WHERE name=?`)
+      .bind(cursor,completed ? 1 : 0,name).run();
+  }
+
+  async indexCloudDataRecordWork(userId,kind,id,work,expectedWriteToken = null) {
+    // Never overwrite a concurrently updated record's schedule with a legacy snapshot.
+    await this._db.prepare(`INSERT INTO cloud_data_work (user_id,kind,id,next_run_at,expires_at)
+      SELECT user_id,kind,id,?,? FROM cloud_data_records WHERE user_id=? AND kind=? AND id=? AND write_token IS ?
+      ON CONFLICT (user_id,kind,id) DO NOTHING`)
+      .bind(work.nextRunAt ?? null,work.expiresAt ?? null,userId,kind,id,expectedWriteToken).run();
+  }
+
+  async readCloudMaintenanceRecord(row) { return this._cloudRecordForList(row); }
+
+  async repairCloudResourceMetadata(limit = 100) {
+    const name = 'metadata-sidecars-v1';
+    const batch = await this.getCloudMaintenanceBatch(name,'cloud_resource_metadata',limit);
+    if (batch.completed) return;
+    const cursor = batch.rows.at(-1)?.maintenance_rowid ?? batch.upperBound;
+    if (batch.rows.length) await this.cleanupCloudResourceMetadata(null,{ after: batch.cursor, through: cursor });
+    await this.finishCloudMaintenanceBatch(name,cursor,batch.rows.length < limit || cursor >= batch.upperBound);
+  }
+
+  /** One explicit repair, or a bounded upgrade batch; never called as a recurring sweep. */
+  async cleanupCloudResourceMetadata(userId = null, range = null) {
+    const targets = {
+      task: [`SELECT 1 FROM scheduled_messages r WHERE r.user_id=m.user_id AND r.uuid=json_extract(m.resource_key,'$[1]')`],
+      state: [
+        `SELECT 1 FROM client_state r WHERE r.user_id=m.user_id
+          AND r.namespace=json_extract(m.resource_key,'$[1]') AND r.key=json_extract(m.resource_key,'$[2]')`,
+        `SELECT 1 FROM client_state r WHERE r.user_id=m.user_id
+          AND r.namespace=char(31)||'amsg-chunks'||char(31)||json_extract(m.resource_key,'$[1]')
           AND r.key >= json_extract(m.resource_key,'$[2]')||char(31)
-          AND r.key < json_extract(m.resource_key,'$[2]')||char(32)))`,
-      credential:`SELECT 1 FROM llm_credentials r WHERE r.user_id=m.user_id AND r.cred_id=json_extract(m.resource_key,'$[1]')`,
-      outbox:`SELECT 1 FROM message_outbox r WHERE r.user_id=m.user_id AND r.message_id=json_extract(m.resource_key,'$[1]')`,
-      subscription:`SELECT 1 FROM push_subscriptions r WHERE r.user_id=m.user_id`
+          AND r.key < json_extract(m.resource_key,'$[2]')||char(32)`
+      ],
+      credential: [`SELECT 1 FROM llm_credentials r WHERE r.user_id=m.user_id AND r.cred_id=json_extract(m.resource_key,'$[1]')`],
+      outbox: [`SELECT 1 FROM message_outbox r WHERE r.user_id=m.user_id AND r.message_id=json_extract(m.resource_key,'$[1]')`],
+      subscription: [`SELECT 1 FROM push_subscriptions r WHERE r.user_id=m.user_id`]
     };
-    const statements=Object.entries(targets).map(([type,exists])=>this._db.prepare(
-      `DELETE FROM cloud_resource_metadata AS m WHERE (? IS NULL OR user_id=?) AND json_valid(resource_key)
-        AND json_extract(resource_key,'$[0]')=? AND NOT EXISTS (${exists})`
-    ).bind(userId,userId,type));
-    const results=await this._cloudBatch(statements,userId);
-    return results.reduce((sum,result)=>sum+(result.meta.changes || 0),0);
+    const statements = Object.entries(targets).map(([type,exists]) => {
+      const conditions = ["json_valid(resource_key)", "json_extract(resource_key,'$[0]')=?"];
+      const args = [type];
+      if (userId !== null) { conditions.unshift('user_id=?'); args.unshift(userId); }
+      if (range) { conditions.unshift('m.rowid>? AND m.rowid<=?'); args.unshift(range.after,range.through); }
+      return this._db.prepare(`DELETE FROM cloud_resource_metadata AS m WHERE ${conditions.join(' AND ')}
+        AND ${exists.map(sql => `NOT EXISTS (${sql})`).join(' AND ')}`).bind(...args);
+    });
+    const results = await this._cloudBatch(statements,userId);
+    return results.reduce((sum,result) => sum + (result.meta.changes || 0),0);
   }
 
   async listCloudOwners(userId) {
@@ -549,6 +621,7 @@ export class D1Adapter {
       }
     }
 
+    for (const trigger of CLOUD_DATA_DELETE_TRIGGERS) await this._db.prepare(trigger.sql).run();
     const criticalFailures = indexResults.filter((i) => i.critical && i.status === 'failed');
     if (criticalFailures.length > 0) {
       const names = criticalFailures.map((i) => i.name).join(', ');
@@ -575,7 +648,7 @@ export class D1Adapter {
    * 构变了而老部署没跑过 initSchema 时，cron 会每分钟静默挂在缺的那一列上，
    * 界面上一切正常——这个方法就是让宿主查得出来。
    *
-   * @returns {Promise<{ tables: Record<string, string[]>, indexes: string[] }>}
+   * @returns {Promise<{ tables: Record<string, string[]>, indexes: string[], triggers: string[] }>}
    */
   async describeSchema() {
     const tableRes = await this._db.prepare(
@@ -599,7 +672,8 @@ export class D1Adapter {
       `SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL`
     ).all();
 
-    return { tables, indexes: (indexRes.results || []).map((row) => row.name) };
+    const triggerRes = await this._db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all();
+    return { tables, indexes: (indexRes.results || []).map((row) => row.name), triggers: (triggerRes.results || []).map((row) => row.name) };
   }
 
   async dropSchema() {
@@ -608,7 +682,7 @@ export class D1Adapter {
     await this._db.prepare('DROP TABLE IF EXISTS push_subscriptions').run();
     await this._db.prepare('DROP TABLE IF EXISTS llm_credentials').run();
     await this._db.prepare('DROP TABLE IF EXISTS message_outbox').run();
-    for (const table of ['cloud_data_record_chunks','cloud_data_records','cloud_data_owners','cloud_resource_metadata','cloud_guard_assertions']) {
+    for (const table of ['cloud_data_work','cloud_data_maintenance','cloud_data_record_chunks','cloud_data_records','cloud_data_owners','cloud_resource_metadata','cloud_guard_assertions']) {
       await this._db.prepare(`DROP TABLE IF EXISTS ${table}`).run();
     }
   }
@@ -919,7 +993,8 @@ export class D1Adapter {
     const cutoff = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000).toISOString();
     const res = await this._db.prepare(
       `DELETE FROM scheduled_messages
-       WHERE status IN ('sent', 'failed') AND updated_at < ?`
+       WHERE rowid IN (SELECT rowid FROM scheduled_messages
+         WHERE status IN ('sent', 'failed') AND updated_at < ? LIMIT 100)`
     ).bind(cutoff).run();
     return res.meta.changes || 0;
   }
@@ -1122,7 +1197,7 @@ export class D1Adapter {
    */
   async cleanupClientState(targets = []) {
     if (!Array.isArray(targets) || targets.length === 0) return 0;
-    const SQL = 'DELETE FROM client_state WHERE namespace = ? AND updated_at < ?';
+    const SQL = 'DELETE FROM client_state WHERE rowid IN (SELECT rowid FROM client_state WHERE namespace = ? AND updated_at < ? LIMIT 100)';
     const statements = targets.map((target) =>
       this._db.prepare(SQL).bind(target.namespace, target.updatedBefore)
     );
@@ -1637,13 +1712,13 @@ export class D1Adapter {
     let deleted = 0;
     if (Number.isFinite(ackedBeforeMs)) {
       const res = await this._db.prepare(
-        'DELETE FROM message_outbox WHERE acked_at IS NOT NULL AND acked_at < ?'
+        'DELETE FROM message_outbox WHERE rowid IN (SELECT rowid FROM message_outbox WHERE acked_at IS NOT NULL AND acked_at < ? LIMIT 100)'
       ).bind(ackedBeforeMs).run();
       deleted += res.meta.changes || 0;
     }
     if (Number.isFinite(allBeforeMs)) {
       const res = await this._db.prepare(
-        'DELETE FROM message_outbox WHERE created_at < ?'
+        'DELETE FROM message_outbox WHERE rowid IN (SELECT rowid FROM message_outbox WHERE created_at < ? LIMIT 100)'
       ).bind(allBeforeMs).run();
       deleted += res.meta.changes || 0;
     }

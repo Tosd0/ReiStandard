@@ -6,6 +6,7 @@ import {
   CLIENT_STATE_INDEXES,
   MESSAGE_OUTBOX_INDEXES,
   SQLITE_ALL_INDEXES,
+  CLOUD_DATA_WORK_INDEXES,
   SQLITE_REQUIRED_SCHEMA,
 } from '../src/server/adapters/schema.sqlite.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
@@ -43,7 +44,7 @@ test('SQLITE_INDEXES defines the 6 indexes incl. the critical unique guard', () 
 test('client_state / message_outbox 的索引组与 SQLITE_INDEXES 同形，合集顺序固定，都不是 critical', () => {
   assert.equal(CLIENT_STATE_INDEXES.length, 1);
   assert.equal(MESSAGE_OUTBOX_INDEXES.length, 4);
-  assert.deepEqual(SQLITE_ALL_INDEXES, [...SQLITE_INDEXES, ...CLIENT_STATE_INDEXES, ...MESSAGE_OUTBOX_INDEXES]);
+  assert.deepEqual(SQLITE_ALL_INDEXES, [...SQLITE_INDEXES, ...CLIENT_STATE_INDEXES, ...MESSAGE_OUTBOX_INDEXES, ...CLOUD_DATA_WORK_INDEXES]);
   for (const index of [...CLIENT_STATE_INDEXES, ...MESSAGE_OUTBOX_INDEXES]) {
     assert.match(index.sql, /CREATE INDEX IF NOT EXISTS/, `${index.name} 必须是 IF NOT EXISTS，老库重跑 initSchema 才补得上`);
     assert.ok(index.sql.includes(index.name), `${index.name} 的 sql 里应出现同名索引`);
@@ -56,7 +57,7 @@ test('client_state / message_outbox 的索引组与 SQLITE_INDEXES 同形，合�
   const names = SQLITE_ALL_INDEXES.map((index) => index.name);
   assert.equal(new Set(names).size, names.length, '索引名重复');
   // 自查清单只认 critical 的：这几个新索引一个都不该进去
-  assert.deepEqual([...SQLITE_REQUIRED_SCHEMA.indexes], ['uidx_uuid']);
+  assert.deepEqual([...SQLITE_REQUIRED_SCHEMA.indexes], ['uidx_uuid', 'idx_cloud_work_due', 'idx_cloud_work_expiry']);
 });
 
 test('schema applies cleanly on real SQLite', async () => {
