@@ -78,9 +78,12 @@ export async function getSchemaVersion(db) {
     if (!liveIndexes.has(index)) missing.push(`index:${index}`);
   }
 
-  const liveTriggers = new Set(live?.triggers || []);
-  for (const name of SQLITE_REQUIRED_SCHEMA.triggers) {
-    if (!liveTriggers.has(name)) missing.push(`trigger:${name}`);
+  // `triggers` 是可选的：适配器不回报它时，触发器这一项不查。
+  if (Array.isArray(live?.triggers)) {
+    const liveTriggers = new Set(live.triggers);
+    for (const name of SQLITE_REQUIRED_SCHEMA.triggers) {
+      if (!liveTriggers.has(name)) missing.push(`trigger:${name}`);
+    }
   }
   const ok = missing.length === 0;
   return { current: ok ? SCHEMA_VERSION : null, required: SCHEMA_VERSION, ok, missing };

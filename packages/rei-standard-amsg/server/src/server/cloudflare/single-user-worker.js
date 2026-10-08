@@ -270,7 +270,7 @@ function pathOf(request) {
 
 /**
  * @param {(env: Object) => Object|Promise<Object>} buildConfig
- * @param {{ onError?: (info: { stage: 'config'|'request'|'tick', error: unknown, cause: import('../lib/errors.js').ErrorCause, path: string|null }) => void|Promise<void> }} [options]
+ * @param {{ onError?: (info: { stage: 'config'|'request'|'tick'|'cloud-cleanup', error: unknown, cause: import('../lib/errors.js').ErrorCause, path: string|null }) => void|Promise<void> }} [options]
  *   `onError` 在 fetch 或 cron 出错时调一次（best-effort，自身抛错只记日志）。
  *   cron 那条路上没有调用方能看到错误响应，这个 hook 是宿主唯一的出口。
  */
@@ -495,7 +495,11 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
    * 返回值不影响 Cloudflare（它不看），是给「自己包一层再转调 scheduled」的
    * 宿主和测试用的。
    *
-   * @returns {Promise<{ ok: true, summary: Object } | { ok: false, cause: import('../lib/errors.js').ErrorCause }>}
+   * 云端清理出错不算「这一跳没跑」：消息照常投递，`ok` 只看投递这一段。清理
+   * 的出错原因另放在 `cloudCleanupCause` 上（没出错就没有这个字段），`onError`
+   * 也会为它单独调一次。
+   *
+   * @returns {Promise<{ ok: true, summary: Object, cloudCleanupCause?: import('../lib/errors.js').ErrorCause } | { ok: false, cause: import('../lib/errors.js').ErrorCause, cloudCleanupCause?: import('../lib/errors.js').ErrorCause }>}
    */
   async function scheduled(event, env /* , ctx */) {
     // fetch() 对 buildConfig 失败有降级路径，cron 这边同样不该以未捕获异常
@@ -509,12 +513,14 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       await reportError({ stage: 'config', error, cause, path: null });
       return { ok: false, cause };
     }
+    // 云端清理这一步出错只上报，这一跳的消息照常投递。
+    const cleanup = {};
     try {
       await resumeCloudDataCleanups(buildTickContext(cfg));
     } catch (error) {
-      const cause = summarizeErrorCause(error, 'cloud-cleanup');
-      await reportError({ stage: 'cloud-cleanup', error, cause, path: null });
-      return { ok: false, cause };
+      console.error('[amsg single-user] scheduled(): cloud cleanup failed:', error && error.message);
+      cleanup.cloudCleanupCause = summarizeErrorCause(error, 'cloud-cleanup');
+      await reportError({ stage: 'cloud-cleanup', error, cause: cleanup.cloudCleanupCause, path: null });
     }
     if (!pushConfigured(cfg)) {
       console.error('[amsg single-user] scheduled(): VAPID/webpush not configured; skipping tick');
@@ -525,18 +531,18 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         'config'
       );
       await reportError({ stage: 'config', error: null, cause, path: null });
-      return { ok: false, cause };
+      return { ok: false, cause, ...cleanup };
     }
     // Swallow tick failures: pending tasks stay pending, so the next cron tick
     // retries them. Logging keeps the failure visible in the tail log.
     try {
       const summary = await runScheduledTick(buildTickContext(cfg));
-      return { ok: true, summary };
+      return { ok: true, summary, ...cleanup };
     } catch (error) {
       console.error('[amsg single-user] scheduled(): tick failed:', error && error.message);
       const cause = summarizeErrorCause(error, 'tick');
       await reportError({ stage: 'tick', error, cause, path: null });
-      return { ok: false, cause };
+      return { ok: false, cause, ...cleanup };
     }
   }
 

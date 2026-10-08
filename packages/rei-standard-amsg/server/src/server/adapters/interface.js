@@ -50,7 +50,8 @@
  * @property {() => Promise<InitSchemaResult>} initSchema
  *   Create the scheduled_messages table and all indexes.
  * @property {() => Promise<{ tables: Record<string, string[]>, indexes: string[], triggers?: string[] }>} [describeSchema]
- *   （可选）活库里现在实际有哪些表 / 列 / 索引，只读不写。
+ *   （可选）活库里现在实际有哪些表 / 列 / 索引 / 触发器，只读不写。`triggers`
+ *   可以不回，不回时触发器这一项不查。
  *   `getSchemaVersion` / `ensureSchema`（lib/schema-version.js）拿它跟这一版
  *   需要的清单对照；不实现的适配器调那两个函数会抛错。内置只有 D1 实现。
  * @property {() => Promise<void>} dropSchema
@@ -264,6 +265,20 @@
  * lease. Renewal/release require the same token; expired workers cannot save progress
  * (`putCloudDataRecord` option `leaseToken`) or delete resources with a stolen lease. `deleteCloudDataRecord` and
  * `cleanupCloudDataRecords(kind,beforeMs)` implement management-data retention.
+ *
+ * Work index (optional group; implement all of it or none). With it, cron looks up
+ * due and expired records directly. Without it, cron lists every operation on each
+ * tick and applies retention through `cleanupCloudDataRecords`.
+ * `putCloudDataRecord` accepts option `work: {nextRunAt,expiresAt}` (epoch ms or null)
+ * and stores it with the record. `listDueCloudDataOperations(now,limit)` returns
+ * unleased operations whose `nextRunAt` has passed, oldest first, each with `writeToken`.
+ * `cleanupExpiredCloudDataRecords(now,limit)` deletes unleased records past `expiresAt`.
+ * `rescheduleCloudDataRecordWork(userId,kind,id,work,expectedWriteToken)` changes a
+ * schedule only while the record still carries that write token.
+ * `getCloudMaintenanceBatch(name,table,limit)`, `finishCloudMaintenanceBatch(name,cursor,completed)`,
+ * `readCloudMaintenanceRecord(row)`, `indexCloudDataRecordWorkBatch(entries)` and
+ * `repairCloudResourceMetadata(limit)` drive the bounded one-time indexing of records
+ * that predate the work index.
  *
  * `listCloudOwners(userId)` lists persistent owner fences, even after operations expire.
  * `getCloudOwner(userId,owner)` => `{active,generation,updatedAt}`; absent owners

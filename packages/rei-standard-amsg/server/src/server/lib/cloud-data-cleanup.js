@@ -478,12 +478,20 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
   }
   return operation;
 }
+const WORK_INDEX_METHODS = [
+  'listDueCloudDataOperations', 'cleanupExpiredCloudDataRecords', 'rescheduleCloudDataRecordWork',
+  'getCloudMaintenanceBatch', 'finishCloudMaintenanceBatch', 'readCloudMaintenanceRecord',
+  'indexCloudDataRecordWorkBatch', 'repairCloudResourceMetadata'
+];
+// How long an operation that could not even be read waits before the next attempt.
+const UNREADABLE_RETRY_MS = 15 * 60000;
+
 async function repairLegacyWorkIndex(ctx) {
   const db = ctx.db;
-  if (typeof db.getCloudMaintenanceBatch !== 'function') return;
   const name = 'management-work-v1';
   const batch = await db.getCloudMaintenanceBatch(name,'cloud_data_records',100);
   if (batch.completed) return;
+  const entries = [];
   for (const row of batch.rows) {
     let work;
     if (['inventory','plan'].includes(row.kind)) {
@@ -494,13 +502,15 @@ async function repairLegacyWorkIndex(ctx) {
         const key = await deriveUserEncryptionKey(row.user_id,ctx.masterKey);
         work = operationWork(JSON.parse(await decryptFromStorage(record.data,key)));
       } catch {
-        // Unreadable content remains visible through management; do not guess whether it is safe to delete.
-        console.warn('[amsg] Legacy cleanup operation could not be indexed');
-        continue;
+        // Unreadable content is queued as due and never expires: the resume loop keeps retrying it
+        // at a slow pace, and it stays visible through management.
+        console.warn('[amsg] Legacy cleanup operation could not be read; queued for retry');
+        work = { nextRunAt: 0, expiresAt: null };
       }
     } else continue;
-    await db.indexCloudDataRecordWork(row.user_id,row.kind,row.id,work,row.write_token);
+    entries.push({ userId: row.user_id, kind: row.kind, id: row.id, work, writeToken: row.write_token });
   }
+  await db.indexCloudDataRecordWorkBatch(entries);
   const cursor = batch.rows.at(-1)?.maintenance_rowid ?? batch.upperBound;
   await db.finishCloudMaintenanceBatch(name,cursor,batch.rows.length < 100 || cursor >= batch.upperBound);
 }
@@ -508,21 +518,44 @@ async function repairLegacyWorkIndex(ctx) {
 export async function resumeCloudDataCleanups(ctx) {
   const db = ctx.db;
   if (!db?.cloudDataManagement) return;
-  await repairLegacyWorkIndex(ctx);
-  if (typeof db.repairCloudResourceMetadata === 'function') await db.repairCloudResourceMetadata(100);
-  if (typeof db.cleanupExpiredCloudDataRecords === 'function') await db.cleanupExpiredCloudDataRecords(Date.now(),100);
-  const rows = typeof db.listDueCloudDataOperations === 'function'
-    ? await db.listDueCloudDataOperations(Date.now(),25)
-    : await db.listCloudDataRecordsAcrossUsers('operation');
+  // Adapters with the whole work index hand back only due operations; the others get a full scan per tick.
+  const indexed = WORK_INDEX_METHODS.every((method) => typeof db[method] === 'function');
+  let rows;
+  if (indexed) {
+    await repairLegacyWorkIndex(ctx);
+    await db.repairCloudResourceMetadata(100);
+    await db.cleanupExpiredCloudDataRecords(Date.now(),100);
+    rows = await db.listDueCloudDataOperations(Date.now(),25);
+  } else {
+    await db.cleanupCloudDataRecords('inventory',Date.now() - 3600000);
+    await db.cleanupCloudDataRecords('plan',Date.now() - 3600000);
+    rows = await db.listCloudDataRecordsAcrossUsers('operation');
+  }
   for (const row of rows) {
     try {
       const key = await deriveUserEncryptionKey(row.userId,ctx.masterKey);
       const operation = JSON.parse(await decryptFromStorage(row.data,key));
+      const work = operationWork(operation);
+      if (indexed) {
+        // A due entry whose content says otherwise gets the schedule its content asks for.
+        if (work.nextRunAt === null || work.nextRunAt > Date.now()) {
+          await db.rescheduleCloudDataRecordWork(row.userId,'operation',row.id,work,row.writeToken);
+          continue;
+        }
+      } else if (work.expiresAt !== null && work.expiresAt <= Date.now()) {
+        await db.deleteCloudDataRecord(row.userId,'operation',row.id);
+        continue;
+      }
       if (['pending','running'].includes(operation.status)) {
         await advanceCleanup(ctx,db,row.userId,key,operation);
       }
-    } catch {
+    } catch (error) {
       console.warn('[amsg] A cloud cleanup operation could not be resumed');
+      // After a lost lease the operation is due again as soon as that lease ends.
+      if (!indexed || error?.code === 'CLOUD_LEASE_LOST') continue;
+      // Push it behind the operations that can run. A no-op when the attempt already saved its own retry time.
+      await db.rescheduleCloudDataRecordWork(row.userId,'operation',row.id,
+        { nextRunAt: Date.now() + UNREADABLE_RETRY_MS, expiresAt: null },row.writeToken).catch(() => {});
     }
   }
 }

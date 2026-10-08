@@ -117,22 +117,33 @@ times; resource contents, labels and operation details stay encrypted.
 Resource deletion removes its exact metadata sidecar in the same transaction,
 including ordinary cancellation, credentials, subscription changes and TTL
 retention. Logical state metadata remains while either the root or any of its
-chunks exists. Roots and chunks use separate full-key index probes. Cron does
-not run a global orphan-sidecar sweep.
+chunks exists. Roots and chunks use separate full-key index probes. Sidecars
+are removed only together with their resource, or by the one-time repair below.
 
 Existing sidecars and management records receive a one-time bounded repair:
 100 root rows per source per tick, with persistent rowid cursors and an initial
-upper bound. Finished repair does not restart after Worker eviction/redeployment.
-Unreadable legacy operation records remain available for inspection, rather
-than being guessed safe to delete. Concurrently changed operations are not
-rescheduled from stale repair snapshots.
+upper bound. Each batch of management records is written to the work index with
+one statement; an operation stored in chunks costs one extra read.
+A finished repair stays finished across Worker eviction and redeployment.
+A legacy operation record that cannot be read is indexed as due with no expiry,
+so it stays available for inspection and is retried. The repair leaves an
+operation's schedule alone when the operation changed after the batch was read.
 
-Normal continuation selects at most 25 due unfinished operations through the
-work index, skips future retries and active leases, and never decrypts completed
-history on each tick. Inventory/plan TTL is one hour; terminal operation TTL is
-30 days from completion/failure. Pending/running operations never expire merely
-because they are old. Existing task, state and outbox retention also deletes at
-most 100 rows per retention predicate per tick, without changing their cutoffs.
+Each tick continues at most 25 due unfinished operations, oldest first, read
+through the work index. Operations waiting for a later retry, operations under
+an active lease and completed history are outside that lookup. An operation
+that cannot be read is retried 15 minutes later, behind the operations still
+waiting. A failed attempt on a readable operation records its own retry time,
+backing off up to one hour. Inventory/plan TTL is one hour; terminal operation
+TTL is 30 days from completion/failure. Pending/running operations have no
+expiry. Task, state and outbox retention deletes at most 100 rows per retention
+predicate per tick, with unchanged cutoffs.
+
+A cron tick runs cloud maintenance first, then message delivery. When
+maintenance throws, for example because the schema has yet to be upgraded, the
+tick reports it through `onError` with stage `cloud-cleanup` and still delivers
+due messages. `ok` in the `scheduled()` return value reflects delivery only; the
+maintenance failure is in `cloudCleanupCause`.
 
 `GET /cloud-data/resources` includes an optional `summary` from the same inventory
 snapshot as its pages. Clients should reuse it instead of immediately calling

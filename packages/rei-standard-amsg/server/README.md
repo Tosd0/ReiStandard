@@ -902,8 +902,8 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 });
 ```
 
-- `onError` 放在工厂的第二个参数上，而不是 `buildConfig` 的返回值里：`buildConfig` 自己抛错时配置里的东西一个都读不到，而那恰恰是最需要被看见的一种故障。`stage` 在 cron 路径上是 `config`（配置构建失败 / VAPID 没配齐）或 `tick`（那一跳抛错）。VAPID 没配齐这一支没有异常对象，`error` 为 `null`、`cause.name` 是 `VapidNotConfigured`。
-- `scheduled()` 现在有返回值：`{ ok: true, summary }` 或 `{ ok: false, cause }`。Cloudflare 不看它，是给「自己包一层再转调 `scheduled`」的宿主和测试用的。
+- `onError` 放在工厂的第二个参数上，而不是 `buildConfig` 的返回值里：`buildConfig` 自己抛错时配置里的东西一个都读不到，而那恰恰是最需要被看见的一种故障。`stage` 在 cron 路径上是 `config`（配置构建失败 / VAPID 没配齐）、`tick`（那一跳抛错）或 `cloud-cleanup`（云端数据清理那一步抛错，这一跳的消息照常投递）。VAPID 没配齐这一支没有异常对象，`error` 为 `null`、`cause.name` 是 `VapidNotConfigured`。
+- `scheduled()` 现在有返回值：`{ ok: true, summary }` 或 `{ ok: false, cause }`，`ok` 只看消息投递这一段。云端数据清理那一步出错时，两种返回值上都会多一个 `cloudCleanupCause`。Cloudflare 不看它，是给「自己包一层再转调 `scheduled`」的宿主和测试用的。
 
 ## 导出 API（Exports）
 
