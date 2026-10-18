@@ -26,9 +26,9 @@ async function seed(db, uuid, payload = base, userId = USER) {
   await db.createTask({ user_id: userId, uuid, encrypted_payload: await encryptForStorage(JSON.stringify(payload), userKey), next_send_at: due, message_type: payload.messageType });
   return db.getTaskByUuid(uuid, userId);
 }
-async function fire(db, row, hooks) {
+async function fire(db, row, hooks, context = {}) {
   const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, key));
-  return runAgenticFire({ task: row, decryptedPayload: payload, userKey: key, ctx: { db, hooks, _agenticNow: () => now, _agenticSleep: async () => {} } });
+  return runAgenticFire({ task: row, decryptedPayload: payload, userKey: key, ctx: { db, hooks, _agenticNow: () => now, _agenticSleep: async () => {}, ...context } });
 }
 
 test('accepted taskInput is bound to its task; failed replacement leaves original input intact', async (t) => {
@@ -335,3 +335,43 @@ test('partial legacy physical-row receipts cannot masquerade as a logical attach
     }, onLLMOutput() {} });
   }
 });
+
+
+for (const retireOwner of [false, true]) {
+  test(`cancelled settlement state and attachments share owner guards (retired: ${retireOwner})`, async (t) => {
+    const { db } = await setup(t);
+    const owner = { type: 'character', id: 'settlement-owner' };
+    const { createCloudGuardedAdapter } = await import('../src/server/lib/cloud-data-guard.js');
+    const guarded = createCloudGuardedAdapter(db, { masterKey: MASTER, guard: { owner, generation: 0 }, userId: USER });
+    const current = await seed(db, 'cancelled-settlement');
+    const controller = new AbortController();
+    let activeWrites;
+    let settledWrites;
+    let status;
+    const writeBoth = ctx => Promise.allSettled([
+      ctx.writeState('terminal', [{ key: 'cancelled', value: 'record', owner, ownerGeneration: 0 }]),
+      ctx.storeAttachment('terminal attachment', { owner, ownerGeneration: 0 }),
+    ]);
+    await assert.rejects(fire(guarded, current, {
+      async onBeforeFire(ctx) {
+        if (retireOwner) await db.setCloudOwnerActive(USER, owner, false);
+        controller.abort();
+        activeWrites = await writeBoth(ctx);
+        return { skip: true };
+      }, onLLMOutput() {},
+    }, { signal: controller.signal, async onFireSettled(ctx) {
+      status = ctx.status;
+      settledWrites = await writeBoth(ctx);
+    } }), { code: 'TASK_CANCELLED' });
+    assert.equal(status, 'cancelled');
+    assert.deepEqual(activeWrites.map(result => [result.status, result.reason?.code]), [['rejected', 'TASK_CANCELLED'], ['rejected', 'TASK_CANCELLED']]);
+    if (retireOwner) {
+      assert.deepEqual(settledWrites.map(result => [result.status, result.reason?.code]), [['rejected', 'CLOUD_OWNER_RETIRED'], ['rejected', 'CLOUD_OWNER_RETIRED']]);
+    } else {
+      assert.deepEqual(settledWrites.map(result => result.status), ['fulfilled', 'fulfilled']);
+      assert.equal(settledWrites[0].value.upserted, 1);
+      const ref = settledWrites[1].value;
+      assert.equal((await db.getClientState(USER, ref.namespace, { key: ref.key })).length, 1);
+    }
+  });
+}

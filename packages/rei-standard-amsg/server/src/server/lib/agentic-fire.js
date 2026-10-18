@@ -428,6 +428,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
   const occurrenceMs = occurrenceMsOf(task);
   const storeAttachment = createAttachmentStore({ task, occurrenceMs, writeState, now: nowFn });
+  // Settlement can record cancellation after the live chain stops. Its raw
+  // writer still goes through the adapter's cloud owner/generation guards.
+  const storeSettledAttachment = createAttachmentStore({ task, occurrenceMs, writeState: writeSettledState, now: nowFn });
 
   // 结果出口：把一条宿主自定义的结果落进收件箱并推出去（见
   // lib/result-emitter.js）。与 readState / writeState 同待遇，fire 级和每轮的
@@ -964,7 +967,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       readState,
       writeState: writeSettledState,
       emitResult,
-      storeAttachment,
+      storeAttachment: storeSettledAttachment,
     });
   }
 }
