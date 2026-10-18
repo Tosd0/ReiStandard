@@ -1,5 +1,342 @@
 # Changelog — @rei-standard/amsg-instant
 
+## 0.11.0
+
+### Minor Changes
+
+- 922afe1: 取消的消息不再从收件箱补收回去；失败细节里的模型名不再被脱敏吃掉
+
+  **1. 投递到一半被取消：没发出去的那几条从 outbox 里撤掉**
+
+  整批 push 是发送前就落进 `message_outbox` 的（那是补收的事实来源），而取消只拦得住 Web Push 这一路。剩下没发出去的行不撤掉的话，客户端下一次 `GET /outbox` 会照样把它们拉回去——用户看到的是「取消接口回了成功，消息还是来了」。
+
+  现在 `DELETE /message` 取消和 `supersedesUuid` 顶替都会把该任务名下还没发出去的行撤掉，两种时机都算：投递正跑到一半时（老链路和 agentic 链路两条发送路都覆盖），以及更常见的那种——上一次投递早就失败了、还没等到重试就被取消。已经推给设备的那几条不动，行留着让客户端照常 ack；取消的意思是「别再发后面的」，不是「把用户已经收到的从收件箱里抹掉」。
+
+  清理是 best-effort：适配器没实现 outbox、或者清理本身出错，都不影响取消 / 顶替的成功返回（任务行已经删掉了）。
+
+  适配器接口新增可选方法 `discardOutboxMessages(userId, messageIds)`，内置只有 D1 实现；不实现的适配器行为与以前一致（取消只挡住 Web Push）。取消 / 顶替这条路还要读一遍未 ack 的行来挑出这条任务的那几段，所以 `listUnackedOutbox` 返回的行上要带 `task_uuid` 和 `delivered_at`（包内 schema 本来就有）。
+
+  **2. 脱敏规则收敛成一份，模型 ID 不受影响**
+
+  错误细节里长得像凭据的串会被遮成 `[redacted]`：`sk-…` / `xai-…` / `sk-ant-api03-…` 这种「短前缀 + 长随机串」，`Bearer …` 连值一起遮，以及光是一长串的 base64 / JWT 片段。随机段里夹着 `-` 和 `_` 的 Key 整条遮掉，不留半截。
+
+  模型 ID 原样保留。上游那句「你写的这个模型不存在」里最关键的就是模型名，遮掉它报错只剩「有个东西不存在」，而模型名写错是这套错误细节要解决的头号场景。
+
+  模型 ID 跟 Key 长得很像，认它靠四道一起：全小写字母数字、被 `-` / `.` 切成一串短段（`gpt-4o-mini-2024-07-18`、`claude-3-5-sonnet-20241022`）；不以公认的凭据前缀开头（`sk` / `key` / `api` / `token` / `xai` …，跟在它们后面的东西不管长什么形状都不豁免）；不含 uuid（8-4-4-4-12 hex）；没有「随机段」（一段里字母块数字块来回切三次以上，`mixtral-8x7b` 那种短版本段例外）。
+
+  单看形状是不够的——自建中转（one-api / new-api / LiteLLM 这类）发的 Key 常常是 `sk-<uuid>`、`key-1a2b3c4d5e6f-7a8b9c0d1e2f` 这样全小写按短横线分段的，跟模型 ID 完全同形。判据里没有任何厂商的模型清单。
+
+  判过是模型名的串也不会被「光长随机串」那条规则二次吞掉：`deepseek-ai.deepseek-v3-0324-thinking-preview-latest` 这类超过 48 字符的模型 ID 照样留着。
+
+  规则本身只有一份，在 `@rei-standard/amsg-shared` 的 `redactCredentials`；amsg-server 的 `sanitizeErrorSummary`（落库的 `last_error` 列）和 amsg-instant 的 Cloudflare 适配器（跨域 502 响应体）都调它，各自只负责后面的截断长度。
+
+  **3. instant 任务的 `last_error` 带上 `errorCode` / `pushStatus`**
+
+  `messageType: 'instant'` 的任务终审失败时，写进 `last_error` 的记录原来只有 `{ at, occurrence, reason }`。现在跟定时任务那条路共用同一份形状：`reason` 是给用户看的人话，`errorCode` / `pushStatus` 是给下游判定用的——`pushStatus === 410` 表示订阅已注销，客户端据此引导用户重新登记，不用回去正则匹配 `reason`。
+
+  **4. `last_error` 一律往行上写**
+
+  原来只有实现了可选的 `claimTask` 的适配器才往行上的 `last_error` 列写。跟着包内 SQL schema 建表、但没实现 `claimTask` 的自定义适配器，行上有这一列、`GET /message` 的投影也认它权威，却没人往里写——`lastError` 读出来永远是 `null`。
+
+  现在一律写，默认状态字段和 `last_error` 合成一笔：库有这一列时永远只花一个来回。
+
+  这一笔挂了才分开重来——先只写状态字段。这笔成了，就说明问题出在 `last_error` 这个字段上（`updateTaskById` 是单条 UPDATE，字段不认时整条不生效，所以退回重写是安全的）；这笔也挂了，那是库真出问题了，原样抛出去按既有路径处理。状态推进（标 failed / 推进排期 / 放租约）无论如何都不受这一列影响：靠错误措辞去猜「是不是缺这一列」的话，猜不中就是 `retry_count` 不涨、`next_send_at` 不动，任务被每一跳 cron 重新捞起来，LLM 每次重跑一遍还每次都计费。
+
+  认定「这个库没有这一列」要连续撞上两次同一个形状，中间只要成功一次就清零：连接重置、语句超时、D1 的 `Network connection lost` 这类瞬时错误落在带 `last_error` 的那笔写上时，跟缺列长得一模一样，而认定的后果是永久的（长驻 Node 部署里适配器活到进程结束）。认定之后不再带这个字段，失败原因仍记在密文 payload 的 `lastError` 里。
+
+  带 `last_error` 的写第一次没成功就会打一行提示（每个 isolate 只说一次，措辞把「缺列」和「偶发」两种可能都写出来）——Cloudflare 部署每个请求都新建适配器，等坐实再说的话运维永远看不到。
+
+  投递成功时行上的列和密文 payload 里的那份记录一起清掉。重写密文之前会先确认行上的密文还是领取时那一份——投递跑几十秒，其间用户 `PUT /update-message` 改过的话，把快照原样写回去等于把那次修改静默回滚；失败收尾写 `lastError` 走同一道确认。
+
+- 68172e8: 导出 `validateClientAuth` / `DEFAULT_MAX_LOOP_ITERATIONS` / `CORS_ALLOW_HEADERS`；`cors.allowHeaders` 可配置
+
+  在同一个 worker 里挂自己路由的宿主，此前只能照抄本包内部的鉴权与 CORS 实现——抄的那份不会跟着上游修：
+
+  - `validateClientAuth(request, expectedToken)`：X-Client-Token 的独立校验口（presence 检查 + 常时比较，与 handler 内部同一套语义）。返回 `{ ok: true }` 或 `{ ok: false, status: 401, body }`，宿主直接用 body 造响应即可；expectedToken 为空 = 部署没配共享密钥，一律放行。
+  - `DEFAULT_MAX_LOOP_ITERATIONS`（= 10）：agentic 循环的默认轮数上限，之前只有内部默认值，宿主各写各的迟早对不上。
+  - `CORS_ALLOW_HEADERS`：本 handler 的允许头列表；`cors.allowHeaders` 现在可配置（宿主的路由多带自定义头时覆盖，不配就是导出的这一份）。
+
+- c3e1906: LLM 上游拒了请求时能看到它到底说了什么，推送失败时能看到推送服务回的状态码
+
+  **LLM 调用失败：上游的错误响应体不再被丢掉**
+
+  上游回非 2xx 时，原来只拿状态行拼一句 `AI API error: 400 Bad Request. Request URL: https://…/chat/completions` 就抛，响应体从来没读过。而「模型名写错、余额不够、上下文超长、被内容审核拦下」这些区别全在那份响应体里，状态行一律只说 400。定时任务的用户看到的是 `GET /message` 里那句话，instant 的调用方看到的是 502 里同一句话，谁都查不出原因，只能等三轮重试白跑十几分钟。
+
+  现在这份响应体会读出来，说明文字接在原来那句后面，格式跟推送失败那边一致：
+
+  ```
+  AI API error: 401 Unauthorized. Request URL: https://api.example.com/v1/chat/completions
+    — Incorrect API key provided: sk-[redacted]. (provider code: invalid_api_key)
+  ```
+
+  各家的错误体形状不一样，按「先找最精确的、找不到退一层」取：OpenAI / Azure 与多数中转的 `{ error: { message, type, code } }`、Anthropic 的 `{ error: { type, message } }`、Gemini 的 `{ error: { message, status } }`，都认；反代挂掉回的 HTML 错误页、纯文本这类解析不了的，原文照抄。
+
+  外传之前会先脱敏再截断：长得像 API Key 的串遮成 `[redacted]`（上游报错很爱把 Key 原样抄回来），说明文字截到 300 字符（内容审核类的报错常把整段请求内容回显回来）。读响应体这一步自己失败了也不影响报错，只是少了说明。
+
+  `@rei-standard/amsg-server` 不用改代码就一起受益：任务的失败记录里，`reason` 带上了上游的原话，`errorCode` 现在是 `LLM_CALL_FAILED`（原来这一类失败的 `errorCode` 是 `null`），「这一跳是 LLM 挂了还是推送挂了」不用读那句人话也能分。
+
+  **`@rei-standard/amsg-instant`：失败信封里多了上游的状态码**
+
+  纯 Push 模式（`Accept: application/json`）下的错误信封，原来只有 `code` 和 `message`：
+
+  ```jsonc
+  {
+    "success": false,
+    "error": {
+      "code": "PUSH_SEND_FAILED",
+      "message": "Web Push delivery failed: 410 Gone — …"
+    }
+  }
+  ```
+
+  订阅已经失效（410 / 404）和推送服务临时抽风（5xx）在这里长得一模一样，要分开只能拿正则去 `message` 里捞那个数字。而前者重发多少次都是同一个结果，instant 又是先跑 LLM 再推送，每次重试都把整轮生成重跑一遍。
+
+  现在信封里按上游分别带上状态码，`onEvent` 的 `error` 事件也带同一份：
+
+  ```jsonc
+  // 推送失败：410 / 404 = 这份订阅没了，该让用户重新订阅，不是重试
+  { "success": false, "error": { "code": "PUSH_SEND_FAILED", "message": "…", "pushStatus": 410 } }
+
+  // LLM 失败：llmStatus 是上游回的状态码，providerCode 是 provider 自己的错误码
+  { "success": false, "error": { "code": "LLM_CALL_FAILED", "message": "…",
+                                 "llmStatus": 401, "providerCode": "invalid_api_key" } }
+  ```
+
+  `pushStatus` 与 `@rei-standard/amsg-server` 记进 `lastError` 的字段同名同义，两个包的告警规则能照抄一份。`llmStatus` / `providerCode` 只在上游确实答复了时才有——网络直接炸、超时的时候不会出现，据此也能分清「上游拒了」和「根本没连上」。
+
+  三条路带的是同一组字段：JSON 信封挂在 `error` 对象上，SSE 的 `event: error` 和掉线兜底的 Web Push 挂在 `ErrorPush` 顶层，`onEvent` 的 `error` 事件也带。SSE 是默认传输方式，只给信封那条路的话，浏览器客户端遇到 Key 失效仍然只能回去正则匹配那句人话。`ErrorPush` 的类型定义随之多了可选的 `llmStatus` / `providerCode`。
+
+  HTTP 状态码没变，这类失败仍然是 502：`error.code` 是这个包对外承诺的分流依据，改状态码会把按 502 分支的老调用方一起打掉，而信息量并不比新字段多。要不要重试读 `error.pushStatus` 就够。
+
+  错误响应体最多读开头 16 KB 就把流断开。错误信封（`{"error":{"message":…}}`）永远在最前面，而中转出问题时能把整个请求体回显回来——任务正文上限接近 1 MB，一次网关故障把一批任务同时打挂时，这些只为留 300 字符而读进来的整段文本会一起压在 Worker 的内存上限上。
+
+  被这个上限切出来的前缀不是合法 JSON，严格解析必然失败，所以这种情况下会从残缺前缀里把 `message` / `detail` / `code` / `status` / `type` 这几个字段扫出来（同名只取第一个——错误信封在最前面，后面重复出现的多半来自被回显的请求）。一个都捞不到时给一句「响应体被截断了」的说明，而不是把一大段裸 JSON 当上游原话外传。非 JSON 的响应体（反代的 HTML 错误页、纯文本）行为不变，原文照抄。
+
+- 747e7d8: `buildResultPush` / `isResultPush` 随其他推送构造函数和类型守卫一起从包根导出，用 `result` 类推送不必另装 `@rei-standard/amsg-shared`。instant 的 `SessionContext` 类型补上 `usage` 字段。
+
+### Patch Changes
+
+- d47a842: 包元数据对齐：instant 的 `engines.node` 从 `>=18` 收紧到与其余包和构建目标一致的 `>=20`；instant / sw 对 `@rei-standard/amsg-shared` 的依赖区间统一为 `^0.4.0-next.1`。
+- ab1df8a: 两个适配器的故障不再伪装成「服务不在」：Cloudflare 配置构建失败回可读的 500，Node 上的 SSE 真流式
+
+  **Cloudflare 适配器：`createCloudflareWorker` 的构建失败有了降级路径。**
+
+  `optionsBuilder` 抛错（wrangler.toml 里 binding 名字写错、preview 环境没配、secret 被重新部署刷掉）或 `createInstantHandler` 拒绝配置时，原来异常直接冲出 `fetch`。跨域前端只能读到一句 `TypeError: Failed to fetch`（Safari 是 `Load failed`），HTTP 状态码、错误码、错误信息一概拿不到；预检 OPTIONS 一起挂，浏览器于是根本不会发那条真正的 POST。运维从外面探测看到的就是「彻底离线且零报错」，而 Worker 其实部署成功、在跑，只是每次请求都在同一行抛。`blobStore` 和 `createCloudflareWorker` 一起用时尤其容易踩到——Workers 的 `env` 只在请求期可得，blob 存储的构造只能写在 `optionsBuilder` 里。
+
+  现在这条路径：
+
+  - 预检回 204，其余请求回一条能读的 500：`{ success: false, error: { code: 'INTERNAL_ERROR', message, cause } }`，`cause` 是机读的 `{ stage, name, message?, code? }`（`stage` = `'config'` 构建配置时炸的 / `'request'` handler 抛出来的），长得像凭据的串会先遮掉；
+  - CORS 头**回显来访的 `Origin`，不退化成 `*`**：配置都没建起来，这个部署允许哪些站点无从得知；配置一修好所有响应立刻回到 handler 自己那套 CORS；
+  - 回显 Origin 意味着任意第三方页面都能读到这条响应，所以构建失败那条路上跨域读到的 `cause` 只有 `stage` / `name` / `code`，不带 `message`——构建期异常的原文往往就是部署信息本身（`env.BLOB_KV is undefined` 报的是 binding 名，配置校验的报错里可能有内网域名、环境变量名）。同源请求和不带 `Origin` 的调用（`curl`、服务端之间调用）照旧拿全文；
+  - `Access-Control-Max-Age: 0`，故障期间答的那次预检不会留在浏览器缓存里；
+  - 同源调用（请求没有 `Origin` 头）依然一个 CORS 头都不加；
+  - 构建失败不被记住，下一个请求照常重试：binding 补上之后不用重新部署也能自己恢复。
+
+  真因除了随响应回给调用方，也照常记一行 `[amsg-instant] createCloudflareWorker:` 日志，`wrangler tail` 里能看到。
+
+  **Node/Express 适配器：`toNodeHandler` 改成边收边写。**
+
+  原来它用 `response.arrayBuffer()` 把响应整个读完再交给 Node，而 instant 的默认传输就是 SSE：客户端要等整轮 LLM + 全部推送跑完才收到第一个字节，`keepaliveMs` 心跳（默认 1 秒，本来就是为了防连接闲置被掐）全被压在缓冲里，慢一点的模型撞上 nginx 默认的 `proxy_read_timeout 60s` 就是 504——而响应头写的仍然是 `text/event-stream`，从外面完全看不出传输层已经降级。现在响应体一产出就往下写，心跳按时到达，反代也不会再把连接判死。
+
+  顺带的行为变化：
+
+  - 客户端提前断开时上游那个流会被 cancel，instant 据此停掉心跳定时器、把剩下的消息切到 Web Push 兜底，不再留一个没人读的流继续跑；
+  - 响应中途出错（字节已经发出去一部分）时连接直接断开，而不是在流里追加一个 JSON 错误信封再正常收尾——调用方能看出这是一条没收完的流；
+  - 所有响应改由 chunked 传输编码发出（原来单次 `end()` 会带 `Content-Length`）。JSON 模式（`Accept: application/json`）的状态码、响应头与响应体不变。
+  - 这条路由上别再套会缓冲响应的中间件：`compression` 默认连 `text/event-stream` 一起压，压缩缓冲区攒够才吐字节，等于把流式又压回非流式，用它的 `filter` 跳过该路由即可。
+
+  `toVercelNodeHandler` 就是同一个函数，一并生效。
+
+  **Node 适配器：响应流没写完就结束时留一行日志。**
+
+  `pipeline` 无论因为什么失败都会先把响应销毁，所以「响应被销毁了」分不出是客户端走了还是服务端自己的流炸了；客户端断开和服务端流中途失败给的也是同一个 `ERR_STREAM_PREMATURE_CLOSE`。分不出就不硬猜：这两种情况 socket 都已经没了，往上抛只会去写一个没人读的 500，所以记一条 `console.warn`（不是 `error`——用户随手关页面是家常便饭，记成故障会把日志淹掉）。socket 层明确的 `EPIPE` / `ECONNRESET` 是对端掐了连接，照旧安静收场；其余错误照常抛给外层。
+
+  **Cloudflare 适配器：请求阶段的兜底 500 走部署自己的 CORS。**
+
+  handler 建起来之后，「允许哪些 origin」就是已知的了，这条兜底 500 用的是部署配置的那套 CORS 头，跟正常响应一致。回显来访 Origin 的降级头只用在「配置都没建起来」那条路上——那时白名单确实无从得知。
+
+- 14406f1: 分片大小上限的校验按最长的 messageKind 算；X-Client-Token 的校验只留一份实现
+
+  `multipart.maxChunkBytes` 的上限校验用一条探针量信封开销，探针之前固定用 `reasoning`，比最长的 `tool_request` 短 3 字节。把 `maxChunkBytes` 配在上限附近（例如照着 `createInstantHandler` 抛错时建议的最大值去配）的部署，`content` / `reasoning` 的分片发得出去，`tool_request` 的分片每一片都超出单条 push 的明文上限、被推送服务拒收。现在按真实取值里最长的那个量，报出来的最大值对所有类型都成立。
+
+  导出的 `validateClientAuth` 与 `createInstantHandler` 内部的校验现在共用同一份实现（存在性检查、常时比较、401 响应体都是同一处），两边不会再各自漂。函数签名和行为不变，handler 仍然用启动时编好的 token 字节，没有每请求重编。
+
+- 65a9f91: `multipart.maxChunkBytes` 加上限校验，配错在 `createInstantHandler` 当场失败
+
+  每片原文经 base64url 膨胀 4/3、再套上分片信封后，必须仍装得进单条 push 的明文上限（约 3993 字节）。`maxChunkBytes` 配超过约 2800 字节时，切出的每一片都会被推送服务拒收——原来的下场是每次触发时 reasoning / 长内容静默丢失，只留一条跟配置对不上号的推送错误，而这个旋钮此前只校验「正整数」，没人拦着调大。
+
+  现在 `createInstantHandler` 解析 `multipart` 配置时校验这个上限（上限按分片信封的实际开销现算，不是写死的数），配超了当场抛 `TypeError`，错误信息带当前配置下允许的最大值；deprecated 别名 `reasoningChunkBytes` 走同一道校验。绕过 handler、自己攒 ctx 直接调 `processInstantMessage` / `sendPushWithMaybeBlob` 的，同一道校验在切片前拦下。这个旋钮的用途不变：只用来把切片收窄到跟接收端那份对齐，默认值与合法收窄值不受影响。
+
+- 65a9f91: Node 适配器：响应流在首字节前就失败时回干净的 500，不再断连
+
+  `toNodeHandler` / `toVercelNodeHandler` 收到的 Response 流如果在吐出第一个字节之前就出错（典型形态：`start` / 首次 `pull` 里懒加载资源失败），原来客户端看到的是一次 connection reset（`fetch()` 直接抛 `TypeError: fetch failed`），状态码和错误码一概读不到。现在这一档回 `500 { success: false, error: { code: 'ADAPTER_ERROR', message } }`，跟适配器其他阶段的故障同一个信封，服务端也照旧记一行能归因的日志。
+
+  「连接直接断开」这个行为保持不变，但只属于它该在的场景：字节已经发出去一部分、流中途才失败——响应头早已发出，追加 JSON 信封只是往流里塞垃圾，断连才能让调用方看出这是一条没收完的流。首字节前失败时客户端一个字节都没收到，断连没有任何信息量，所以收回 500 信封这档。
+
+  实现上是在进 `pipeline` 之前先手动读一次首块：`pipeline` 无论因为什么失败都会先把 `res` 销毁，销毁完就只剩断连一条路；首块读失败时 `res` 还一个字节都没沾，走的还是外层原有的 500 兜底。首块读到了才写响应头开始转发，客户端不会因此多等——Node 本来就攒着响应头等第一个字节一起发。
+
+- b09a3bc: 中转站回 200 但响应体是报错时，按 LLM 调用失败处理，不再当成「模型这轮没说话」
+
+  不少中转站出错时照样回 HTTP 200，响应体里装的是 `{"error":{…}}` 或 `{"code":401,"msg":"…"}`，没有 `choices`。`callLlm` 现在只要拿到的 2xx 响应体解析不成 JSON，或者没有非空的 `choices` 数组，就抛上游错误，`requireContent` 取什么都一样：
+
+  ```
+  AI API error: HTTP 200 but body is not a chat completion (no choices). Request URL: https://…/chat/completions
+    — 当前分组上游负载已饱和，请稍后再试 (provider code: upstream_saturated)
+
+  AI API error: HTTP 200 but body is not valid JSON. Request URL: https://…/chat/completions
+    — <html><title>Just a moment...</title></html>
+  ```
+
+  错误上的机读字段跟非 2xx 那一类相同：`code` 是 `LLM_CALL_FAILED`，`llmStatus` 是上游实际回的 2xx 状态码（据此能分清「HTTP 就失败了」和「200 里装着报错」），`providerCode` 取响应体里的错误码。响应体里只有数字错误码时（`{"code":401,"msg":"…"}`），它会转成字符串放进 `providerCode`。说明文字的取法、脱敏和截断规则也跟非 2xx 一致。有两种情况不回显响应体内容，因为里面装的多半是模型生成的正文：响应体是 JSON 但一个报错字段都认不出时（比如 apiUrl 指到了非 OpenAI 格式的端点），只列出顶层字段名；中转站无视 `stream: false`、回了流式数据（SSE）时，只说明「回的是流」。
+
+  `choices` 在、只是 `content` 为空（模型只回了 tool_calls、被内容审核拦下）不算格式错误，行为不变。
+
+  各包的表现：
+
+  - `@rei-standard/amsg-server`：配了 fire-time hook 的任务（agentic 路径），这类响应之前会作为一轮空输出交给 `onLLMOutput`，通常被当成「没话说」跳过，任务算成功消费，失败原因一个字都不留；不走 hook 的单次调用之前会失败，但失败原因只有一句「缺 content」，看不到中转站说了什么。现在两条路都按普通的 LLM 调用失败处理：`last_error` 里记下中转站的原话，`errorCode` 是 `LLM_CALL_FAILED`，任务留在重试阶梯上。这跟 HTTP 401 / 5xx 这类 LLM 失败的处理一样，不会因为响应体里写着 401 就判成永久失败。
+  - `@rei-standard/amsg-instant`：agentic 路径之前会把这类响应当成一轮空回复交给 hook，legacy 路径只报一句没有上游原话的「缺 content」。现在两条路跟其他 LLM 调用失败一样回 502，错误信封带 `llmStatus` / `providerCode`。
+
+  非 2xx 的错误响应体也多认一种写法：最外层的 `msg` 字段（`{"code":…,"msg":"…"}`）会当作说明文字取出来，不再整段 JSON 原文照抄。
+
+- 3dae842: LLM 调用器收敛到 shared：新模块 `shared/src/llm-call.js` 承载「构造请求体 + fetch + 超时 + 解析响应 + trim」的公共核心，从包根导出 `callLlm` / `buildLlmRequestBody` / `normalizeAiApiUrl`
+
+  此前 instant（`message-processor.js` 的 `callLlmRaw`）与 server（`lib/llm.js` 的 `callLlm`）各写一份 LLM HTTP 调用，已出现漂移（stream 字段、messages 模式探测、超时可配性、trim 位置）。现在单一来源在 shared，两侧差异走 options 参数化（`stream` / `forwardTools` / `timeoutMs` / `fetch` / `requireContent`），instant 与 server 的调用点改薄，各自的导出名（instant 的 `normalizeAiApiUrl`、server 的 `callLlm` / `buildAiRequestBody` / `normalizeAiApiUrl`）与错误码包装不变。`llm.js` 里「两包各自拷贝以避免架构依赖」的过期注释一并删除——两包都已依赖 shared，该理由不再成立。
+
+  行为变化（均为边缘修正）：
+
+  - instant：messages 模式探测统一为 `Array.isArray(payload.messages) && payload.messages.length > 0`（server 语义）。`messages: []` 从「把空数组原样发给上游 LLM」改为「回退 completePrompt 模式」——这是修正错误行为。经公开 handler 不可触达（校验层已拒绝空 messages），仅影响直接调用 `processInstantMessage` 的调用方。
+  - instant：`maxTokens` 非法时的错误文案统一为 server 措辞（`Invalid maxTokens: maxTokens must be a positive integer when provided.`）。handler 校验在前，正常路径不可触达。
+  - server：`normalizeAiApiUrl` 对非字符串输入统一为 instant 的宽松语义（先 `String()` 强转再解析；此前直接抛「apiUrl is required」）。字符串输入两侧行为本就一致，不受影响。
+  - server：`callLlm` 现接受额外 options（`fetch` / `stream` / `forwardTools`），默认值即原 server 语义，既有调用不受影响。
+
+- 80f471d: 通知策略统一成「要推就一定弹，不想弹就别推」
+
+  订阅是按 `userVisibleOnly: true` 建的，收到 push 却不弹通知，各家浏览器的处理不一样。iOS 那边实测下来是宽限期机制：订阅刚建好的几天里，发多少条不弹通知的 push 都不掉订阅（跟条数无关，只跟订阅建了多久有关）；宽限期一过，一条不弹的就立刻吊销；吊销后重新订阅，判定比第一次更严，之后随时可能再掉。最难查的是这个时间差——本地订阅完立刻测一轮都正常，上线几天后用户订阅才开始成片掉，而且掉订阅是静默的，服务端只看到推送返回 410。
+
+  于是通知策略的口径收敛成一条，跟客户端跑在什么设备上无关：**要推就一定弹**（`notification.show: "always"`，嫌打扰用 `tag` 折叠加 `silent: true`；弹通知不影响页面自绘，`postMessage` 照常派发），**不想弹就别推**（内容落服务端收件箱，客户端上线 `GET /outbox?since=` 补拉）。
+
+  `"when-hidden"` 标为兼容档：应用在前台时它就是一条不弹的 push，那笔账照记（规范允许 user agent 在有可见窗口时免掉展示约束，Chrome 认这条豁免，iOS 不认）。既有部署照常工作，新代码在上面两条里挑一个。文档里的场景示例统一改用 `"always"` + `tag` 折叠 + `silent: true`。
+
+  `show` 四个档各是什么、什么时候用，收进 `@rei-standard/amsg-shared` README 的「选哪个 `show`」一张表，其余包只留一句「兼容档，新代码不选」加链接。amsg-sw README 新增「不展示通知的代价」一节收口这套取舍，shared / server / instant / client 的相关段落指过去；Service Worker 规范同步新增 §4.1.2，正文与变更历史里的通知策略建议改用同一口径。纯文档改动，运行行为不变。
+
+- d1b269d: `notification.silent` 新增 `"when-visible"`：前台安静、切后台照响
+
+  `silent` 管的是通知响不响铃、震不震，跟弹不弹（`show`）是两件独立的事。除了原有的 `true` / `false`，现在还认一个 `"when-visible"`：
+
+  | 值               | 行为                                                                |
+  | ---------------- | ------------------------------------------------------------------- |
+  | 不配 / `false`   | 正常响铃震动                                                        |
+  | `true`           | 一律不响                                                            |
+  | `"when-visible"` | 有 `visibilityState === "visible"` 的窗口客户端时静音，没有就照常响 |
+
+  它是给「页面自己会把内容画出来」的那类消息准备的——聊天回复、即时对话这种用户按下发送就盯着屏幕等的。用户正看着页面时，内容页面已经渲染了，通知安静地进通知中心就够；人切后台或者锁了屏，这条照样响铃震动把他叫回来。
+
+  这一档只有 Service Worker 算得出来，跟 `show: "when-hidden"` 是同一个道理：发送端发推的那一刻并不知道用户此刻在不在前台，`silent: true` 一写死，切到后台收到的那条也不会响。实现上两者读同一份窗口可见性，一条 payload 只取一次结论，不会出现「按 A 时刻决定要弹、按 B 时刻决定静音」。
+
+  `true` / `false` / 不配的行为一个字没变。`@rei-standard/amsg-shared` 的 push builders 放行 `notification.silent: "when-visible"`，别的字符串照旧拒掉并在报错里列出合法取值；顶层 `payload.silent`（老 payload 的兜底档）与 `notification.silent` 读同一套规则。各包 README 与 Service Worker 规范里「前台自绘」的示例改用这一档。
+
+- 8ca959c: 线协议常量收敛到 shared：新模块 `shared/src/protocol.js` 承载 multipart transport 与 SW ↔ 页面 postMessage 的全部线协议常量，从包根导出
+
+  此前 multipart 的 kind / encoding / 默认限额在 instant（`src/multipart.js`，导出）与 sw（`src/index.js`，本地重写、未导出）各写一份，`version: 1` 字面量也两侧各写；SW ↔ 页面 postMessage 常量只定义在 sw 包里，README 教页面侧硬编码字符串。现在单一来源在 shared：
+
+  - multipart：`MULTIPART_MESSAGE_KIND` / `MULTIPART_ENCODING` / `MULTIPART_VERSION`（新增，替代两侧的 `version: 1` 字面量）/ `DEFAULT_MULTIPART_TTL_MS` / `DEFAULT_MULTIPART_MAX_CHUNKS` / `DEFAULT_MULTIPART_MAX_TOTAL_BYTES`
+  - postMessage 信封：`REI_AMSG_POSTMESSAGE_TYPE` / `REI_SW_EVENT` / `REI_SW_MESSAGE_TYPE` / `REI_AMSG_DELIVER_MESSAGE_TYPE`
+
+  instant 的 `src/multipart.js` 与 sw 的 `src/index.js` 改为 import shared 并按原导出名 re-export，两个包的公开导出面与 wire format 不变（`DEFAULT_MULTIPART_CHUNK_BYTES` 是发送端独有的切片默认值，留在 instant）。页面侧代码现在可以从 `@rei-standard/amsg-shared` import 这些常量，不必硬编码字符串，也不必从 sw 包 import（那会执行 SW 模块的顶层状态）；client / sw 的 README 示例已相应更新。
+
+- 80f471d: 文档：新接入的推荐路径收敛到 amsg-server 单用户线
+
+  **接入这套 SDK 的标准四步**写进了工作区 README：部署 worker → 装 Service Worker + 订阅推送 → 发消息 / 排任务 → **应用启动时拉一次收件箱**。第四步以前只在 API 列表里有两行说明，现在 amsg-client README 有独立一节「上线补一次收件箱」，给出翻页、ack 顺序、去重的完整写法——到了客户端不会弹通知的内容只落收件箱、不发推送，少了这步就等于没有。
+
+  **amsg-client README 按这条线重排**：开头新增「先看你接的是哪条服务端线」，把 `scheduleMessage()`（含 `messageType: 'instant'`）+ 收件箱补拉这条摆在前面，`deliver()` / `sendInstant()` 收进 instant 那条线的说明里；「上线补一次收件箱」一节提到目录第二位、正文紧跟「快速使用」。`scheduleMessage()` 的 JSDoc（会出现在 IDE 悬浮提示和 `.d.ts` 里）同步改写成同一口径。
+
+  **amsg-server README 开头新增「两条部署线」**，把单用户线（D1）和多租户线（pg / neon）的能力差异摆成一张表：服务端收件箱和 `client_state` 目前只有 D1 适配器实现，多租户线上这两组端点返回 501，不会弹通知的 payload 也只能照旧推送。新接入走单用户线，README 也给了它一段快速使用。给 pg / neon 补收件箱记为待办。
+
+  **amsg-instant 标为维护态**：它是无后端场景的产物，没有数据库也就没有服务端收件箱，push 漏掉的内容补不回来。继续修，已经在用的部署照常工作，新接入不从它起步。amsg-sw README 的「生产推荐链路」一节据此改写成「Web Push + 上线补拉 + SW dedupe」。
+
+  **两份规范按同一条线重排**。API 规范：新增 §1.1「两条部署线」把单用户线和多租户线的差异摆成一张表；第 6 章端点清单补上单用户线独有的那几组端点（`outbox` / `push-subscription` / `vapid-public-key` / `client-state` / `llm-credentials` / `capabilities`）；新增 §6.7「服务端收件箱与到达保证」，收件箱的两个端点、落行时序、哪些 payload 发推送、ack 顺序都在那一节；§10 补上 10.1 单用户线的对接流程（部署三步 + 客户端四步），原有的多租户流程顺延；§12 DoD 分成「两条线通用」与「多租户线另需满足」两组，前者把实现服务端收件箱、按 §6.7 决定发不发推送列为要求。
+
+  Service Worker 规范第 0 章的最小示例补上「订 Web Push 并 `putPushSubscription()` 登记订阅」这一步，四步齐了；§4.1.1 的前台自绘一节写明它跟弹不弹系统通知是两件独立的事。
+
+- 922afe1: 思考过程发不出去不再连累正文，超长的思考过程改走分片送达
+
+  **1. 思考过程发不出去时，正文照发**
+
+  模型回了 `reasoning_content` 时，库会在正文之前先发一条 ReasoningPush。原来它和正文共用一个发送循环，而这个循环是一条抛错就整批中断——ReasoningPush 又排在最前面，所以它一失败，这条消息的正文一句都发不出去。一条 push 的明文上限是 3993 字节（约 1300 汉字），推理模型的思考过程很容易超，于是 `deepseek-reasoner` 这类默认返回思考过程的模型，定时消息基本必挂。
+
+  现在思考过程单独发，失败就地记一行日志、正文一条不少地照发。它是正文之外的附赠内容，发不出去只影响它自己。
+
+  失败原因同时回到结果上（`reasoningError`）——`success` 仍是 `true`，但「这次没有思考过程」在三处看得见：定时任务的 tick 汇总多一个 `details.reasoningSkippedTasks`（`[{ taskId, reason }]`，这些任务照常计入 `successCount`），instant 消息（`POST /schedule-message`）的成功响应带上 `reasoningError`，服务端日志各打一行。
+
+  刻意不写进 `last_error`：那一列说的是「上一次没发出去的原因」，一条正文已经送达的消息挂着它，客户端会当成这次投递失败了。
+
+  任务在投递期间被取消是例外：那是整条任务的中止信号，不是「思考过程没发成」，会照常往上抛。
+
+  **2. 一条装不下的思考过程改走分片**
+
+  超出单条上限的思考过程会切成 `_multipart` 分片逐条发出，Service Worker 收齐后还原成原样的 ReasoningPush 再走正常派发——用的是 `@rei-standard/amsg-instant` 已经在用的那套通用分片传输，`@rei-standard/amsg-sw` 的重组端不用改。切完仍超出分片传输量级上限（默认 256 KB / 128 片）的，跳过这条思考过程，正文照发。
+
+  分片的重组窗口由接收端说了算：Service Worker 取「信封上写的 `ttlMs`」和「它自己的 `multipart.ttlMs`」里更紧的那个，默认 60 秒，从它收到第一片起算。
+
+  发送节奏按这个窗口排：片数少时每片之间隔 1.5 秒（跟正文的段一样，一口气推几十条会被推送服务限流），片数多时自动收紧到刚好能在窗口内发完（128 片约 236 毫秒一片）；收紧到下限还塞不进窗口，就一片都不发、走上面那条 `reasoningError`。发一半的下场是接收端窗口一到就宣告这条收不到，之后的分片被静默丢弃，用户那边整段思考过程凭空消失，而发送端每一片都发成功、看不出任何异常。
+
+  限额跟着宿主走：`multipart`（`maxChunkBytes` / `maxChunks` / `maxTotalBytes` / `ttlMs`）在 `createReiServer` / `createSingleUserServer` / `createSingleUserCloudflareWorker` 的 config 上收，把传给 `installReiSW` 的那一份原样传过来即可（cron 和 `runTask` 两条路都认）。不配 = 两边都用默认值。两边对不上的话——接收端把 `maxChunks` 调小了而发送端不知道——切出来的分片到了那边会被逐片拒收，一条也拼不回来，而发送端这边两道门槛全都过了、看不出任何异常。
+
+  切片构造函数 `buildMultipartPushPayloads` 与默认切片大小 `DEFAULT_MULTIPART_CHUNK_BYTES` 随之上移到 `@rei-standard/amsg-shared`，两个发送端共用同一份。`@rei-standard/amsg-instant` 的导出名和行为不变。
+
+  **3. `pushStatusCode` 只认推送那一步的状态码**
+
+  失败结果里的 `pushStatusCode` 原来是从捕获到的任何异常上读 `statusCode`，而这个 catch 罩着整个投递流程——LLM 调用、fire-time hook、解密都在里面。Node 生态的 HTTP 库习惯把上游状态码挂成 `statusCode`，所以宿主 hook 里转手抛出的一个 404，会让任务被判成「推送订阅已失效」永久 `failed`，失败记录里的 `pushStatus: 404` 还会让客户端去引导用户重建订阅。
+
+  现在这个字段只在真正发 push 的那一步赋值，别的来路的 `statusCode` 一律不认。推送服务回的 404 / 410 / 413 判定不变。
+
+- 914ddcf: amsg-shared 新增 agentic 循环契约工具：`buildSessionContext`、`extractAssistantMessage`、`assertValidDecision`（新增 `inlineToolCalls` 选项，允许 `tool-request` 直接携带 `toolCalls`，供服务端就地执行工具的场景用）、`extractToolCallsFromDecision`。amsg-instant 的 SessionContext 构建与 decision 校验改为从 amsg-shared 复用同一实现，对外行为与错误信息不变。
+- ef2f2d1: messages 数组形状校验统一到 amsg-shared，修复 amsg-server 误拒 agentic 会话的 bug。
+
+  - amsg-shared 新增 `validateLlmMessagesShape(messages)` 与 `LLM_MESSAGES_ERROR` 错误码常量（新模块 `src/llm-messages.js`）：返回结构化错误（稳定 code + 定位索引），支持 assistant 带 `tool_calls` 时 content 可空、`role:'tool'` 要求 `tool_call_id` 的 OpenAI 协议形状。
+  - amsg-instant 的 `validateMessagesArray` 改为调用 shared 实现的薄封装，导出名、错误文案与返回形状不变。
+  - amsg-server 的 `validateLlmMessagesArray` 同样改为调用 shared 实现。修复：此前该函数缺少 tool_calls / tool 消息分支，注释却声称与 amsg-instant lockstep，导致 agentic 会话（assistant tool_calls + tool 结果）回放到 `scheduleMessage` / `updateMessage` 会被 400 拒绝；现在与 amsg-instant 接受完全相同的形状。畸形 tool 消息新增对应英文错误文案（`tool_calls[j] is malformed` / `tool_call_id is required` 等）。
+
+- 6ead0c4: crypto / 编码 utils 收敛到 shared：新模块 `shared/src/webcrypto-utils.js` 承载全生态唯一一份 runtime-neutral 帮手（`toUint8` / `concatBytes` / `utf8` / `utf8Decode` / `bytesToBase64` / `bytesToBase64Url` / `base64UrlToBytes` / `jsonToBase64Url` / `bytesToHex` / `hexToBytes` / `hmacSha256` / `timingSafeEqualBytes` / `randomBytes` / `randomUUID`），index 聚合导出（`utf8Decode` / `bytesToBase64` / `bytesToHex` / `hexToBytes` / `timingSafeEqualBytes` / `randomUUID` 为 shared 新增导出）。instant 的 `src/utils.js` 与 server 的 `lib/webcrypto-utils.js` 改为纯 re-export（文件与导出名不变，包内引用不受影响）；server 的 tenant token 模块也换用 shared 的 base64url / 常量时间比较实现（编码逐字节一致，HMAC 因同步 API 约束仍走 node:crypto）。
+- b146fde: Web Push 加密栈上移 amsg-shared，instant / server 共用同一份实现
+
+  此前 amsg-instant 的 `src/webpush.js` 与 amsg-server 的 `lib/webpush-webcrypto.js` 是逐字相同的两份拷贝（RFC 8030 传输 / RFC 8291 aes128gcm / RFC 8292 VAPID，纯 WebCrypto）。现在实现只有一份，放在 amsg-shared 的独立模块 `src/webpush.js`，从包根导出：
+
+  - `sendWebPush` / `buildVapidJwt` / `verifyVapidJwt`
+  - 顺带上移它依赖的 runtime-neutral 帮手：`utf8`、`bytesToBase64Url`、`jsonToBase64Url`、`hmacSha256`、`randomBytes`
+
+  instant 与 server 的对应模块变薄，re-export shared 实现；两个包的公开导出面与 wire format 不变。server 独有的部分原样保留在自己包里：payload 大小护栏（`measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` 等，`sendWebPush` 超限仍抛 `PUSH_PAYLOAD_TOO_LARGE`）、scheduled 默认 4 周 TTL 与 `createWebCryptoWebPush`。
+
+- 9d1f89f: 补齐许可证文件：每个包根目录加入 MIT LICENSE 文本（此前 package.json 声明 MIT 但 tarball 里没有许可证文件）。仓库层面确立双许可——代码 MIT、`standards/` 规范文本 CC BY-NC-SA 4.0，根 README 的许可一节与 npm 元数据不再互相矛盾。
+- c064ecd: 修复发布产物里损坏的 .d.ts：四个包此前用 tsup `dts: true` 处理 .js 入口，发出去的 .d.ts 是 JS 源码原文，TS 消费者 import 即报错。现改用 shared 同款两步构建（tsup 出 JS + `tsc --allowJs --emitDeclarationOnly` 出真声明），subpath 导出（server `./cloudflare`、instant `./adapters/*` `./blob/*`）的声明文件一并对齐。
+
+  amsg-server 另含两处加固：pg / neon 适配器的动态 UPDATE 列名补上与 D1 一致的白名单校验（此前直接插值进 SQL）；清理死代码（未引用的 `REQUIRED_COLUMNS`、`timingSafeEqualBytes`、schedule-message 的死分支与重复注释）。amsg-sw 清理 `createNotificationFromPayload` 永不触发的两处假值守卫。
+
+- Updated dependencies [160ca1b]
+- Updated dependencies [f13f2f1]
+- Updated dependencies [922afe1]
+- Updated dependencies [ca83382]
+- Updated dependencies [b09a3bc]
+- Updated dependencies [c3e1906]
+- Updated dependencies [3dae842]
+- Updated dependencies [68172e8]
+- Updated dependencies [80f471d]
+- Updated dependencies [d1b269d]
+- Updated dependencies [8ca959c]
+- Updated dependencies [a384a93]
+- Updated dependencies [d6bea67]
+- Updated dependencies [922afe1]
+- Updated dependencies [914ddcf]
+- Updated dependencies [ef2f2d1]
+- Updated dependencies [65a9f91]
+- Updated dependencies [68172e8]
+- Updated dependencies [80f471d]
+- Updated dependencies [922afe1]
+- Updated dependencies [6ead0c4]
+- Updated dependencies [b146fde]
+- Updated dependencies [9d1f89f]
+  - @rei-standard/amsg-shared@0.4.0
+
 ## 0.11.0-next.9
 
 ### Patch Changes

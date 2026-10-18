@@ -1,5 +1,140 @@
 # Changelog — @rei-standard/amsg-client
 
+## 2.9.0
+
+### Minor Changes
+
+- f13f2f1: `GET /capabilities` 特性探测端点 + 客户端 `getCapabilities()`
+
+  worker 部署版本落后时，新功能只是「探测不到」而不是静默失效。单用户 worker 新增 `GET /capabilities`，返回 `{ serverVersion, features }`（feature 名如 `client-state` / `client-state-chunking` / `agentic-hooks`，随版本演进追加；表达代码能力，不反映部署配置）；鉴权与 `/vapid-public-key` 一致。客户端 SDK 新增 `getCapabilities()`：打到没有该路由的老 worker（404）返回 `null` 不抛错，前端可据此在设置里提示「worker 需要重新部署」。
+
+- b30597a: `putClientState()` 的 entry 认 `value: null`，表示删掉这个 key
+
+  类型放宽到 `value: string | null`。传 `null` 时 server 把这个 key 的行（含大值的切片行）删干净，之后 `getClientState()` 读不到它；删除同样按 `updatedAt` last-write-wins，被拦下的 key 进响应的 `data.skippedEntries`，删掉的条数在 `data.deleted`。
+
+  server 从特性位 `client-state-delete` 起认这个语义，用 `getCapabilities()` 探测；老 server 会把 null 条目按 `INVALID_STATE_VALUE` 逐条拒掉、其余条目照常入库。SDK 本身不做运行时校验，与从前一致。
+
+- a26b797: 新增 client_state 三方法，对接单用户 worker 的云端状态镜像（amsg-server 2.6.0 的 `/client-state` 端点）。
+
+  - `putClientState(entries)`：批量 upsert。一次请求发完全部变更（照顾 iOS 切后台前只有几秒的存活窗口）；请求体走既有加密链路（需先 `init()`），服务端按 `updatedAt` 最后写赢，重发旧批次无害。
+  - `getClientState(namespace)`：取一个 namespace 的全部条目，自动解密响应 envelope（同 `listMessages`）。
+  - `clearClientState()`：清空该用户全部云端状态（给设置页「清除云端状态」这类入口用）。
+
+  配了 `serverToken` 时三个方法都带 `X-Client-Token`。
+
+- 3f8e197: 新增 `getOutbox()` / `ackOutbox()`，对接服务端的消息收件箱（amsg-server 的 `/outbox` 与 `/outbox/ack`）
+
+  服务端在每条 Web Push 发出去之前先把它记进账本，「哪些消息客户端还没收下」因此是查得出来的事实。此前这套账本只有服务端一半，SDK 没有对应方法，而加密与 userKey 封在客户端内部、没有通用出口，调用方没法自己拼请求。补上这两个方法之后，补收不再需要拿本地最近几条记录去比对着猜。
+
+  - `getOutbox({ since, limit })`：拉还没确认收到的消息，返回 `{ entries, cursor, hasMore }`。响应走加密信封，方法内解密后返回明文。每条 entry 的 `push` 就是推送信封本身，与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页时把上一页的 `cursor` 当下一页的 `since`；两个参数都不传就从头拉、由服务端定页大小。
+  - `ackOutbox(messageIds)`：销账，之后 `getOutbox()` 不再返回这些消息。请求体加密，幂等，单次最多 200 条。顺序上先落库再 ack——反过来的话账已经销了而落库半途失败，消息就补不回来了。
+
+  `since` / `limit` / `messageIds` 不合法时在本地抛 `TypeError`，不跑一趟必然被服务端拒的网络请求。
+
+- 19c264c: 新增可选 `serverToken`：配置后，client 会在 amsg-server 端点（schedule / messages / update / cancel / user-key / init）的请求上带 `X-Client-Token` 共享密钥，用于单用户部署的访问校验。instant 路径不受影响，仍使用 `instantClientToken`。
+- 5e75d69: `subscribePush()` 认出并重订浏览器给的死 endpoint，订阅成功就是真能收到推送
+
+  刚 `unsubscribe()` 过又马上 `subscribe()` 时，Chromium 那边旧订阅的待删除标记还没清干净，这一小段窗口期里它不去推送服务要新地址，而是直接给一个 `https://permanently-removed.invalid/...` 的占位订阅。`.invalid` 是 RFC 2606 保留顶级域，全球 DNS 永不解析。这种订阅结构上完全正常——有 endpoint、有密钥、`getSubscription()` 也认得——之前会被原样返回、登记到服务端，之后所有推送必然发不出去。表现是最难查的那一种：用户看到「订阅成功」，服务端也存下了，两边都没有任何报错，只是到点什么都收不到。
+
+  现在 `subscribePush()` 返回的订阅保证 endpoint 是活的：拿到占位订阅就先退掉它，等浏览器把标记清干净再重订，最多试三次（间隔 800ms、1600ms）。
+
+  - 三次都是占位订阅时抛错，`err.code === 'PUSH_ENDPOINT_ZOMBIE'`，`err.details` 为 `{ attempts, endpoint }`。SDK 不产出面向用户的提示文案——那句话该怎么说、用什么语言，由接入方按自己的产品和用户群决定。
+  - `pushManager.subscribe()` 自己抛的错（用户拒了通知权限、运行环境没有 Push API、VAPID 公钥不合法）原样往外抛，不重试：重试只会把同一个错误多抛两遍。
+  - 第一次就拿到活 endpoint 时只调一次 `subscribe()`，不产生任何额外等待，与之前一致。
+
+- f4d1a9b: Add D1-backed cloud data inventory, encrypted ownership metadata, durable cleanup previews and operations, and owner retirement with transactional generation guards. The client SDK exposes management, operation history, and explicit restoration APIs. Cloud inventories include acknowledged outbox rows, orphaned state chunks, and resources without a local owner; unsupported adapters do not advertise this capability.
+- d94ccf7: 用户级 LLM 凭据存储（llm_credentials 表）+ 任务凭据引用（credRefs）
+
+  凭据（apiUrl / apiKey / primaryModel）可以先用 `PUT /llm-credentials` 集中登记（`cred_id` 由客户端起名的不透明字符串，per-user key 加密落库），排程 payload 里带 `credRefs: { chat: '<credId>' }` 引用它——任务到点按引用现读，换 Key 覆盖对应行就够，所有引用它的任务（包括角色在 fire 里给自己排的、客户端不知道存在的那些）下次触发自动用新凭据。内联三件套继续支持（存量任务不迁移，fire 时作为表行缺失的兜底）。
+
+  服务端：`PUT/GET/DELETE /llm-credentials` 三端点（GET 只回 credId + updatedAt，凭据本体永远不回传）；schedule/update 对 credRefs 做存在性检查（缺的 `409 CREDENTIAL_NOT_FOUND` 点名）、credRefs.chat 与内联同传 `400`；fire 解析顺序为表 → 内联兜底 → `CREDENTIAL_MISSING` 常规重试；`ctx.scheduleTask()` 自排任务复制引用而不是凭据本体；fire hook ctx 新增 `resolveLlmCredential(credId)`（每次返回新对象，供宿主取非 chat 用途的副 API）；任务投影带 `credRefs`；capabilities 新增 `'llm-credentials'`。D1 / pg / neon 适配器都实现了新表，自定义适配器需补四个方法（缺则相关端点 501）。
+
+  客户端 SDK：新增 `putLlmCredentials()` / `listLlmCredentials()` / `deleteLlmCredentials()`；`scheduleMessage` / `updateMessage` 的 payload 原样透传 `credRefs`。
+
+- 747e7d8: `buildResultPush` / `isResultPush` 随其他推送构造函数和类型守卫一起从包根导出，用 `result` 类推送不必另装 `@rei-standard/amsg-shared`。instant 的 `SessionContext` 类型补上 `usage` 字段。
+- 17741db: 新增 `GET /message` 单条任务查询；`update-message` 认 `contactName`
+
+  - **`GET /message?id=<uuid>`（客户端 `client.getMessage(uuid)`）** 返回单条任务，形状与 `GET /messages` 列出来的一样，外加**完整的 `metadata`**。`PUT /update-message` 对 `metadata` 是整体替换（不深合并），而列表的投影只给 `charId` / `clientTaskId` 两个子字段——两件事凑在一起，「只改 metadata 里的一个键」是做不到的：拿不回完整的那份就没法读-改-写，盲传一部分会把宿主存在里面的其余键（任务指令、锚点时间戳、过期策略之类）一起冲掉，下次触发直接失败。列表维持不带整份 metadata：一页最多 100 条，每条都驮着它会把响应撑得很大，而列表要的只是「有哪些任务」。单条查询只读得到还没发出去的任务，已完成 / 已失败返回 `409 TASK_ALREADY_COMPLETED`、不存在返回 `404 TASK_NOT_FOUND`，与 `PUT /update-message` 同一口径。
+
+  - **`PUT /update-message` 的可写字段加上 `contactName`**（非空字符串，口径与排程时一致；空串 / `null` / 非字符串返回 `400 INVALID_UPDATE_DATA`）。用户给角色改了名之后，之前排好的任务推送出来的通知标题（「来自 `<contactName>`」）靠它跟着改。`contactName` 不是 key——宿主按角色过滤用的是 `metadata.charId`，它会跨角色重名——数据库里也只活在加密 payload 中，没有独立列或索引引用它。
+
+  `GET /capabilities` 的 features 追加 `get-message-detail` / `update-message-contact-name`。
+
+- d6bea67: 推送订阅改成用户级的一份，任务不再携带它
+
+  - **新增 `push_subscriptions` 表与 `PUT` / `GET` / `DELETE /push-subscription` 三个端点。** 一个用户一份订阅，落库前用 per-user key 加密；`GET` 返回 `{ exists, updatedAt, endpoint }`，不含订阅的密钥部分。内置的 D1 / pg / neon 适配器都实现了对应的 `getPushSubscription` / `upsertPushSubscription` / `deletePushSubscription`，`initSchema()` 会建表；自定义适配器缺任何一个，这三个端点返回 501。
+  - **任务不再携带订阅，到点投递时现读那一份。** 订阅冻结在每条任务里的话，用户清站点数据 / 重装 PWA / 推送服务轮换 endpoint 之后，每条老任务都拿着一个已死的订阅，而「刷新订阅」只能按客户端本地已知的任务清单逐行 PUT——它不知道的任务（角色在 fire 里给自己排的那些）就永远刷不到，成了死循环：推不出去 → 状态记不下来 → 客户端不知道这条任务存在 → 更刷不到它。现在覆盖用户级那一份就全好了，已排的任务一条都不用碰。
+  - **`POST /schedule-message` 与 `PUT /update-message` 都不收 `pushSubscription` 字段**（带了返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）：静默丢弃会让人以为「这条任务用的是我传的这个订阅」。排程时这个用户还没登记订阅 → `409 PUSH_SUBSCRIPTION_MISSING`，建了也永远发不出去。投递时读不到订阅 → 任务按投递失败处理，原因记进 payload 的 `lastError`，`GET /messages` 上看得见。
+  - **`ctx.scheduleTask()` 建的任务同样不携带订阅**，也不需要继承——到点读的就是当时最新的那份。
+  - **客户端 SDK 新增** `putPushSubscription(subscription, opts?)` / `getPushSubscription()` / `deletePushSubscription()`。`putPushSubscription` 直接收 `pushManager.subscribe()` 的结果（内部取 `toJSON()`），什么时候调：拿到订阅之后一次，之后每次应用启动确认订阅仍然有效时再一次（幂等覆盖）。
+  - **`GET /capabilities` 的 features 追加** `user-push-subscription`。
+
+- 7630754: 单用户 worker 暴露 VAPID 公钥端点，供前端跨源订阅。
+
+  - amsg-server：单用户 Worker 新增 `GET /vapid-public-key`，返回本 Worker 自己的 `VAPID_PUBLIC_KEY`（未配置时返回 503 `VAPID_NOT_CONFIGURED`）。和其它端点共用同一套 CORS 与 `serverToken` 校验。前端拿它作为 `applicationServerKey` 来创建 Web Push 订阅——各自部署的 worker 各有各的 VAPID，公钥在运行时从 worker 拉取。
+  - amsg-client：新增 `ReiClient.getVapidPublicKey()`，GET 该端点并返回公钥字符串（配了 `serverToken` 时带上 `X-Client-Token`）。
+
+### Patch Changes
+
+- 65a9f91: `deleteLlmCredentials()` 对 `all` 与 `credIds` 同时出现的入参直接抛错，不再静默按全删执行
+
+  以前 `{ all: true, credIds: [...] }` 这种两个字段都传的调用，SDK 会悄悄取 `all: true`、只发 `{ all: true }` 出去——同样的 body 直接发 HTTP 会被服务端 400 拒掉（「all 与 credIds 不能同时出现」），经 SDK 反而变成把该用户所有凭据行全删。典型踩法是用两份 UI 状态拼 opts：一个过期的「全删」标志加上一行勾选，云端凭据就被清空了，之后所有带 `credRefs` 的任务到点都记 `CREDENTIAL_MISSING`。
+
+  现在 SDK 跟服务端同一口径：`all: true` 且 `credIds` 出现（空数组也算）时本地抛 `TypeError`（「all 与 credIds 不能同时出现」），请求不会发出。只传其中一个字段的调用行为不变。JSDoc 和 README 补上了两种删法互斥的说明。
+
+- e6b382a: credRefs 继承按 chat 引用分支，空凭据任务响亮失败
+
+  `ctx.scheduleTask()` 的凭据继承改按 `credRefs.chat` 分支：父任务带 chat 引用 → 复制整份引用、内联置空（原行为）；父任务只带非 chat 引用（如仅 emotion）→ 引用与内联三件套**都**复制——此前对任何非空 credRefs 一刀切置空内联，会产出既无引用可解析又无内联凭据的空壳后代。
+
+  `prompted` / `auto` 任务 fire 时既无 `credRefs.chat` 也无内联三件套 → 按 `CREDENTIAL_MISSING` 失败进常规重试（此前会拿空凭据去撞 LLM 接口、报一句对不上号的 Invalid apiUrl）。`instant` 的「无凭据 = 纯推送」路由语义不变。
+
+  client 侧只改文档提法：可用性门槛引用 capabilities feature `'llm-credentials'`，不再写死版本号。
+
+- 80f471d: 文档：新接入的推荐路径收敛到 amsg-server 单用户线
+
+  **接入这套 SDK 的标准四步**写进了工作区 README：部署 worker → 装 Service Worker + 订阅推送 → 发消息 / 排任务 → **应用启动时拉一次收件箱**。第四步以前只在 API 列表里有两行说明，现在 amsg-client README 有独立一节「上线补一次收件箱」，给出翻页、ack 顺序、去重的完整写法——到了客户端不会弹通知的内容只落收件箱、不发推送，少了这步就等于没有。
+
+  **amsg-client README 按这条线重排**：开头新增「先看你接的是哪条服务端线」，把 `scheduleMessage()`（含 `messageType: 'instant'`）+ 收件箱补拉这条摆在前面，`deliver()` / `sendInstant()` 收进 instant 那条线的说明里；「上线补一次收件箱」一节提到目录第二位、正文紧跟「快速使用」。`scheduleMessage()` 的 JSDoc（会出现在 IDE 悬浮提示和 `.d.ts` 里）同步改写成同一口径。
+
+  **amsg-server README 开头新增「两条部署线」**，把单用户线（D1）和多租户线（pg / neon）的能力差异摆成一张表：服务端收件箱和 `client_state` 目前只有 D1 适配器实现，多租户线上这两组端点返回 501，不会弹通知的 payload 也只能照旧推送。新接入走单用户线，README 也给了它一段快速使用。给 pg / neon 补收件箱记为待办。
+
+  **amsg-instant 标为维护态**：它是无后端场景的产物，没有数据库也就没有服务端收件箱，push 漏掉的内容补不回来。继续修，已经在用的部署照常工作，新接入不从它起步。amsg-sw README 的「生产推荐链路」一节据此改写成「Web Push + 上线补拉 + SW dedupe」。
+
+  **两份规范按同一条线重排**。API 规范：新增 §1.1「两条部署线」把单用户线和多租户线的差异摆成一张表；第 6 章端点清单补上单用户线独有的那几组端点（`outbox` / `push-subscription` / `vapid-public-key` / `client-state` / `llm-credentials` / `capabilities`）；新增 §6.7「服务端收件箱与到达保证」，收件箱的两个端点、落行时序、哪些 payload 发推送、ack 顺序都在那一节；§10 补上 10.1 单用户线的对接流程（部署三步 + 客户端四步），原有的多租户流程顺延；§12 DoD 分成「两条线通用」与「多租户线另需满足」两组，前者把实现服务端收件箱、按 §6.7 决定发不发推送列为要求。
+
+  Service Worker 规范第 0 章的最小示例补上「订 Web Push 并 `putPushSubscription()` 登记订阅」这一步，四步齐了；§4.1.1 的前台自绘一节写明它跟弹不弹系统通知是两件独立的事。
+
+- e7bbcb5: Prevent idle D1 cron ticks from exhausting the free row-read quota: delete metadata atomically with resources, resume only indexed due cleanup operations, reclaim expired records in bounded batches, and repair legacy metadata once with persistent cursors. Include snapshot summaries in resource pages so clients can avoid duplicate inventory scans.
+- 9d1f89f: 补齐许可证文件：每个包根目录加入 MIT LICENSE 文本（此前 package.json 声明 MIT 但 tarball 里没有许可证文件）。仓库层面确立双许可——代码 MIT、`standards/` 规范文本 CC BY-NC-SA 4.0，根 README 的许可一节与 npm 元数据不再互相矛盾。
+- c064ecd: 修复发布产物里损坏的 .d.ts：四个包此前用 tsup `dts: true` 处理 .js 入口，发出去的 .d.ts 是 JS 源码原文，TS 消费者 import 即报错。现改用 shared 同款两步构建（tsup 出 JS + `tsc --allowJs --emitDeclarationOnly` 出真声明），subpath 导出（server `./cloudflare`、instant `./adapters/*` `./blob/*`）的声明文件一并对齐。
+
+  amsg-server 另含两处加固：pg / neon 适配器的动态 UPDATE 列名补上与 D1 一致的白名单校验（此前直接插值进 SQL）；清理死代码（未引用的 `REQUIRED_COLUMNS`、`timingSafeEqualBytes`、schedule-message 的死分支与重复注释）。amsg-sw 清理 `createNotificationFromPayload` 永不触发的两处假值守卫。
+
+- Updated dependencies [160ca1b]
+- Updated dependencies [f13f2f1]
+- Updated dependencies [922afe1]
+- Updated dependencies [ca83382]
+- Updated dependencies [b09a3bc]
+- Updated dependencies [c3e1906]
+- Updated dependencies [3dae842]
+- Updated dependencies [68172e8]
+- Updated dependencies [80f471d]
+- Updated dependencies [d1b269d]
+- Updated dependencies [8ca959c]
+- Updated dependencies [a384a93]
+- Updated dependencies [d6bea67]
+- Updated dependencies [922afe1]
+- Updated dependencies [914ddcf]
+- Updated dependencies [ef2f2d1]
+- Updated dependencies [65a9f91]
+- Updated dependencies [68172e8]
+- Updated dependencies [80f471d]
+- Updated dependencies [922afe1]
+- Updated dependencies [6ead0c4]
+- Updated dependencies [b146fde]
+- Updated dependencies [9d1f89f]
+  - @rei-standard/amsg-shared@0.4.0
+
 ## 2.9.0-next.16
 
 ### Patch Changes
