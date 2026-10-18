@@ -49,6 +49,7 @@ export { readRequestBody, DEFAULT_MAX_REQUEST_BODY_BYTES } from './lib/request.j
 export {
   deriveUserEncryptionKey,
   decryptPayload,
+  encryptPayload,
   encryptForStorage,
   decryptFromStorage
 } from './lib/encryption.js';
