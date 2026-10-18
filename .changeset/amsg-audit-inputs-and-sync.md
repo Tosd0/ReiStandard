@@ -3,14 +3,12 @@
 "@rei-standard/amsg-client": minor
 ---
 
-Add task-bound inputs, live paginated task views in fire hooks, explicit tool
-execution allowlists, and occurrence-bound attachments with owner metadata,
-targeted encrypted reads, and bounded retention. Keep credential references live
-and preserve existing atomic task replacement behavior.
+任务输入、后台任务视图与附件：让关页后执行的任务带着自己的输入，到点能查实际任务，产出的大内容也能按引用补收。
 
-Allow fire hooks to read one client-state key and only its chunks, supporting
-large immutable task input references without loading an entire namespace.
+- 排程支持 `taskInput`，和创建／替换任务一起加密保存，受理失败不会覆盖旧输入。子任务只使用显式传入的输入，不继承父任务那一份；修改输入需替换任务，更新接口带此字段会整份拒绝。输入不出现在任务列表和详情里，凭据仍可通过 `credRefs` 现读。
+- fire hook 可按 key 读取完整状态，也可用 `listTasks` 分页查看当前用户的实际任务。创建、重复 UUID 和改期的回执带安全任务字段，方便宿主对账；工具执行名单同时约束原生和文本协议调用，异常条目不会让拒绝路径崩溃。
+- D1 部署可用 `storeAttachment` 保存长内容，把完整引用交给客户端 `getAttachment` 读取。附件绑定任务与触发时刻，读取不删除，重试和其他设备仍可取回；引用默认且最长有效 30 天，物理清理由宿主的保留时间配置优先决定。取消后的结算钩子可以保存附件，所有者与代次护栏仍生效。
 
-Add strict per-entry state write receipt classification and an optional persistent
-latest-value synchronization queue. Concurrent saves drain after the active upload;
-failed or conflicting versions remain pending without automatic timestamp changes.
+客户端增加可持久化的最新值同步队列。断网后保留待同步值，上传期间的后续保存会继续发送；队列同时按条数和加密请求字节数分批，单条超限只拒绝该条。冲突和拒绝由宿主决定处理，`discard` 只放弃报告里的那个版本，不误删之后的新值，也不擅自调大时间戳覆盖其他设备。
+
+写入回执逐条区分成功、冲突、拒绝、未知和失败，并兼容可确认全部写入的旧式分块计数。服务端提供 `task-input`、`client-state-key`、`agentic-list-tasks`、`agentic-tool-allowlist`、`attachments` 特性标记；宿主启用相关功能前可先探测部署是否认识这些接口。

@@ -18,7 +18,7 @@ export const MAX_ATTACHMENT_TTL_MS = ATTACHMENT_RETENTION_DAYS * 24 * 60 * 60 * 
 
 /** Each write gets an independent immutable identity. Reads never delete: an
  * outbox retry or another device can still resolve the same reference. Shorter
- * TTLs expire logically; cron reclaims all rows after the retention ceiling.
+ * TTLs expire logically; cron defaults to 30-day physical retention, which the host may override.
  * @param {{ task: Object, occurrenceMs: number|null, writeState: Function, now: () => number }} args
  */
 export function createAttachmentStore({ task, occurrenceMs, writeState, now }) {

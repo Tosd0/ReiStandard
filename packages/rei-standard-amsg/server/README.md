@@ -346,6 +346,7 @@ ctx / metadata / push 上）。
 
 - `contactName` 必须是非空字符串（口径与排程时一致），空串 / `null` / 非字符串一律 `400`。用户给角色改了名之后，之前排的任务推送出来的通知标题（「来自 <contactName>」）靠它跟着改。
 - `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。
+- `taskInput` 只在创建或替换任务时设置。更新请求带这个字段（包括 `null`）返回 `400 INVALID_UPDATE_DATA`，`details.invalidFields` 为 `['taskInput']`；整份请求被拒，同传的其他字段也不会修改。
 - `avatarUrl` 显式传 `null` 是「不改」而不是「清空」（§6.2 的软清空策略要求非法头像被摘掉时保留旧头像，「摘掉」和「传了个 null」在这一层是同一件事）。
 - 凭据三件套传 `null` 同样只是忽略：清掉任何一个，任务到点就发不出去。
 - 凭据三件套只对**没存 `credRefs.chat`** 的任务是「凭据刷新」入口。任务已经通过 `credRefs.chat` 引用凭据的话，触发时以凭据表那行为准、内联只是表行缺失的兜底，改内联不会生效——这种组合返回 `409 TASK_USES_CRED_REFS`，换 Key 走 `PUT /llm-credentials` 覆盖对应凭据，或在请求里改用 `credRefs` 指向新凭据。
@@ -386,7 +387,7 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 
 | 返回值 | 这次触发怎么走 |
 |---|---|
-| 消息数组，或 `{ messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice? }` | 用这份 prompt 生成 |
+| 消息数组，或 `{ messages, maxToolIterations?, totalTimeoutMs?, tools?, toolChoice?, allowedToolNames? }` | 用这份 prompt 生成 |
 | `{ skip: true }` | 这次不发，按零推送的成功收场：一次性任务删掉、循环任务推进到下一次 |
 | `{ defer: { afterMs } }` | 现在不合适，`afterMs` 毫秒后再来问。见下面[推迟这次触发](#推迟这次触发defer) |
 | `null` | 交还给排程时冻结的 prompt |
@@ -396,11 +397,13 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 
 | ctx 上的口子 | 干什么 |
 |---|---|
-| `readState(ns)` / `writeState(ns, entries)` | 读写 `client_state`，和客户端 `GET/PUT /client-state` 是同一份数据 |
+| `readState(ns, { key }?)` / `writeState(ns, entries)` | 读写 `client_state`，按 key 读取时只返回零至一条完整值 |
+| `storeAttachment(value, options?)` | 保存本次触发的附件，返回可放进结果里的完整引用 |
+| `listTasks(options?)` | 分页读取当前用户名下的实际任务，默认带 metadata |
 | `emitResult(payload)` | 给客户端送一条**不是聊天内容**的结果（落收件箱 + 推送） |
 | `scheduleTask(options)` | 给同一个用户再建一条定时任务 |
 | `cancelTask(uuid)` | 取消同一个用户名下另一条待发任务（不能取消当前正在 fire 的任务），并撤掉它尚未投递的收件箱分段，返回 `{ cancelled }` |
-| `renewTask(uuid, nextSendAt)` | 把同一个用户名下另一条待发任务改到新的触发时刻（至少比现在晚 60 秒），返回 `{ renewed: true, uuid, nextSendAt }` 或 `{ renewed: false, reason: 'not_found' \| 'in_flight' }` |
+| `renewTask(uuid, nextSendAt)` | 把同一个用户名下另一条待发任务改到新的触发时刻（至少比现在晚 60 秒），返回 `{ renewed: true, uuid, nextSendAt, task }` 或 `{ renewed: false, reason: 'not_found' \| 'in_flight' }` |
 | `resolveLlmCredential(credId)` | 按 `credId` 现读一份已登记的 LLM 凭据（供非 chat 用途的副 API 使用），不存在或不支持时返回 `null` |
 | `signal` / `isCancelled()` / `throwIfCancelled()` | 任务在执行期被取消或顶替时的协作取消信号，详见[取消正在执行的生成与工具](#取消正在执行的生成与工具) |
 | `scratch` | 本次 fire 的便签对象，三个 hook 加上发送后的 `onAfterSend` / `onFireSettled` 共享同一个引用，fire 结束即丢弃 |
@@ -414,6 +417,99 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 | `occurrenceMs` | 本次触发的名义时刻，epoch 毫秒 |
 
 `sessionId` 是给日志和去重用的不透明字符串，格式随版本变，别拆它拿上面这些值。
+
+### 任务输入与按 key 读取状态
+
+排程时要固定下来的一份输入放在 `taskInput`：`POST /schedule-message` 接受对象或 `null`，与任务一起加密保存；`onBeforeFire` 通过 `ctx.task.taskInput` 读取。内置适配器在创建、原子替换任务时一起保存输入，替换请求被拒不会改掉旧任务的输入。任务列表和单条查询都不返回 `taskInput`，也不返回凭据本体。
+
+`taskInput` 不能经 `PUT /update-message` 修改；输入有变化时创建替换任务。整份序列化任务（包括输入）共用 `MAX_TASK_PAYLOAD_BYTES` 上限，目前为 995,871 字节，HTTP 超限返回 `400 TASK_PAYLOAD_TOO_LARGE`。凭据用 `credRefs` 引用，别复制进输入里；这样换 Key 后已排任务仍能读到最新凭据。需要在触发时读取的动态配置继续用 `readState`。
+
+输入太大时，可以先写到宿主自己的 `client_state` 命名空间，每份输入使用独立且不再改写的 key，在 `taskInput` 中只保存引用：
+
+```js
+async onBeforeFire(ctx) {
+  const { namespace, key } = ctx.task.taskInput;
+  const [entry] = await ctx.readState(namespace, { key });
+  if (!entry) throw new Error('任务输入不存在');
+  return buildMessages(JSON.parse(entry.value));
+}
+```
+
+宿主负责校验引用、控制输入是否可修改，以及设置所有者和保留时间。`readState(ns, { key })` 返回零至一条已解密、已拼好分块的记录；`readState(ns)` 读取整个命名空间。D1 按索引选根行，只读取它的分块范围。旧自定义适配器忽略选择参数时仍会过滤返回结果，但底层可能读取整个命名空间；实现 `getClientState(userId, namespace, { key?, keyPrefix? })` 才能获得同样的读取范围。
+
+自定义加密受理路由可从包根或 `@rei-standard/amsg-server/cloudflare` 导入 `deriveUserEncryptionKey`、`decryptPayload`、`encryptPayload`。Cloudflare 子路径使用 Web Crypto，不需要导入私有文件或 Node 依赖。
+
+### 工具执行名单
+
+`onBeforeFire` 返回对象中的 `allowedToolNames` 控制本次 fire 允许执行哪些工具，与发给模型的 `tools` / `toolChoice` 分开设置：
+
+| 值 | 执行规则 |
+|---|---|
+| 不传 | 有效调用按宿主 hook 的原有约定执行 |
+| `[]` | 不执行任何工具 |
+| 非空字符串数组 | 只执行名单里的名称 |
+
+`onLLMOutput` 返回的原生调用和文本协议调用都要经过这道检查，再交给 `executeToolCalls`。被挡住的调用收到 `error.code: 'TOOL_NOT_ALLOWED'` 的工具结果，模型可以据此继续下一轮。混入 `null`、缺少有效函数名的条目收到 `INVALID_TOOL_CALL`，不会交给执行器；缺少 id 的调用会补一个避开现有 id 的标识，assistant 声明和工具结果共用这个标识。
+
+宿主仍需安全解析文本协议，并在直接调用的业务操作里做自己的权限判断。分类器应覆盖模型声明的全部原生调用；想拒绝其中一项时要返回对应调用让库处理，不能只把它从列表删掉而留下无人应答的 assistant 声明。
+
+### `ctx.listTasks(options)`
+
+`onBeforeFire`、`onLLMOutput` 和 `executeToolCalls` 都能分页读取当前用户的任务：
+
+```js
+const page = await ctx.listTasks({
+  status: 'pending',       // pending / sent / failed / all
+  limit: 100,              // 1–100
+  offset: 0,
+  includeMetadata: true,
+});
+// { tasks, pagination: { total, limit, offset, hasMore } }
+```
+
+示例中的值都是默认值。结果沿用 HTTP 任务接口的安全字段，默认额外带完整 `metadata`，不包含凭据本体或 `taskInput`。用户边界由库限制，角色等应用归属由宿主按 metadata 筛选。
+
+`pending` 包括到期未结算、已占位和正在执行的任务，也可能包含当前 fire 的这一条。一次性任务成功完成后会从列表消失。计算名额或判断某条任务不存在前，应翻完所有页；每页读取的是当时的数据库状态，翻页期间有并发修改时需要再次对账。
+
+`scheduleTask` 和 `renewTask` 的成功回执带 `task`，描述已接受的变更。重复 UUID 的创建回执也带可读到的原任务。这些回执不作为持久日志保存；宿主可用 `emitResult` 送回客户端，漏收时用任务列表对账，不能把读取了一份新上下文当成客户端已认领任务的确认。
+
+### 本次触发的附件
+
+长文或结果详情可以保存成附件，推送和 outbox 只带引用：
+
+```js
+const ref = await ctx.storeAttachment(JSON.stringify(result), {
+  ttlMs: 7 * 24 * 60 * 60 * 1000,
+  owner: { type: 'character', id: characterId },
+  kind: 'attachment',
+  ownerGeneration,
+});
+// { version: 1, namespace, key, taskUuid, occurrenceMs, expiresAt }
+```
+
+`storeAttachment` 接受已序列化的字符串，每次在 `amsg:attachments` 下生成新 key，保存的内容绑定任务和触发时刻。重试可能留下另一份附件，但不会覆盖先前结果引用的内容。把完整 `ref` 放进推送或结果载荷，客户端用 `client.getAttachment(ref)` 取回原文；读取不删除也不确认消费，其他设备、补收和推送重试可以继续使用同一引用。
+
+附件归属于角色等应用实体时应显式传 `owner`、`ownerGeneration` 和 `kind`（默认 `'attachment'`）。这些字段进入加密的云端资源元数据和附件内容，普通的所有者清理可以找到它们。原任务的所有者及代次护栏仍生效，不能跨所有者写入，也不能恢复已停用的所有者。
+
+内置适配器中只有 D1 支持附件；pg / neon 调用时抛 `DeploymentConfigError`，code 为 `ATTACHMENT_STORAGE_UNSUPPORTED`。自定义适配器需实现 `client_state` 读写，回执支持情况见客户端 README 的同步队列说明。包支持附件不等于当前部署的适配器支持。
+
+引用的 `ttlMs` 默认且最长为 30 天，可以设得更短；过期、缺失或内容与引用不匹配时，客户端返回 `null`，读库或网络错误仍抛出。物理清理由运行中的 scheduled tick 和适配器的 `cleanupClientState` 执行，默认清掉 30 天前的附件根行及分块。宿主的 `clientStateTtl['amsg:attachments']` 优先：配 7 天会提前移除尚未逻辑过期的附件，配 60 天只延后物理删除，不延长引用的有效期。保留时间应覆盖宿主需要的补收窗口。
+
+附件仍受状态单值及分块限制，默认 5 MiB 的单值上限计算的是包含引用、所有者等字段的整份序列化附件。`onFireSettled` 也提供 `storeAttachment`；与该钩子的 `writeState` 一样，任务取消后仍可保存收尾记录，所有者停用和代次护栏不会因此绕过。
+
+### 特性探测
+
+`GET /capabilities` 的 `features` 包含以下标记：
+
+| 标记 | 可识别的接口能力 |
+|---|---|
+| `task-input` | 任务输入与创建／替换绑定 |
+| `client-state-key` | 按 key 读取状态 |
+| `agentic-list-tasks` | fire hook 分页列任务 |
+| `agentic-tool-allowlist` | 工具执行名单 |
+| `attachments` | 附件写入及引用读取协议 |
+
+这些标记描述代码能力，不反映部署配置；尤其 `attachments` 不保证当前数据库适配器支持存储。客户端启用功能前先探测标记，别按包版本猜测；更新浏览器 SDK 不会自动更新已部署的 Worker。
 
 ### 推迟这次触发（defer）
 
@@ -457,7 +553,7 @@ tick 汇总的 `details.deferredTasks`（`{ taskId, retryAfter }`）列出这一
 | hook | 什么时候调 | 调用签名 / 载荷 |
 |---|---|---|
 | `onAfterSend(info)` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
-| `onFireSettled(info)` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, retryAfter, willRetry, failureStage, sentCount, pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult, signal, isCancelled, throwIfCancelled }` |
+| `onFireSettled(info)` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, retryAfter, willRetry, failureStage, sentCount, pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult, storeAttachment, signal, isCancelled, throwIfCancelled }` |
 | `onStaleSkip(task, info)` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | 第一个参数为任务行 `task`，第二个参数 `info` 为 `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
 
 三个 hook 都自带 `readState` / `writeState` / `emitResult`，作用于当前用户，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
@@ -513,13 +609,14 @@ const result = await ctx.scheduleTask({
   recurrenceType: 'none',         // 可选，默认 none
   tzId: 'Asia/Tokyo',             // 可选，默认继承当前任务；循环推进按这个时区的墙钟走
   metadata: { beat: 'followup' }, // 可选，整体替换当前任务的 metadata（不深合并）
+  taskInput: { followup: 'one' }, // 可选，子任务自己的输入；不传就是 null
   uuid: `fire-${ctx.taskId}-${ctx.occurrenceMs}`, // 可选，默认随机
 });
-// → { created: true, id, uuid, nextSendAt }
+// → { created: true, id, uuid, nextSendAt, task }
 //   或 { created: false, reason: 'duplicate', uuid, task }
 ```
 
-撞 uuid 时 `task` 是那条**已经存在的任务行**的投影，形状与 `GET /messages` 列出来的一样（`{ id, uuid, contactName, messageType, messageSubtype, nextSendAt, recurrenceType, tzId, status, retryCount, createdAt, updatedAt, charId, clientTaskId, lastError }`，不含任何凭据）。用确定性 uuid 做重试幂等时，重跑那轮靠它把这条任务记进自己的账本、随 push 带回客户端认领——否则这条任务只活在数据库里，面板列不出、用户取消不了，却照样到点触发。行读不回来（已经不是 pending）→ `task` 为 `null`。
+新建成功与重复 UUID 两种回执都带 `task`，字段形状一致，包含完整 `metadata` 和凭据引用 `credRefs`，不含凭据本体或 `taskInput`。重复时返回数据库里当前的任务；行读不回来（例如已不再 pending）时为 `null`。`created` 与 `reason` 仍用于判断本次是否新建，不能只看 `task` 是否有值。
 
 凭据和投递配置（`apiUrl` / `apiKey` / `primaryModel` / `maxTokens` / `temperature` / `splitPattern`）以及 `contactName` / `avatarUrl` / `messageSubtype` / `userMessage` / `tzId` 从当前任务继承，宿主只说「什么时候、说什么方向」——hook 全程看不到凭据。推送订阅是用户级的一份，任务不携带、也不用继承。`completePrompt` / `messages` 不继承（都置 `null`）：hook 每次现场重组 prompt，把排程时冻结的旧 prompt 带过去，新任务万一走回冻结 prompt 老链路就会静默发出一条谁也没打算发的文案。
 
@@ -535,6 +632,8 @@ const result = await ctx.scheduleTask({
 | `tzId` | 可用的 IANA 时区 id，或 `null` | `TypeError` | 认不出来的时区会让循环推进悄悄退回 UTC，用户设的钟点从此对不上 |
 | 任务内容大小 | 与 `POST /schedule-message` 同一道闸门 | 抛 `RangeError`（`code: 'TASK_PAYLOAD_TOO_LARGE'`） | 往 `metadata` 里塞一坨大对象会顶穿存储的单行上限，不拦的话到落库那步才炸，报错看不出所以然 |
 | 数据库适配器没有 `createTask` | — | 抛 `DeploymentConfigError`（`code: 'AGENTIC_SCHEDULE_UNSUPPORTED'`） | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
+
+`taskInput` 只使用子任务显式传入的对象，不传或传 `null` 时为 `null`，不会继承父任务的输入。
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。
 
@@ -643,7 +742,7 @@ await fetch(`${baseUrl}/client-state`, {
 
 ## `client_state` 的过期清理（`clientStateTtl`）
 
-`client_state` 默认不过期：写进去的是宿主的数据，库不替它决定什么时候该没。
+普通 `client_state` 命名空间默认不过期；附件命名空间 `amsg:attachments` 默认按 30 天清理，宿主可用同名配置覆盖。
 
 但「大内容旁路」那类用法写的是一次性内容——一条 push 塞不下的正文先写进状态、push 里只带一个引用键，客户端取走之后没人再回来删它。给这类命名空间配上天数，cron 每跳顺手清一次：
 
@@ -654,7 +753,7 @@ clientStateTtl: {
 }
 ```
 
-- **逐个命名空间开**，没写进配置的一个都不动。
+- 普通命名空间逐个配置，未配置的不清理；附件命名空间使用默认 30 天，宿主同名配置优先。
 - 判据是行本来就有的 `updated_at` 列，不加列——升级后老库不用改表结构，也就没有「表没跟上、cron 静默挂在缺的那一列上」这一说。
 - 大值分块存储的切片行跟着根行一起走，不留读不出来的垃圾行。
 - 天数不是正数的条目会被跳过并告警一次；清理本身失败只记日志，不影响这一跳的投递。
@@ -947,7 +1046,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES` — 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原），自己包路由时代替 `await request.text()`
 - `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
 - `createTenantToken` / `verifyTenantToken`
-- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage` — 全部为 `async` 函数，返回 `Promise`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptPayload` / `encryptForStorage` / `decryptFromStorage` — 全部为 `async` 函数，返回 `Promise`
 - `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl` / `MAX_TASK_PAYLOAD_BYTES`
 - `supportsLlmCredentialsStore` / `isValidCredId` / `validateCredRefs` / `validateCredValue` / `hasChatCredRef` / `resolveLlmCredential` / `CRED_ID_MAX_LENGTH` / `CRED_PUT_BATCH_MAX` / `CRED_ROWS_PER_USER_MAX` / `CRED_REFS_MAX_ENTRIES` — 用户级 LLM 凭据存储与 `credRefs` 校验/解析工具
 - `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
@@ -963,7 +1062,7 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
 - `isValidTimeZoneId` / `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence`
 - `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES`
-- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptPayload` / `encryptForStorage` / `decryptFromStorage`
 
 ## 运行环境与要求
 
@@ -1041,7 +1140,7 @@ async function executeToolCalls(calls, ctx) {
 
 取消收尾使用 `onFireSettled({ status: 'cancelled', willRetry: false, error, ... })`，不是生成失败。应用应在这里释放资源、结算已发生的用量，避免发出失败提示或把未送达内容记为已回复。取消时已经开始写入的 outbox 批次会在写完后检查信号并撤掉未投递部分；已经发到客户端的消息仍由客户端处理。应用需要记录停止的任务身份，拦住迟到推送、补收以及尚未显示的本地内容。已完成的外部副作用无法撤销；不支持 AbortSignal 的工具也需要自己在执行步骤之间检查取消。
 
-执行阶段的 `ctx.writeState`、`scheduleTask`、`cancelTask`、`renewTask` 和 `emitResult` 会拒绝取消后新发起的操作。`onFireSettled` 的 `info.writeState` 特意仍可用，供宿主释放锁、保存账单等收尾；它不能用于继续生成阶段的业务动作。已经开始的数据库写入不支持回滚，宿主仍需处理并发状态版本。
+执行阶段的 `ctx.writeState`、`storeAttachment`、`scheduleTask`、`cancelTask`、`renewTask` 和 `emitResult` 会拒绝取消后新发起的操作。`onFireSettled` 的 `info.writeState` 和 `info.storeAttachment` 仍可用，供宿主释放锁、保存账单和取消记录等收尾，所有者及代次护栏仍生效；这两个方法不能用于继续生成阶段的业务动作。`emitResult` 仍受取消信号限制。已经开始的数据库写入不支持回滚，宿主仍需处理并发状态版本。
 
 ### Cloud data inventory and cleanup (D1)
 
