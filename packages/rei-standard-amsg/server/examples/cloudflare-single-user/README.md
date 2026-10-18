@@ -27,7 +27,7 @@
 
 ## 端点
 
-`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/client-state/namespaces`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/capabilities`。
+`/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/client-state/namespaces`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/cloud-data/*`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
 `GET /messages` 是列表，`GET /message?id=<uuid>` 是单条。单条比列表多给一个**完整的 `metadata`**：`PUT /update-message` 对 `metadata` 是整体替换，只改其中一个键就得先把完整那份读回来。列表不带整份 metadata——一页最多 100 条，每条都驮着它会把响应撑得很大。
@@ -135,8 +135,9 @@ export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   hooks: {
     // 触发时组装 prompt。返回 null 则这个任务走冻结 prompt 老链路。
-    // ctx: { task, userId, readState(ns), writeState(ns, entries),
-    //        scheduleTask(options), now, scratch }
+    // ctx: { task, userId, readState(ns), writeState(ns, entries), emitResult(payload),
+    //        scheduleTask(options), cancelTask(uuid), renewTask(uuid, nextSendAt),
+    //        resolveLlmCredential(credId), signal, isCancelled(), throwIfCancelled(), now, scratch }
     //   task 是解密后的任务字段（不含 apiKey；推送订阅是用户级的一份，
     //   根本不在任务 payload 里）；
     //   自定义字段排程时放 metadata 里，这里原样读回。
@@ -245,6 +246,7 @@ async onLLMOutput(ctx) {
 | 单次 fire 的建任务条数 | 默认 **2 条**，config 里的 `maxScheduledTasksPerFire` 可调（`0` = 不许自排） | `RangeError` | 模型自排后续本质上是条能无限延伸的链，没有上限就没人按停止键 |
 | `uuid` 撞车 | 不当错误处理 | 返回 `{ created: false, reason: 'duplicate', uuid, task }` | fire 失败会整条重跑（见「慢任务与 cron 占位」），宿主传一个由「任务 id + 触发时刻」推出来的确定性 uuid 就天然幂等，重试不会多排一条 |
 | `tzId` | 可用的 IANA 时区 id，或 `null` | `TypeError` | 认不出来的时区会让循环推进悄悄退回 UTC，用户设的钟点从此对不上 |
+| 任务内容大小 | 与 `POST /schedule-message` 同一道闸门 | 抛 `RangeError`（`code: 'TASK_PAYLOAD_TOO_LARGE'`） | 往 `metadata` 里塞大对象会顶穿存储单行上限，提前拦截给出明确错误码 |
 | 数据库适配器没有 `createTask` | — | 抛 `AGENTIC_SCHEDULE_UNSUPPORTED` | 静默成功会让宿主以为后续那条排上了，其实谁也不会触发它 |
 
 `recurrenceType` 沿用排程接口那套 `none` / `daily` / `weekly`，别的值抛 `TypeError`。参数不合法的调用不占建任务额度；uuid 撞车占（那条任务其实已经建出来了）。新任务的触发靠 cron，所以自排的时间点也受 cron 精度约束——排在 `x:xx:30` 会等到下一跳才发出去。
@@ -301,14 +303,14 @@ export default createSingleUserCloudflareWorker((env) => ({
   async onStaleSkip(task, info) {
     // info: { reason: 'stale', action, metadata, recurrenceType, occurrenceMs,
     //         skippedCount, skippedOccurrences, skippedTruncated, nextSendAt,
-    //         readState, writeState }
+    //         readState, writeState, emitResult }
     await info.writeState('missed', [
       { key: info.metadata?.charId ?? 'unknown', value: JSON.stringify(info.skippedOccurrences) },
     ]);
   },
   async onAfterSend(info) {
     // info: { task, sentCount, pushedCount, total, error, usage, usageTotal,
-    //         llmCalls, outboxed, scratch, readState, writeState }
+    //         llmCalls, outboxed, scratch, readState, writeState, emitResult }
     // scratch 与本次 fire 的 onBeforeFire / onLLMOutput 是同一个引用
   },
 }));
@@ -326,9 +328,11 @@ export default createSingleUserCloudflareWorker((env) => ({
 export default createSingleUserCloudflareWorker((env) => ({
   // ...其余 config
   async onFireSettled(info) {
-    // info: { task, status, skipReason, retryAfter, sentCount, pushedCount, total, iterations,
+    // info: { task, status, skipReason, retryAfter, willRetry, failureStage,
+    //         sentCount, pushedCount, total, iterations,
     //         error, metadata, usage, usageTotal, llmCalls, outboxed,
-    //         scratch, readState, writeState }
+    //         scratch, readState, writeState, emitResult,
+    //         signal, isCancelled, throwIfCancelled }
     if (info.scratch.scheduledFollowUp) {
       // fire 里用 ctx.scheduleTask 建出来的任务已经真的写进库了，不管这次有没
       // 有发出去，账都得记上——不然它只活在数据库里：面板列不出、用户取消不
@@ -347,6 +351,7 @@ export default createSingleUserCloudflareWorker((env) => ({
 | `skipped` | 这次不发。`skipReason` 区分是 `onBeforeFire` 直接 `{ skip: true }`（`'before-fire'`）还是模型跑完后判定不发（`'skip-push'`） |
 | `deferred` | `onBeforeFire` 返回了 `{ defer: { afterMs } }`：这次没生成也没发，`retryAfter`（ISO 时刻）之后再从 `onBeforeFire` 走一遍 |
 | `failed` | 链路抛错，`error` 带原始错误。发到第 k 段挂了也是这个：`sentCount = k`、`total` 是原本要发的段数 |
+| `cancelled` | 任务在投递期间被取消或顶替 |
 | `not-handled` | `onBeforeFire` 返回 `null`，这条任务交还给排程时冻结的 prompt 老链路。那条链路不归 fire hook 管 |
 
 跟 `onAfterSend` 的分工：`onAfterSend` 只走「有 push 要发」这条路，`onFireSettled` 什么结局都到。正常发完时两个都会调，`onAfterSend` 在前。没配 hooks 的部署、以及不需要 LLM 的固定文本任务不走 fire 这条路径，两个都不会调。同样是 best-effort，自身抛错只记日志。
@@ -406,7 +411,7 @@ Worker 上有两个方法可以查、可以补：
 
 ```js
 const state = await worker.getSchemaVersion(env);
-// → { current: '2.6.0' | null, required: '2.6.0', ok, missing: ['column:scheduled_messages.last_error', …] }
+// → { current: '2.6.0-cloud-data.2' | null, required: '2.6.0-cloud-data.2', ok, missing: ['column:scheduled_messages.last_error', …] }
 
 if (!state.ok) await worker.ensureSchema(env); // 建表 + 补列 + 建索引，重复调没事
 ```
