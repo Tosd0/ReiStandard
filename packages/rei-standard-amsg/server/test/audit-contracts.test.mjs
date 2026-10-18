@@ -375,3 +375,25 @@ for (const retireOwner of [false, true]) {
     }
   });
 }
+
+
+test('scheduleTask duplicate receipts project the same metadata and safe task fields as creation', async (t) => {
+  const { db } = await setup(t);
+  const current = await seed(db, 'receipt-parent');
+  await fire(db, current, { async onBeforeFire(ctx) {
+    const input = { uuid: 'receipt-child', firstSendTime: '2026-10-19T00:05:00.000Z', metadata: { purpose: 'followup', nested: { value: 1 } }, taskInput: { secretInput: true } };
+    const created = await ctx.scheduleTask(input);
+    const duplicate = await ctx.scheduleTask(input);
+    assert.equal(created.created, true);
+    assert.equal(duplicate.created, false);
+    assert.equal(duplicate.reason, 'duplicate');
+    assert.deepEqual(Object.keys(duplicate.task).sort(), Object.keys(created.task).sort());
+    // Creation adapters can omit updated_at; the duplicate path reads the
+    // current stored row. Compare the stable fields, not that observation time.
+    assert.deepEqual({ ...duplicate.task, updatedAt: null }, { ...created.task, updatedAt: null });
+    assert.deepEqual(duplicate.task.metadata, input.metadata);
+    assert.equal(duplicate.task.apiKey, undefined);
+    assert.equal(duplicate.task.taskInput, undefined);
+    return { skip: true };
+  }, onLLMOutput() {} });
+});

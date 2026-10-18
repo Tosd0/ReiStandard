@@ -469,7 +469,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
       if (!row) return null;
       const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
-      return projectTask(row, payload);
+      return projectTask(row, payload, { includeMetadata: true });
     } catch (error) {
       console.warn('[amsg-server] scheduleTask: 读取撞车任务失败（已忽略）:', error && error.message);
       return null;
