@@ -32,6 +32,7 @@
 - [本地软清空与可选 `maxPayloadBytes`](#本地软清空与可选-maxpayloadbytes)
 - [其他工具：scheduleMessage / listMessages / client-state / subscribePush…](#其他工具)
 - [模块格式与环境](#模块格式与环境)
+- [Server-owned cloud data management](#server-owned-cloud-data-management)
 
 ---
 
@@ -49,6 +50,7 @@ import { ReiClient } from '@rei-standard/amsg-client';
 const client = new ReiClient({
   baseUrl: '/api/v1',
   userId: '550e8400-e29b-41d4-a716-446655440000',
+  serverToken: 'your-shared-secret', // 可选：单用户 amsg-server 配了 AMSG_SERVER_TOKEN 时填，自动附带 X-Client-Token 头
 });
 
 await client.init();
@@ -415,10 +417,12 @@ POST JSON 到 instant endpoint，原样返回 worker 的 `{ success, data?, erro
 
 > ⚠ **HTTP 200 ≠ delivery confirmation**，当 worker 配了 backup Web Push 时（amsg-instant 0.9.0+ 默认）。`200` 只说明 dispatch 成功，不说明消费者真收到。要正确判断送达，用 `deliver()`。
 
-可选 `opts.expectsBackupPush`：
-- 设 `true` —— 本实例此方法首次调用时 `console.warn` 一次，提醒上述陷阱（migration 期审计有用）
-- 设 `false` —— 显式表示「我知道这点」，永久静音
-- 不传 —— 不警告
+可选 `opts`：
+- `opts.authorization` —— 可选，透传为 `Authorization` 请求头
+- `opts.expectsBackupPush`：
+  - 设 `true` —— 本实例此方法首次调用时 `console.warn` 一次，提醒上述陷阱（migration 期审计有用）
+  - 设 `false` —— 显式表示「我知道这点」，永久静音
+  - 不传 —— 不警告
 
 ### `consumeInstantStream(payload, endpointPath?, options)`
 
@@ -427,6 +431,7 @@ POST 并按 SSE 帧解析 `event: payload` / `event: done` / `event: error`，�
 ```js
 try {
   await client.consumeInstantStream(payload, '/instant', {
+    headers: { 'X-Custom': '1' },
     onPayload: async (push) => routePush(push),
     onError: (err) => log.warn('stream error', err),
     onDone:  () => stopSpinner(),
@@ -439,15 +444,15 @@ try {
 
 > ⚠ **rejection ≠ delivery failure**，当 worker 配了 backup Web Push 时。SSE 可能因为 iOS 杀后台 fetch、网络抖动、worker 5xx 而 reject，但 backup push 仍然把消息送到了。把 reject 当成「发送失败」会导致**虚报失败 + 消息晚到时用户困惑**。要正确判断送达，用 `deliver()`。
 
-`opts.expectsBackupPush` 与 `sendInstant` 一致。
+`options.expectsBackupPush` 与 `sendInstant` 一致。
 
 ---
 
 ## 发送即时消息（加密 vs 明文）
 
-`deliver()` 与 `sendInstant` 共享同一套 transport 配置，由构造器决定：
+`deliver()` 与 `sendInstant` 共享同一套 transport 配置，由构造器决定（注意：这两个方法面向无数据库的 `@rei-standard/amsg-instant`，因此请求体需带 `pushSubscription`；若对接 `@rei-standard/amsg-server` 3.0.0 的即时或定时消息，请先调 `putPushSubscription()` 登记用户级订阅，再用不带 `pushSubscription` 的 `scheduleMessage()`）：
 
-### 加密模式（默认；兼容 amsg-server / amsg-instant 0.1.x）
+### 加密模式（默认；兼容 amsg-instant 0.1.x）
 
 ```js
 const client = new ReiClient({
@@ -493,13 +498,16 @@ const client = new ReiClient({
 
 ## `messages` 多轮 / `splitPattern` 自定义分句
 
-`deliver()` / `sendInstant` / `consumeInstantStream` 都是 **payload-agnostic 透传**——这些字段写进 payload 就行，client 不校验，所有错误从 Worker / Server 端返回。
+`scheduleMessage` / `updateMessage`（对接 `amsg-server`）与 `deliver()` / `sendInstant` / `consumeInstantStream`（对接 `amsg-instant`）都是 **payload-agnostic 透传**——字段写进 payload 就行，client 不做业务字段校验，所有校验错误从服务端返回。
 
-`messages`（OpenAI 格式数组）：
+`messages`（OpenAI 格式数组，`amsg-server` 与 `amsg-instant` 均支持）：
 
 ```js
-await client.deliver({
+await client.scheduleMessage({
   contactName: 'Rei',
+  messageType: 'prompted',
+  firstSendTime: new Date(Date.now() + 60_000).toISOString(),
+  recurrenceType: 'none',
   messages: [
     { role: 'system', content: '你是 Rei，回复要简短自然。' },
     { role: 'user', content: '今天会下雨吗？' },
@@ -509,13 +517,12 @@ await client.deliver({
   apiUrl: '...',
   apiKey: '...',
   primaryModel: 'gpt-4o-mini',
-  pushSubscription: subscription.toJSON(),
-}, { delivery: ..., timeoutMs: 300_000 });
+});
 ```
 
-`completePrompt` 和 `messages` **必须恰好二选一**，同时给会被远端返回 `400 INVALID_PAYLOAD_FORMAT`。
+`completePrompt` 和 `messages` **必须恰好二选一**，同时给会被远端返回 `400 INVALID_PARAMETERS`（`amsg-server`）或 `400 INVALID_PAYLOAD_FORMAT`（`amsg-instant`）。
 
-`splitPattern`（自定义分句正则，`string | string[]`）：
+`splitPattern`（自定义分句正则，`string | string[]`，**仅适用于 `amsg-server` 的 `scheduleMessage` / `updateMessage`**；`amsg-instant` 0.8.0+ 已改为在 `onLLMOutput` hook 内自定义切分，传 `splitPattern` 会返 400）：
 
 ```js
 splitPattern: '([\\n]+)',                   // 按换行
@@ -531,7 +538,7 @@ splitPattern: ['(\\n\\n+)', '([。！？!?]+)'], // 数组级联：先段落、�
 
 ## 本地软清空与可选 `maxPayloadBytes`
 
-`scheduleMessage` / `sendInstant` / `consumeInstantStream` / `deliver` / `updateMessage` 在发请求**之前**会保留 `avatarUrl` 软清空保护。请求体大小默认不限制；要本地护栏可在构造器显式传 `maxPayloadBytes`：
+`scheduleMessage` / `sendInstant` / `consumeInstantStream` / `deliver` / `updateMessage` 在发请求**之前**会执行 `avatarUrl` 软清空保护。请求体大小默认不限制；要开启本地大小护栏可在构造器显式传 `maxPayloadBytes`（对上述五个方法以及 `putClientState` / `putPushSubscription` / `putLlmCredentials` / `ackOutbox`、云端数据管理写接口均生效）：
 
 ```js
 const client = new ReiClient({
@@ -563,20 +570,20 @@ try {
 
 ## 其他工具
 
-`ReiClient` 还有这些方法（与 2.4.x 相比无字节变化）：
+`ReiClient` 还有这些方法：
 
 - `scheduleMessage(payload)` —— 排定 fixed / prompted / auto / instant 任务，加密走 amsg-server
 - `updateMessage(uuid, updates)` —— 改任务字段
 - `cancelMessage(uuid)` —— 取消任务
 - `listMessages(opts)` —— 拉当前 user 的任务列表。每条任务只带 `charId` / `clientTaskId` 两个 `metadata` 子字段
-- `getMessage(uuid)` —— 单条任务（`GET /message`，单用户线），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
+- `getMessage(uuid)` —— 单条任务（`GET /message`），比列表多给**完整的 `metadata`**。`updateMessage` 对 `metadata` 是整体替换，只改其中一个键就得先用它读回完整那份，改完再整份传上去；只传一部分会把存在里面的其余键一起冲掉。只读得到还没发出去的任务（已完成/已失败 → 409，不存在 → 404）
 - `subscribePush(vapidPublicKey, registration)` —— 标准 Push API 订阅封装，返回的 endpoint 保证是活的（认出 Chromium 的 `permanently-removed.invalid` 占位订阅就退掉重订，最多三次；仍然拿不到就抛 `PUSH_ENDPOINT_ZOMBIE`）
 
-对接单用户 amsg-server worker 的配套方法：
+对接 amsg-server 的配套方法：
 
-- `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
+- `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`，单用户线），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
 - `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
-- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；非法/超限条目只拒绝自己，此时响应带 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
+- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt, owner?, kind?, ownerGeneration? }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；返回 `{ success, data?: { upserted, skipped, deleted?, skippedEntries?, rejected? }, error? }`，非法/超限条目只拒绝自己并写入 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
 - `getClientState(namespace)` —— 读回一个 namespace 的全部条目（走加密响应信封，方法内解密后返回明文值）
 - `clearClientState()` —— 清空该用户所有 namespace 的云端状态（如「清除云端数据」设置项）
 - `putPushSubscription(subscription, opts?)` —— 登记 / 覆盖这个用户的 Web Push 订阅（`PUT /push-subscription`）。传 `pushManager.subscribe()` 的结果（或它的 `toJSON()`）即可，方法内部会取 `toJSON`。服务端一个用户存一份，所有定时任务到点投递时都读它——包括角色在 fire 里给自己排的、客户端根本不知道存在的那些任务。`opts.updatedAt` 是 epoch 毫秒，不传由服务端取当前时刻
