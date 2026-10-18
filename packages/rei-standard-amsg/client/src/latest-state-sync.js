@@ -13,6 +13,12 @@
 /** @typedef {{ outcomes: StateWriteOutcome[], pending: StateSyncEntry[], revision: number }} StateSyncReport */
 const identity = (entry) => JSON.stringify([entry.namespace, entry.key]);
 const copy = (value) => JSON.parse(JSON.stringify(value));
+const encoder = new TextEncoder();
+// Match the default server limits without importing its Node-capable entry.
+const DEFAULT_REQUEST_BYTES = 32 * 1024 * 1024;
+const DEFAULT_STATE_BYTES = 5 * 1024 * 1024;
+const ENVELOPE_BYTES = JSON.stringify({ iv: 'x'.repeat(16), authTag: 'x'.repeat(24), encryptedData: '' }).length;
+const encryptedBodyBytes = (plainBytes) => ENVELOPE_BYTES + 4 * Math.ceil(plainBytes / 3);
 
 /** A successful HTTP request is not proof that every entry was written. Unknown
  * or incomplete receipts never authorize clearing a pending value.
@@ -53,10 +59,13 @@ export function classifyClientStateWrite(entries, response) {
  * Persistence commits before sending and before forgetting an accepted value.
  * Optional load/save adapters make the queue survive restart. Use one instance
  * per user/store; cross-tab coordination belongs to the storage adapter.
- * @param {{ send: (entries: StateSyncEntry[]) => Promise<Object>|Object, loadPending?: () => Promise<StateSyncEntry[]>|StateSyncEntry[], savePending?: (entries: StateSyncEntry[]) => Promise<void>|void }} options
+ * @param {{ send: (entries: StateSyncEntry[]) => Promise<Object>|Object, loadPending?: () => Promise<StateSyncEntry[]>|StateSyncEntry[], savePending?: (entries: StateSyncEntry[]) => Promise<void>|void, maxRequestBodyBytes?: number, maxStateValueBytes?: number }} options
  */
-export function createLatestStateSync({ send, loadPending, savePending } = {}) {
+export function createLatestStateSync({ send, loadPending, savePending, maxRequestBodyBytes = DEFAULT_REQUEST_BYTES, maxStateValueBytes = DEFAULT_STATE_BYTES } = {}) {
   if (typeof send !== 'function') throw new TypeError('createLatestStateSync requires send(entries)');
+  for (const limit of [maxRequestBodyBytes, maxStateValueBytes]) {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new TypeError('State sync byte limits must be positive integers');
+  }
   let pending = new Map();
   let revision = 0;
   let running = null;
@@ -75,6 +84,9 @@ export function createLatestStateSync({ send, loadPending, savePending } = {}) {
   const restored = Promise.resolve().then(async () => {
     for (const entry of normalize(loadPending ? await loadPending() : [])) pending.set(identity(entry), entry);
   });
+  // Observe immediately even if the host never calls an API. Keep the original
+  // rejected promise so every API still reports restoration failure.
+  void restored.catch(() => {});
   let stateQueue = restored;
 
   // Serialize storage mutations. Failed persistence leaves the previous durable
@@ -100,9 +112,30 @@ export function createLatestStateSync({ send, loadPending, savePending } = {}) {
     for (;;) {
       await stateQueue;
       processedRevision = revision;
-      const batch = [...pending.values()].filter((entry) => !attempted.has(entry)).slice(0, 200);
+      const batch = [];
+      let plainBytes = encoder.encode('{"entries":[]}').length;
+      for (const entry of pending.values()) {
+        if (attempted.has(entry)) continue;
+        const valueBytes = entry.value === null ? 0 : encoder.encode(entry.value).length;
+        const entryBytes = encoder.encode(JSON.stringify(entry)).length;
+        const singleBodyBytes = encryptedBodyBytes(encoder.encode('{"entries":[]}').length + entryBytes);
+        const rejection = valueBytes > maxStateValueBytes
+          ? { code: 'STATE_VALUE_TOO_LARGE', bytes: valueBytes, maxBytes: maxStateValueBytes }
+          : singleBodyBytes > maxRequestBodyBytes
+            ? { code: 'STATE_REQUEST_TOO_LARGE', bytes: singleBodyBytes, maxBytes: maxRequestBodyBytes }
+            : null;
+        if (rejection) {
+          attempted.add(entry);
+          outcomes.push({ entry, status: 'rejected', error: rejection });
+          continue;
+        }
+        const nextBytes = plainBytes + entryBytes + (batch.length ? 1 : 0);
+        if (batch.length >= 200 || encryptedBodyBytes(nextBytes) > maxRequestBodyBytes) break;
+        attempted.add(entry);
+        batch.push(entry);
+        plainBytes = nextBytes;
+      }
       if (!batch.length) break;
-      batch.forEach((entry) => attempted.add(entry));
       let response;
       try { response = await send(copy(batch)); }
       catch (error) { response = { success: false, error: { code: error?.code || 'STATE_SYNC_FAILED', message: error?.message || String(error) } }; }
@@ -117,7 +150,7 @@ export function createLatestStateSync({ send, loadPending, savePending } = {}) {
         });
       }
     }
-    return { outcomes, pending: copy([...pending.values()]), revision: processedRevision };
+    return { outcomes: copy(outcomes), pending: copy([...pending.values()]), revision: processedRevision };
   };
 
   /** @returns {Promise<StateSyncReport>} */
@@ -138,6 +171,19 @@ export function createLatestStateSync({ send, loadPending, savePending } = {}) {
       const normalized = normalize(entries);
       await commit((next) => { for (const entry of normalized) next.set(identity(entry), entry); });
       return flush();
+    },
+    /** Drop only still-matching snapshots from a previous report. Bare keys are
+     * insufficient: a newer value must survive a delayed conflict decision.
+     * @param {StateSyncEntry[]} entries @returns {Promise<StateSyncEntry[]>} */
+    async discard(entries) {
+      const snapshots = normalize(entries);
+      await commit((next) => {
+        for (const snapshot of snapshots) {
+          const id = identity(snapshot);
+          if (JSON.stringify(next.get(id)) === JSON.stringify(snapshot)) next.delete(id);
+        }
+      });
+      return copy([...pending.values()]);
     },
     /** One bounded retry of pending versions; call after reconnect/backoff. */
     flush,

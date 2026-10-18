@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { encryptPayload } from '../../server/src/server/lib/encryption.js';
 import * as sdk from '../src/index.js';
 
 const entry = (value, updatedAt = 100) => ({ namespace: 'tools', key: 'config', value, updatedAt });
@@ -96,4 +98,87 @@ test('failed pending restoration cannot silently replace unknown durable work wi
   await assert.rejects(sync.getPending(), /storage unavailable/);
   assert.equal(sends, 0);
   assert.equal(writes, 0);
+});
+
+
+test('discard removes only the reported snapshot and preserves later saves', async () => {
+  let durable = [];
+  const sync = sdk.createLatestStateSync({
+    savePending(entries) { durable = entries; },
+    send(entries) { return { success: true, data: { upserted: 0, skipped: entries.length, skippedEntries: entries } }; },
+  });
+  const first = await sync.enqueue([entry('first')]);
+  await sync.discard(first.outcomes.map(outcome => outcome.entry));
+  assert.deepEqual(await sync.getPending(), []);
+  assert.deepEqual(durable, []);
+  await sync.enqueue([entry('later', 101)]);
+  await sync.discard(first.outcomes.map(outcome => outcome.entry));
+  assert.deepEqual(await sync.getPending(), [entry('later', 101)]);
+  const sameStamp = await sync.enqueue([entry('same-stamp-old', 102)]);
+  await sync.enqueue([entry('same-stamp-new', 102)]);
+  await sync.discard(sameStamp.outcomes.map(outcome => outcome.entry));
+  assert.deepEqual(await sync.getPending(), [entry('same-stamp-new', 102)]);
+});
+
+test('state sync splits encrypted request bytes including JSON escaping and UTF-8', async () => {
+  const batches = [];
+  const sync = sdk.createLatestStateSync({
+    maxRequestBodyBytes: 600,
+    async send(entries) {
+      const envelope = await encryptPayload({ entries }, 'a'.repeat(64));
+      assert.ok(Buffer.byteLength(JSON.stringify(envelope)) <= 600, 'actual encrypted wire body must fit');
+      batches.push(entries);
+      return { success: true, data: { upserted: entries.length, skipped: 0 } };
+    },
+  });
+  const result = await sync.enqueue(Array.from({ length: 3 }, (_, i) => ({ ...entry('界"\n'.repeat(30)), key: String(i) })));
+  assert.equal(batches.length, 3);
+  assert.deepEqual(result.pending, []);
+});
+
+test('state sync rejects one oversized value without uploading or blocking valid peers', async () => {
+  const uploaded = [];
+  const sync = sdk.createLatestStateSync({ send(entries) {
+    uploaded.push(...entries.map(item => item.key));
+    return { success: true, data: { upserted: entries.length, skipped: 0 } };
+  } });
+  const large = { ...entry('x'.repeat(5 * 1024 * 1024 + 1)), key: 'large' };
+  const result = await sync.enqueue([large, entry('valid')]);
+  assert.deepEqual(uploaded, ['config']);
+  assert.equal(result.outcomes.find(item => item.entry.key === 'large').status, 'rejected');
+  assert.equal(result.outcomes.find(item => item.entry.key === 'large').error.code, 'STATE_VALUE_TOO_LARGE');
+  assert.deepEqual(result.pending.map(item => item.key), ['large']);
+  await sync.discard(result.outcomes.filter(item => item.status === 'rejected').map(item => item.entry));
+  assert.deepEqual(await sync.getPending(), []);
+});
+
+test('state sync isolates a single entry whose encrypted body cannot fit', async () => {
+  const uploaded = [];
+  const sync = sdk.createLatestStateSync({ maxRequestBodyBytes: 300, send(entries) {
+    uploaded.push(...entries.map(item => item.key));
+    return { success: true, data: { upserted: entries.length, skipped: 0 } };
+  } });
+  const result = await sync.enqueue([{ ...entry('x'.repeat(200)), key: 'large' }, entry('ok')]);
+  assert.deepEqual(uploaded, ['config']);
+  assert.equal(result.outcomes.find(item => item.entry.key === 'large').error.code, 'STATE_REQUEST_TOO_LARGE');
+});
+
+test('state sync keeps the 200-entry server batch limit while draining the remainder', async () => {
+  const sizes = [];
+  const sync = sdk.createLatestStateSync({ send(entries) {
+    sizes.push(entries.length);
+    return { success: true, data: { upserted: entries.length, skipped: 0 } };
+  } });
+  await sync.enqueue(Array.from({ length: 201 }, (_, i) => ({ ...entry('ok'), key: String(i) })));
+  assert.deepEqual(sizes, [200, 1]);
+});
+
+test('unattended loadPending failure does not become an unhandled rejection', () => {
+  const moduleUrl = new URL('../src/latest-state-sync.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', '--input-type=module', '-e', `
+    import { createLatestStateSync } from ${JSON.stringify(moduleUrl)};
+    createLatestStateSync({ send() {}, loadPending() { throw new Error('unavailable'); } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+  `], { encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
 });
