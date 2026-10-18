@@ -10,7 +10,7 @@
 | [`@rei-standard/amsg-sw`](./sw/README.md) | Service Worker：推送展示、离线队列、delivery dedupe |
 | [`@rei-standard/amsg-instant`](./instant/README.md) | 无数据库的一次性即时推送 handler（维护态） |
 
-各包当前版本以其 `package.json` / npm 为准（仓库处于 changesets pre 模式时，`next` dist-tag 为最新预发布）。
+各包当前版本以其 `package.json` / npm 为准；预发布版会发到 `next` dist-tag，流程见 [`RELEASING.md`](../../RELEASING.md)。
 
 ## 新接入怎么走
 

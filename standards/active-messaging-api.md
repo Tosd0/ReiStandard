@@ -1,12 +1,12 @@
-# 主动消息 API 技术规范（v2.4）
+# 主动消息 API 技术规范（v3.0）
 
 > 状态：当前生效（Active）
 >
-> 版本日期：2026-05-19
+> 版本日期：2026-10-19
 >
 > 对齐实现：`@rei-standard/amsg-shared` / `amsg-server` / `amsg-instant` / `amsg-client` / `amsg-sw` 五个 npm 包（各包当前版本以其 `package.json` / npm 为准）。
 >
-> 本轮是一次跨包协调的 minor 升级：push wire shape 统一到 `@rei-standard/amsg-shared` 的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器），同时移除旧的 `{ type: 'error', code: '...' }` 错误信封。上层包对 `@rei-standard/amsg-shared` 用脱字号区间（具体区间以各包 `package.json` 为准）：在 0.x 上只放行同一 minor 内的补丁，shared 出补丁时消费者自动跟随，shared 升 minor 则需消费者显式升级区间。
+> 所有推送载荷统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合（以 `messageKind` 为字面量类型判别器）。上层包对 `@rei-standard/amsg-shared` 使用脱字号区间（具体区间以各包 `package.json` 为准）：在 0.x 上只放行同一 minor 内的补丁，shared 出补丁时消费者自动跟随，shared 升 minor 则需消费者显式升级区间。
 
 ## 1. 目标与范围
 
@@ -51,6 +51,12 @@
 - `splitPattern` 自定义分句正则，见 §6.1。`amsg-server` 2.3.0+ 继续支持；`amsg-instant` 0.6.0 ~ 0.7.x 曾支持，0.8.0 起移除公共旋钮，改为 hook 内自定义 split 函数 + `pushPayloads`。
 - `avatarUrl` 软清空策略（不合法值仅 `console.warn` 并置空，不再 400 整个任务），见 §6.2。`amsg-server` 2.3.3+ / 2.4.0+、`amsg-instant` 0.7.1+ / 0.8.0+、`amsg-client` 2.2.4+ / 2.3.0+ 实装；2.3.1 ~ 2.3.2 / 0.6.1 ~ 0.7.0 / 2.2.3 走老版"严格 400"。
 - **三轴 push schema 统一**（`messageKind` 判别联合 + 自动 `ReasoningPush`），见 §6.3 / §6.4。`@rei-standard/amsg-shared` 0.1.0、`amsg-server` 2.4.0、`amsg-instant` 0.8.0、`amsg-sw` 2.1.0、`amsg-client` 2.3.0 协同实装。旧 `{ type: 'error', code: '...' }` 错误信封同步移除。
+
+**v3.0 核心变更与增量**：
+
+- **推送订阅改为用户级登记（破坏性，`amsg-server` 3.0.0 · `amsg-client` 2.9.0）**：订阅按用户存进 `push_subscriptions` 表（`PUT / GET / DELETE /api/v1/push-subscription`）。`POST /api/v1/schedule-message` 与 `PUT /api/v1/update-message` 不再接受请求体里的 `pushSubscription`（返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）；排程时该用户尚未登记订阅返回 `409 PUSH_SUBSCRIPTION_MISSING`。存量老任务投递时若查不到用户级订阅，回退读取老任务 payload 内嵌的订阅。
+- **第五种 `messageKind: 'result'`（`ResultPush`）**：`@rei-standard/amsg-shared` 0.4.0、`amsg-server` 3.0.0、`amsg-sw` 2.4.0 支持宿主自定义结果推送（如 Fire 时刻 hook 的 `ctx.emitResult()`）。
+- **单用户部署线、服务端收件箱（`/outbox`）、客户端状态镜像（`/client-state`）、用户级 LLM 凭据（`/llm-credentials`）、单条任务查询（`GET /message`）、云端数据管理（`/cloud-data/*`）**：`amsg-server` 3.0.0、`amsg-client` 2.9.0 实装。
 
 ## 3. 角色与职责
 
@@ -150,10 +156,15 @@ export const config = {
 
 ### 5.5 失败响应
 
-无 token、token 过期、签名错误、token 类型不匹配，均返回：
+多租户线无 token、token 过期、签名错误、token 类型不匹配，均返回：
 
 - HTTP `401`
 - `error.code = INVALID_TENANT_AUTH`
+
+单用户线配置了共享密钥（`serverToken`）时，`X-Client-Token` 缺失或不匹配返回：
+
+- HTTP `401`
+- `error.code = INVALID_CLIENT_TOKEN`
 
 ## 6. API 端点清单
 
@@ -161,6 +172,8 @@ export const config = {
 |---|---|---|---|
 | `POST` | `/api/v1/init-tenant` | 一体化初始化租户 | `X-Init-Secret`（可选） |
 | `GET` | `/api/v1/get-user-key` | 派生用户密钥 | `tenantToken` |
+| `PUT` / `GET` / `DELETE` | `/api/v1/push-subscription` | 用户级 Web Push 订阅读写删（排程前必先登记） | `tenantToken` |
+| `PUT` / `GET` / `DELETE` | `/api/v1/llm-credentials` | 用户级 LLM 凭据读写删（排程 payload 用 `credRefs` 引用） | `tenantToken` |
 | `POST` | `/api/v1/schedule-message` | 创建任务/即时消息 | `tenantToken` |
 | `PUT` | `/api/v1/update-message?id={uuid}` | 更新任务 | `tenantToken` |
 | `DELETE` | `/api/v1/cancel-message?id={uuid}` | 取消任务 | `tenantToken` |
@@ -169,29 +182,37 @@ export const config = {
 | `POST` | `/api/v1/send-notifications` | cron 触发发送 | `cronToken` |
 | `POST` | `/api/v1/send-notifications-scheduled` | 每分钟聚合调度（推荐，可选） | 平台内部调度调用 |
 
-`/messages` 是列表、`/message` 是单条：列表的每条任务只投影 `metadata` 里的 `charId` / `clientTaskId`，单条则给出完整的 `metadata`。`update-message` 对 `metadata` 是整体替换，所以「只改其中一个子字段」要先用单条查询把完整的那份读回来。单条查询只返回还没发出去的任务（`pending`），已结束的返回 `409 TASK_ALREADY_COMPLETED`，与 `update-message` 同一口径。
+`/messages` 是列表、`/message` 是单条：列表的每条任务只投影 `metadata` 里的 `charId` / `clientTaskId`，单条则给出完整的 `metadata`。`update-message` 对 `metadata` 是整体替换，所以「只改其中一个子字段」要先用单条查询把完整的那份读回来。单条查询只返回还没发出去的任务（`pending`），已结束的返回 `409 TASK_ALREADY_COMPLETED`（`details.lastError` 附上次失败摘要），与 `update-message` 同一口径。
 
-上表的 `tenantToken` / `cronToken` 是多租户线的鉴权（§5）。**单用户线**（§1.1）同样提供上表里两个 `send-notifications*` 之外的端点（它的定时投递不走 HTTP，由平台周期调度直接触发运行时的定时入口），鉴权换成可选的共享密钥；并且另有这几组：
+上表的 `tenantToken` / `cronToken` 是多租户线的鉴权（§5）。**单用户线**（§1.1）同样提供上表里两个 `send-notifications*` 之外的全部端点（它的定时投递不走 HTTP，由平台周期调度直接触发运行时的定时入口），鉴权换成可选的 `X-Client-Token` 共享密钥；并且额外提供以下端点：
 
 | 方法 | 路径 | 描述 |
 |---|---|---|
 | `GET` | `/api/v1/outbox` | 拉这个用户还没 ack 的服务端消息（§6.7） |
 | `POST` | `/api/v1/outbox/ack` | 销账（§6.7） |
-| `PUT` / `GET` / `DELETE` | `/api/v1/push-subscription` | 用户级 Web Push 订阅：任务行不携带订阅，到点投递时读这一份 |
+| `DELETE` | `/api/v1/outbox` | 主动删除收件箱行（`{ messageIds }` 或 `{ all: true }`） |
 | `GET` | `/api/v1/vapid-public-key` | 本部署的 VAPID 公钥，前端建订阅时作 `applicationServerKey` |
-| `PUT` / `GET` / `DELETE` | `/api/v1/client-state` | 客户端状态的云端镜像，供 fire 时刻的 hooks 读 |
-| `PUT` / `GET` / `DELETE` | `/api/v1/llm-credentials` | 用户级 LLM 凭据，排程 payload 用 `credRefs` 引用 |
+| `PUT` / `GET` / `DELETE` | `/api/v1/client-state` | 客户端状态的云端镜像（`GET` / `DELETE` 支持 `?namespace=<ns>`） |
+| `GET` | `/api/v1/client-state/namespaces` | 列出云端已有的 `client_state` 命名空间及条目数、字节数 |
+| `GET` / `POST` | `/api/v1/cloud-data/*` | 云端数据盘点、清理预览与持久清理任务、owner 退役与恢复 |
 | `GET` | `/api/v1/capabilities` | `{ serverVersion, features }`，给前端做特性探测 |
 
-字段与错误码见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)；接入顺序见 §10.1。
+字段与错误码见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md) 及 [`docs/cloud-data-management.md`](../docs/cloud-data-management.md)；接入顺序见 §10.1。
 
-上表是 `@rei-standard/amsg-server` 的端点。`@rei-standard/amsg-instant` 是另一套无状态 worker，自带 `/instant`（一次性即时推送）与 `/continue`（agentic-loop 工具回执续跑，仅当 handler 配了 `onLLMOutput` 时可用）两个端点，鉴权用可选的 client token，详见 [`amsg-instant` README](../packages/rei-standard-amsg/instant/README.md)。本规范正文提到 `/continue` 时即指这里。
+上表是 `@rei-standard/amsg-server` 的端点。`@rei-standard/amsg-instant` 是另一套无状态 worker，自带 `POST /instant`（一次性即时推送）、`POST /continue`（agentic-loop 工具回执续跑，仅当 handler 配了 `onLLMOutput` 时可用）与 `GET /blob/:key`（配置了 `blobStore` 时读取超限 payload）三个端点，鉴权用可选的 client token 或 Bearer JWT，详见 [`amsg-instant` README](../packages/rei-standard-amsg/instant/README.md)。本规范正文提到 `/continue` 时即指这里。
 
-### 6.1 AI 消息字段约束
+### 6.1 AI 消息与排程字段约束
 
-当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束适用于 `schedule-message`、`update-message`、`amsg-instant` handler；其中 `splitPattern` 仅适用于 `amsg-server` 的调度任务，`amsg-instant` 0.8.0 的替代方式见本节末尾。
+当消息使用 AI（`messageType=prompted/auto`，或 `instant` 提供完整 AI 配置）时，下述字段约束适用于 `schedule-message`、`update-message`、`amsg-instant` handler；其中 `credRefs`、`splitPattern`、`immediate`、`supersedesUuid`、`tzId` 仅适用于 `amsg-server`。
 
-**`apiUrl`（必填，字符串）** — 聊天端点 URL。必须能 `new URL(...)` 解析，否则抛错（缺失 / 空串 / 非法 URL）。实现方按下表对 OpenAI 风格路径做**幂等**补全（跑两次 = 跑一次，传完整 URL 不会被改坏），先去首尾空白、去路径尾部多余 `/`，再按路径形态决定：
+**LLM 凭据：内联三件套 vs `credRefs`（互斥二选一）**
+
+- 在 `amsg-server` 上，AI 任务的聊天凭据可以通过两种方式之一提供：
+  1. **内联**：请求体直接提供 `apiUrl`、`apiKey`、`primaryModel`。
+  2. **引用（`credRefs`）**：先通过 `PUT /api/v1/llm-credentials` 登记凭据，排程或更新时传 `credRefs: { chat: '<credId>' }`（服务端在排程/更新时校验全部 `credId` 已存在，否则返回 `409 CREDENTIAL_NOT_FOUND`；同一请求同时传 `credRefs.chat` 与内联三件套返回 `400 INVALID_PARAMETERS`；已使用 `credRefs.chat` 的任务若在 `update-message` 单独改内联三件套返回 `409 TASK_USES_CRED_REFS`）。
+- 在无状态的 `amsg-instant` 上，始终使用内联 `apiUrl`、`apiKey`、`primaryModel`。
+
+**`apiUrl`（内联模式下必填，字符串）** — 聊天端点 URL。必须能 `new URL(...)` 解析，否则抛错（缺失 / 空串 / 非法 URL）。实现方按下表对 OpenAI 风格路径做**幂等**补全（跑两次 = 跑一次，传完整 URL 不会被改坏），先去首尾空白、去路径尾部多余 `/`，再按路径形态决定：
 
 | 输入路径形态 | 处理 |
 |---|---|
@@ -212,6 +233,16 @@ query string 原样保留。要绕开补全（代理路径很特殊时），直�
 **`temperature`（可选数字）** — 透传给 LLM。`completePrompt` 路径未传时默认 `0.8`（保留旧行为）；`messages` 路径未传时不发，由上游主路径决定。
 
 **`maxTokens`（可选正整数）** — 映射到上游 `max_tokens`；不传则不指定。
+
+**`llmExtraBody`（可选普通对象，`Record<string, unknown> | null`）** — 透传到上游 LLM 请求体的额外参数（展开在 `model` / `messages` / `temperature` / `max_tokens` / `tools` 之前，不覆盖核心字段）。`update-message` 传 `null` 可重置为空。
+
+**`amsg-server` 排程与更新专用字段**：
+
+- **`pushSubscription`（禁止在任务内传入）**：`POST /schedule-message` 与 `PUT /update-message` 传入 `pushSubscription` 字段一律返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`。订阅统一通过 `PUT /api/v1/push-subscription` 按用户登记。
+- **`immediate`（仅 `schedule-message` 非 `instant` 任务，可选布尔值）**：传 `true` 时不要求 `firstSendTime` 在未来，任务 `next_send_at` 直接设为当前时刻，由下一跳 cron 立即触发。
+- **`supersedesUuid`（仅 `schedule-message`，可选非空字符串）**：在同一用户名下创建新任务时原子取消（删除）指定 UUID 的旧任务，并撤掉旧任务尚未投递的收件箱分段。
+- **`tzId`（`schedule-message` / `update-message`，可选 IANA 时区字符串或 `null`）**：`daily` / `weekly` 循环任务按该时区的墙钟时间推进（`update-message` 传 `null` 改回按 UTC 推进）。
+- **任务正文大小上限**：单条任务 payload 明文 UTF-8 字节上限为 `MAX_TASK_PAYLOAD_BYTES = 995871` 字节，超限返回 `400 TASK_PAYLOAD_TOO_LARGE`。
 
 **`splitPattern`（仅 `amsg-server` 调度任务，可选，`string | string[] | null`）** — 自定义 LLM 返回文本的分句正则；默认 `/([。！？!?]+)/`。
 
@@ -296,27 +327,27 @@ createInstantHandler({
 - `amsg-instant` → `400 INVALID_PAYLOAD_FORMAT`
 - `amsg-client` 本地预校验抛 `Error` 的 `.code === 'INVALID_AVATAR_URL_LOCAL'`（2.2.4+ 已移除，改为本地 `console.warn` + 置空）。
 
-预校验工具：`validateAvatarUrl(value)`（`amsg-server` 与 `amsg-instant` 同步导出）—— 返回错误描述字符串或 `null`，**纯函数**，不副作用；上层调用方按软清空策略处理。
+预校验工具：`validateAvatarUrl(value)`（`@rei-standard/amsg-shared`、`amsg-server` 与 `amsg-instant` 同步导出）—— 返回错误描述字符串或 `null`，**纯函数**，不产生副作用；上层调用方按软清空策略处理。
 
 ### 6.3 推送 wire shape：`AmsgPush` 判别联合
 
-自 v2.4 起，所有 amsg 包推出的 Web Push payload 统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合。每条推送由三个互不影响的维度描述：
+所有 amsg 包推出的 Web Push payload 统一遵循 `@rei-standard/amsg-shared` 定义的 `AmsgPush` 判别联合。每条推送由三个互不影响的维度描述：
 
 | 轴 | 字段 | 取值 | 由谁定 |
 |---|---|---|---|
 | Dispatch | `messageType` | `instant` / `fixed` / `prompted` / `auto` | 包（固定枚举） |
 | Business | `messageSubtype` | 任意字符串 | 调用方（自由命名） |
-| Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` | 包（固定枚举） |
+| Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` / `result` | 包（固定枚举） |
 
 外加 `source: 'instant' | 'scheduled'` —— 路由来源（`amsg-instant` 输出恒为 `'instant'`；`amsg-server` 按 `messageType` 推导：`instant` 配 `'instant'`，其余配 `'scheduled'`）。`messageType: 'instant'` 必配 `source: 'instant'`；其余三种 `messageType` 必配 `source: 'scheduled'`。
 
-`messageKind` 是**字面量类型判别器**：TS 端 `switch (push.messageKind)` 即可窄化到具体子类型；JS 端用 `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` 守卫函数。
+`messageKind` 是**字面量类型判别器**：TS 端 `switch (push.messageKind)` 即可窄化到具体子类型；JS 端用 `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` / `isResultPush` 守卫函数。
 
 #### 6.3.1 所有 push 共有字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `messageKind` | `'content' \| 'reasoning' \| 'tool_request' \| 'error'` | 判别器 |
+| `messageKind` | `'content' \| 'reasoning' \| 'tool_request' \| 'error' \| 'result'` | 判别器 |
 | `messageType` | `'instant' \| 'fixed' \| 'prompted' \| 'auto'` | Dispatch 轴 |
 | `source` | `'instant' \| 'scheduled'` | 路由来源 |
 | `messageId` | `string` | 每条推送唯一，格式由 producer 自定 |
@@ -324,6 +355,11 @@ createInstantHandler({
 | `timestamp` | `string` (ISO 8601) | producer 端时钟 |
 | `messageSubtype` | `string?` | 业务命名空间，producer 默认填 `'chat'` |
 | `metadata` | `object?` | **调用方透传**；包不得写入此字段 |
+| `notification` | `NotificationDirective?` | 可选通知显示与静音指令（`show` / `silent` / `title` / `body` / `tag` 等） |
+| `taskId` | `number \| string \| null?` | 调度任务行 ID（仅 server 路径） |
+| `taskUuid` | `string \| null?` | 调度任务 UUID（仅 server 路径） |
+| `recurrenceType` | `'none' \| 'daily' \| 'weekly'?` | 任务周期类型（仅 server 路径） |
+| `occurrenceMs` | `number \| null?` | 本次触发的名义时刻 epoch 毫秒（仅 server 路径） |
 
 #### 6.3.2 `ContentPush`（`messageKind: 'content'`）
 
@@ -337,11 +373,10 @@ createInstantHandler({
 | `title` | `string?` | 通知标题 |
 | `contactName` | `string?` | 发送者显示名 |
 | `avatarUrl` | `string \| null?` | 仅 `https:`，`data:` 入口拦截 |
-| `taskId` | `string \| null?` | 调度任务 ID（仅 server 路径） |
 
 #### 6.3.3 `ReasoningPush`（`messageKind: 'reasoning'`）
 
-LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
+LLM 思考过程，从 `choices[0].message.reasoning_content`（或 `<think>` / `<thinking>` / `<thought>` 标签）提取而来。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -349,8 +384,12 @@ LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
 | `title` | `string?` | |
 | `contactName` | `string?` | |
 | `avatarUrl` | `string \| null?` | |
+| `messageIndex` | `number?` | 单条省略 |
+| `totalMessages` | `number?` | 单条省略 |
+| `chunkIndex` | `number?` | 单条省略 |
+| `totalChunks` | `number?` | 单条省略 |
 
-**不带** `messageIndex` / `totalMessages` —— 推理是一轮 LLM 一条，不是分句 burst。这两个字段在类型上故意缺席。
+当前 producer 每轮 LLM 只产一条 `ReasoningPush`，上面四个分段字段在单条时省略；超长推理走通用 `_multipart` 分片传输。
 
 #### 6.3.4 `ToolRequestPush`（`messageKind: 'tool_request'`）
 
@@ -374,25 +413,38 @@ LLM 思考过程，从 `choices[0].message.reasoning_content` 提升而来。
 | `code` | `string` | producer 定义的稳定码，例如 `HOOK_THREW` / `LOOP_EXCEEDED` |
 | `message` | `string` | 人类可读描述 |
 | `iteration` | `number?` | agentic-loop 迭代序号（如适用） |
+| `llmStatus` | `number?` | 上游 LLM 返回的 HTTP 状态码（如适用） |
+| `providerCode` | `string?` | 上游 provider 错误码（如适用） |
 
-**v2.4 移除：旧的 `{ type: 'error', code: '...' }` 错误信封**（0.7.x `amsg-instant` 用于 `HOOK_THREW` / `LOOP_EXCEEDED`）已删除。错误推送统一走 `ErrorPush` 形状，顶层不再有 `type: 'error'` 字段——不要在新代码里找这个字段。
+错误推送统一走 `ErrorPush` 形状，顶层没有 `type: 'error'` 字段。
+
+#### 6.3.6 `ResultPush`（`messageKind: 'result'`）
+
+宿主自定义的一条非聊天结果（如 `amsg-server` Fire hook 的 `ctx.emitResult()` 产出）。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `resultKind` | `string` | 宿主给该类结果定义的类型名，客户端按它分流 |
+| `title` | `string?` | 通知标题兜底（`notification.title` 优先） |
+| `body` | `string?` | 通知正文兜底（`notification.body` 优先） |
+| `data` | `object?` | 可选结构化结果载荷（顶层任意宿主自定义字段也原样保留） |
 
 完整字段表、builders、类型守卫与常量见 [`../packages/rei-standard-amsg/shared/README.md`](../packages/rei-standard-amsg/shared/README.md)。
 
 ### 6.4 `ReasoningPush` 自动产出不变量
 
-LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回 `choices[0].message.reasoning_content` 非空时，必须**先**产出一条独立的 `ReasoningPush`，**再**产出后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端靠 `sessionId` 把"思考中"UI 拼到真正回复上。
+LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回非空思考内容时，必须**先**产出一条独立的 `ReasoningPush`，**再**产出后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端靠 `sessionId` 把"思考中"UI 拼到真正回复上。
 
 这里说的是**产出顺序**，不是到达顺序。`ReasoningPush` 默认不弹通知，因此有服务端收件箱的实现只把它落进收件箱、不发推送（见 §6.7）——那条线上客户端先由推送拿到正文，再由 `GET /outbox?since=` 补到思考过程。所以客户端不能拿"思考过程先到"当前提去切 UI，要靠 `sessionId` 关联，什么时候补到就什么时候补上去。
 
 具体规则：
 
-1. **触发条件**：`choices[0].message.reasoning_content` 是非空字符串。空串、`null`、`undefined` 均不触发。
+1. **触发条件**：`choices[0].message.reasoning_content` 是非空字符串，或 `choices[0].message.content` 中含 `<think>...</think>` / `<thinking>...</thinking>` / `<thought>...</thought>` 块（此时标签内容提取为 `ReasoningPush`，并从后续 `ContentPush` 正文中剥离）。
 2. **顺序**：`ReasoningPush` 必须先于该 LLM 轮的任何 `ContentPush` 产出，落收件箱时也排在前面。
 3. **`sessionId` 共享**：
    - 同一 LLM 轮：`ReasoningPush` + 该轮所有 `ContentPush` 共用一个 `sessionId`。
    - Agentic loop：同一 `/instant` 请求的所有 iteration 共用一个 `sessionId`（不是每轮重新 mint）。
-   - `amsg-server` 端：调度行用 `sess_task_<task.id>`（跨重试稳定）；无 task id 时 mint `sess_<uuid>`。
+   - `amsg-server` 端：调度行用 `sess_task_<task.id>@<occurrenceMs>`（同一次触发跨重试稳定，不同触发周期互不冲突）；无 task id 时 mint `sess_<uuid>`。
 4. **钩子路径 opt-out**：`amsg-instant` 的 `createInstantHandler({ autoEmitReasoning: false })` 让钩子作者拿回完整控制权——此时框架不发自动 ReasoningPush，钩子自行读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush(...)` 自建。legacy（非钩子）路径**始终**自动发，无 opt-out。
 5. **非 LLM 路径不触发**：`fixed` 任务与 `userMessage` 显式路径不产 LLM 响应，自然不发 ReasoningPush。
 6. **`messageIndex` / `totalMessages` 不带**：ReasoningPush 不参与分句 burst 计数；server 端的 `messagesSent` 也只数 ContentPush。
@@ -467,8 +519,10 @@ Body:
 
 ### 7.2 成功响应
 
-- 新建成功：HTTP `201`
-- 幂等命中已有租户：HTTP `200`
+- 多租户线新建成功：HTTP `201`（若指定 `tenantId` 已存在则返回 HTTP `409 TENANT_ALREADY_INITIALIZED`）
+- 单用户线幂等建表成功：HTTP `200`（返回 `{ success: true, data: { tenantId: 'single', schema } }`）
+
+多租户线 HTTP `201` 响应体：
 
 ```json
 {
@@ -517,9 +571,9 @@ Body:
 - `tenantId` 与 `cronToken` 必须同源（同一次租户初始化签发），避免索引错配。
 - `send-notifications-scheduled` 读取索引后，应按 `tenantId` 循环触发后台发送，并记录失败租户用于重试。
 
-### 8.3 数据库（业务任务）
+### 8.3 数据库（业务数据）
 
-数据库仅存业务任务表（如 `scheduled_messages`）。
+多租户数据库存业务任务表 `scheduled_messages`、用户级推送订阅表 `push_subscriptions` 与用户级 LLM 凭据表 `llm_credentials`（单用户 D1 另含 `message_outbox`、`client_state` 与 `cloud_data_*` 表）。
 
 - 不再保存 `system_config`。
 - 不再在数据库持久化 masterKey。
@@ -533,38 +587,56 @@ Body:
 |---|---|---|
 | 400 | `INVALID_JSON` | 请求体不是有效 JSON |
 | 400 | `INVALID_REQUEST_BODY` | 请求体不是 JSON 对象 |
+| 400 | `INVALID_CONTENT_ENCODING` | 声明了 `Content-Encoding: gzip` 但压缩数据损坏（仅单用户线） |
 | 400 | `INVALID_ENCRYPTED_PAYLOAD` | 加密信封格式错误（缺 `iv` / `authTag` / `encryptedData`） |
 | 400 | `ENCRYPTION_REQUIRED` | 未按规范提交加密请求体 |
 | 400 | `UNSUPPORTED_ENCRYPTION_VERSION` | 不支持的加密版本 |
-| 400 | `DECRYPTION_FAILED` | 请求体解密失败（`schedule-message` / `update-message`） |
+| 400 | `DECRYPTION_FAILED` | 请求体解密失败 |
 | 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法（`init-tenant` / `schedule-message` / `messages` 查询参数） |
+| 400 | `INVALID_MESSAGE_TYPE` | `schedule-message` 的 `messageType` 不在允许集合内 |
+| 400 | `INVALID_TIMESTAMP` | `firstSendTime` 格式非法或未满足未来时间要求 |
+| 400 | `PUSH_SUBSCRIPTION_NOT_ACCEPTED` | `schedule-message` 或 `update-message` 请求体携带了已废弃的 `pushSubscription` 字段 |
+| 400 | `TASK_PAYLOAD_TOO_LARGE` | 任务 payload 超过 `MAX_TASK_PAYLOAD_BYTES`（995,871 字节） |
 | 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
-| 400 | `INVALID_PAYLOAD_FORMAT` | 解密后数据非 JSON 对象；或 `amsg-instant` payload 格式非法（含 §6.1 / §6.2 校验） |
+| 400 | `INVALID_PAYLOAD_FORMAT` | 解密后数据非 JSON 对象；或 `amsg-instant` payload 格式非法 |
+| 400 | `INVALID_PUSH_SUBSCRIPTION` | `PUT /push-subscription` 的 `subscription` 缺少非空 `endpoint` |
+| 400 | `INVALID_UPDATED_AT` | `PUT /push-subscription` 的 `updatedAt` 不是正整数毫秒时间戳 |
+| 400 | `LLM_CREDENTIALS_LIMIT_EXCEEDED` | 单用户登记的 LLM 凭据超过上限（500 条） |
+| 400 | `INVALID_OUTBOX_CURSOR` / `INVALID_OUTBOX_LIMIT` / `INVALID_OUTBOX_ACK` / `TOO_MANY_OUTBOX_ACK_IDS` / `INVALID_OUTBOX_DELETE` / `TOO_MANY_OUTBOX_DELETE_IDS` | `/outbox` 与 `/outbox/ack` 参数校验失败 |
+| 400 | `INVALID_STATE_ENTRIES` / `TOO_MANY_STATE_ENTRIES` / `NAMESPACE_REQUIRED` / `INVALID_STATE_NAMESPACE` / `INVALID_NAMESPACE_LIMIT` | `/client-state` 与 `/client-state/namespaces` 参数校验失败 |
 | 400 | `INVALID_DRIVER` | 不支持的数据库驱动 |
 | 400 | `INVALID_DATABASE_URL` | `databaseUrl` 缺失或为空 |
 | 400 | `INVALID_TENANT_ID` | `init-tenant` 传入的 `tenantId` 非 UUID v4 |
 | 400 | `INVALID_USER_ID_FORMAT` | `X-User-Id` 非 UUID v4 |
 | 400 | `USER_ID_REQUIRED` | 缺少 `X-User-Id` 请求头 |
-| 400 | `TASK_ID_REQUIRED` | 缺少任务 id（`cancel-message` / `update-message` 的 `?id=`） |
+| 400 | `TASK_ID_REQUIRED` | 缺少任务 id（`cancel-message` / `update-message` / `message` 的 `?id=`） |
 | 401 | `INVALID_INIT_AUTH` | 初始化鉴权失败（仅当服务端启用 `INIT_SECRET` 时） |
 | 401 | `INVALID_TENANT_AUTH` | 租户 token 无效、过期、类型不匹配或缺失 |
+| 401 | `INVALID_CLIENT_TOKEN` | 单用户线 `X-Client-Token` 缺失或不匹配 |
 | 404 | `TASK_NOT_FOUND` | 任务不存在 |
+| 409 | `PUSH_SUBSCRIPTION_MISSING` | 该用户尚未通过 `PUT /push-subscription` 登记推送订阅 |
+| 409 | `CREDENTIAL_NOT_FOUND` | `credRefs` 引用的 `credId` 尚未在 `/llm-credentials` 登记 |
+| 409 | `TASK_USES_CRED_REFS` | 任务已使用 `credRefs.chat`，不能通过 `update-message` 单独改内联三件套 |
+| 409 | `TASK_IN_FLIGHT` | 任务正由一次投递持有租约，暂不可修改 `nextSendAt` |
 | 409 | `TASK_UUID_CONFLICT` | 创建任务时 UUID 冲突 |
-| 409 | `TASK_ALREADY_COMPLETED` | 任务已结束，不可更新 |
+| 409 | `TASK_ALREADY_COMPLETED` | 任务已结束，不可更新或按 pending 详情读取 |
 | 409 | `UPDATE_CONFLICT` | 任务更新失败（可能已被并发修改或删除） |
 | 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化 |
+| 413 | `REQUEST_BODY_TOO_LARGE` | `Content-Encoding: gzip` 解压后超过 `maxRequestBodyBytes`（默认 32 MB，仅单用户线） |
+| 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding`（仅单用户线） |
+| 500 | `INIT_FAILED` | 单用户 `init-tenant` 建表失败 |
 | 500 | `TASK_CREATE_FAILED` | 创建任务失败 |
 | 500 | `MESSAGE_SEND_FAILED` | in-server instant 同步发送失败（§6.5）；底层错误见 `error.details` |
 | 500 | `VAPID_CONFIG_ERROR` | VAPID 配置不完整 |
+| 501 | `PUSH_SUBSCRIPTION_NOT_SUPPORTED` / `LLM_CREDENTIALS_NOT_SUPPORTED` / `LLM_CREDENTIALS_PREFIX_DELETE_NOT_SUPPORTED` / `OUTBOX_NOT_SUPPORTED` / `OUTBOX_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACE_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACES_NOT_SUPPORTED` / `CLOUD_DATA_NOT_SUPPORTED` | 当前数据库适配器未实现对应能力 |
+| 503 | `VAPID_NOT_CONFIGURED` | `GET /vapid-public-key` 时服务端未配置 VAPID 公钥 |
+| 503 | `PUSH_SUBSCRIPTION_LOOKUP_FAILED` / `LLM_CREDENTIALS_LOOKUP_FAILED` | 排程或读取时查询订阅表 / 凭据表失败 |
 
-未被上述分类捕获的内部异常不包成统一信封，直接抛给平台适配器（由运行时返回 5xx）。
+未被上述分类捕获的内部异常在单用户 Worker 上返回 `500 INTERNAL_ERROR`（附脱敏 `error.cause`），在多租户处理器上直接抛给平台适配器返回 5xx。
 
 ### 9.1 处理阶段错误码（嵌套，非顶层）
 
-消息处理过程（取任务、调 LLM、发推送、清理）产生的错误码不作为顶层 `error.code`，而是出现在两处：
-
-- **in-server instant 路径（§6.5）**：包在 `MESSAGE_SEND_FAILED` 的 `error.details` 里。
-- **cron `send-notifications` 路径**：HTTP 仍 `200`（除非 VAPID 缺失 → `500 VAPID_CONFIG_ERROR`），逐任务汇总进 `data.details.failedTasks[].reason`。
+in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段）：
 
 | code | 含义 |
 |---|---|
@@ -593,7 +665,7 @@ Body:
 
 ### 10.2 多租户线：管理员一次性流程
 
-1. 部署服务。
+1. 部署服务并映射 `createReiServer` 返回的全部路由处理器（含 `/api/v1/push-subscription` 等）。
 2. 配置环境变量（见第 3.1 节）。
 3. 提供租户初始化入口（页面或 API 文档）。
 
@@ -608,8 +680,9 @@ Body:
 
 ### 10.4 多租户线：日常调用流程
 
-1. 前端调用业务端点时自动携带 `tenantToken`。
-2. 调度触发可单轨或双轨：
+1. 前端调用业务端点时携带 `Authorization: Bearer <tenantToken>` 与 `X-User-Id`。
+2. 前端在创建或更新 Web Push 订阅后，先调用 `PUT /api/v1/push-subscription` 登记用户级订阅，再调用 `POST /api/v1/schedule-message` 排程（请求体不带 `pushSubscription`）。
+3. 调度触发可单轨或双轨：
    - 兼容模式：外部 cron 周期调用 `send-notifications`。
    - 推荐模式：Netlify Scheduled Function 每分钟调用 `send-notifications-scheduled`，后者循环触发后台发送。
    - 双轨兼容：两条路径同时保留，按第 5.4 节做互斥/幂等。

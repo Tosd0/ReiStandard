@@ -5,8 +5,8 @@
 
 ## 版本信息
 
-- **版本号**: v2.3.1
-- **最后更新**: 2026-06-28
+- **版本号**: v2.4.0
+- **最后更新**: 2026-10-19
 - **状态**: Stable
 - **关联标准**: [主动消息API端点标准](./active-messaging-api.md)
 
@@ -376,12 +376,12 @@ self.addEventListener('push', event => {
     const shouldShow =
       showPolicy === 'always' ||
       (showPolicy === 'when-hidden' && !hasVisibleClient) ||
-      (showPolicy === 'auto' && kind === 'content');
+      (showPolicy === 'auto' && (kind === 'content' || kind === 'result'));
 
     if (!shouldShow || showPolicy === false) return;
 
     // 构建通知选项
-    const options = buildNotificationOptions(notificationData);
+    const options = buildNotificationOptions(notificationData, hasVisibleClient);
 
     // 如果需要显示通知，则调用 showNotification
     try {
@@ -394,11 +394,15 @@ self.addEventListener('push', event => {
 });
 
 // 辅助函数：构建通知选项
-function buildNotificationOptions(data) {
+function buildNotificationOptions(data, hasVisibleClient = false) {
   const notif = data.notification || {};
+  const silent =
+    notif.silent === 'when-visible'
+      ? hasVisibleClient
+      : Boolean(notif.silent ?? data.silent ?? false);
   return {
     title: notif.title || data.title || `来自 ${data.contactName}`,
-    body: notif.body || data.message || '您有一条新消息',
+    body: notif.body || data.body || data.message || '您有一条新消息',
     icon: notif.icon || data.avatarUrl || '/icons/default-avatar.png',
     badge: '/icons/badge.png',
     tag: data.messageId || `msg-${Date.now()}`,
@@ -422,7 +426,7 @@ function buildNotificationOptions(data) {
       }
     ],
     requireInteraction: false, // 自动关闭
-    silent: false,
+    silent,
     vibrate: [200, 100, 200], // 震动模式
     renotify: true // 相同 tag 的通知会替换旧通知
   };
@@ -435,15 +439,20 @@ function buildNotificationOptions(data) {
 
 ```json
 {
+  "messageKind": "content",
   "title": "来自 Rei",
   "message": "早上好！今天的天气很不错呢。",
   "contactName": "Rei",
-  "messageId": "msg_1705308000_abc123",
+  "messageId": "msg_task_12345@1736931600000_0",
+  "sessionId": "sess_task_12345@1736931600000",
   "messageIndex": 1,
   "totalMessages": 3,
   "messageType": "auto",
   "messageSubtype": "chat",
   "taskId": 12345,
+  "taskUuid": "550e8400-e29b-41d4-a716-446655440000",
+  "recurrenceType": "daily",
+  "occurrenceMs": 1736931600000,
   "timestamp": "2025-01-15T09:00:00Z",
   "source": "scheduled",
   "avatarUrl": "https://example.com/avatar.png",
@@ -517,11 +526,11 @@ self.addEventListener('push', async event => {
       const shouldShow =
         showPolicy === 'always' ||
         (showPolicy === 'when-hidden' && !hasVisibleClient) ||
-        (showPolicy === 'auto' && kind === 'content');
+        (showPolicy === 'auto' && (kind === 'content' || kind === 'result'));
 
       if (showPolicy !== false && shouldShow) {
         console.log('[SW] 显示系统通知');
-        const options = buildNotificationOptions(notificationData);
+        const options = buildNotificationOptions(notificationData, hasVisibleClient);
         await self.registration.showNotification(options.title, options);
       }
     })()
@@ -1414,14 +1423,19 @@ self.addEventListener('push', (event) => {
     const shouldShow =
       showPolicy === 'always' ||
       (showPolicy === 'when-hidden' && !hasVisibleClient) ||
-      (showPolicy === 'auto' && kind === 'content');
+      (showPolicy === 'auto' && (kind === 'content' || kind === 'result'));
 
     if (!shouldShow || showPolicy === false) return;
 
+    const silent =
+      notif.silent === 'when-visible'
+        ? hasVisibleClient
+        : Boolean(notif.silent ?? data.silent ?? false);
     await self.registration.showNotification(notif.title || data.title || '新消息', {
-      body: notif.body || data.message || '您有一条新消息',
+      body: notif.body || data.body || data.message || '您有一条新消息',
       icon: notif.icon || data.avatarUrl || '/icons/icon-192.png',
       badge: notif.badge || '/icons/badge.png',
+      silent,
       data
     });
   })());
@@ -1439,6 +1453,30 @@ self.addEventListener('notificationclick', (event) => {
 
 ## 15. 变更日志
 
+### v2.4.0 (2026-10-19)
+
+#### 改进优化
+
+**1. `messageKind: 'result'` 与 `RESULT_RECEIVED` 事件**
+- 新增对第 5 种 `messageKind: 'result'`（`ResultPush`）的分发支持，广播事件名为 `REI_SW_EVENT.RESULT_RECEIVED`（`'rei-amsg-result-received'`）。
+- 默认展示策略与 `content` 一致（`notification.show` 未配或为 `'auto'` 时自动弹系统通知，通知正文回退读取 `notification.body` → `payload.body` → `payload.message`）。
+
+**2. `notification.silent: 'when-visible'` 与空白正文兜底 `defaultBody`**
+- `notification.silent` 新增 `'when-visible'` 取值：当下有 `visibilityState === 'visible'` 的窗口时静音，无可见窗口时正常响铃震动。
+- `installReiSW(self, { defaultBody })` 新增空白通知正文兜底（默认 `'New message'`），防止正文为空或纯空白时弹出空横幅。
+
+**3. 重复包业务自愈与 DELIVER ack 错误可见性**
+- 当首投的 `onBusinessPayload` 抛错并在 dedupe 记录上留下 `businessError` 时，后续同 key 的重复包到达会重跑一次 `onBusinessPayload`：重跑成功则清除 `businessError`，之后恢复纯去重；业务已成功过的记录仍永不重跑。
+- `REI_AMSG_DELIVER` ack 新增可选字段 `dedupeError`（去重库读写失败、绕过去重直接分发）与 `notificationError`（`showNotification` 失败）。
+
+**4. Multipart 失败原因枚举与本地重组窗口**
+- `REI_SW_EVENT.MULTIPART_EXPIRED` 的 `payload` 新增 `reason` 字段（取值见 `MULTIPART_FAILURE_REASON`：`'ttl-expired'` / `'invalid-chunk'` / `'chunk-conflict'` / `'size-limit-exceeded'` / `'restore-failed'` / `'storage-failed'` / `'disabled'`）。
+- 重组窗口从本地收到第一片起算，当场判废的分片也会触发一次 `MULTIPART_EXPIRED`（同一 multipart `id` 只报一次）。
+
+**5. 离线队列回执与 4xx 丢弃广播**
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT` 新增 `delivered: boolean` 及 4xx 永久拒收时的 `dropped: true` / `status` / `error`。
+- 新增广播消息类型 `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`（`'REI_QUEUE_DROPPED'`），当队列请求在后台被服务端 4xx 永久拒收并移除时广播给所有窗口。
+
 ### v2.3.1 (2026-06-09)
 
 #### 改进优化
@@ -1455,7 +1493,7 @@ self.addEventListener('notificationclick', (event) => {
 
 **2. 业务感知的 DELIVER ack（`businessError`）**
 - DELIVER ack 新增可选字段 `businessError`（非破坏）：`onBusinessPayload` reject 或抛错时，ack 仍是 `ok: true` 但带上 `businessError: <message>`；成功时不出现。`ok` 的含义明确为「已收下并分发」，不代表「业务已落库」。需要严格区分两者的消费方读 `businessError`。
-- 该失败会持久化到 dedupe 记录：之后同 key 的重复包被去重后，ack 仍带首包的 `businessError`，而不是回一个看着干净的 `ok:true, duplicate:true`。去重不会让 `onBusinessPayload` 重跑——这只让信号诚实，要可重试需消费方自做幂等。webpush `push` 路径无 ack，业务失败仅内部 `console.error`。
+- 该失败会持久化到 dedupe 记录：之后同 key 的重复包被去重后，ack 仍带首包的 `businessError`，而不是回一个看着干净的 `ok:true, duplicate:true`。去重不会让 `onBusinessPayload` 重跑——这只让信号诚实，要可重试需消费方自做幂等（注：v2.4.0 起改为带 `businessError` 的记录在收到同 key 重复包时会重跑一次 `onBusinessPayload` 自愈）。webpush `push` 路径无 ack，业务失败仅内部 `console.error`。
 
 ### v2.2.0 (2026-05-31)
 

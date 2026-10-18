@@ -14,7 +14,7 @@
   - `INIT_SECRET`（服务端启用初始化鉴权时再配置）
   - `TEST_USER_ID`
 
-说明：测试端点会先调用 `init-tenant`，然后自动完成 `get-user-key`、`schedule-message`、`send-notifications` 验证。
+说明：测试端点会先调用 `init-tenant`，然后依次完成 `get-user-key`、`schedule-message`、`send-notifications` 验证。注意 `tests/test-vercel-function.js` 仍按 v2.0.1 契约在 `schedule-message` 请求体内传 `pushSubscription`；若被测服务端为 `@rei-standard/amsg-server` 3.0.0+，需在 `get-user-key` 之后先调 `PUT /api/v1/push-subscription` 登记用户级订阅，并从 `schedule-message` 请求体中去掉 `pushSubscription`。
 
 ## 部署方式一：集成到现有项目
 
@@ -111,6 +111,7 @@ jobs:
 
 ## 故障排查
 
-1. `500`：缺失 `TENANT_DATABASE_URL`。
+1. `init-tenant` 子步骤返回 `400 INVALID_PARAMETERS`（外层 HTTP 仍为 `200`，`summary.failed > 0`）：缺失 `TENANT_DATABASE_URL`。
 2. `401 INVALID_INIT_AUTH`：服务端启用了 `INIT_SECRET` 且当前值不一致。
 3. `401 INVALID_TENANT_AUTH`：token 签发/验签配置异常。
+4. `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED` / `409 PUSH_SUBSCRIPTION_MISSING`：服务端已升至 3.0.0+，需改为先调用 `PUT /api/v1/push-subscription` 登记订阅且不在 `schedule-message` 中传 `pushSubscription`。

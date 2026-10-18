@@ -91,6 +91,24 @@ const rei = await createReiServer({
 // DELETE /api/v1/llm-credentials    -> rei.handlers.llmCredentials.DELETE
 ```
 
+## 从 2.x 升级
+
+从 2.5.3 升级到 3.0.0 的多租户部署（`createReiServer`）和排程客户端需按以下顺序迁移：
+
+1. 先升级部署 `@rei-standard/amsg-server@3.0.0`，在多租户路由里挂载 `rei.handlers.pushSubscription`（必挂），并按需挂载 `rei.handlers.getMessage` 与 `rei.handlers.llmCredentials`。升级前已入库的老任务在投递时若查不到用户级订阅，会自动回退读取老任务 payload 内嵌的订阅。
+2. 客户端升级到 `@rei-standard/amsg-client@2.9.0`（建议同步将 `@rei-standard/amsg-sw` 升到 `2.4.0`）。
+3. 客户端在 `subscribePush()` 拿到订阅后、以及每次应用启动确认订阅仍有效时，调用 `await client.putPushSubscription(subscription)` 登记用户级订阅。
+4. 客户端调用 `client.scheduleMessage()` 和 `client.updateMessage()` 时去掉 `pushSubscription` 字段。
+
+主要破坏性变更与行为变化：
+
+- **推送订阅改为用户级登记**：`POST /schedule-message` 和 `PUT /update-message` 带 `pushSubscription` 字段返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`；用户未通过 `PUT /push-subscription` 登记过订阅时，`POST /schedule-message` 返回 `409 PUSH_SUBSCRIPTION_MISSING`。
+- **包根加密工具函数改为 async**：`deriveUserEncryptionKey`、`decryptPayload`、`encryptForStorage`、`decryptFromStorage` 底层改为 Web Crypto API，全部返回 `Promise`，直接调用处需补 `await`；密文格式不变。
+- **自定义数据库适配器接口补充**：通过 `tenant.adapterFactory` 自定义适配器时，需实现 `getPushSubscription` / `upsertPushSubscription` / `deletePushSubscription`（否则返 `501`），以及按需补齐 `claimTask`、`renewTaskLease`、`createTaskSuperseding`、`getTaskStatusInfo`、`getTaskStatusByUuidOnly`、`llm_credentials` 四方法等。内置 `pg` / `neon` 适配器已全部实现。
+- **表结构自动补齐与投递语义更新**：每个进程首次拿到租户适配器时会幂等执行建表（`push_subscriptions`、`llm_credentials`）、`scheduled_messages` 补列（`lease_until`、`retry_after`、`serialize_group`、`last_error`）与建索引（`idx_serialize_group_lease`），数据库账号需有 DDL 权限；错过触发时刻超过 60 分钟的任务不再补发；LLM 上游 `400/401/402/403/404/405/413/422` 与推送服务 `404/410/413` 直接终审不再重试；默认 `messageId` 和 `sessionId` 带 `@<occurrenceMs>` 后缀。
+
+完整的改前/改后代码示例、自定义适配器方法清单及新老版本混用兼容表见 [CHANGELOG.md](./CHANGELOG.md) 的 `3.0.0` 条目。
+
 ## 关于 `messageType: 'instant'`
 
 > **两条 instant 路径：**
@@ -275,7 +293,7 @@ LLM API 凭据（`apiUrl` / `apiKey` / `primaryModel`）有两种给法：
 |---|---|
 | `PUT /llm-credentials` | 批量登记 / 覆盖。body =（加密后的）`{ credentials: [{ credId, value: { apiUrl, apiKey, primaryModel } }] }`，一批 ≤100 条，单用户 ≤500 行 |
 | `GET /llm-credentials` | 对账清单 `{ credentials: [{ credId, updatedAt }] }`。**凭据本体永远不回传** |
-| `DELETE /llm-credentials` | 删除。body =（加密后的）`{ credIds: [...] }` / `{ all: true }` / `{ credIdPrefix: 'char:<charId>/' }`，**三选一**，混着传返回 400 |
+| `DELETE /llm-credentials` | 删除。body =（加密后的）`{ credIds: [...] }` / `{ all: true }` / `{ credIdPrefix: 'char:<charId>/' }`，**三选一**，混着传返回 400（其中 `credIdPrefix` 仅 D1 适配器支持，pg / neon 返回 501） |
 
 客户端侧对应 `client.putLlmCredentials(credentials)` / `listLlmCredentials()` / `deleteLlmCredentials(opts)`。
 
@@ -381,7 +399,11 @@ hook 在 `pushPayloads` 里自己写了这几个字段的话会被库覆盖：�
 | `readState(ns)` / `writeState(ns, entries)` | 读写 `client_state`，和客户端 `GET/PUT /client-state` 是同一份数据 |
 | `emitResult(payload)` | 给客户端送一条**不是聊天内容**的结果（落收件箱 + 推送） |
 | `scheduleTask(options)` | 给同一个用户再建一条定时任务 |
-| `scratch` | 本次 fire 的便签对象，三个 hook 加上发送后的 `onAfterSend` 共享同一个引用，fire 结束即丢弃 |
+| `cancelTask(uuid)` | 取消同一个用户名下另一条待发任务（不能取消当前正在 fire 的任务），并撤掉它尚未投递的收件箱分段，返回 `{ cancelled }` |
+| `renewTask(uuid, nextSendAt)` | 把同一个用户名下另一条待发任务改到新的触发时刻（至少比现在晚 60 秒），返回 `{ renewed: true, uuid, nextSendAt }` 或 `{ renewed: false, reason: 'not_found' \| 'in_flight' }` |
+| `resolveLlmCredential(credId)` | 按 `credId` 现读一份已登记的 LLM 凭据（供非 chat 用途的副 API 使用），不存在或不支持时返回 `null` |
+| `signal` / `isCancelled()` / `throwIfCancelled()` | 任务在执行期被取消或顶替时的协作取消信号，详见[取消正在执行的生成与工具](#取消正在执行的生成与工具) |
+| `scratch` | 本次 fire 的便签对象，三个 hook 加上发送后的 `onAfterSend` / `onFireSettled` 共享同一个引用，fire 结束即丢弃 |
 
 `onLLMOutput` / `executeToolCalls` 的 ctx 上另外带着任务身份：
 
@@ -430,13 +452,13 @@ tick 汇总的 `details.deferredTasks`（`{ taskId, retryAfter }`）列出这一
 
 ### config 级 hook
 
-这两个挂在 worker 工厂 config 的顶层（不在 `hooks` 里）：
+这三个挂在 worker 工厂 config 的顶层（不在 `hooks` 里）：
 
-| hook | 什么时候调 | 载荷 |
+| hook | 什么时候调 | 调用签名 / 载荷 |
 |---|---|---|
-| `onAfterSend` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
-| `onFireSettled` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, retryAfter, sentCount, pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
-| `onStaleSkip` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
+| `onAfterSend(info)` | fire 的 pushPayloads 逐段发完，或中途发挂 | `{ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult }` |
+| `onFireSettled(info)` | 一次 fire 收尾——只要 `onBeforeFire` 被调用过，什么结局都调一次 | `{ task, status, skipReason, retryAfter, willRetry, failureStage, sentCount, pushedCount, total, iterations, error, metadata, usage, usageTotal, llmCalls, outboxed, scratch, readState, writeState, emitResult, signal, isCancelled, throwIfCancelled }` |
+| `onStaleSkip(task, info)` | 任务错过触发时刻超过 60 分钟、这一次（或这几次）不再补发 | 第一个参数为任务行 `task`，第二个参数 `info` 为 `{ reason, action, metadata, recurrenceType, occurrenceMs, skippedCount, skippedOccurrences, skippedTruncated, nextSendAt, readState, writeState, emitResult }` |
 
 三个 hook 都自带 `readState` / `writeState` / `emitResult`，作用于当前用户，语义与 fire 级那套一致。`onStaleSkip` 尤其需要：服务停摆恢复后的第一跳里可能一次 fire 都没跑过，而那正是它要留痕迹的时候。
 
@@ -575,9 +597,9 @@ const { messageId, pushed } = await ctx.emitResult({
 - `MAX_PUSH_PAYLOAD_BYTES` — 一条 push 的明文上限，3993 字节。
 - `PUSH_ENVELOPE_RESERVED_BYTES` — 库在 hook 交还 payload 之后还要补的那批字段占的字节上界，384。
 - `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES` — 推送服务的密文 body 上限（4096）与 aes128gcm 固定开销（103），上面那个数就是两者相减。
-- `measurePushPayload(payload)` — 量一段 payload 的字节数与剩余额度，返回 `{ bytes, maxBytes, remainingBytes, withinLimit }`。
+- `measurePushPayload(payload, options?)` — 量一段 payload 的字节数与剩余额度，返回 `{ bytes, maxBytes, remainingBytes, withinLimit, envelopeReservedBytes }`。
 
-以上几个在包根和 `@rei-standard/amsg-server/cloudflare` 两个入口都有。
+其中 push 容量相关的常量和 `measurePushPayload` 在包根和 `@rei-standard/amsg-server/cloudflare` 两个入口都有；`validateLlmMessagesArray` 和 `validateSplitPattern` 在包根导出。
 
 ## 一体化初始化流程
 
@@ -588,7 +610,7 @@ const { messageId, pushed } = await ctx.emitResult({
 
 ## 端点鉴权
 
-- `get-user-key`、`schedule-message`、`update-message`、`cancel-message`、`messages`、`message`
+- `get-user-key`、`schedule-message`、`update-message`、`cancel-message`、`messages`、`message`、`push-subscription`、`llm-credentials`
   - `Authorization: Bearer <tenantToken>`
 - `send-notifications`
   - `Authorization: Bearer <cronToken>` 或 `?token=<cronToken>`
@@ -811,7 +833,7 @@ await runScheduledTick({
 import { getSchemaVersion, ensureSchema } from '@rei-standard/amsg-server/cloudflare';
 
 const state = await getSchemaVersion(db);
-// → { current: '2.6.0' | null, required: '2.6.0', ok: true | false, missing: [] }
+// → { current: '2.6.0-cloud-data.2' | null, required: '2.6.0-cloud-data.2', ok: true | false, missing: [] }
 
 if (!state.ok) {
   const fixed = await ensureSchema(db); // 建表 + 补列 + 建索引，重复调没事
@@ -823,8 +845,8 @@ if (!state.ok) {
 |---|---|
 | `required` | 这一版代码需要的表结构版本（导出常量 `SCHEMA_VERSION`）。表结构自己的版本号，只在表 / 列 / 关键索引变化时抬，与包版本各走各的 |
 | `current` | 活库当前满足的版本：够用就是 `required` 那个值，缺东西就是 `null`（只知道不够用，不知道它停在哪一版） |
-| `ok` | 需要的表 / 列 / 关键索引是不是都在 |
-| `missing` | 缺什么，形如 `table:message_outbox` / `column:scheduled_messages.last_error` / `index:uidx_uuid`。整张表缺席时只报这一张表，不逐列展开 |
+| `ok` | 需要的表 / 列 / 关键索引 / 触发器是不是都在 |
+| `missing` | 缺什么，形如 `table:message_outbox` / `column:scheduled_messages.last_error` / `index:uidx_uuid` / `trigger:trg_cloud_metadata_task_delete`。整张表缺席时只报这一张表，不逐列展开 |
 | `migrated`（只有 `ensureSchema` 有） | 这次有没有真的跑 `initSchema()`。本来就够用 → `false`，`schema` 也是 `null` |
 
 「需要什么」是从建表语句里解析出来的，不是另抄一份清单：抄的那份漏掉新列的话，自查会对着一个缺列的库回「一切正常」。
@@ -912,18 +934,22 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `createReiServer` — 多租户装配线（标准路由处理器全家）
 - `createSingleUserServer` — 单用户装配线：没有租户概念，不需要 Blob 租户配置和 tenantToken 体系
 - `createSingleUserCloudflareWorker` — 单用户 Cloudflare Worker 一键装配（`fetch` + `scheduled` 两个入口）
+- `CORS_ALLOW_HEADERS` / `CORS_ALLOW_METHODS` — 单用户 Worker 的默认 CORS 允许头与方法列表
 - `createAdapter` / `createD1Adapter` — pg·neon / Cloudflare D1 数据库适配器
 - `runScheduledTick` — 手动触发一轮到期任务投递（自定义 cron 宿主、要调 `claimLeaseMs` 时用）
 - `runTask` — 只跑指定那一条任务（与 cron 同一条投递链）
-- `DEFAULT_MAX_DELIVERY_RETRIES` — 投递失败的默认重试次数（3），config 的 `maxDeliveryRetries` 不配时用它
+- `DEFAULT_MAX_DELIVERY_RETRIES` / `DEFAULT_CLAIM_LEASE_MS` / `DEFAULT_LEASE_HEARTBEAT_MS` / `DEFAULT_HEARTBEAT_LEASE_TTL_MS` — 投递失败默认重试次数（3）与任务占位/心跳租期默认常量
+- `sanitizeErrorSummary` — 将异常对象脱敏压缩为 `last_error` 存储摘要
+- `DEFAULT_MAX_TOOL_ITERATIONS` / `DEFAULT_TOTAL_TIMEOUT_MS` / `DEFAULT_MAX_SCHEDULED_TASKS_PER_FIRE` / `MIN_SCHEDULE_LEAD_MS` / `MAX_DEFER_AFTER_MS` — Fire 时刻 agentic 循环与 `scheduleTask` / `defer` 默认预算常量
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION` — 表结构自查与补齐
 - `summarizeErrorCause` — 把异常压成响应体里 `error.cause` 那个形状（自己包一层路由、想回同样形状时用同一份）
-- `NonRetryableError` / `isNonRetryableError` — hook 侧标注「重试也好不了」的失败
+- `NonRetryableError` / `DeploymentConfigError` / `isNonRetryableError` — hook 侧标注确定性失败（`permanent: true`）与部署配置缺失错误（走退避阶梯）
 - `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES` — 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原），自己包路由时代替 `await request.text()`
 - `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
 - `createTenantToken` / `verifyTenantToken`
-- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
-- `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl`
+- `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage` — 全部为 `async` 函数，返回 `Promise`
+- `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl` / `MAX_TASK_PAYLOAD_BYTES`
+- `supportsLlmCredentialsStore` / `isValidCredId` / `validateCredRefs` / `validateCredValue` / `hasChatCredRef` / `resolveLlmCredential` / `CRED_ID_MAX_LENGTH` / `CRED_PUT_BATCH_MAX` / `CRED_ROWS_PER_USER_MAX` / `CRED_REFS_MAX_ENTRIES` — 用户级 LLM 凭据存储与 `credRefs` 校验/解析工具
 - `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
 - `isValidISO8601` / `isValidUrl` / `isValidUUID` / `isValidUUIDv4` / `isValidTimeZoneId`
 - `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence` — 循环任务的时区感知推进（宿主想自己算「下次什么时候」时用同一份实现）
@@ -931,9 +957,11 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 `@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
 
 - `createSingleUserCloudflareWorker` / `createSingleUserServer` / `createD1Adapter` / `runScheduledTick` / `runTask` / `DEFAULT_MAX_DELIVERY_RETRIES`
+- `MAX_DEFER_AFTER_MS`
 - `getSchemaVersion` / `ensureSchema` / `SCHEMA_VERSION`
 - `summarizeErrorCause` / `NonRetryableError` / `isNonRetryableError`
-- `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `createWebCryptoWebPush` / `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
+- `isValidTimeZoneId` / `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence`
 - `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES`
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptForStorage` / `decryptFromStorage`
 

@@ -26,10 +26,10 @@ The two are intentionally independent: any `messageType` can carry any
 `messageKind`.
 
 There is also `source: 'instant' | 'scheduled'` — the **routing
-origin** (`'instant'` for `amsg-instant`, `'scheduled'` for any
-`amsg-server` output). `messageType: 'instant'` always pairs with
-`source: 'instant'`; the other three `messageType`s always pair with
-`source: 'scheduled'`.
+origin**: `messageType: 'instant'` (both `amsg-instant` and
+`amsg-server`'s in-server instant path) always pairs with
+`source: 'instant'`; the other three scheduled `messageType`s always
+pair with `source: 'scheduled'`.
 
 ---
 
@@ -45,6 +45,7 @@ origin** (`'instant'` for `amsg-instant`, `'scheduled'` for any
 | `timestamp`      | `string` (ISO 8601) | Producer-side wall clock.                                                 |
 | `messageSubtype` | `string?`         | Caller's business namespace. Defaults to `'chat'` at producers.             |
 | `metadata`       | `object?`         | **Caller passthrough.** Packages MUST NOT write here.                       |
+| `notification`   | `NotificationDirective?` | Optional producer-side notification display hint (see below).        |
 | `taskId`         | `number \| string \| null?` | Scheduled task row id.                                          |
 | `taskUuid`       | `string \| null?` | Scheduled task uuid (the id the scheduling side chose).                    |
 | `recurrenceType` | `'none' \| 'daily' \| 'weekly'?` | Whether that task fires again.                            |
@@ -64,7 +65,7 @@ omit all four.
 
 ## Notification directive
 
-`ContentPush` and `ToolRequestPush` can carry an optional
+Every push variant (`AmsgPushCommon`) can carry an optional
 `notification` object. It is a producer-side hint consumed by
 `@rei-standard/amsg-sw` before rendering a system notification.
 
@@ -187,12 +188,14 @@ instead and may carry a `toolCalls` array directly — see
 
 ### `ErrorPush` — producer-level error
 
-| Field         | Type      | Notes                                                                  |
-|---------------|-----------|------------------------------------------------------------------------|
-| `messageKind` | `'error'` | Discriminator.                                                         |
-| `code`        | `string`  | Stable producer-defined code, e.g. `HOOK_THREW`, `LOOP_EXCEEDED`.      |
-| `message`     | `string`  | Human-readable description.                                            |
-| `iteration`   | `number?` | Agentic-loop iteration when relevant.                                  |
+| Field          | Type      | Notes                                                                  |
+|----------------|-----------|------------------------------------------------------------------------|
+| `messageKind`  | `'error'` | Discriminator.                                                         |
+| `code`         | `string`  | Stable producer-defined code, e.g. `HOOK_THREW`, `LOOP_EXCEEDED`.      |
+| `message`      | `string`  | Human-readable description.                                            |
+| `iteration`    | `number?` | Agentic-loop iteration when relevant.                                  |
+| `llmStatus`    | `number?` | Upstream LLM HTTP status code when the error came from an LLM call.    |
+| `providerCode` | `string?` | Upstream provider error code when present in the LLM error body.       |
 
 Replaces the legacy 0.7.0 `{ type: 'error', code: '...' }` envelope.
 The legacy `type` field is **gone** — do not look for it on
@@ -206,6 +209,7 @@ The legacy `type` field is **gone** — do not look for it on
 | `resultKind`  | `string`   | 宿主给这类结果起的名字（`'fire-pack'`、`'ledger-entry'`……），客户端按它分流。 |
 | `title`       | `string?`  | 通知标题的兜底（`notification.title` 优先）。                    |
 | `body`        | `string?`  | 通知正文的兜底（`notification.body` 优先）。                     |
+| `data`        | `object?`  | 可选结构化数据字段（任意其它顶层自定义字段也会原样保留）。         |
 
 不是聊天内容，而是「这次跑完产出了点什么，客户端拿去自己消化」：整理好的一份数据、一条账目、后台生成的产物。形状由宿主定，`buildResultPush` 是唯一**保留自己不认识的字段**的 builder——白名单式的复制会把内容删掉一半。
 
@@ -362,19 +366,20 @@ the full contract.
 
 `toUint8` · `concatBytes` · `utf8` · `utf8Decode` · `bytesToBase64` ·
 `bytesToBase64Url` · `base64UrlToBytes` · `jsonToBase64Url` ·
-`bytesToHex` · `hexToBytes` · `randomBytes` · `hmacSha256` ·
+`bytesToHex` · `hexToBytes` · `randomBytes` · `randomUUID` · `hmacSha256` ·
 `timingSafeEqualBytes` — WebCrypto-friendly byte/encoding helpers for
-base64url, hex, HMAC, and constant-time comparison.
+base64url, hex, UUID v4 generation, HMAC, and constant-time comparison.
 
 ### LLM call
 
 | Export | What it is |
 |---|---|
 | `callLlm(...)` | Call an OpenAI-compatible chat-completions endpoint with timeout / abort handling (default 300 000 ms, injectable `fetch`). |
-| `buildLlmRequestBody(...)` | Build the request body for prompt mode or `messages` mode. |
+| `buildLlmRequestBody(...)` | Build the request body for prompt mode or `messages` mode (with optional `llmExtraBody`). |
 | `normalizeAiApiUrl(apiUrl)` | Normalize a base URL to its chat-completions endpoint without doubling `/v1`; unrecognized paths pass through unchanged. |
 | `validateLlmMessagesShape(...)` | Validate a `messages` array, including assistant `tool_calls` and `role: 'tool'` entries. |
 | `LLM_MESSAGES_ERROR` | Stable error codes emitted by that validation. |
+| `redactCredentials(text)` | Redact `Bearer ...`, `sk-...`, and long opaque credential tokens from error strings while keeping model names intact. |
 
 ### Web Push
 
@@ -388,8 +393,9 @@ base64url, hex, HMAC, and constant-time comparison.
 
 | Export | What it is |
 |---|---|
-| `MULTIPART_MESSAGE_KIND` / `MULTIPART_ENCODING` / `MULTIPART_VERSION` | The generic multipart chunk envelope (`'_multipart'`) produced by `amsg-instant` and reassembled by `amsg-sw`. |
-| `DEFAULT_MULTIPART_TTL_MS` / `DEFAULT_MULTIPART_MAX_CHUNKS` / `DEFAULT_MULTIPART_MAX_TOTAL_BYTES` | Multipart reassembly budget defaults. |
+| `MULTIPART_MESSAGE_KIND` / `MULTIPART_ENCODING` / `MULTIPART_VERSION` / `MULTIPART_FAILURE_REASON` | The generic multipart chunk envelope (`'_multipart'`) produced by `amsg-instant` / `amsg-server` and reassembled by `amsg-sw`, plus the failure reason enum. |
+| `DEFAULT_MULTIPART_CHUNK_BYTES` / `DEFAULT_MULTIPART_TTL_MS` / `DEFAULT_MULTIPART_MAX_CHUNKS` / `DEFAULT_MULTIPART_MAX_TOTAL_BYTES` | Multipart chunking and reassembly budget defaults. |
+| `buildMultipartPushPayloads(payload, options?)` | Slice a JSON-safe push payload into `_multipart` chunk envelopes. |
 | `REI_AMSG_POSTMESSAGE_TYPE` / `REI_SW_EVENT` / `REI_SW_MESSAGE_TYPE` / `REI_AMSG_DELIVER_MESSAGE_TYPE` | The window ⇄ Service Worker `postMessage` protocol strings — import these instead of hard-coding the literals. |
 
 ### Agentic-loop contract
@@ -398,9 +404,9 @@ base64url, hex, HMAC, and constant-time comparison.
 |---|---|
 | `assertValidDecision(decision, options?)` | Runtime-validate an `onLLMOutput` hook decision (`finish` / `tool-request` / `continue` / `skip-push`); `{ inlineToolCalls: true }` enables the amsg-server flavor. |
 | `extractToolCallsFromDecision(...)` | Pull tool calls out of either decision flavor (inline `toolCalls` or tool-request `pushPayloads`). |
-| `buildSessionContext(...)` | Build the frozen, credential-free context object handed to agentic hooks. |
+| `buildSessionContext(...)` | Build the frozen, credential-free context object handed to agentic hooks (includes `usage` and optional `scratch`). |
 | `extractAssistantMessage(...)` | Safely read `choices[0].message` off an LLM response (never throws). |
-| `readReasoningContent(...)` | Read `reasoning_content` off an assistant message; empty string means "none". |
+| `readReasoningContent(llmResponse)` | Read `reasoning_content` off an LLM response (or fall back to `<think>` / `<thinking>` / `<thought>` tags in `message.content`); returns `string \| null`. |
 | `stripReasoningTags(...)` | Strip reasoning that leaked into `message.content` so it doesn't ship inside the `ContentPush` burst. |
 | `chunkReasoningByUtf8Bytes(text, maxBytes)` | Split reasoning text on safe UTF-8 edges for payload-limited transports. |
 
@@ -427,8 +433,9 @@ avatar-URL soft-strip rule shared by client / instant / server
    multi-part bursts — never as a redundant `1 / 1`.
 4. **`metadata` is caller-owned.** Packages must add protocol-level
    data as top-level fields, never inside `metadata`.
-5. **`source` is the routing origin, not the dispatch type.**
-   `'instant'` ⇄ `amsg-instant`; `'scheduled'` ⇄ `amsg-server`.
+5. **`source` is the routing origin.**
+   `messageType: 'instant'` pairs with `source: 'instant'`; scheduled
+   `messageType`s (`fixed` / `prompted` / `auto`) pair with `source: 'scheduled'`.
 
 See [§6 of `standards/active-messaging-api.md`](../../../standards/active-messaging-api.md)
 for the wire-level contract.

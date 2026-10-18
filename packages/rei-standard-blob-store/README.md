@@ -3,10 +3,8 @@
 纯前端应用的令牌式 Blob 存储：图片 / 音频 / 模型文件等二进制存 IndexedDB，业务字段里只留一个短令牌 `blobref:<id>`。字段仍是普通 string——JSON 序列化、结构化克隆、备份导出都不受影响；渲染时令牌解析成 objectURL。相比 base64 内嵌省 ~33% 空间，且二进制不再常驻 JS 堆。
 
 ```bash
-npm install @rei-standard/blob-store@next
+npm install @rei-standard/blob-store
 ```
-
-目前处于预发布期，请装 `@next`（稳定版发布后本句和上面的 `@next` 一起移除）。
 
 ## 最小接入
 
@@ -168,6 +166,6 @@ async function putDeduped(blob) {
 
 ## 错误哲学
 
-存储层错误不打断业务：读失败返回 null、删失败静默、GC 宁留勿删、迁移失败回退原串。`put` 失败会上抛——调用方必须知道图没存进去。
+存储层错误不打断业务：读失败返回 null、删失败静默、GC 宁留勿删、迁移失败回退原串。`put` / `restore` 失败会上抛——调用方必须知道图没存进去。
 
 完整规范见 [`standards/blob-storage.md`](https://github.com/Tosd0/ReiStandard/blob/main/standards/blob-storage.md)（绝对链接是刻意的：npm 包页不会替包内相对路径向仓库上层爬升，相对链接在那儿是死的）。
