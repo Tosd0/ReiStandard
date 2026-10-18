@@ -183,9 +183,10 @@ export function createClientStateHandler(ctx) {
 
     // 落库（加密 + 大值分块 + 旧切片清理 + value:null 的删除）与 hook 的
     // ctx.writeState() 共用 lib/client-state-store.js。
-    const { upserted, skipped, deleted, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
+    const { upserted, skipped, deleted, skippedEntries, unknown } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
 
     const data = { upserted, skipped };
+    if (unknown > 0) data.unknown = unknown;
     // 有 key 被删掉才带 deleted：不含删除的请求，响应形状与从前一字不差。
     if (deleted > 0) data.deleted = deleted;
     // 被 last-write-wins（含 version 护栏）拦下的 key 逐条回报：带护栏的写入

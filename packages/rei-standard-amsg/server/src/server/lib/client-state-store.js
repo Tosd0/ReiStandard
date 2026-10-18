@@ -106,12 +106,13 @@ export function planClientStateCleanup(ttl, now) {
  *   比较用它（写进行的 updated_at 列）；没带照旧用 `updatedAt`。
  * @param {() => number} [args.now] - 取服务端当前时刻（测试可注入假时钟）。适配器
  *   拿它认出库里「来自未来」的脏行。
- * @returns {Promise<{ upserted: number, skipped: number, deleted: number, skippedEntries: Array<{ namespace: string, key: string }> }>}
- *   `upserted` / `skipped` / `deleted` 按逻辑条目计（切片行不计），三者之和等于
- *   条目数。`deleted` 是删除之后 key 已不在库里的条数——删掉了、或本来就没有，
+ * @returns {Promise<{ upserted: number, skipped: number, deleted: number, unknown?: number, skippedEntries: Array<{ namespace: string, key: string }> }>}
+ *   `upserted` / `skipped` / `deleted` 按逻辑条目计（切片行不计）。旧适配器
+ *   回执不完整时，未能确认的逻辑写入计入可选的 `unknown`。四者之和等于条目数。
+ *   `deleted` 是删除之后 key 已不在库里的条数——删掉了、或本来就没有，
  *   两种都算；被 last-write-wins 拦下的删除（库里那行更新）计入 `skipped`。
  *   `skippedEntries` 逐条列出被拦下的 key，写入与删除都在里面（适配器不回
- *   outcomes / cleanupOutcomes 时分不清是哪条：写入按物理行计数兜底，删除一律
+ *   outcomes / cleanupOutcomes 时，仅整批物理行写入成功可折算成逻辑计数；其余写入计入 unknown，删除一律
  *   按「已删」计）。
  */
 export async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
@@ -208,6 +209,7 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
   let upserted = 0;
   let skipped = 0;
   let deleted = 0;
+  let unknown = 0;
   const skippedEntries = [];
   if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
     // 逻辑计数：一条条目的 upserted/skipped 看它的根行，切片行不计数。
@@ -222,10 +224,12 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
         skippedEntries.push({ namespace: entry.namespace, key: entry.key });
       }
     }
+  } else if (result.upserted === physicalRows.length && result.skipped === 0) {
+    // 老适配器只有物理行总数。全部成功时能确定每个逻辑根及其切片均已落库；
+    // 部分成功则不能猜是哪一条，也不能让物理计数碰巧等于逻辑条数时误报成功。
+    upserted = rootRowIndexes.length;
   } else {
-    // 自定义 adapter 只回老形状 { upserted, skipped } 时按物理行计数兜底。
-    upserted = result.upserted;
-    skipped = result.skipped;
+    unknown = rootRowIndexes.length;
   }
 
   // 删除条目的结局与写入同一个规矩：库里那行比这次的护栏值新，删除就不生效，
@@ -242,5 +246,5 @@ export async function writeClientStateEntries({ db, userId, userKey, entries, no
       deleted++;
     }
   }
-  return { upserted, skipped, deleted, skippedEntries };
+  return { upserted, skipped, deleted, skippedEntries, ...(unknown > 0 ? { unknown } : {}) };
 }

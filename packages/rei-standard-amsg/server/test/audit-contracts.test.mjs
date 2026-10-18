@@ -296,3 +296,42 @@ for (const allowedToolNames of [['allowed'], [], undefined]) {
     assert.ok(declaration.every(call => call.type === 'function' && typeof call.function.name === 'string'));
   });
 }
+
+
+test('chunked attachments accept complete physical-row receipts from legacy adapters', async (t) => {
+  const { db } = await setup(t);
+  const current = await seed(db, 'legacy-attachment');
+  const receipts = [];
+  const legacy = { getClientState: (...args) => db.getClientState(...args), async upsertClientState(...args) {
+    const { upserted, skipped } = await db.upsertClientState(...args);
+    receipts.push({ upserted, skipped });
+    return { upserted, skipped };
+  } };
+  const value = '界'.repeat(136_533);
+  let ref;
+  await fire(legacy, current, { async onBeforeFire(ctx) {
+    ref = await ctx.storeAttachment(value);
+    const rows = await ctx.readState(ref.namespace, { key: ref.key });
+    assert.equal(rows.length, 1);
+    assert.equal(JSON.parse(rows[0].value).value, value);
+    return { skip: true };
+  }, onLLMOutput() {} });
+  assert.equal(receipts[0].upserted, 4, 'three complete codepoint chunks plus the root');
+  assert.equal(receipts[0].skipped, 0);
+});
+
+
+test('partial legacy physical-row receipts cannot masquerade as a logical attachment success', async (t) => {
+  const { db } = await setup(t);
+  const current = await seed(db, 'partial-legacy-attachment');
+  for (const receipt of [{ upserted: 1, skipped: 0 }, { upserted: 3, skipped: 1 }]) {
+    await fire({ async upsertClientState() { return receipt; } }, current, { async onBeforeFire(ctx) {
+      const value = '界'.repeat(136_533);
+      const result = await ctx.writeState('partial', [{ key: 'large', value }]);
+      assert.equal(result.upserted, 0);
+      assert.equal(result.unknown, 1);
+      await assert.rejects(ctx.storeAttachment(value), /ATTACHMENT_WRITE_INCOMPLETE/);
+      return { skip: true };
+    }, onLLMOutput() {} });
+  }
+});

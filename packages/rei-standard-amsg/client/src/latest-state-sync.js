@@ -1,3 +1,5 @@
+import { chunkReasoningByUtf8Bytes } from '@rei-standard/amsg-shared';
+
 /**
  * @typedef {Object} StateSyncEntry
  * @property {string} namespace
@@ -17,6 +19,7 @@ const encoder = new TextEncoder();
 // Match the default server limits without importing its Node-capable entry.
 const DEFAULT_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_STATE_BYTES = 5 * 1024 * 1024;
+const STATE_CHUNK_BYTES = 200 * 1024;
 const ENVELOPE_BYTES = JSON.stringify({ iv: 'x'.repeat(16), authTag: 'x'.repeat(24), encryptedData: '' }).length;
 const encryptedBodyBytes = (plainBytes) => ENVELOPE_BYTES + 4 * Math.ceil(plainBytes / 3);
 
@@ -37,12 +40,26 @@ export function classifyClientStateWrite(entries, response) {
     && (item.namespace === undefined || item.namespace === entry.namespace)
     && (item.key === undefined || item.key === entry.key)));
   const matchedSkipped = entries.map((entry) => skipped.some((item) => item.namespace === entry.namespace && item.key === entry.key));
-  const complete = Number.isInteger(data.upserted) && data.upserted >= 0
+  const validCounts = (data.unknown === undefined || data.unknown === 0)
+    && Number.isInteger(data.upserted) && data.upserted >= 0
     && Number.isInteger(data.skipped) && data.skipped >= 0
     && Number.isInteger(data.deleted ?? 0) && (data.deleted ?? 0) >= 0
-    && data.upserted + (data.deleted ?? 0) + data.skipped + rejected.length === entries.length
     && matchedRejected.filter(Boolean).length === rejected.length
     && matchedSkipped.filter(Boolean).length === data.skipped;
+  const completeLogical = validCounts
+    && data.upserted + (data.deleted ?? 0) + data.skipped + rejected.length === entries.length;
+  // Older servers may return physical row totals. Only an exact, all-written
+  // receipt proves success; partial counts cannot identify the affected roots.
+  let completePhysical = false;
+  if (!completeLogical && validCounts && data.skipped === 0 && skipped.length === 0) {
+    const accepted = entries.filter((_, index) => !matchedRejected[index]);
+    const physicalRows = accepted.reduce((count, entry) => count + (entry.value === null ? 0
+      : encoder.encode(entry.value).length <= STATE_CHUNK_BYTES ? 1
+        : 1 + chunkReasoningByUtf8Bytes(entry.value, STATE_CHUNK_BYTES).length), 0);
+    completePhysical = data.upserted === physicalRows
+      && (data.deleted ?? 0) === accepted.filter(entry => entry.value === null).length;
+  }
+  const complete = completeLogical || completePhysical;
   return entries.map((entry, index) => {
     if (matchedRejected[index]) return { entry, status: 'rejected', error: matchedRejected[index] };
     if (matchedSkipped[index]) return { entry, status: 'conflict' };

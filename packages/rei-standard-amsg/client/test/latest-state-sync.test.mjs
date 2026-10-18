@@ -182,3 +182,18 @@ test('unattended loadPending failure does not become an unhandled rejection', ()
   `], { encoding: 'utf8' });
   assert.equal(child.status, 0, child.stderr);
 });
+
+
+test('legacy physical-row receipts only clear a fully written batch, including UTF-8 boundaries', async () => {
+  const value = '界'.repeat(136_533);
+  const large = entry(value);
+  const classify = (upserted, skipped = 0) => sdk.classifyClientStateWrite([large], { success: true, data: { upserted, skipped } })[0].status;
+  assert.equal(classify(4), 'applied', 'codepoint-safe split has three chunks plus the root');
+  assert.equal(classify(3), 'unknown', 'ceil(byteLength / chunkSize) undercounts this value');
+  assert.equal(classify(3, 1), 'unknown');
+  assert.equal(classify(0, 4), 'unknown');
+  const sync = sdk.createLatestStateSync({ send() { return { success: true, data: { upserted: 4, skipped: 0 } }; } });
+  assert.deepEqual((await sync.enqueue([large])).pending, []);
+  const partial = sdk.createLatestStateSync({ send() { return { success: true, data: { upserted: 3, skipped: 1 } }; } });
+  assert.equal((await partial.enqueue([large])).pending.length, 1);
+});
