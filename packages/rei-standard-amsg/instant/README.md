@@ -39,6 +39,8 @@ npm install @rei-standard/amsg-instant
 | `clientToken`       | string    | ❌   | 弱共享密钥；配了则校验 `X-Client-Token` 头。**只防 URL 直怼/脚本小子**，不防有心人（前端 bundle 必然带着 token） |
 | `tokenSigningKey`   | string    | ❌   | 强鉴权 HMAC 密钥；配了则校验 `Authorization: Bearer <jwt>` |
 | `cors.allowOrigin`  | string    | ❌   | `Access-Control-Allow-Origin` 的值，默认 `*`。配成具体来源（如 `https://app.example.com`）会自动加 `Vary: Origin`。0.4.0 起 handler 在入口处短路 `OPTIONS` 预检请求并对所有响应（200/4xx/5xx 都包括）叠 CORS headers。 |
+| `cors.allowHeaders` | string    | ❌   | **0.11.0+**：`Access-Control-Allow-Headers` 的值，默认 `CORS_ALLOW_HEADERS`（`'Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding'`）。 |
+| `waitUntil`         | function  | ❌   | `(work: Promise<unknown>) => void`。纯 Web Push 模式下将主回复链路注册到运行时后台生命周期（若请求第 3 个参数 `ctx.waitUntil` 未提供时作后备）。 |
 | `webpush`           | object    | ❌   | **0.3.0 起废弃**。保留参数兼容旧代码但被忽略；测试改用 `fetch` 拦截 push endpoint 的 POST。 |
 | `fetch`             | function  | ❌   | 自定义 fetch（测试 / 自建代理用）。同时用于 **LLM 调用** 和 **Web Push 推送**两个出口。 |
 | `onEvent`           | function  | ❌   | 事件钩子，收 `{ type, ...上下文 }` 形状的运行事件（`llm_done` / `push_sent` / `sse_*` / `multipart_*` 等 30+ 种，完整清单见 [`onEvent` 事件一览](#onevent-事件一览)）。明文模式下 `request` 事件不带 userId —— 需要按用户分流日志时，从 `payload.contactName` 或 `payload.metadata` 自取 |
@@ -80,7 +82,7 @@ createInstantHandler({
 |-------------------------------------|------------------------------------------|
 | `Access-Control-Allow-Origin`       | `*`（默认）或 `cors.allowOrigin`         |
 | `Access-Control-Allow-Methods`      | `POST, OPTIONS`                          |
-| `Access-Control-Allow-Headers`      | `Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding` |
+| `Access-Control-Allow-Headers`      | `Content-Type, Authorization, X-Client-Token, X-Amsg-Request-Encoding`（或 `cors.allowHeaders`） |
 | `Access-Control-Max-Age`            | `86400`                                  |
 | `Vary`                              | `Origin`（仅当 `allowOrigin !== '*'`）   |
 
@@ -230,7 +232,11 @@ Content-Type: application/json
   primaryModel: string;
   maxTokens?: number;
   temperature?: number;            // 0.5.0+：透传给 LLM；completePrompt 路径未传默认 0.8
+  llmExtraBody?: Record<string, unknown>; // 0.11.0+：透传给上游 LLM 请求体的额外键值（先展开，不覆盖核心字段）
   messageSubtype?: string;         // SW 端分类标签，取值由业务决定
+  sessionId?: string;              // 可选：指定本次会话 ID（缺省自动生成；/continue 必填）
+  charId?: string;                 // 可选：非空字符串，透传到 SessionContext
+  iteration?: number;              // 可选：当前轮号（0..maxLoopIterations - 1；/continue 必填）
 
   pushSubscription: {              // Web Push 标准订阅
     endpoint: string;
@@ -242,7 +248,7 @@ Content-Type: application/json
 
 `completePrompt` 和 `messages` 必须**恰好提供一个**；同时给或都不给都会返回 `400 INVALID_PAYLOAD_FORMAT`。`messages` 数组不能为空，每条 `role` 必须是 `system / user / assistant / tool`。handler **不会**对 `messages` 做任何自动注入或重排——上游传什么就发什么。
 
-`firstSendTime` 和 `recurrenceType` 在 `amsg-instant` 上是**非法字段**，会直接返回 `INVALID_PAYLOAD_FORMAT`。
+`firstSendTime` 以及非 `'none'` 的 `recurrenceType` 在 `amsg-instant` 上是**非法字段**，会直接返回 `400 INVALID_PAYLOAD_FORMAT`。
 
 #### `messages` 模式 curl 示例
 
@@ -305,10 +311,13 @@ curl -X POST https://instant.example.com/instant \
   "success": true,
   "data": {
     "messagesSent": 3,
-    "sentAt": "2026-05-16T12:34:56.789Z"
+    "sentAt": "2026-05-16T12:34:56.789Z",
+    "sessionId": "sess_..."
   }
 }
 ```
+
+（若启用了 `onLLMOutput` agentic loop，`data` 为 `{ status: 'finished' | 'tool_requested' | 'skipped' | 'loop_exceeded', sessionId, iteration }`。）
 
 ```json
 { "success": false, "error": { "code": "LLM_CALL_FAILED", "message": "..." } }
@@ -337,16 +346,17 @@ curl -X POST https://instant.example.com/instant \
 
 **`/blob/:key` 端点的 error envelope 不同** —— 它走 plain `{ error: 'invalid_key' | 'blob_not_found_or_expired' | 'blob_store_not_configured' | 'blob_read_failed' }`，因为这条路径是给 SW 直 fetch 用的、跟主 SDK 的 wrap envelope 不在一条契约上。
 
-### 失败来自 LLM 时的机读标注
+### 失败来自上游（LLM / 推送服务）时的机读标注
 
-`LLM_CALL_FAILED` 这类失败额外带两个字段，客户端靠它们分流「Key 失效，要去改配置」和「上游一时抽风，等会儿再说」，不用回去正则匹配 `message` 那句人话（那句是给用户看的，措辞随时会变）：
+`LLM_CALL_FAILED` 和 `PUSH_SEND_FAILED` 额外带机读状态字段，客户端靠它们分流「Key 或订阅失效，要去改配置」和「上游一时抽风，等会儿再说」，不用回去正则匹配 `message` 那句人话（那句是给用户看的，措辞随时会变）：
 
-| 字段 | 是什么 |
-|---|---|
-| `llmStatus` | 上游 LLM 回的 HTTP 状态码（`401` / `429` / `400`…） |
-| `providerCode` | provider 自己的错误码（`invalid_api_key` / `context_length_exceeded` / `RESOURCE_EXHAUSTED`…） |
+| 字段 | 出现条件 | 是什么 |
+|---|---|---|
+| `llmStatus` | `LLM_CALL_FAILED` | 上游 LLM 回的 HTTP 状态码（`401` / `429` / `400`…） |
+| `providerCode` | `LLM_CALL_FAILED` | provider 自己的错误码（`invalid_api_key` / `context_length_exceeded` / `RESOURCE_EXHAUSTED`…） |
+| `pushStatus` | `PUSH_SEND_FAILED`（0.11.0+） | Web Push 推送服务回的 HTTP 状态码（`410` / `404` / `413` / `503`…） |
 
-三条路上带的是同一组：JSON 信封里挂在 `error` 对象上，SSE 的 `event: error` 和掉线兜底的 Web Push 挂在 `ErrorPush` 顶层，`onEvent` 的 `type: 'error'` 事件也带。上游没答复（网络层就断了）时两个字段都不出现。
+三条路上带的是同一组：JSON 信封里挂在 `error` 对象上，SSE 的 `event: error` 和掉线兜底的 Web Push 挂在 `ErrorPush` 顶层，`onEvent` 的 `type: 'error'` 事件也带。网络层断开（上游还没返回 HTTP 状态码）时对应字段不出现。
 
 ## 推送 payload 字段（SW 端契约）
 
@@ -395,6 +405,7 @@ onLLMOutput(ctx: SessionContext): LLMOutputDecision | Promise<LLMOutputDecision>
 | `charId?` | 调用方业务字段，透传 |
 | `messages` | 当前对话 history。已 append 本轮 LLM 整对象 `choices[0].message`（含 `tool_calls` / `reasoning_content` / `refusal`），**不是只塞 `{role, content}`** —— 后者会让下一轮把 tool result 发回 OpenAI 时因为缺 `tool_calls` 被拒 |
 | `llmResponse` | 完整 LLM API response 对象（含 `usage` / `reasoning_content` 等） |
+| `usage` | `llmResponse.usage` 对象；上游未返回 `usage` 时为 `null` |
 | `llmOutputText` | `choices[0].message.content`。**可能是空串**（纯 `tool_calls` 响应合法） |
 | `iteration` | 0-indexed 当前轮号 |
 | `metadata` | 调用方传入的 metadata，透传 |
@@ -1195,22 +1206,34 @@ await client.sendInstant({
 
 ## 导出
 
-主入口：
+主入口（`@rei-standard/amsg-instant`）：
 
-- `createInstantHandler(options)`
-- `validateInstantPayload(payload)`
-- `processInstantMessage(payload, ctx)`
+- `createInstantHandler(options)` / `DEFAULT_MAX_LOOP_ITERATIONS`（`10`，0.11.0+）
+- `validateInstantPayload(payload, opts?)` / `validateContinuePayload(payload, opts?)` / `validateAvatarUrl(value)`
+- `validateClientAuth(request, expectedToken)` — 0.11.0 新增，独立校验 `X-Client-Token` 请求头，返回 `{ ok: true }` 或 `{ ok: false, status: 401, body }`
+- `buildCorsHeaders(cors?)` / `CORS_ALLOW_HEADERS` — 0.11.0 新增，构造与 handler 一致的 CORS 响应头
+- `processInstantMessage(payload, ctx)` / `sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId)` / `readReasoningContent(llmResponse)`
+- `buildSessionContext(args)` / `extractAssistantMessage(llmResponse)`
+- `segmentTextWithProtectedBlocks(text, options)` — 按保护块正则切分文本
 - `normalizeAiApiUrl(apiUrl)` — 0.4.0 新增，幂等地补全 `/v1/chat/completions`
 - `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现
 - `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
 - `buildMultipartPushPayloads(payload, { maxChunkBytes?, id?, ttlMs? })` — 0.8.0 新增，构造 generic `_multipart` transport payloads
+- 错误类：`HookError` / `PayloadTooLargeError` / `LlmCallError` / `MemoryStoreFullError`
+- 从 `@rei-standard/amsg-shared` 透传导出：`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`、`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush`、`isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush`、`chunkReasoningByUtf8Bytes`
 
 子路径：
 
-- `@rei-standard/amsg-instant/adapters/cloudflare` — `createCloudflareWorker(optionsBuilder)`
+- `@rei-standard/amsg-instant/adapters/cloudflare` — `createCloudflareWorker(optionsBuilder)` / `createInstantHandler`
 - `@rei-standard/amsg-instant/adapters/node`       — `toNodeHandler(fetchHandler, options?)`
 - `@rei-standard/amsg-instant/adapters/netlify`    — `toNetlifyHandler(fetchHandler)`
-- `@rei-standard/amsg-instant/adapters/vercel`     — `toVercelEdgeHandler(fetchHandler)` / `toVercelNodeHandler`
+- `@rei-standard/amsg-instant/adapters/vercel`     — `toVercelEdgeHandler(fetchHandler)` / `toVercelNodeHandler(fetchHandler)`
+- `@rei-standard/amsg-instant/blob/d1`             — `createD1BlobStore(db, opts?)`
+- `@rei-standard/amsg-instant/blob/kv`             — `createKVBlobStore(kv)`
+- `@rei-standard/amsg-instant/blob/upstash`        — `createUpstashBlobStore(redis)`
+- `@rei-standard/amsg-instant/blob/netlify`        — `createNetlifyBlobStore(store)`
+- `@rei-standard/amsg-instant/blob/postgres`       — `createPostgresBlobStore(client, opts?)`
+- `@rei-standard/amsg-instant/blob/memory`         — `createMemoryBlobStore(opts?)`
 
 ## 相关链接
 
