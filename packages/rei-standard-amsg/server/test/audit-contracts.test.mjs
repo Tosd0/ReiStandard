@@ -261,3 +261,38 @@ test('attachments report a specific unsupported-storage code on adapters without
     return { skip: true };
   }, onLLMOutput() {} });
 });
+
+
+for (const allowedToolNames of [['allowed'], [], undefined]) {
+  test(`malformed tool calls keep valid transcript identities with allowlist ${JSON.stringify(allowedToolNames)}`, async (t) => {
+    const { db } = await setup(t);
+    const current = await seed(db, 'malformed-tools');
+    const calls = [null,
+      { type: 'function', function: { name: 'blocked', arguments: '{}' } },
+      { id: 'call_1_1', type: 'function', function: { name: 'allowed', arguments: '{}' } },
+    ];
+    const requests = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return Response.json({ choices: [{ message: { role: 'assistant', content: '', tool_calls: requests.length === 1 ? calls : undefined } }] });
+    };
+    t.after(() => { globalThis.fetch = original; });
+    const executed = [];
+    let round = 0;
+    await fire(db, current, {
+      onBeforeFire() { return { messages: [{ role: 'user', content: 'hello' }], ...(allowedToolNames === undefined ? {} : { allowedToolNames }) }; },
+      onLLMOutput() { return round++ === 0 ? { decision: 'tool-request', toolCalls: calls } : { decision: 'skip-push' }; },
+      executeToolCalls(permitted) { executed.push(...permitted.map(call => call.function.name)); return permitted.map(call => ({ role: 'tool', tool_call_id: call.id, content: 'ok' })); },
+    });
+    assert.deepEqual(executed, allowedToolNames === undefined ? ['blocked', 'allowed'] : allowedToolNames);
+    const transcript = requests[1].messages;
+    const declaration = transcript.find(message => message.role === 'assistant').tool_calls;
+    const results = transcript.filter(message => message.role === 'tool');
+    assert.equal(results.length, 3);
+    assert.ok(results.every(result => typeof result.tool_call_id === 'string' && result.tool_call_id.length > 0));
+    assert.equal(new Set(results.map(result => result.tool_call_id)).size, 3);
+    assert.deepEqual(declaration.map(call => call.id).sort(), results.map(result => result.tool_call_id).sort());
+    assert.ok(declaration.every(call => call.type === 'function' && typeof call.function.name === 'string'));
+  });
+}

@@ -1123,8 +1123,30 @@ async function runFireChain({
 
     const decision = await hooks.onLLMOutput(sessionCtx);
     ctx.throwIfCancelled();
+    // Repair model-produced call entries before validating the surrounding
+    // hook decision. Invalid decision tags/containers still fail validation.
+    const rawCalls = decision?.decision === 'tool-request' ? extractToolCallsFromDecision(decision) : [];
+    const validId = (call) => typeof call?.id === 'string' && call.id.trim().length > 0;
+    const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
+    const usedIds = new Set([...rawCalls, ...nativeCalls].filter(validId).map(call => call.id));
+    const malformedIds = new Set();
+    const toolCalls = rawCalls.map((call, index) => {
+      let id = validId(call) ? call.id : `call_${iteration + 1}_${index + 1}`;
+      if (!validId(call)) {
+        while (usedIds.has(id)) id += '_';
+        usedIds.add(id);
+      }
+      if (typeof call?.function?.name !== 'string' || !call.function.name.trim()) {
+        malformedIds.add(id);
+        return { id, type: 'function', function: { name: 'invalid_tool_call', arguments: '{}' } };
+      }
+      return { ...call, id };
+    });
+    const validationDecision = decision?.decision === 'tool-request' && Array.isArray(decision.toolCalls) && decision.toolCalls.length > 0
+      ? { ...decision, toolCalls }
+      : decision;
     try {
-      assertValidDecision(decision, { inlineToolCalls: true });
+      assertValidDecision(validationDecision, { inlineToolCalls: true });
     } catch (error) {
       // 决策形状不合契约：宿主的分类器返回了库不认的东西，重试必然同败。
       // 标成确定性失败之前保住它原本的 TypeError 身份（宿主可能按类型分流）。
@@ -1162,7 +1184,6 @@ async function runFireChain({
     }
 
     // 'tool-request' — execute right here in the worker.
-    const toolCalls = extractToolCallsFromDecision(decision);
     if (toolCalls.length === 0) {
       // 留在退避阶梯里：这一轮模型没吐出能解析的 tool_calls，是这次生成的结果，
       // 不是部署配置错了。判成终态的话，一次性任务第一次掷歪就永久 failed，而
@@ -1172,11 +1193,13 @@ async function runFireChain({
         'AGENTIC_EMPTY_TOOL_REQUEST'
       );
     }
-    const permittedCalls = normalized.allowedToolNames === undefined ? toolCalls
-      : toolCalls.filter((call) => normalized.allowedToolNames.has(call?.function?.name));
+    const permittedCalls = toolCalls.filter((call) => !malformedIds.has(call.id)
+      && (normalized.allowedToolNames === undefined || normalized.allowedToolNames.has(call.function.name)));
     const deniedResults = toolCalls.filter((call) => !permittedCalls.includes(call)).map((call) => ({
       role: 'tool', tool_call_id: call.id,
-      content: JSON.stringify({ error: { code: 'TOOL_NOT_ALLOWED', message: 'Tool execution is not allowed for this fire' } }),
+      content: JSON.stringify({ error: malformedIds.has(call.id)
+        ? { code: 'INVALID_TOOL_CALL', message: 'Tool call requires a function name' }
+        : { code: 'TOOL_NOT_ALLOWED', message: 'Tool execution is not allowed for this fire' } }),
     }));
     if (permittedCalls.length > 0 && typeof hooks.executeToolCalls !== 'function') {
       throw new DeploymentConfigError(
@@ -1226,12 +1249,13 @@ async function runFireChain({
     // no matching role:'tool' result, and a strict relay rejects the next
     // round over the unanswered id. Drop a call on purpose → return a
     // result for it saying so, don't just omit it.
-    const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
-    const nativeIds = new Set(nativeCalls.map((tc) => tc && tc.id));
-    const synthesized = toolCalls.filter((tc) => !nativeIds.has(tc && tc.id));
-    const assistantWithTools = synthesized.length === 0
-      ? assistantMessage
-      : { ...assistantMessage, tool_calls: [...nativeCalls, ...synthesized] };
+    // Replace handled malformed declarations with the same normalized calls
+    // used by the executor/results. Missing-ID native entries are represented
+    // by their normalized decision entries, never left as orphan declarations.
+    const declared = nativeCalls.filter(validId).map(call => toolCalls.find(item => item.id === call.id) || call);
+    const nativeIds = new Set(declared.map(call => call.id));
+    const synthesized = toolCalls.filter(call => !nativeIds.has(call.id));
+    const assistantWithTools = { ...assistantMessage, tool_calls: [...declared, ...synthesized] };
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 
