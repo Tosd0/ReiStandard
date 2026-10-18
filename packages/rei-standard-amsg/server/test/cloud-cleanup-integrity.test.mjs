@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { deriveUserEncryptionKey, decryptFromStorage } from '../src/server/lib/encryption.js';
-import { cloudInventory, makeCleanupPlan, startCleanup, readCloudRecord, resumeCloudDataCleanups } from '../src/server/lib/cloud-data-cleanup.js';
+import { cloudInventory, makeCleanupPlan, startCleanup, advanceCleanup, readCloudRecord, resumeCloudDataCleanups } from '../src/server/lib/cloud-data-cleanup.js';
 const masterKey = 'cleanup-integrity-key';
 async function setup(count = 1) {
   const raw = createTestD1(); const db = createD1Adapter(raw); await db.initSchema();
@@ -51,6 +51,24 @@ test('recreated purge resource fails the old operation instead of looping or del
     assert.equal(op.status,'failed');
     assert.equal(op.errors[0].code,'CLOUD_PLAN_CHANGED');
     assert.equal((await db.getClientState('u','n'))[0].value,'new content');
+  } finally {raw.close();}
+});
+
+test('cleanup that runs out of retries says it stopped instead of promising another retry', async () => {
+  const {raw,db,key,ctx,plan}=await setup();
+  db.deleteCloudResourceRows=async ()=>{throw new Error('still down');};
+  try {
+    const first=await startCleanup(ctx,db,'u',key,{planId:plan.id,idempotencyKey:'exhaust'});
+    assert.equal(first.status,'pending');
+    assert.match(first.errors[0].message,/重试/);
+    // 跳过退避等待，把剩下的 7 次重试一口气跑完
+    for (let i=0;i<7;i++) {
+      const saved=await readCloudRecord(db,'u',key,'operation',first.id);
+      await advanceCleanup(ctx,db,'u',key,{...saved,nextAttemptAt:0});
+    }
+    const last=await readCloudRecord(db,'u',key,'operation',first.id);
+    assert.equal(last.status,'failed');
+    assert.doesNotMatch(last.errors[0].message,/将按服务端记录重试/);
   } finally {raw.close();}
 });
 

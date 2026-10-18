@@ -124,8 +124,9 @@ function jsonResponse(status, body, extraHeaders) {
 // 导出：在这个 worker 外面再包一层路由的宿主（自己的 fetch 里先答 OPTIONS）
 // 直接 import 这一份，别手抄——两处手抄的列表迟早对不上，preflight 一挂整个
 // 部署看起来就像离线。
+// Content-Encoding 不是 amsg-client 发的，是给宿主压缩大请求体用的（见 readRequestBody）。
 export const CORS_ALLOW_HEADERS =
-  'Content-Type, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token';
+  'Content-Type, Content-Encoding, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token';
 export const CORS_ALLOW_METHODS = 'GET, POST, PUT, DELETE, OPTIONS';
 
 /**

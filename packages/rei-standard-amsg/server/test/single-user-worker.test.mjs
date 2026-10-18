@@ -165,6 +165,8 @@ test('CORS opt-in: OPTIONS preflight answered, real response echoes the allowed 
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), 'https://app.example.com');
   assert.match(preflight.headers.get('Access-Control-Allow-Headers'), /X-Client-Token/);
+  // 压缩请求体（readRequestBody）要跨域可用，preflight 得放行 Content-Encoding
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers'), /Content-Encoding/);
   assert.match(preflight.headers.get('Access-Control-Allow-Methods'), /DELETE/);
 
   const listed = await worker.fetch(

@@ -149,3 +149,60 @@ CREATE TABLE IF NOT EXISTS cloud_guard_assertions (
     metadata_allowed INTEGER CONSTRAINT cloud_metadata_guard CHECK (metadata_allowed = 1),
     lease_allowed INTEGER CONSTRAINT cloud_lease_guard CHECK (lease_allowed = 1)
   );
+
+-- Cloud data cleanup: due-work queue, maintenance cursors, and triggers that drop
+-- metadata / work rows when the underlying row is deleted.
+CREATE TABLE IF NOT EXISTS cloud_data_work (
+    user_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    next_run_at INTEGER, expires_at INTEGER,
+    PRIMARY KEY (user_id, kind, id)
+  );
+
+CREATE TABLE IF NOT EXISTS cloud_data_maintenance (
+    name TEXT PRIMARY KEY, cursor INTEGER NOT NULL, upper_bound INTEGER NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0
+  );
+
+CREATE INDEX IF NOT EXISTS idx_cloud_work_due
+      ON cloud_data_work (kind, next_run_at) WHERE next_run_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_cloud_work_expiry
+      ON cloud_data_work (expires_at) WHERE expires_at IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_task_delete AFTER DELETE ON scheduled_messages
+        BEGIN DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+          AND resource_key=json_array('task',OLD.uuid); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_credential_delete AFTER DELETE ON llm_credentials
+        BEGIN DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+          AND resource_key=json_array('credential',OLD.cred_id); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_outbox_delete AFTER DELETE ON message_outbox
+        BEGIN DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+          AND resource_key=json_array('outbox',OLD.message_id); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_subscription_delete AFTER DELETE ON push_subscriptions
+        BEGIN DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+          AND resource_key=json_array('subscription',OLD.user_id); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_metadata_state_delete
+      AFTER DELETE ON client_state BEGIN
+      DELETE FROM cloud_resource_metadata WHERE user_id=OLD.user_id
+        AND resource_key=json_array('state',CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31)
+  THEN substr(OLD.namespace,14) ELSE OLD.namespace END,CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31) AND instr(OLD.key,char(31))>0
+  THEN substr(OLD.key,1,instr(OLD.key,char(31))-1) ELSE OLD.key END)
+        AND NOT EXISTS (SELECT 1 FROM client_state r WHERE r.user_id=OLD.user_id
+          AND r.namespace=(CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31)
+  THEN substr(OLD.namespace,14) ELSE OLD.namespace END) AND r.key=(CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31) AND instr(OLD.key,char(31))>0
+  THEN substr(OLD.key,1,instr(OLD.key,char(31))-1) ELSE OLD.key END))
+        AND NOT EXISTS (SELECT 1 FROM client_state r WHERE r.user_id=OLD.user_id
+          AND r.namespace=char(31)||'amsg-chunks'||char(31)||(CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31)
+  THEN substr(OLD.namespace,14) ELSE OLD.namespace END)
+          AND r.key >= (CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31) AND instr(OLD.key,char(31))>0
+  THEN substr(OLD.key,1,instr(OLD.key,char(31))-1) ELSE OLD.key END)||char(31) AND r.key < (CASE WHEN substr(OLD.namespace,1,13)=char(31)||'amsg-chunks'||char(31) AND instr(OLD.key,char(31))>0
+  THEN substr(OLD.key,1,instr(OLD.key,char(31))-1) ELSE OLD.key END)||char(32)); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cloud_work_delete
+      AFTER DELETE ON cloud_data_records BEGIN
+      DELETE FROM cloud_data_work WHERE user_id=OLD.user_id AND kind=OLD.kind AND id=OLD.id;
+      DELETE FROM cloud_data_record_chunks WHERE user_id=OLD.user_id AND kind=OLD.kind AND id=OLD.id; END;
