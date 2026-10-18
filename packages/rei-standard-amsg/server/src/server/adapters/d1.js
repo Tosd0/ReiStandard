@@ -1215,7 +1215,7 @@ export class D1Adapter {
 
   /**
    * 例行清理：把指定命名空间下太久没更新的条目删掉（run-tick 每跳顺手调，
-   * 宿主配了 `clientStateTtl` 才会调）。
+   * 附件默认保留 30 天，宿主 `clientStateTtl` 可覆盖或配置其他命名空间）。
    *
    * 不限用户——「这个命名空间只留最近 N 天」是命名空间级的约定，单用户部署
    * 下也就是这一个用户的行。指令由 lib/client-state-store.js 的

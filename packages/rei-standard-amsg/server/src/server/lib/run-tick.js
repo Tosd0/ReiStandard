@@ -321,14 +321,12 @@ export async function runScheduledTick(ctx) {
 }
 
 /**
- * client_state 的按命名空间过期清理（宿主配了 `ctx.clientStateTtl` 才做）。
+ * client_state 的按命名空间过期清理：附件默认 30 天，宿主配置优先。
  *
- * 默认什么都不清：写进 client_state 的东西是宿主的数据，库不替它决定什么时候
- * 该没。但「大内容旁路」那类用法（一条 push 塞不下的正文先写进状态、push 里
- * 只带引用键）写的是一次性内容，客户端取走之后没人再去删，攒着只会白占库。
- * 给这类命名空间配上天数，这里每跳顺手清一次。
+ * 库内附件命名空间有默认保留期；其他 client_state 属于宿主数据，需要显式配置
+ * 才清理。宿主给附件配置的天数覆盖默认值，包括更短或更长的保留期。
  *
- * 配置形状是 `{ 命名空间: 天数 }`，逐个命名空间开——没写进配置的一个都不动。
+ * 配置形状是 `{ 命名空间: 天数 }`；除库内附件外，没配置的命名空间不动。
  * 判据是行的 `updated_at` 列（本来就有，不加列）：升级后老库不用改表结构，
  * 也就没有「表没跟上 → cron 静默挂在缺的那一列上」这一说。
  *
@@ -344,7 +342,7 @@ export async function runScheduledTick(ctx) {
  */
 async function cleanupExpiredClientState(ctx) {
   if (typeof ctx.db.cleanupClientState !== 'function') return;
-  const targets = planClientStateCleanup({ ...ctx.clientStateTtl, [ATTACHMENT_NAMESPACE]: ATTACHMENT_RETENTION_DAYS }, Date.now());
+  const targets = planClientStateCleanup({ [ATTACHMENT_NAMESPACE]: ATTACHMENT_RETENTION_DAYS, ...ctx.clientStateTtl }, Date.now());
   if (targets.length === 0) return;
   try {
     await ctx.db.cleanupClientState(targets);

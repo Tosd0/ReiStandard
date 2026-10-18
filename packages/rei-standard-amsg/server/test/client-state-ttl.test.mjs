@@ -1,12 +1,12 @@
 /**
  * client_state 的按命名空间过期清理（config 的 `clientStateTtl`）。
  *
- * 默认一个都不清——写进去的是宿主的数据，库不替它决定什么时候该没。但「大内容
+ * 除库内附件默认 30 天外，其他命名空间按宿主配置清理。「大内容
  * 旁路」那类用法写的是一次性内容（push 塞不下的正文先写进状态、push 里只带引用
  * 键），客户端取走之后没人再去删，攒着白占库。给那个命名空间配上天数，cron 每
  * 跳顺手清一次。
  *
- * 三件事必须钉住：没配就一行都不动、只清配了的那个命名空间、大值的切片行跟着
+ * 三件事必须钉住：普通命名空间没配就不动、宿主能覆盖附件期限、大值的切片行跟着
  * 根行一起走（切片留下来就是永远读不出来的垃圾行）。
  */
 
@@ -152,3 +152,23 @@ describe('runScheduledTick 里的顺手清理', () => {
     assert.equal(summary.totalTasks, 0);
   });
 });
+
+
+for (const days of [7, 60]) {
+  test(`host attachment retention of ${days} days overrides the 30-day default`, async () => {
+    const raw = createTestD1();
+    const db = createD1Adapter(raw);
+    try {
+      await db.initSchema();
+      const namespace = 'amsg:attachments';
+      const stamp = Date.now() - (days === 7 ? 10 : 40) * DAY_MS;
+      await seedState(db, [
+        { namespace, key: 'root', updatedAt: stamp },
+        { namespace: chunkNamespaceFor(namespace), key: chunkKeyFor('root', 0), updatedAt: stamp },
+      ]);
+      await runScheduledTick({ db, masterKey: MASTER_KEY, clientStateTtl: { [namespace]: days } });
+      assert.deepEqual(await keysIn(db, namespace), days === 7 ? [] : ['root']);
+      assert.equal((await keysIn(db, chunkNamespaceFor(namespace))).length, days === 7 ? 0 : 1);
+    } finally { raw.close(); }
+  });
+}
