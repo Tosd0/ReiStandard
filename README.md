@@ -24,12 +24,10 @@
 **安装最新版（`latest` dist-tag）**：
 
 ```bash
-npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client @rei-standard/blob-store@next
+npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/amsg-server @rei-standard/amsg-sw @rei-standard/amsg-client @rei-standard/blob-store
 ```
 
-`@rei-standard/blob-store` 目前只有 `next` 预发布版，没有 `latest`；等它随 Changesets 发出第一个正式版，这里会去掉 `@next`。
-
-仓库处于 Changesets pre（`next`）模式期间，新功能先以 `x.y.z-next.N` 版本发到 `next` dist-tag，`latest` 停在进入 pre 模式前的稳定线。要用最新功能请显式装 `next`（如 `npm install @rei-standard/amsg-client@next`）；是否处于 pre 模式以 `.changeset/pre.json` 为准，详见 [`RELEASING.md`](./RELEASING.md)。
+预发布版会发到 `next` dist-tag，流程见 [`RELEASING.md`](./RELEASING.md)。从 `@rei-standard/amsg-server` 2.x 升级到 3.0.0 请先阅读 [server README 的「从 2.x 升级」](./packages/rei-standard-amsg/server/README.md#从-2x-升级)。
 
 ## 推送 schema
 
@@ -39,20 +37,21 @@ npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/a
 |---|---|---|---|
 | Dispatch | `messageType` | `instant` / `fixed` / `prompted` / `auto` | 包（固定枚举） |
 | Business | `messageSubtype` | 任意字符串 | 调用方（自由命名） |
-| Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` | 包（固定枚举） |
+| Content | `messageKind` | `content` / `reasoning` / `tool_request` / `error` / `result` | 包（固定枚举） |
 
-外加一个 `source: 'instant' | 'scheduled'` —— 路由来源（`instant` 来自 `amsg-instant`，`scheduled` 来自 `amsg-server` 的任何输出）。
+外加一个 `source: 'instant' | 'scheduled'` —— 路由来源（`messageType: 'instant'` 配 `'instant'`，其余三种定时 `messageType` 配 `'scheduled'`）。
 
-**`messageKind` 四种值**（载荷里到底是什么）：
+**`messageKind` 五种值**（载荷里到底是什么）：
 
 - `content` —— 最终面向用户的文本片段。携带 `message`、可选 `messageIndex` / `totalMessages`（N 段分句 burst 用）、`title`、`contactName`、`avatarUrl` 等。
 - `reasoning` —— LLM 的思考过程（`choices[0].message.reasoning_content`）。携带 `reasoningContent`。**不带** `messageIndex` / `totalMessages`，因为推理是一轮 LLM 一条，不是分句 burst。
 - `tool_request` —— Agentic loop 钩子返回的工具调用请求。携带 `toolCalls`（OpenAI `tool_calls` 透传形状），客户端执行后通过 `/continue` 恢复。
-- `error` —— 生产端诊断错误（如 `HOOK_THREW` / `LOOP_EXCEEDED`）。携带 `code`、`message`、可选 `iteration`。**取代了 0.7.x 那个 `{ type: 'error', code: '...' }` 旧信封**。
+- `error` —— 生产端诊断错误（如 `HOOK_THREW` / `LOOP_EXCEEDED`）。携带 `code`、`message`、可选 `iteration`、`llmStatus`、`providerCode`。
+- `result` —— 宿主自定义的一条结果（由 `amsg-server` 的 `ctx.emitResult()` 等产出）。携带必填 `resultKind`，可选 `title`、`body` 以及任意宿主自定义字段。
 
 **`messageType` 四种值**（怎么发出来的）：
 
-- `instant` —— 一次性即时推送（`amsg-instant` 一发即走，无 DB、无 cron）。总是配 `source: 'instant'`。
+- `instant` —— 一次性即时推送（`amsg-server` 的即时消息路径或 `amsg-instant`）。总是配 `source: 'instant'`。
 - `fixed` —— 固定文本的定时任务（`amsg-server`，无 LLM）。
 - `prompted` —— LLM 生成 + 定时调度（`amsg-server` 的 prompted 路径）。
 - `auto` —— LLM 生成 + 自动周期（`amsg-server` 的 auto 路径）。
@@ -63,7 +62,7 @@ npm install @rei-standard/amsg-shared @rei-standard/amsg-instant @rei-standard/a
 
 **`sessionId` 不变性**：同一个 LLM 轮次内自动发出的 `ReasoningPush` 和后续 `ContentPush` burst 共享同一个 `sessionId`；agentic-loop 路径下，同一个 `/instant` 请求的所有 iteration 也共享一个 `sessionId`。客户端可以靠 `sessionId` 把"思考中"UI 和真正回复拼回到同一条消息上。
 
-字段表、builders（`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush`）、类型守卫（`isContentPush` / `isReasoningPush` / …）与常量（`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`）的完整说明见 [`packages/rei-standard-amsg/shared/README.md`](./packages/rei-standard-amsg/shared/README.md)。
+字段表、builders（`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush` / `buildResultPush`）、类型守卫（`isContentPush` / `isReasoningPush` / …）与常量（`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`）的完整说明见 [`packages/rei-standard-amsg/shared/README.md`](./packages/rei-standard-amsg/shared/README.md)。
 
 ## 🚀 接入
 
