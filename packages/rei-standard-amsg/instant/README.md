@@ -1220,7 +1220,7 @@ await client.sendInstant({
 - `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
 - `buildMultipartPushPayloads(payload, { maxChunkBytes?, id?, ttlMs? })` — 0.8.0 新增，构造 generic `_multipart` transport payloads
 - 错误类：`HookError` / `PayloadTooLargeError` / `LlmCallError` / `MemoryStoreFullError`
-- 从 `@rei-standard/amsg-shared` 透传导出：`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`、`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush`、`isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush`、`chunkReasoningByUtf8Bytes`
+- 从 `@rei-standard/amsg-shared` 透传导出：`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`、`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush` / `buildResultPush`、`isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` / `isResultPush`、`chunkReasoningByUtf8Bytes`
 
 子路径：
 

@@ -598,8 +598,8 @@ try {
 以及从 `@rei-standard/amsg-shared` re-export 的运行时常量 / builder / type guard：
 
 - `MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`
-- `buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush`
-- `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush`
+- `buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush` / `buildResultPush`
+- `isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` / `isResultPush`
 
 这些在 SW / app 端处理 push 时用得上，单独装 `@rei-standard/amsg-shared` 没必要。
 
