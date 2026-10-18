@@ -157,7 +157,7 @@ const plainText = await decryptFromStorage(cipherText, userKey);
 #### 5. 大小上限与默认 `messageId` 格式
 
 - **单条 Web Push 明文上限**：`MAX_PUSH_PAYLOAD_BYTES = 3993` UTF-8 字节（推送服务密文上限 `4096` 字节减去 `aes128gcm` 固定开销 `103` 字节；Fire hook 预留信封字节 `PUSH_ENVELOPE_RESERVED_BYTES = 384` 后剩余 `3609` 字节）。超限在发送前直接抛 `PUSH_PAYLOAD_TOO_LARGE`。
-- **单条任务正文上限**：`MAX_TASK_PAYLOAD_BYTES = 995871` UTF-8 字节（约 972.5 KB）。`POST /schedule-message` 或 `PUT /update-message`（扩容时）超出上限返回 HTTP `400` `TASK_PAYLOAD_TOO_LARGE`。
+- **单条任务正文上限**：`MAX_TASK_PAYLOAD_BYTES = 995871` UTF-8 字节（约 972.5 KB）。`POST /schedule-message` 或 `PUT /update-message`（更新后正文变大时）超出上限返回 HTTP `400` `TASK_PAYLOAD_TOO_LARGE`。
 - **压缩请求体解压上限**：支持 `Content-Encoding: gzip` 请求体，解压后默认上限 `DEFAULT_MAX_REQUEST_BODY_BYTES = 33554432` 字节（32 MB），超出返回 HTTP `413` `REQUEST_BODY_TOO_LARGE`；不支持的编码（如 `br`、`deflate`）返回 `415` `UNSUPPORTED_CONTENT_ENCODING`。未压缩的明文请求体不受此 32 MB 阈值限制。
 - **默认 `messageId` 与 `sessionId` 格式**：2.5.3 对循环任务每次触发都生成相同的 `msg_task_<id>_<i>` 和 `sess_task_<id>`；3.0.0 在 `task.next_send_at` 可解析为毫秒时间戳 `occurrenceMs` 时拼入 `@<occurrenceMs>`，避免循环任务不同周期的推送在客户端去重时互相冲掉：
   - `sessionId`：`sess_task_<id>@<occurrenceMs>`（无 `task.id` 时为 `sess_<uuid>`）
