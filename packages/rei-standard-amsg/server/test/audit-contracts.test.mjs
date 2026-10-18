@@ -397,3 +397,27 @@ test('scheduleTask duplicate receipts project the same metadata and safe task fi
     return { skip: true };
   }, onLLMOutput() {} });
 });
+
+
+test('update-message atomically rejects taskInput changes including null', async (t) => {
+  const { raw, db } = await setup(t);
+  const uuid = 'immutable-task-input';
+  const taskInput = { original: { value: 'accepted' } };
+  const seeded = await seed(db, uuid, { ...base, taskInput, userMessage: 'original body' });
+  const worker = createSingleUserCloudflareWorker(() => ({ db, masterKey: MASTER }));
+  for (const replacement of [{ changed: true }, null]) {
+    const response = await worker.fetch(new Request(`https://w.test/update-message?id=${uuid}`, {
+      method: 'PUT', headers: { 'X-User-Id': USER, 'X-Payload-Encrypted': 'true', 'X-Encryption-Version': '1' },
+      body: JSON.stringify(await encryptPayload({ taskInput: replacement, contactName: 'changed name', userMessage: 'changed body' }, key)),
+    }), { DB: raw });
+    assert.equal(response.status, 400);
+    const result = await response.json();
+    assert.equal(result.error.code, 'INVALID_UPDATE_DATA');
+    assert.deepEqual(result.error.details.invalidFields, ['taskInput']);
+    const stored = await db.getTaskByUuid(uuid, USER);
+    assert.equal(stored.encrypted_payload, seeded.encrypted_payload, 'mixed patch cannot change other fields');
+    let seen;
+    await fire(db, stored, { onBeforeFire(ctx) { seen = ctx.task.taskInput; return { skip: true }; }, onLLMOutput() {} });
+    assert.deepEqual(seen, taskInput);
+  }
+});

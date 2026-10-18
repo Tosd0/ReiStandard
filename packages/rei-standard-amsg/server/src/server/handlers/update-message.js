@@ -73,6 +73,12 @@ export function createUpdateMessageHandler(ctx) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误' } } };
     }
 
+    // taskInput is the immutable input accepted with task creation/replacement.
+    // Reject the whole patch before any other fields can be written.
+    if (Object.prototype.hasOwnProperty.call(updates, 'taskInput')) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'taskInput 只能在创建或替换任务时设置', details: { invalidFields: ['taskInput'] } } } };
+    }
+
     if (updates.nextSendAt && !isValidISO8601(updates.nextSendAt)) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['nextSendAt'] } } } };
     }
