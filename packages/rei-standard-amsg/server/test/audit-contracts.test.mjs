@@ -251,3 +251,13 @@ test('hook readState rejects invalid key selectors before querying storage', asy
     await assert.rejects(readState('inputs', { key: invalid }), TypeError);
   }
 });
+
+
+test('attachments report a specific unsupported-storage code on adapters without client state', async (t) => {
+  const { db } = await setup(t);
+  const current = await seed(db, 'unsupported-attachment');
+  await fire({}, current, { async onBeforeFire(ctx) {
+    await assert.rejects(ctx.storeAttachment('result'), { code: 'ATTACHMENT_STORAGE_UNSUPPORTED' });
+    return { skip: true };
+  }, onLLMOutput() {} });
+});

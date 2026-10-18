@@ -1,4 +1,5 @@
 import { randomUUID } from './webcrypto-utils.js';
+import { DeploymentConfigError } from './errors.js';
 
 // A dedicated namespace lets the regular cron reclaim abandoned/retried writes.
 export const ATTACHMENT_NAMESPACE = 'amsg:attachments';
@@ -32,7 +33,15 @@ export function createAttachmentStore({ task, occurrenceMs, writeState, now }) {
     }
     const at = now();
     const ref = { version: /** @type {1} */ (1), namespace: ATTACHMENT_NAMESPACE, key: randomUUID(), taskUuid: task.uuid, occurrenceMs, expiresAt: at + ttlMs };
-    const result = await writeState(ATTACHMENT_NAMESPACE, [{ key: ref.key, value: JSON.stringify({ ...ref, owner, kind, ownerGeneration, value }), updatedAt: at, owner, kind, ownerGeneration }]);
+    let result;
+    try {
+      result = await writeState(ATTACHMENT_NAMESPACE, [{ key: ref.key, value: JSON.stringify({ ...ref, owner, kind, ownerGeneration, value }), updatedAt: at, owner, kind, ownerGeneration }]);
+    } catch (error) {
+      if (error?.code === 'AGENTIC_STATE_WRITE_UNSUPPORTED') {
+        throw new DeploymentConfigError('ATTACHMENT_STORAGE_UNSUPPORTED: attachments require a client_state adapter (built-in support: D1)', { code: 'ATTACHMENT_STORAGE_UNSUPPORTED' });
+      }
+      throw error;
+    }
     if (result.upserted !== 1 || result.skipped !== 0) {
       throw new Error('ATTACHMENT_WRITE_INCOMPLETE: attachment was not stored');
     }
