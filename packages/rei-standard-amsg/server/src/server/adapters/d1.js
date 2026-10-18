@@ -1188,19 +1188,28 @@ export class D1Adapter {
   }
 
   /**
-   * All entries of one namespace (values still encrypted).
+   * Entries of one namespace (values still encrypted); optional exact/prefix selection.
    *
    * @param {string} userId
    * @param {string} namespace
    * @returns {Promise<Array<{ namespace: string, key: string, value: string, updated_at: number }>>}
    */
-  async getClientState(userId, namespace) {
+  async getClientState(userId, namespace, options = {}) {
+    const params = [userId, namespace];
+    let selector = '';
+    if (options.key !== undefined) {
+      selector = ' AND key = ?';
+      params.push(options.key);
+    } else if (options.keyPrefix !== undefined) {
+      selector = ' AND key >= ? AND key < ?';
+      params.push(options.keyPrefix, prefixRangeEnd(options.keyPrefix));
+    }
     const res = await this._db.prepare(
       `SELECT namespace, key, value, updated_at
        FROM client_state
-       WHERE user_id = ? AND namespace = ?
+       WHERE user_id = ? AND namespace = ?${selector}
        ORDER BY key ASC`
-    ).bind(userId, namespace).all();
+    ).bind(...params).all();
     return res.results || [];
   }
 

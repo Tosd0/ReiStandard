@@ -398,7 +398,7 @@ describe('agentic fire loop', () => {
         'iteration', 'metadata', 'contactName', 'avatarUrl', 'scratch',
         // server 侧在共享 SessionContext 之上加的任务身份、状态访问器与建任务口
         'taskId', 'taskUuid', 'occurrenceMs',
-        'readState', 'writeState', 'scheduleTask',
+        'readState', 'writeState', 'scheduleTask', 'listTasks', 'storeAttachment',
         // 往客户端补一条自定义结果（落收件箱 + 推送）
         'emitResult',
         // usage 是共享 SessionContext 新增的便捷字段（llmResponse.usage 的引用）；

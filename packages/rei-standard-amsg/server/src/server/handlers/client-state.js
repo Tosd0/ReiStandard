@@ -46,6 +46,7 @@ import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
   INTERNAL_STATE_CHAR_RE,
   chunkNamespaceFor,
+  chunkKeyPrefixFor,
   resolveClientStateEntries,
 } from '../lib/state-chunks.js';
 import {
@@ -204,7 +205,12 @@ export function createClientStateHandler(ctx) {
     if (gate.error) return gate.error;
     const { userId } = gate;
 
-    const namespace = new URL(url, 'https://dummy').searchParams.get('namespace') || '';
+    const query = new URL(url, 'https://dummy').searchParams;
+    const namespace = query.get('namespace') || '';
+    const key = query.get('key');
+    if (key !== null && (!key.trim() || key.length > MAX_KEY_CHARS || INTERNAL_STATE_CHAR_RE.test(key))) {
+      return err(400, 'INVALID_STATE_KEY', 'key must be non-empty, at most 256 characters, without control characters');
+    }
     if (!namespace.trim()) return err(400, 'NAMESPACE_REQUIRED', '必须提供 namespace 查询参数');
     if (INTERNAL_STATE_CHAR_RE.test(namespace)) {
       return err(400, 'INVALID_STATE_NAMESPACE', 'namespace 不能包含控制字符（\\u0000-\\u001f 为库内部保留）');
@@ -215,11 +221,11 @@ export function createClientStateHandler(ctx) {
     }
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
-    const rows = await db.getClientState(userId, namespace);
+    const rows = await db.getClientState(userId, namespace, key === null ? undefined : { key });
     // 分块存储的值在这里拼回原文；块不齐全的 key 视为不存在（不抛错）。
     const decrypted = await resolveClientStateEntries(
-      rows,
-      () => db.getClientState(userId, chunkNamespaceFor(namespace)),
+      key === null ? rows : rows.filter((row) => row.key === key),
+      () => db.getClientState(userId, chunkNamespaceFor(namespace), key === null ? undefined : { keyPrefix: chunkKeyPrefixFor(key) }),
       (value) => decryptFromStorage(value, userKey)
     );
 

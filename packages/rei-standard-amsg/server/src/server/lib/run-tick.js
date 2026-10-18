@@ -78,6 +78,7 @@ import { processSingleMessage } from './message-processor.js';
 import { buildHookTask, occurrenceSuffix } from './agentic-fire.js';
 import { createStateAccessors } from './state-accessors.js';
 import { planClientStateCleanup } from './client-state-store.js';
+import { ATTACHMENT_NAMESPACE, ATTACHMENT_RETENTION_DAYS } from './attachments.js';
 import { createResultEmitter } from './result-emitter.js';
 import { discardUndeliveredPushesForTask } from './outbox-store.js';
 import { nextFutureOccurrence, planNextOccurrence } from './recurrence.js';
@@ -343,7 +344,7 @@ export async function runScheduledTick(ctx) {
  */
 async function cleanupExpiredClientState(ctx) {
   if (typeof ctx.db.cleanupClientState !== 'function') return;
-  const targets = planClientStateCleanup(ctx.clientStateTtl, Date.now());
+  const targets = planClientStateCleanup({ ...ctx.clientStateTtl, [ATTACHMENT_NAMESPACE]: ATTACHMENT_RETENTION_DAYS }, Date.now());
   if (targets.length === 0) return;
   try {
     await ctx.db.cleanupClientState(targets);

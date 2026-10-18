@@ -479,7 +479,9 @@ describe('fire ctx cancelTask / renewTask', () => {
     let tooSoonError = null;
     const res = await fireCtxOf(adapter, async (ctx) => {
       const r = await ctx.renewTask(otherUuid, newAt);
-      assert.deepEqual(r, { renewed: true, uuid: otherUuid, nextSendAt: newAt });
+      assert.deepEqual({ renewed: r.renewed, uuid: r.uuid, nextSendAt: r.nextSendAt }, { renewed: true, uuid: otherUuid, nextSendAt: newAt });
+      assert.equal(r.task.uuid, otherUuid);
+      assert.equal(r.task.nextSendAt, newAt);
       assert.deepEqual(await ctx.renewTask('no-such-uuid', newAt), { renewed: false, reason: 'not_found' });
       try { await ctx.renewTask(otherUuid, new Date(Date.now() + 10_000).toISOString()); } catch (e) { tooSoonError = e; }
     });

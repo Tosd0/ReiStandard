@@ -117,7 +117,7 @@
  *   `cleanupOutcomes`（可选）逐条报告 cleanups[i] 的结局：精确 key 形态回 `true`（这个 key 的行已不在——
  *   删掉了或本来就没有）/ `false`（行还在，库里那行更新、删除被条件写拦下）；前缀形态回 `null`。
  *   调用方靠它把被拦下的删除计入 skippedEntries；缺席时删除一律按「已删」计。
- * @property {(userId: string, namespace: string) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
+ * @property {(userId: string, namespace: string, options?: { key?: string, keyPrefix?: string }) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
