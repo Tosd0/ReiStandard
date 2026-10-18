@@ -3,9 +3,9 @@
 `@rei-standard/amsg-sw` 是 ReiStandard 主动消息标准的 Service Worker 插件包，负责推送展示和离线重试，装上就能用。
 
 
-## v2.1.0 — 按 kind 分发的客户端事件
+## 按 kind 分发的客户端事件
 
-2.1.0 跟随 `@rei-standard/amsg-shared` 的三轴 push schema：每条 push 现在通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error` / `result`）区分内容类型。SW 在收到 push 后会做两件事：
+每条 push 通过 `payload.messageKind`（`content` / `reasoning` / `tool_request` / `error` / `result`）区分内容类型（遵循 `@rei-standard/amsg-shared` 的三轴 push schema）。SW 在收到 push 后会做两件事：
 
 1. **永远** 通过 `postMessage` 把 payload 广播给所有受控窗口（包括 `includeUncontrolled: true` 的未受控窗口）。
 2. **仅当** `messageKind === 'content'` / `'result'`，或 payload 没有 `messageKind`（2.0.x 老 payload 的回退路径）时，才调用 `showNotification`。`reasoning` / `tool_request` / `error` 三种 kind 一律不弹通知——业务在 app 内通过 postMessage 通道自行渲染。
@@ -176,6 +176,7 @@ installReiSW(self, {
   dedupe: {
     enabled: true,              // 默认 true
     ttlMs: 10 * 60_000,         // 默认 10 分钟
+    cleanupIntervalMs: 60_000,  // 默认 60 秒（传 0 关闭周期清理）
     dbName: 'rei_amsg_sw_dedupe_v1', // 想隔离另一套去重数据就改这个；每个 dbName 是独立 IDB instance
     key: (payload) => payload.messageId,
   },
@@ -279,7 +280,7 @@ installReiSW(self, {
 
 ### Blob envelope
 
-当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type?, messageId?, id?, dedupeKey? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'`（或缺失）时才渲染占位通知，与普通 push 行为一致。
+当 `amsg-instant` 检测到 payload 超过 `maxInlineBytes` 时会改发 blob envelope `{ _blob: true, key, url, messageKind?, type?, messageId?, id?, dedupeKey? }`。SW **不会** 自动 fetch blob 内容（那是 client 的职责），但仍然会按 envelope 上的 `messageKind` 分发对应事件，让 client 知道有什么类型的内容即将到达，自己决定要不要拉取。Blob envelope 也只在 `messageKind === 'content'` / `'result'`（或缺失，或显式配置了 `notification.show`）时才渲染占位通知，与普通 push 行为一致。
 
 ### Generic multipart transport（2.1.0+）
 
@@ -385,7 +386,7 @@ dedupe 库、queue / multipart 库都把 IndexedDB 连接缓存复用。浏览�
 
 ## 功能概览
 
-- 处理 `push` 事件：按 `messageKind` 分发到客户端 + 仅 `content` 走 `showNotification`
+- 处理 `push` 事件：按 `messageKind` 分发到客户端 + 默认 `content` / `result` 走 `showNotification`（可由 `notification.show` 覆盖）
 - 透明重组 `_multipart` transport：应用层只收到完整原始 payload
 - 处理 `message` 事件：支持离线请求入队与主动冲刷队列
 - 处理 `sync` 事件：在网络恢复后自动重试队列请求
@@ -458,7 +459,8 @@ export async function enqueueRequestToSW(requestPayload) {
 
 ## 消息协议
 
-- `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到 outbox，并立即尝试发送
+- `REI_SW_MESSAGE_TYPE.DELIVER`（同 `REI_AMSG_DELIVER_MESSAGE_TYPE`）：页面把 SSE / 补拉收到的业务 payload 转交给 SW，共用 SW 的 dedupe、通知展示与 `onBusinessPayload` 管线
+- `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到离线发送队列，并立即尝试发送
 - `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送
 - `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果。点对点，一次入队一条。`ok: true` 表示已入队；`delivered: true` 表示这条已经真的发出去了（自己入队触发的冲刷、或恰好并发在跑的另一轮冲刷发的都算）；`delivered: false` 且没有 `dropped` 表示还在队列里等下次冲刷；被服务端 4xx 永久拒掉时带 `dropped: true` / `status` / `error`
 - `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
@@ -488,23 +490,27 @@ export async function enqueueRequestToSW(requestPayload) {
 ## 导出 API（Exports）
 
 - `installReiSW`
-- `REI_SW_EVENT` — 2.1.0 新增，按 kind 分发的客户端事件名
-- `REI_AMSG_POSTMESSAGE_TYPE` — 2.1.0 新增，SW → client 广播信封的 `type` 字段（恒为 `'REI_AMSG_PUSH'`）
-- `REI_SW_MESSAGE_TYPE`
+- `REI_SW_EVENT` — 按 kind 分发的客户端事件名
+- `REI_AMSG_POSTMESSAGE_TYPE` — SW → client 广播信封的 `type` 字段（恒为 `'REI_AMSG_PUSH'`）
+- `REI_SW_MESSAGE_TYPE` — client ⇄ SW `postMessage` 消息类型枚举
+- `REI_AMSG_DELIVER_MESSAGE_TYPE` — 页面 → SW 投递桥消息类型常量（恒为 `'REI_AMSG_DELIVER'`，与 `REI_SW_MESSAGE_TYPE.DELIVER` 同值）
+- `MULTIPART_FAILURE_REASON` — `_multipart` 分片重组失败原因枚举（`REI_SW_EVENT.MULTIPART_EXPIRED` 的 `payload.reason` 取值）
 
 以上常量的单一来源是 `@rei-standard/amsg-shared`（本包 re-export 同一份）。页面侧代码请直接从 shared import，避免在窗口环境里执行本包 SW 模块的顶层状态。
 
-`REI_SW_EVENT` 包含（详见上文 v2.1.0 章节）：
+`REI_SW_EVENT` 包含（详见上文「按 kind 分发的客户端事件」章节）：
 
 - `CONTENT_RECEIVED`
 - `REASONING_RECEIVED`
 - `TOOL_REQUEST_RECEIVED`
 - `ERROR_RECEIVED`
+- `RESULT_RECEIVED`
 - `MULTIPART_EXPIRED`
 - `UNKNOWN_RECEIVED`
 
 `REI_SW_MESSAGE_TYPE` 包含：
 
+- `DELIVER`
 - `ENQUEUE_REQUEST`
 - `FLUSH_QUEUE`
 - `QUEUE_RESULT`
