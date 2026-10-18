@@ -39,6 +39,7 @@
  * @property {string}                   [charId]
  * @property {ChatMessage[]}            messages         - Including the just-appended assistant turn.
  * @property {unknown}                  llmResponse      - Full LLM response (choices, usage, …).
+ * @property {Record<string, unknown>|null} usage     - `llmResponse.usage` 的直接引用；响应没带 usage → null。
  * @property {string}                   llmOutputText    - May be '' for pure tool-call responses.
  * @property {number}                   iteration        - 0-indexed: the round that just finished.
  * @property {Record<string, unknown>}  metadata

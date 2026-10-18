@@ -34,7 +34,6 @@
  *   }));
  *
  * wrangler.toml (excerpt):
- *   compatibility_flags = ["nodejs_compat"]
  *   # Secrets — set via `wrangler secret put NAME`
  *   #   VAPID_PUBLIC_KEY
  *   #   VAPID_PRIVATE_KEY

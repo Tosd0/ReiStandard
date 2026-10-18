@@ -106,3 +106,20 @@ test('uidx_uuid enforces uniqueness on non-null uuid but allows multiple NULLs',
     db.close();
   }
 });
+
+test('examples/schema.sql alone builds a schema that passes getSchemaVersion', async () => {
+  // 手维护的 SQL 和代码里的建表语句会漂，这条把两边钉在一起。
+  const { readFileSync } = await import('node:fs');
+  const { createD1Adapter } = await import('../src/server/adapters/d1.js');
+  const { getSchemaVersion } = await import('../src/server/lib/schema-version.js');
+  const sql = readFileSync(new URL('../examples/cloudflare-single-user/schema.sql', import.meta.url), 'utf8');
+  const raw = createTestD1();
+  try {
+    raw._raw.exec(sql);
+    const result = await getSchemaVersion(createD1Adapter(raw));
+    assert.deepEqual(result.missing, []);
+    assert.equal(result.ok, true);
+  } finally {
+    raw.close();
+  }
+});

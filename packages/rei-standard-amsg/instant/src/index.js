@@ -1075,10 +1075,12 @@ export {
   buildReasoningPush,
   buildToolRequestPush,
   buildErrorPush,
+  buildResultPush,
   isContentPush,
   isReasoningPush,
   isToolRequestPush,
   isErrorPush,
+  isResultPush,
   chunkReasoningByUtf8Bytes,
 } from '@rei-standard/amsg-shared';
 

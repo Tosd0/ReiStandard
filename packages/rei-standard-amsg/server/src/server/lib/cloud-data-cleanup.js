@@ -455,9 +455,12 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
     operation.errors = [
       {
         code: error.code || 'CLOUD_CLEANUP_FAILED',
-        message:
-          error.code === 'CLOUD_PLAN_CHANGED'
-            ? error.message
+        message: ['CLOUD_PLAN_CHANGED', 'CLOUD_OWNER_CHANGED'].includes(
+          error.code
+        )
+          ? error.message
+          : terminal
+            ? '云端清理多次重试仍未完成，已停止重试。'
             : '云端清理未完成，将按服务端记录重试。'
       }
     ];

@@ -42,6 +42,7 @@ const TEXT_ENCODER = new TextEncoder();
 /** @typedef {import('@rei-standard/amsg-shared').ReasoningPush} ReasoningPush */
 /** @typedef {import('@rei-standard/amsg-shared').ToolRequestPush} ToolRequestPush */
 /** @typedef {import('@rei-standard/amsg-shared').ErrorPush} ErrorPush */
+/** @typedef {import('@rei-standard/amsg-shared').ResultPush} ResultPush */
 
 /** @typedef {{ type: string, id: string, label?: string }} CloudOwner */
 /** @typedef {'task'|'state'|'credential'|'outbox'|'subscription'} CloudResourceType */
@@ -524,7 +525,7 @@ export class ReiClient {
   }
 
   /**
-   * Fetch the worker's capability manifest (single-user amsg-server 2.7.0+,
+   * Fetch the worker's capability manifest (single-user amsg-server 3.0.0+,
    * `GET /capabilities`).
    *
    * Feature detection for deploy drift: an outdated worker lacks newer
@@ -1103,7 +1104,7 @@ export class ReiClient {
   }
 
   /**
-   * Read one task, with its **full** `metadata` (amsg-server 2.6.0+
+   * Read one task, with its **full** `metadata` (amsg-server 3.0.0+
    * `GET /message`).
    *
    * `listMessages` 的每条任务只带 `charId` / `clientTaskId` 两个 metadata 子
@@ -1303,7 +1304,7 @@ export class ReiClient {
 
   /**
    * Batch-upsert client-state entries (single-user worker,
-   * amsg-server 2.6.0+ `/client-state`).
+   * amsg-server 3.0.0+ `/client-state`).
    *
    * The worker keeps one live copy per (namespace, key); this client is
    * the only writer. Send everything that changed in ONE call — e.g.
@@ -1316,7 +1317,7 @@ export class ReiClient {
    * (requires `init()`); the worker re-encrypts each value at rest
    * under the per-user key.
    *
-   * Large values: on amsg-server 2.7.0+ a value over 200KB is stored
+   * Large values: on amsg-server 3.0.0+ a value over 200KB is stored
    * chunked across rows by the worker itself — no client-side splitting
    * needed, and reads return the original value reassembled. The default
    * per-value ceiling is 5MB (worker factory config `maxStateValueBytes`).
@@ -1660,7 +1661,7 @@ export class ReiClient {
   // ─── Message outbox（服务端投递账本） ─────────────────────────────
 
   /**
-   * 拉这个用户还没确认收到的服务端消息（`GET /outbox`，amsg-server 2.7.0+
+   * 拉这个用户还没确认收到的服务端消息（`GET /outbox`，amsg-server 3.0.0+
    * 单用户线）。
    *
    * 服务端在每条 Web Push 发出去之前先把它记进账本，所以「哪些消息客户端还
@@ -2275,8 +2276,10 @@ export {
   buildReasoningPush,
   buildToolRequestPush,
   buildErrorPush,
+  buildResultPush,
   isContentPush,
   isReasoningPush,
   isToolRequestPush,
   isErrorPush,
+  isResultPush,
 } from '@rei-standard/amsg-shared';
