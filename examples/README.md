@@ -2,16 +2,19 @@
 
 > 本文档用于不使用 SDK 包时的手动接入。优先推荐 Package-First。
 
-> ⚠️ **OUTDATED — 停留在 v2.0.1，落后于 SDK 包 v2.3（最后核对 2026-05-18）**
+> ⚠️ **OUTDATED — 停留在 v2.0.1，落后于最新稳定版 SDK（`amsg-server` 3.0.0 / `amsg-client` 2.9.0 / `amsg-sw` 2.4.0）**
 >
-> 这份手动接入示例只覆盖 v2.0.1 的核心契约：一体化 `init-tenant`、`tenantToken` / `cronToken` 鉴权、`schedule-message` / `update-message` 接受 `completePrompt: string`。**未对接**以下规范增量（详见 [`standards/active-messaging-api.md`](../standards/active-messaging-api.md) §6.1 / §6.2）：
+> 这份手动接入示例只覆盖 v2.0.1 的核心契约：一体化 `init-tenant`、`tenantToken` / `cronToken` 鉴权、`schedule-message` / `update-message` 接受 `completePrompt: string` 与随任务内嵌的 `pushSubscription`。**未对接**以下协议变更与增量（详见 [`standards/active-messaging-api.md`](../standards/active-messaging-api.md)）：
 >
-> | 增量 | SDK 起始版本 | 示例缺什么 |
+> | 协议变更 / 增量 | SDK 起始版本 | 示例缺什么 |
 > |---|---|---|
+> | 用户级推送订阅（`PUT / GET / DELETE /push-subscription`） | server 3.0.0 · client 2.9.0 | 示例仍在 `POST /schedule-message` 要求请求体带 `pushSubscription`，未实现 `/push-subscription` 端点与 `push_subscriptions` 表，与 `amsg-client` 2.9.0+ 不兼容 |
+> | 三轴推送信封（`messageKind` / `sessionId` / `ReasoningPush` / `ResultPush`） | shared 0.1.0+ / 0.4.0 · server 2.4.0+ / 3.0.0 · sw 2.1.0+ / 2.4.0 | `lib/message-processor.js` 发出的推送不带 `messageKind`、`sessionId` 与任务身份字段 |
+> | 服务端收件箱（`/outbox`）、客户端状态镜像（`/client-state`）、用户级 LLM 凭据（`/llm-credentials`）、单条任务详情（`GET /message`）、任务时区（`tzId`）、自定义分句（`splitPattern`）、Fire 时刻 hooks、云端数据管理（`/cloud-data/*`） | server 2.3.0–3.0.0 · client 2.9.0 | 均未实现 |
 > | OpenAI 格式 `messages` 数组（system / 多轮 / tool role）+ `temperature` 透传 | server 2.2.0 · instant 0.5.0 · client 2.2.1 | `lib/message-processor.js` 的 `buildAiRequestBody` 把 prompt 硬包成单条 user 消息 |
 > | `avatarUrl` 软清空（不合法值 `console.warn` + 置空，不再 400 整个任务） | server 2.3.3 / 2.4.0 · instant 0.7.1 / 0.8.0 · client 2.2.4 / 2.3.0 | 只检 `new URL(...)` 能 parse；`data:` base64 头像会进库再触发下游 413 |
 >
-> 新接入请直接用 SDK 包（`@rei-standard/amsg-server` / `amsg-instant` / `amsg-client`），行为已按规范对齐到字节级。这份示例的文档与代码后续会同步更新。
+> 新接入请直接用 SDK 包（`@rei-standard/amsg-server` / `amsg-instant` / `amsg-client`），行为已按规范对齐到字节级。
 
 ## 目录结构
 
