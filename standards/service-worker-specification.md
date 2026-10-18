@@ -402,7 +402,7 @@ function buildNotificationOptions(data, hasVisibleClient = false) {
       : Boolean(notif.silent ?? data.silent ?? false);
   return {
     title: notif.title || data.title || `来自 ${data.contactName}`,
-    body: notif.body || data.message || data.body || '您有一条新消息',
+    body: notif.body || data.body || data.message || '您有一条新消息',
     icon: notif.icon || data.avatarUrl || '/icons/default-avatar.png',
     badge: '/icons/badge.png',
     tag: data.messageId || `msg-${Date.now()}`,
@@ -1432,7 +1432,7 @@ self.addEventListener('push', (event) => {
         ? hasVisibleClient
         : Boolean(notif.silent ?? data.silent ?? false);
     await self.registration.showNotification(notif.title || data.title || '新消息', {
-      body: notif.body || data.message || data.body || '您有一条新消息',
+      body: notif.body || data.body || data.message || '您有一条新消息',
       icon: notif.icon || data.avatarUrl || '/icons/icon-192.png',
       badge: notif.badge || '/icons/badge.png',
       silent,
@@ -1459,7 +1459,7 @@ self.addEventListener('notificationclick', (event) => {
 
 **1. `messageKind: 'result'` 与 `RESULT_RECEIVED` 事件**
 - 新增对第 5 种 `messageKind: 'result'`（`ResultPush`）的分发支持，广播事件名为 `REI_SW_EVENT.RESULT_RECEIVED`（`'rei-amsg-result-received'`）。
-- 默认展示策略与 `content` 一致（`notification.show` 未配或为 `'auto'` 时自动弹系统通知，通知正文回退读取 `notification.body` → `payload.message` → `payload.body`）。
+- 默认展示策略与 `content` 一致（`notification.show` 未配或为 `'auto'` 时自动弹系统通知，通知正文回退读取 `notification.body` → `payload.body` → `payload.message`）。
 
 **2. `notification.silent: 'when-visible'` 与空白正文兜底 `defaultBody`**
 - `notification.silent` 新增 `'when-visible'` 取值：当下有 `visibilityState === 'visible'` 的窗口时静音，无可见窗口时正常响铃震动。

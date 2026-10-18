@@ -587,7 +587,7 @@ Body:
 |---|---|---|
 | 400 | `INVALID_JSON` | 请求体不是有效 JSON |
 | 400 | `INVALID_REQUEST_BODY` | 请求体不是 JSON 对象 |
-| 400 | `INVALID_CONTENT_ENCODING` | 声明了 `Content-Encoding: gzip` 但压缩数据损坏 |
+| 400 | `INVALID_CONTENT_ENCODING` | 声明了 `Content-Encoding: gzip` 但压缩数据损坏（仅单用户线） |
 | 400 | `INVALID_ENCRYPTED_PAYLOAD` | 加密信封格式错误（缺 `iv` / `authTag` / `encryptedData`） |
 | 400 | `ENCRYPTION_REQUIRED` | 未按规范提交加密请求体 |
 | 400 | `UNSUPPORTED_ENCRYPTION_VERSION` | 不支持的加密版本 |
@@ -622,8 +622,8 @@ Body:
 | 409 | `TASK_ALREADY_COMPLETED` | 任务已结束，不可更新或按 pending 详情读取 |
 | 409 | `UPDATE_CONFLICT` | 任务更新失败（可能已被并发修改或删除） |
 | 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化 |
-| 413 | `REQUEST_BODY_TOO_LARGE` | `Content-Encoding: gzip` 解压后超过 `maxRequestBodyBytes`（默认 32 MB） |
-| 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding` |
+| 413 | `REQUEST_BODY_TOO_LARGE` | `Content-Encoding: gzip` 解压后超过 `maxRequestBodyBytes`（默认 32 MB，仅单用户线） |
+| 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding`（仅单用户线） |
 | 500 | `INIT_FAILED` | 单用户 `init-tenant` 建表失败 |
 | 500 | `TASK_CREATE_FAILED` | 创建任务失败 |
 | 500 | `MESSAGE_SEND_FAILED` | in-server instant 同步发送失败（§6.5）；底层错误见 `error.details` |
@@ -636,7 +636,7 @@ Body:
 
 ### 9.1 处理阶段错误码（嵌套，非顶层）
 
-in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回 `{ taskId, reason, status, retryCount?, nextRetryAt? }`）：
+in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段）：
 
 | code | 含义 |
 |---|---|
