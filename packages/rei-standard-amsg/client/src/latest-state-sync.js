@@ -19,6 +19,9 @@ const encoder = new TextEncoder();
 // Match the default server limits without importing its Node-capable entry.
 const DEFAULT_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_STATE_BYTES = 5 * 1024 * 1024;
+// Multi-entry batches stop here so a Free-plan Worker can decrypt and write one
+// request within its CPU budget; a single entry may still use the full request limit.
+const BATCH_TARGET_BYTES = 1024 * 1024;
 const STATE_CHUNK_BYTES = 200 * 1024;
 const ENVELOPE_BYTES = JSON.stringify({ iv: 'x'.repeat(16), authTag: 'x'.repeat(24), encryptedData: '' }).length;
 const encryptedBodyBytes = (plainBytes) => ENVELOPE_BYTES + 4 * Math.ceil(plainBytes / 3);
@@ -147,7 +150,8 @@ export function createLatestStateSync({ send, loadPending, savePending, maxReque
           continue;
         }
         const nextBytes = plainBytes + entryBytes + (batch.length ? 1 : 0);
-        if (batch.length >= 200 || encryptedBodyBytes(nextBytes) > maxRequestBodyBytes) break;
+        const batchLimit = batch.length ? Math.min(BATCH_TARGET_BYTES, maxRequestBodyBytes) : maxRequestBodyBytes;
+        if (batch.length >= 200 || encryptedBodyBytes(nextBytes) > batchLimit) break;
         attempted.add(entry);
         batch.push(entry);
         plainBytes = nextBytes;

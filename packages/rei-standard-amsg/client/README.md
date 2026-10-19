@@ -612,7 +612,7 @@ await sync.discard(report.outcomes
 
 ### 大小预算和被拒条目
 
-队列每批最多 200 条，并同时检查字节预算：默认单值最多 5 MiB，加密请求信封最多 32 MiB。预算包含 JSON 转义、UTF-8 编码、加密后 base64 和信封字段的开销；服务端限额调小了，宿主也要相应传小的 `maxRequestBodyBytes` / `maxStateValueBytes`，两者都要求正整数。若 `ReiClient` 配了更小的 `maxPayloadBytes`，或 `send` 还有其他大小限制，宿主也要相应收紧队列预算；队列无法从 `send` 推断这些设置。
+队列每批最多 200 条，并同时检查字节预算：默认单值最多 5 MiB，加密请求信封最多 32 MiB。多条合批时每批凑到约 1 MiB 就发出，让免费计划的 Worker 也能在 CPU 限额内处理完一次请求；单条大值仍可单独占满请求上限。免费计划上单条状态建议控制在几百 KB 以内，几 MB 的单值写入和读取都可能超出 CPU 限额，返回 503。预算包含 JSON 转义、UTF-8 编码、加密后 base64 和信封字段的开销；服务端限额调小了，宿主也要相应传小的 `maxRequestBodyBytes` / `maxStateValueBytes`，两者都要求正整数。若 `ReiClient` 配了更小的 `maxPayloadBytes`，或 `send` 还有其他大小限制，宿主也要相应收紧队列预算；队列无法从 `send` 推断这些设置。
 
 单值超限在报告中标为 `rejected`，code 为 `STATE_VALUE_TOO_LARGE`；一条内容连同信封就超请求预算时为 `STATE_REQUEST_TOO_LARGE`。这类条目不会上传，也不妨碍同批其他条目发送，仍由宿主显式 `discard` 或写入修正后的值。服务端返回的字段校验拒绝也保留在报告里。
 

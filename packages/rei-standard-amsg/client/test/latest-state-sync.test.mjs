@@ -163,6 +163,19 @@ test('state sync isolates a single entry whose encrypted body cannot fit', async
   assert.equal(result.outcomes.find(item => item.entry.key === 'large').error.code, 'STATE_REQUEST_TOO_LARGE');
 });
 
+test('state sync caps default multi-entry batches near 1 MiB but still sends one large value alone', async () => {
+  const batches = [];
+  const sync = sdk.createLatestStateSync({ send(entries) {
+    batches.push(entries.map(item => item.key));
+    return { success: true, data: { upserted: entries.length, skipped: 0 } };
+  } });
+  const medium = (key) => ({ ...entry('m'.repeat(400 * 1024)), key });
+  const result = await sync.enqueue([medium('a'), medium('b'), medium('c'), { ...entry('L'.repeat(2 * 1024 * 1024)), key: 'large' }]);
+  assert.deepEqual(batches, [['a'], ['b'], ['c'], ['large']]);
+  assert.deepEqual(result.pending, []);
+  assert.ok(result.outcomes.every(item => item.status === 'applied'));
+});
+
 test('state sync keeps the 200-entry server batch limit while draining the remainder', async () => {
   const sizes = [];
   const sync = sdk.createLatestStateSync({ send(entries) {
