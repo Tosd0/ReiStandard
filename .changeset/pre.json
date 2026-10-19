@@ -1,0 +1,14 @@
+{
+  "mode": "pre",
+  "tag": "next",
+  "initialVersions": {
+    "rei-standard-examples": "2.0.2",
+    "@rei-standard/amsg-client": "2.9.0",
+    "@rei-standard/amsg-instant": "0.11.0",
+    "@rei-standard/amsg-server": "3.0.0",
+    "@rei-standard/amsg-shared": "0.4.0",
+    "@rei-standard/amsg-sw": "2.4.0",
+    "@rei-standard/blob-store": "0.1.0"
+  },
+  "changesets": []
+}
