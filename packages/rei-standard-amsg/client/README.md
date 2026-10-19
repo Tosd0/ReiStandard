@@ -626,7 +626,7 @@ await sync.discard(report.outcomes
 
 ## 按引用读取附件
 
-服务端 `ctx.storeAttachment` 返回的完整引用交给 `client.getAttachment(ref)`，可拿回原始字符串。方法通过加密的 `getClientState(namespace, { key })` 读取单条状态，D1 只查对应根行及分块。不同设备使用同一用户身份可以读取同一个引用，读取不会删掉或确认消费附件。
+服务端 `ctx.storeAttachment` 返回的完整引用交给 `client.getAttachment(ref)`，可拿回原始字符串。方法通过加密的 `getClientState(namespace, { key })` 读取单条状态，D1 只查对应根行及分块。不同设备使用同一用户身份可以读取同一个引用，读取不会删掉或确认消费附件。附件在应用打开后按需读取，通知要显示的文字由推送本身携带。
 
 过期、缺失或引用与内容不匹配时返回 `null`；引用形状不合法会抛 `TypeError`，读库及网络错误也会抛出。引用默认且最长有效 30 天，服务端的物理清理配置可能更早移除内容，宿主应按自己的补收窗口配置保留时间。
 

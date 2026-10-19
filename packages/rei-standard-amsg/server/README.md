@@ -475,7 +475,7 @@ const page = await ctx.listTasks({
 
 ### 本次触发的附件
 
-长文或结果详情可以保存成附件，推送和 outbox 只带引用：
+长文或结果详情可以保存成附件。推送和 outbox 照样带通知要显示的文字（或摘要），附件只放打开应用后才需要的完整内容：
 
 ```js
 const ref = await ctx.storeAttachment(JSON.stringify(result), {
@@ -487,7 +487,7 @@ const ref = await ctx.storeAttachment(JSON.stringify(result), {
 // { version: 1, namespace, key, taskUuid, occurrenceMs, expiresAt }
 ```
 
-`storeAttachment` 接受已序列化的字符串，每次在 `amsg:attachments` 下生成新 key，保存的内容绑定任务和触发时刻。重试可能留下另一份附件，但不会覆盖先前结果引用的内容。把完整 `ref` 放进推送或结果载荷，客户端用 `client.getAttachment(ref)` 取回原文；读取不删除也不确认消费，其他设备、补收和推送重试可以继续使用同一引用。
+`storeAttachment` 接受已序列化的字符串，每次在 `amsg:attachments` 下生成新 key，保存的内容绑定任务和触发时刻。重试可能留下另一份附件，但不会覆盖先前结果引用的内容。把完整 `ref` 和要显示的文字一起放进推送或结果载荷，客户端用 `client.getAttachment(ref)` 取回原文。应用被关掉时，SW 只显示推送里带着的文字，不会去读附件，所以只带引用的推送弹不出有内容的通知。附件读取不删除也不确认消费，其他设备、补收和推送重试可以继续使用同一引用。
 
 附件归属于角色等应用实体时应显式传 `owner`、`ownerGeneration` 和 `kind`（默认 `'attachment'`）。这些字段进入加密的云端资源元数据和附件内容，普通的所有者清理可以找到它们。原任务的所有者及代次护栏仍生效，不能跨所有者写入，也不能恢复已停用的所有者。
 
