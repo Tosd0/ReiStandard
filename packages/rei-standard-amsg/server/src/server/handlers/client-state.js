@@ -46,6 +46,7 @@ import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
   INTERNAL_STATE_CHAR_RE,
   chunkNamespaceFor,
+  chunkKeyPrefixFor,
   resolveClientStateEntries,
 } from '../lib/state-chunks.js';
 import {
@@ -182,9 +183,10 @@ export function createClientStateHandler(ctx) {
 
     // 落库（加密 + 大值分块 + 旧切片清理 + value:null 的删除）与 hook 的
     // ctx.writeState() 共用 lib/client-state-store.js。
-    const { upserted, skipped, deleted, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
+    const { upserted, skipped, deleted, skippedEntries, unknown } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
 
     const data = { upserted, skipped };
+    if (unknown > 0) data.unknown = unknown;
     // 有 key 被删掉才带 deleted：不含删除的请求，响应形状与从前一字不差。
     if (deleted > 0) data.deleted = deleted;
     // 被 last-write-wins（含 version 护栏）拦下的 key 逐条回报：带护栏的写入
@@ -204,7 +206,12 @@ export function createClientStateHandler(ctx) {
     if (gate.error) return gate.error;
     const { userId } = gate;
 
-    const namespace = new URL(url, 'https://dummy').searchParams.get('namespace') || '';
+    const query = new URL(url, 'https://dummy').searchParams;
+    const namespace = query.get('namespace') || '';
+    const key = query.get('key');
+    if (key !== null && (!key.trim() || key.length > MAX_KEY_CHARS || INTERNAL_STATE_CHAR_RE.test(key))) {
+      return err(400, 'INVALID_STATE_KEY', 'key must be non-empty, at most 256 characters, without control characters');
+    }
     if (!namespace.trim()) return err(400, 'NAMESPACE_REQUIRED', '必须提供 namespace 查询参数');
     if (INTERNAL_STATE_CHAR_RE.test(namespace)) {
       return err(400, 'INVALID_STATE_NAMESPACE', 'namespace 不能包含控制字符（\\u0000-\\u001f 为库内部保留）');
@@ -215,11 +222,11 @@ export function createClientStateHandler(ctx) {
     }
 
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
-    const rows = await db.getClientState(userId, namespace);
+    const rows = await db.getClientState(userId, namespace, key === null ? undefined : { key });
     // 分块存储的值在这里拼回原文；块不齐全的 key 视为不存在（不抛错）。
     const decrypted = await resolveClientStateEntries(
-      rows,
-      () => db.getClientState(userId, chunkNamespaceFor(namespace)),
+      key === null ? rows : rows.filter((row) => row.key === key),
+      () => db.getClientState(userId, chunkNamespaceFor(namespace), key === null ? undefined : { keyPrefix: chunkKeyPrefixFor(key) }),
       (value) => decryptFromStorage(value, userKey)
     );
 

@@ -117,7 +117,7 @@
  *   `cleanupOutcomes`（可选）逐条报告 cleanups[i] 的结局：精确 key 形态回 `true`（这个 key 的行已不在——
  *   删掉了或本来就没有）/ `false`（行还在，库里那行更新、删除被条件写拦下）；前缀形态回 `null`。
  *   调用方靠它把被拦下的删除计入 skippedEntries；缺席时删除一律按「已删」计。
- * @property {(userId: string, namespace: string) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
+ * @property {(userId: string, namespace: string, options?: { key?: string, keyPrefix?: string }) => Promise<Array<{namespace: string, key: string, value: string, updated_at: number}>>} [getClientState]
  *   (optional; single-user/D1 only) All entries of one namespace; values still encrypted.
  * @property {(userId: string) => Promise<number>} [clearClientState]
  *   (optional; single-user/D1 only) Delete every entry of this user; returns rows deleted.
@@ -137,9 +137,9 @@
  *   501（不带 namespace 的整表全清仍走 clearClientState，不受影响）。
  * @property {(targets: Array<{ namespace: string, updatedBefore: number }>) => Promise<number>} [cleanupClientState]
  *   （可选；单用户/D1）按命名空间清掉 `updated_at` 早于 `updatedBefore`（epoch 毫秒）
- *   的行，不限用户。宿主配了 `clientStateTtl` 时 runScheduledTick 每跳顺手调；
+ *   的行，不限用户。runScheduledTick 每跳按附件默认保留期及宿主 `clientStateTtl` 调用；
  *   指令由 lib/client-state-store.js 的 `planClientStateCleanup` 算好（含大值切片
- *   所在的保留命名空间）。不实现 → 不清理，与不配 TTL 时行为一致。
+ *   所在的保留命名空间）。不实现 → 不做物理清理，附件读取仍检查到期时间。
  * @property {(userId: string) => Promise<{ subscription: string, updated_at: number }|null>} [getPushSubscription]
  *   这个用户当前登记的 Web Push 订阅（`subscription` 是密文，解密在上层）。没有登记过 → null。
  *   一个用户一份：任务行不携带订阅，到点投递时读这里。

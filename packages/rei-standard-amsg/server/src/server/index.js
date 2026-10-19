@@ -219,7 +219,7 @@ export {
   WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
 } from './lib/webpush-webcrypto.js';
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
-export { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
+export { deriveUserEncryptionKey, decryptPayload, encryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
 // 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原）。自己包路由的宿主
 // 用它代替 `await request.text()`，压缩请求体就跟单用户 Worker 一样自动认。

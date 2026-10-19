@@ -1362,22 +1362,26 @@ export class ReiClient {
   }
 
   /**
-   * Read every entry of one client-state namespace.
+   * Read one client-state namespace, or one key without downloading its peers.
    *
    * The response rides the encrypted-response envelope (same as
    * `listMessages`); this method decrypts it and returns plaintext
    * values.
    *
    * @param {string} namespace
+   * @param {{ key?: string }} [options]
    * @returns {Promise<Object>} `{ success, data?: { namespace, entries }, error? }`
    *   where `entries` is `Array<{ namespace, key, value, updatedAt }>`.
    */
-  async getClientState(namespace) {
+  async getClientState(namespace, { key } = {}) {
     if (typeof namespace !== 'string' || !namespace.trim()) {
       throw new TypeError('[rei-standard-amsg-client] namespace must be a non-empty string');
     }
+    if (key !== undefined && (typeof key !== 'string' || !key.trim() || key.length > 256 || /[\u0000-\u001f]/.test(key))) {
+      throw new TypeError('getClientState key must be a non-empty string without control characters');
+    }
     const res = await fetch(
-      `${this._baseUrl}/client-state?namespace=${encodeURIComponent(namespace)}`,
+      `${this._baseUrl}/client-state?namespace=${encodeURIComponent(namespace)}${key === undefined ? '' : `&key=${encodeURIComponent(key)}`}`,
       {
         method: 'GET',
         headers: this._withServerToken({
@@ -1398,6 +1402,34 @@ export class ReiClient {
       version: json.version || 1,
       data: decrypted
     };
+  }
+
+  /**
+   * Resolve an occurrence-bound attachment through the authenticated encrypted
+   * state route. Missing, expired, or mismatched references return null. Reading
+   * never consumes the value, so outbox retries and other devices remain safe.
+   * @param {{ version: 1, namespace: string, key: string, taskUuid: string, occurrenceMs: number, expiresAt: number }} ref
+   * @returns {Promise<string|null>}
+   */
+  async getAttachment(ref) {
+    if (ref?.version !== 1 || ref.namespace !== 'amsg:attachments'
+      || typeof ref.key !== 'string' || !ref.key || typeof ref.taskUuid !== 'string' || !ref.taskUuid
+      || !Number.isFinite(ref.occurrenceMs) || !Number.isFinite(ref.expiresAt)) {
+      throw new TypeError('getAttachment requires a valid occurrence-bound reference');
+    }
+    if (ref.expiresAt <= Date.now()) return null;
+    const result = await this.getClientState(ref.namespace, { key: ref.key });
+    if (!result?.success) {
+      throw Object.assign(new Error(result?.error?.message || 'Attachment read failed'), { code: result?.error?.code || 'ATTACHMENT_READ_FAILED' });
+    }
+    const entry = result.data?.entries?.find((candidate) => candidate.key === ref.key);
+    if (!entry) return null;
+    let stored;
+    try { stored = JSON.parse(entry.value); } catch { return null; }
+    for (const field of ['version', 'namespace', 'key', 'taskUuid', 'occurrenceMs', 'expiresAt']) {
+      if (stored?.[field] !== ref[field]) return null;
+    }
+    return stored.expiresAt > Date.now() && typeof stored.value === 'string' ? stored.value : null;
   }
 
   /**
@@ -2283,3 +2315,5 @@ export {
   isErrorPush,
   isResultPush,
 } from '@rei-standard/amsg-shared';
+
+export { createLatestStateSync, classifyClientStateWrite } from './latest-state-sync.js';

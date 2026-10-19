@@ -568,6 +568,72 @@ try {
 ---
 
 
+## 状态同步队列
+
+要把设置等本地最新值同步到云端，可以用 `createLatestStateSync` 合并同一个 namespace/key 的待发内容，再交给 `client.putClientState`。宿主提供持久化函数后，断网和刷新页面留下的待同步值也能恢复：
+
+```js
+import { createLatestStateSync } from '@rei-standard/amsg-client';
+
+const sync = createLatestStateSync({
+  send: entries => client.putClientState(entries),
+  loadPending: () => localStore.loadPending(),
+  savePending: entries => localStore.savePending(entries),
+  maxRequestBodyBytes: 32 * 1024 * 1024,
+  maxStateValueBytes: 5 * 1024 * 1024,
+});
+const report = await sync.enqueue(entries);
+```
+
+`loadPending` 和 `savePending` 可选，省略时队列只保存在内存。单条格式为 `{ namespace, key, value, updatedAt, version?, owner?, kind?, ownerGeneration? }`；`value` 是序列化字符串，传 `null` 表示删除。`updatedAt` 和可选 `version` 由宿主提供，队列不会为了重试或解决冲突擅自调大它们。
+
+| 方法 | 行为 |
+|---|---|
+| `enqueue(entries)` | 先持久化各 key 的最新值，再开始上传；上传期间又保存了新值，会在当前请求结束后继续发送 |
+| `flush()` | 等待恢复完成，重试待同步内容 |
+| `getPending()` | 返回当前待同步条目的副本 |
+| `discard(entrySnapshots)` | 放弃报告中的指定版本；完整快照仍匹配时才删除，之后保存的新值会留下 |
+
+`enqueue` / `flush` 返回 `{ outcomes, pending, revision }`，每个 outcome 包含 `{ entry, status, error? }`。只有 `applied` 自动出队，`conflict`、`rejected`、`unknown`、`failed` 都留在 pending。每个版本在一次 flush 中最多尝试一次，宿主负责安排断网恢复和退避重试。
+
+用户决定接受远端内容，或宿主决定放弃某个无效值时，把对应报告的 **entry 快照**交给 `discard`，不要只传 key：
+
+```js
+const report = await sync.flush();
+// 仅在宿主已决定放弃这些版本后执行；筛选规则由应用决定。
+await sync.discard(report.outcomes
+  .filter(item => item.status === 'conflict' || item.status === 'rejected')
+  .map(item => item.entry));
+```
+
+匹配包含内容、时间戳、版本和所有者字段。同一 key 即使复用了时间戳，只要内容已变化，旧报告也删不掉它。上传成功后的自动出队同样只针对实际发出的版本。报告和 `getPending()` 都是副本，修改它们不会改动内部队列。
+
+上传前和出队前都先保存持久化状态；存储失败时操作抛错，内存中也保留先前已持久化的队列。构造时恢复失败会被立即观察，没人调用方法时也不会形成未处理的 promise rejection；后续方法仍报告原来的恢复错误，存储恢复后需创建新实例。一个实例协调一个用户的一份队列，跨标签页的存储互斥仍由宿主实现。
+
+### 大小预算和被拒条目
+
+队列每批最多 200 条，并同时检查字节预算：默认单值最多 5 MiB，加密请求信封最多 32 MiB。多条合批时每批凑到约 1 MiB 就发出，让免费计划的 Worker 也能在 CPU 限额内处理完一次请求；单条大值仍可单独占满请求上限。免费计划上单条状态建议控制在几百 KB 以内，几 MB 的单值写入和读取都可能超出 CPU 限额，返回 503。预算包含 JSON 转义、UTF-8 编码、加密后 base64 和信封字段的开销；服务端限额调小了，宿主也要相应传小的 `maxRequestBodyBytes` / `maxStateValueBytes`，两者都要求正整数。若 `ReiClient` 配了更小的 `maxPayloadBytes`，或 `send` 还有其他大小限制，宿主也要相应收紧队列预算；队列无法从 `send` 推断这些设置。
+
+单值超限在报告中标为 `rejected`，code 为 `STATE_VALUE_TOO_LARGE`；一条内容连同信封就超请求预算时为 `STATE_REQUEST_TOO_LARGE`。这类条目不会上传，也不妨碍同批其他条目发送，仍由宿主显式 `discard` 或写入修正后的值。服务端返回的字段校验拒绝也保留在报告里。
+
+### 写入回执与旧适配器
+
+不使用队列时，可直接调用 `classifyClientStateWrite(entries, response)`，按原请求顺序得到 `applied`、`conflict`、`rejected`、`unknown` 或 `failed`。分类依据是 `skippedEntries`、`rejected` 和完整计数，HTTP 成功本身不足以确认每条都已写入。
+
+服务端适配器只有旧式 `{ upserted, skipped }` 物理行总数时，所有根行和分块都确认写入、且 skipped 为零，服务端才折算成逻辑条数。否则无法确认的逻辑写入计入 `data.unknown`，保留待同步值。客户端也兼容旧服务器返回的精确全物理行成功计数，分块数按 UTF-8 码点边界计算；部分物理计数不能拿来猜哪些 key 成功。
+
+旧接口缺失的信息无法从总数补回。例如旧服务器返回 `{ upserted: 1, skipped: 0 }`，客户端无法区分它是完整的一条逻辑回执，还是残缺的一行物理回执；需要服务器按上述规则归一化。另一个兼容边界是删除：旧适配器不提供 `cleanupOutcomes` 时，服务端沿用按请求数计为 deleted 的行为，不能据此确认陈旧删除是否被条件写拦住。需要精确冲突判断的自定义适配器应实现逐行 outcomes 和 cleanupOutcomes。
+
+## 按引用读取附件
+
+服务端 `ctx.storeAttachment` 返回的完整引用交给 `client.getAttachment(ref)`，可拿回原始字符串。方法通过加密的 `getClientState(namespace, { key })` 读取单条状态，D1 只查对应根行及分块。不同设备使用同一用户身份可以读取同一个引用，读取不会删掉或确认消费附件。附件在应用打开后按需读取，通知要显示的文字由推送本身携带。
+
+过期、缺失或引用与内容不匹配时返回 `null`；引用形状不合法会抛 `TypeError`，读库及网络错误也会抛出。引用默认且最长有效 30 天，服务端的物理清理配置可能更早移除内容，宿主应按自己的补收窗口配置保留时间。
+
+启用前用 `getCapabilities()` 探测 `attachments` 和 `client-state-key`。特性标记表示代码能力；内置存储支持 D1，pg / neon 的写入报 `ATTACHMENT_STORAGE_UNSUPPORTED`，不能仅凭标记推断当前部署的存储支持情况。
+
+排程时的 `taskInput` 也应先探测 `task-input`；它与任务一起受理，只在创建或替换时设置，`updateMessage` 带该字段（包括 `null`）会被整份拒绝为 `400 INVALID_UPDATE_DATA`。任务列表和单条查询都不返回输入及凭据本体。`agentic-list-tasks`、`agentic-tool-allowlist` 分别表示服务端 hook 的分页任务视图和工具执行名单。旧 Worker 没有相应标记时，应由宿主停用相关入口或提示更新部署，SDK 不会代替宿主做这项选择。
+
 ## 其他工具
 
 `ReiClient` 还有这些方法：
@@ -583,8 +649,9 @@ try {
 
 - `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`，单用户线），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
 - `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
-- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt, owner?, kind?, ownerGeneration? }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；返回 `{ success, data?: { upserted, skipped, deleted?, skippedEntries?, rejected? }, error? }`，非法/超限条目只拒绝自己并写入 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
-- `getClientState(namespace)` —— 读回一个 namespace 的全部条目（走加密响应信封，方法内解密后返回明文值）
+- `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt, owner?, kind?, ownerGeneration? }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；返回 `{ success, data?: { upserted, skipped, deleted?, skippedEntries?, rejected?, unknown? }, error? }`，非法/超限条目只拒绝自己并写入 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
+- `getClientState(namespace, { key }?)` —— 读回整个 namespace，或指定 key 的零至一条完整值（走加密响应信封，方法内解密并由服务器拼好分块）
+- `getAttachment(ref)` —— 按完整附件引用读取原始字符串，过期、缺失或不匹配返回 `null`，读取不删除
 - `clearClientState()` —— 清空该用户所有 namespace 的云端状态（如「清除云端数据」设置项）
 - `putPushSubscription(subscription, opts?)` —— 登记 / 覆盖这个用户的 Web Push 订阅（`PUT /push-subscription`）。传 `pushManager.subscribe()` 的结果（或它的 `toJSON()`）即可，方法内部会取 `toJSON`。服务端一个用户存一份，所有定时任务到点投递时都读它——包括角色在 fire 里给自己排的、客户端根本不知道存在的那些任务。`opts.updatedAt` 是 epoch 毫秒，不传由服务端取当前时刻
 - `getPushSubscription()` —— 服务端登记的订阅现状：`{ exists, updatedAt, endpoint }`，不含订阅的密钥部分。设置页显示状态、或者拿 `endpoint` 跟本地订阅对一下是不是同一个

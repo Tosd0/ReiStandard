@@ -1,5 +1,5 @@
 /**
- * hook 手里的 client_state 读写口：`readState(namespace)` /
+ * hook 手里的 client_state 读写口：`readState(namespace, { key }?)` /
  * `writeState(namespace, entries)`。
  *
  * 读到和写出的都是客户端 `GET/PUT /client-state` 那套数据（加密、大值分块、
@@ -17,6 +17,7 @@ import {
   DEFAULT_MAX_STATE_VALUE_BYTES,
   INTERNAL_STATE_CHAR_RE,
   chunkNamespaceFor,
+  chunkKeyPrefixFor,
   resolveClientStateEntries,
 } from './state-chunks.js';
 import {
@@ -29,10 +30,10 @@ import {
 
 /**
  * @typedef {Object} StateAccessors
- * @property {(namespace: string) => Promise<Array<{ namespace: string, key: string, value: string, updatedAt: number }>>} readState
- *   一个 namespace 下的全部条目（值已解密、分块的已拼回原文）。适配器不支持
+ * @property {(namespace: string, options?: { key?: string }) => Promise<Array<{ namespace: string, key: string, value: string, updatedAt: number }>>} readState
+ *   一个 namespace 下的全部条目，或指定 key 的零至一条（值已解密、分块的已拼回原文）。适配器不支持
  *   client_state 时返回空数组——读不到状态，hook 走自己的兜底就行。
- * @property {(namespace: string, entries: Array<{ key: string, value: string|null, updatedAt?: number }>) => Promise<{ upserted: number, skipped: number, deleted: number }>} writeState
+ * @property {(namespace: string, entries: Array<{ key: string, value: string|null, updatedAt?: number }>) => Promise<{ upserted: number, skipped: number, deleted: number, unknown?: number }>} writeState
  *   批量写。`value` 是字符串 → 整条覆盖（不是追加，宿主自己序列化）；
  *   `value` 为 `null` → 删掉这个 key（连它的分块切片行一起）。`updatedAt`
  *   默认取当前时刻，语义与客户端同步一致：比库里已有值旧的写入（或删除）
@@ -48,9 +49,10 @@ import {
  * lib/webpush-webcrypto.js 的 MAX_PUSH_PAYLOAD_BYTES），塞不下的内容先写进
  * client_state，push 里只带一个引用键，客户端上线后按键取回。
  *
- * 谁清、什么时候清：库不做 TTL 也不自动回收，写进去的东西一直在，直到有人
- * 覆盖或删除它。旁路内容建议放在固定的少量 key 上（例如每个角色一个），下次
- * 写同一个 key 直接覆盖，存量天然有上限；一次性的大内容在确认客户端取走后，
+ * 谁清、什么时候清：普通命名空间默认不过期，宿主可用 clientStateTtl 配清理
+ * 天数；amsg:attachments 默认 30 天且宿主同名配置优先。普通旁路内容可以放在
+ * 固定的少量 key 上（例如每个角色一个），下次写同一个 key 直接覆盖，存量天然
+ * 有上限；一次性的大内容在确认客户端取走后，
  * 用 `{ key, value: null }` 删掉。`DELETE /client-state` 仍然是清空这个用户
  * 全部状态的兜底。
  *
@@ -68,17 +70,21 @@ export function createStateAccessors({ db, userId, userKey, maxStateValueBytes, 
     ? maxStateValueBytes
     : DEFAULT_MAX_STATE_VALUE_BYTES;
 
-  const readState = async (namespace) => {
+  const readState = async (namespace, { key } = {}) => {
     if (typeof namespace !== 'string' || !namespace.trim()) {
       throw new TypeError('readState(namespace) requires a non-empty string');
     }
+    if (key !== undefined && (typeof key !== 'string' || !key.trim() || key.length > MAX_KEY_CHARS || INTERNAL_STATE_CHAR_RE.test(key))) {
+      throw new TypeError(`readState key must be a non-empty string of at most ${MAX_KEY_CHARS} characters without control characters`);
+    }
     if (!db || typeof db.getClientState !== 'function') return [];
-    const rows = await db.getClientState(userId, namespace);
+    const rows = await db.getClientState(userId, namespace, key === undefined ? undefined : { key });
     // 分块存储的值在这里拼回原文（见 state-chunks.js）；块不齐全的 key 视为
     // 不存在 —— hook 作者拿到的与客户端写入的一致，永远不会是半截数据。
     return resolveClientStateEntries(
-      rows,
-      () => db.getClientState(userId, chunkNamespaceFor(namespace)),
+      // 老适配器可能忽略第三个参数，仍在解密前过滤根行，保持返回契约。
+      key === undefined ? rows : rows.filter((row) => row.key === key),
+      () => db.getClientState(userId, chunkNamespaceFor(namespace), key === undefined ? undefined : { keyPrefix: chunkKeyPrefixFor(key) }),
       (value) => decryptFromStorage(value, userKey)
     );
   };
@@ -140,6 +146,9 @@ export function createStateAccessors({ db, userId, userKey, maxStateValueBytes, 
         namespace,
         key: entry.key,
         value: entry.value,
+        owner: entry.owner,
+        kind: entry.kind,
+        ownerGeneration: entry.ownerGeneration,
         updatedAt: entry.updatedAt ?? at,
         ...(entry.version !== undefined ? { version: entry.version } : {}),
       };

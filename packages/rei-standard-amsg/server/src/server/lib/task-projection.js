@@ -1,8 +1,8 @@
 /**
  * 任务行的对外投影：`GET /messages` 列出来的那一份形状。
  *
- * 一份实现两处用：HTTP 列表接口，以及 fire-time hook 的
- * `ctx.scheduleTask()` 撞 uuid 时回给宿主的那条已存在任务。两边给出的字段
+ * HTTP 列表／单条接口与 fire-time hook 的任务查询、变更回执共用。
+ * `ctx.scheduleTask()` 创建和撞 uuid 时均带完整 metadata。各处基础字段
  * 一样，宿主拿到哪一份都能直接进自己的任务面板。
  *
  * 白名单式取字段：解密后的 payload 里还躺着 `apiKey` / `apiUrl` /
@@ -69,7 +69,7 @@ export function projectTask(row, decryptedPayload, options = {}) {
     // 凭据引用只是名字（cred_id），本体在 llm_credentials 表里，凭据字段本身
     // 照旧被白名单挡在外面。
     credRefs: payload.credRefs ?? null,
-    // 整份 metadata 只在单条查询里给（见上面的 includeMetadata）。
+    // 整份 metadata 由 includeMetadata 控制，单条查询与 hook 回执会带。
     ...(options.includeMetadata ? { metadata: payload.metadata ?? null } : {}),
     // 上一次没发出去的原因。reason 'stale' 表示错过触发时刻太久被判定不再补
     // 发；其余是投递失败的错误信息。没有记录 → null。

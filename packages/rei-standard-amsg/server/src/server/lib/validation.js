@@ -209,6 +209,10 @@ export function taskPayloadByteLength(serializedPayload) {
  * @returns {{ valid: boolean, errorCode?: string, errorMessage?: string, details?: Object }}
  */
 export function validateScheduleMessagePayload(payload) {
+  if (payload.taskInput != null && (typeof payload.taskInput !== 'object' || Array.isArray(payload.taskInput))) {
+    return { valid: false, errorCode: 'INVALID_TASK_INPUT', errorMessage: 'taskInput must be an object or null' };
+  }
+
   if (!payload.contactName || typeof payload.contactName !== 'string') {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: '缺少必需参数或参数格式错误', details: { missingFields: ['contactName'] } };
   }

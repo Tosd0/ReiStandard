@@ -126,6 +126,7 @@
  */
 
 import { failureRetryDecision } from './retry-policy.js';
+import { createAttachmentStore } from './attachments.js';
 import {
   assertValidDecision,
   buildSessionContext,
@@ -271,7 +272,7 @@ export function buildHookTask(task, decryptedPayload) {
  * onBeforeFire 的返回值。
  *
  * @typedef {Array<Object>
- *   | { messages: Array<Object>, maxToolIterations?: number, totalTimeoutMs?: number, tools?: Array<Object>, toolChoice?: any }
+ *   | { messages: Array<Object>, maxToolIterations?: number, totalTimeoutMs?: number, tools?: Array<Object>, toolChoice?: any, allowedToolNames?: string[] }
  *   | { skip: true }
  *   | { defer: { afterMs: number } }
  *   | null
@@ -318,6 +319,10 @@ function normalizeBeforeFireResult(result) {
     return { messages: result };
   }
   if (result && typeof result === 'object' && Array.isArray(result.messages)) {
+    if (result.allowedToolNames !== undefined && (!Array.isArray(result.allowedToolNames)
+      || result.allowedToolNames.some((name) => typeof name !== 'string' || !name.trim()))) {
+      throw markPermanent(new TypeError('allowedToolNames must be an array of non-empty strings'), 'AGENTIC_BAD_BEFORE_FIRE');
+    }
     return {
       messages: result.messages,
       maxToolIterations: result.maxToolIterations,
@@ -327,6 +332,7 @@ function normalizeBeforeFireResult(result) {
       // buildAiRequestBody（那边有测试钉着），这层只是不把空数组往下传。
       tools: Array.isArray(result.tools) && result.tools.length > 0 ? result.tools : undefined,
       toolChoice: result.toolChoice,
+      allowedToolNames: result.allowedToolNames === undefined ? undefined : new Set(result.allowedToolNames),
     };
   }
   throw markPermanent(new TypeError(BAD_BEFORE_FIRE_MESSAGE), 'AGENTIC_BAD_BEFORE_FIRE');
@@ -421,6 +427,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const sessionId = task.id != null ? `sess_task_${task.id}${occurrenceSuffix(task)}` : `sess_${randomUUID()}`;
   const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
   const occurrenceMs = occurrenceMsOf(task);
+  const storeAttachment = createAttachmentStore({ task, occurrenceMs, writeState, now: nowFn });
+  // Settlement can record cancellation after the live chain stops. Its raw
+  // writer still goes through the adapter's cloud owner/generation guards.
+  const storeSettledAttachment = createAttachmentStore({ task, occurrenceMs, writeState: writeSettledState, now: nowFn });
 
   // 结果出口：把一条宿主自定义的结果落进收件箱并推出去（见
   // lib/result-emitter.js）。与 readState / writeState 同待遇，fire 级和每轮的
@@ -459,12 +469,36 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       const row = await ctx.db.getTaskByUuid(uuid, task.user_id);
       if (!row) return null;
       const payload = JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey));
-      return projectTask(row, payload);
+      return projectTask(row, payload, { includeMetadata: true });
     } catch (error) {
       console.warn('[amsg-server] scheduleTask: 读取撞车任务失败（已忽略）:', error && error.message);
       return null;
     }
   }
+
+  /**
+   * Read the authenticated user's actual task rows. Pending includes leased and
+   * due rows until settlement; it does not mean "future and idle". Consumers
+   * must exhaust pagination before applying policies over the complete set.
+   * @param {{ status?: 'pending'|'sent'|'failed'|'all', limit?: number, offset?: number, includeMetadata?: boolean }} [options]
+   */
+  const listTasks = async (options = {}) => {
+    throwIfCancelled();
+    const { status = 'pending', limit = 100, offset = 0, includeMetadata = true } = options;
+    if (!['pending', 'sent', 'failed', 'all'].includes(status)
+      || !Number.isInteger(limit) || limit < 1 || limit > 100
+      || !Number.isInteger(offset) || offset < 0) {
+      throw new TypeError('listTasks requires a valid status, limit 1-100, and non-negative offset');
+    }
+    if (typeof ctx.db?.listTasks !== 'function') {
+      throw new DeploymentConfigError('AGENTIC_TASK_VIEW_UNSUPPORTED: adapter has no listTasks', { code: 'AGENTIC_TASK_VIEW_UNSUPPORTED' });
+    }
+    const { tasks, total } = await ctx.db.listTasks(task.user_id, { status, limit, offset });
+    const projected = await Promise.all(tasks.map(async (row) => projectTask(
+      row, JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)), { includeMetadata }
+    )));
+    return { tasks: projected, pagination: { total, limit, offset, hasMore: offset + tasks.length < total } };
+  };
 
   /**
    * scheduleTask(options) —— 在这次 fire 里给**同一个用户**再建一条定时任务。
@@ -489,6 +523,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
    * @param {string|null} [options.avatarUrl]   - 默认继承
    * @param {string} [options.messageSubtype]   - 默认继承
    * @param {string|null} [options.userMessage] - 默认继承；messageType 'fixed' 时必须有
+   * @param {Object|null} [options.taskInput] - Immutable input for this new task; never inherited
    * @param {string} [options.uuid]             - 默认 randomUUID()；传确定性 uuid 可做重试幂等
    * @returns {Promise<{ created: true, id: number|null, uuid: string, nextSendAt: string }
    *   | { created: false, reason: 'duplicate', uuid: string, task: import('./task-projection.js').TaskProjection|null }>}
@@ -500,6 +535,10 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     throwIfCancelled();
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('scheduleTask(options) 需要一个对象，至少包含 { firstSendTime }');
+    }
+
+    if (options.taskInput != null && (typeof options.taskInput !== 'object' || Array.isArray(options.taskInput))) {
+      throw new TypeError('scheduleTask: taskInput must be an object or null');
     }
 
     // ---- 触发时刻 ----
@@ -617,6 +656,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       // 自排的后续任务不该突然掉档。
       llmExtraBody: decryptedPayload.llmExtraBody ?? null,
       metadata,
+      taskInput: options.taskInput ?? null,
     };
 
     // 与 POST /schedule-message 同一道闸门：任务内容太大在这里就说清楚，别等
@@ -690,6 +730,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       id: created.id ?? null,
       uuid: created.uuid ?? uuid,
       nextSendAt: created.next_send_at ?? nextSendAt,
+      task: projectTask({ status: 'pending', next_send_at: nextSendAt, ...created }, fullTaskData, { includeMetadata: true }),
     };
   };
 
@@ -799,7 +840,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       const stillPending = await ctx.db.getTaskByUuid(uuid, task.user_id);
       return { renewed: false, reason: stillPending ? 'in_flight' : 'not_found' };
     }
-    return { renewed: true, uuid, nextSendAt: nextSendAtIso };
+    return { renewed: true, uuid, nextSendAt: nextSendAtIso, task: projectTask(
+      { ...row, next_send_at: nextSendAtIso, retry_count: 0 }, payload, { includeMetadata: true }
+    ) };
   };
 
   /**
@@ -832,7 +875,9 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     readState,
     writeState,
     emitResult,
+    storeAttachment,
     scheduleTask,
+    listTasks,
     cancelTask,
     renewTask,
     resolveLlmCredential,
@@ -868,7 +913,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   try {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-      readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
+      readState, writeState, emitResult, storeAttachment, scratch, scheduleTask, listTasks, cancelTask, renewTask,
       resolveLlmCredential, fireCtx, progress,
       sessionId, messageIdBase, occurrenceMs,
     });
@@ -922,6 +967,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       readState,
       writeState: writeSettledState,
       emitResult,
+      storeAttachment: storeSettledAttachment,
     });
   }
 }
@@ -935,7 +981,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
  */
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
-  readState, writeState, emitResult, scratch, scheduleTask, cancelTask, renewTask,
+  readState, writeState, emitResult, storeAttachment, scratch, scheduleTask, listTasks, cancelTask, renewTask,
   resolveLlmCredential, fireCtx, progress,
   sessionId, messageIdBase, occurrenceMs,
 }) {
@@ -1070,7 +1116,9 @@ async function runFireChain({
       readState,
       writeState,
       emitResult,
+      storeAttachment,
       scheduleTask,
+      listTasks,
       cancelTask,
       renewTask,
       resolveLlmCredential,
@@ -1078,8 +1126,30 @@ async function runFireChain({
 
     const decision = await hooks.onLLMOutput(sessionCtx);
     ctx.throwIfCancelled();
+    // Repair model-produced call entries before validating the surrounding
+    // hook decision. Invalid decision tags/containers still fail validation.
+    const rawCalls = decision?.decision === 'tool-request' ? extractToolCallsFromDecision(decision) : [];
+    const validId = (call) => typeof call?.id === 'string' && call.id.trim().length > 0;
+    const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
+    const usedIds = new Set([...rawCalls, ...nativeCalls].filter(validId).map(call => call.id));
+    const malformedIds = new Set();
+    const toolCalls = rawCalls.map((call, index) => {
+      let id = validId(call) ? call.id : `call_${iteration + 1}_${index + 1}`;
+      if (!validId(call)) {
+        while (usedIds.has(id)) id += '_';
+        usedIds.add(id);
+      }
+      if (typeof call?.function?.name !== 'string' || !call.function.name.trim()) {
+        malformedIds.add(id);
+        return { id, type: 'function', function: { name: 'invalid_tool_call', arguments: '{}' } };
+      }
+      return { ...call, id };
+    });
+    const validationDecision = decision?.decision === 'tool-request' && Array.isArray(decision.toolCalls) && decision.toolCalls.length > 0
+      ? { ...decision, toolCalls }
+      : decision;
     try {
-      assertValidDecision(decision, { inlineToolCalls: true });
+      assertValidDecision(validationDecision, { inlineToolCalls: true });
     } catch (error) {
       // 决策形状不合契约：宿主的分类器返回了库不认的东西，重试必然同败。
       // 标成确定性失败之前保住它原本的 TypeError 身份（宿主可能按类型分流）。
@@ -1117,7 +1187,6 @@ async function runFireChain({
     }
 
     // 'tool-request' — execute right here in the worker.
-    const toolCalls = extractToolCallsFromDecision(decision);
     if (toolCalls.length === 0) {
       // 留在退避阶梯里：这一轮模型没吐出能解析的 tool_calls，是这次生成的结果，
       // 不是部署配置错了。判成终态的话，一次性任务第一次掷歪就永久 failed，而
@@ -1127,7 +1196,15 @@ async function runFireChain({
         'AGENTIC_EMPTY_TOOL_REQUEST'
       );
     }
-    if (typeof hooks.executeToolCalls !== 'function') {
+    const permittedCalls = toolCalls.filter((call) => !malformedIds.has(call.id)
+      && (normalized.allowedToolNames === undefined || normalized.allowedToolNames.has(call.function.name)));
+    const deniedResults = toolCalls.filter((call) => !permittedCalls.includes(call)).map((call) => ({
+      role: 'tool', tool_call_id: call.id,
+      content: JSON.stringify({ error: malformedIds.has(call.id)
+        ? { code: 'INVALID_TOOL_CALL', message: 'Tool call requires a function name' }
+        : { code: 'TOOL_NOT_ALLOWED', message: 'Tool execution is not allowed for this fire' } }),
+    }));
+    if (permittedCalls.length > 0 && typeof hooks.executeToolCalls !== 'function') {
       throw new DeploymentConfigError(
         'AGENTIC_CONFIG_ERROR: onLLMOutput returned tool-request but hooks.executeToolCalls is not configured',
         { code: 'AGENTIC_CONFIG_ERROR' }
@@ -1142,7 +1219,7 @@ async function runFireChain({
     let toolResults;
     try {
       ctx.throwIfCancelled();
-      toolResults = await hooks.executeToolCalls(toolCalls, sessionCtx);
+      toolResults = permittedCalls.length > 0 ? await hooks.executeToolCalls(permittedCalls, sessionCtx) : [];
       ctx.throwIfCancelled();
       if (!Array.isArray(toolResults)) {
         throw new TypeError('executeToolCalls must resolve to an array of { tool_call_id, role: "tool", content }');
@@ -1152,12 +1229,14 @@ async function runFireChain({
       if (isTaskCancelledError(error)) throw error;
       // Feed the failure back as tool results and let the LLM talk its way
       // out, instead of failing the whole fire.
-      toolResults = toolCalls.map((toolCall) => ({
+      toolResults = permittedCalls.map((toolCall) => ({
         tool_call_id: toolCall && typeof toolCall === 'object' && typeof toolCall.id === 'string' ? toolCall.id : '',
         role: 'tool',
         content: `Tool execution failed: ${error?.message ?? String(error)}`,
       }));
     }
+
+    toolResults = [...toolResults, ...deniedResults];
 
     // Text-protocol classifiers synthesize toolCalls the raw assistant
     // message doesn't carry; stamp them on so the appended role:'tool'
@@ -1173,12 +1252,13 @@ async function runFireChain({
     // no matching role:'tool' result, and a strict relay rejects the next
     // round over the unanswered id. Drop a call on purpose → return a
     // result for it saying so, don't just omit it.
-    const nativeCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
-    const nativeIds = new Set(nativeCalls.map((tc) => tc && tc.id));
-    const synthesized = toolCalls.filter((tc) => !nativeIds.has(tc && tc.id));
-    const assistantWithTools = synthesized.length === 0
-      ? assistantMessage
-      : { ...assistantMessage, tool_calls: [...nativeCalls, ...synthesized] };
+    // Replace handled malformed declarations with the same normalized calls
+    // used by the executor/results. Missing-ID native entries are represented
+    // by their normalized decision entries, never left as orphan declarations.
+    const declared = nativeCalls.filter(validId).map(call => toolCalls.find(item => item.id === call.id) || call);
+    const nativeIds = new Set(declared.map(call => call.id));
+    const synthesized = toolCalls.filter(call => !nativeIds.has(call.id));
+    const assistantWithTools = { ...assistantMessage, tool_calls: [...declared, ...synthesized] };
     messages = [...messages.slice(0, -1), assistantWithTools, ...toolResults];
   }
 

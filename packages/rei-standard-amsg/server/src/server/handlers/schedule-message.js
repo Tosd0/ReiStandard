@@ -176,6 +176,9 @@ export function createScheduleMessageHandler(ctx) {
       owner: payload.owner,
       kind: payload.kind,
       ownerGeneration: payload.ownerGeneration,
+      // Input is persisted with the task in the same create/supersede transaction.
+      // Shared credentials remain references and continue to resolve at fire time.
+      taskInput: payload.taskInput ?? null,
       metadata: payload.metadata || {}
     };
 

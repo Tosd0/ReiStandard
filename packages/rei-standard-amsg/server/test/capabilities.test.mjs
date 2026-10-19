@@ -67,6 +67,11 @@ const EXPECTED_FEATURES = [
   'max-delivery-retries',
   'max-generation-retries',
   'before-fire-defer',
+  'task-input',
+  'client-state-key',
+  'agentic-list-tasks',
+  'agentic-tool-allowlist',
+  'attachments',
 ];
 
 function makeWorker(extra = {}) {
@@ -111,4 +116,15 @@ describe('GET /capabilities', () => {
     }), env);
     assert.equal(ok.status, 200);
   });
+});
+
+
+test('capabilities advertise immutable inputs, keyed reads, task views, tool permissions and attachments', async (t) => {
+  const raw = createTestD1();
+  t.after(() => raw.close());
+  const response = await makeWorker().fetch(new Request('https://w.dev/capabilities'), { DB: raw });
+  const body = await response.json();
+  for (const feature of ['task-input', 'client-state-key', 'agentic-list-tasks', 'agentic-tool-allowlist', 'attachments']) {
+    assert.ok(body.features.includes(feature), `missing feature: ${feature}`);
+  }
 });
