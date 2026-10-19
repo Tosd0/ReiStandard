@@ -1,9 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
+  # Main-branch pushes are validated by the Release workflow.
   pull_request:
 
 jobs:
