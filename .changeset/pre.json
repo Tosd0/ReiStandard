@@ -10,5 +10,7 @@
     "@rei-standard/amsg-sw": "2.4.0",
     "@rei-standard/blob-store": "0.1.0"
   },
-  "changesets": []
+  "changesets": [
+    "amsg-audit-inputs-and-sync"
+  ]
 }
