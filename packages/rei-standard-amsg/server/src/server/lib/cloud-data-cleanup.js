@@ -116,13 +116,15 @@ export async function makeCleanupPlan(ctx, db, userId, key, input) {
       '云端清单不完整，暂不能生成清理计划',
       409
     );
+  const resourceIdSet = resourceIds ? new Set(resourceIds) : null;
+  const typeSet = types ? new Set(types) : null;
   const entries = inventory.entries.filter(
     (e) =>
       (!owner || ownerEquals(e.resource.owner, owner)) &&
-      (!resourceIds || resourceIds.includes(e.resource.id)) &&
-      (!types || types.includes(e.resource.type))
+      (!resourceIdSet || resourceIdSet.has(e.resource.id)) &&
+      (!typeSet || typeSet.has(e.resource.type))
   );
-  if (resourceIds && new Set(resourceIds).size !== entries.length)
+  if (resourceIdSet && resourceIdSet.size !== entries.length)
     throw cloudError(
       'CLOUD_RESOURCE_NOT_FOUND',
       '部分选中资源不存在或不属于当前范围',
@@ -304,6 +306,7 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
     if (operation.status === 'completed' || operation.status === 'failed')
       return operation;
     operation.status = 'running';
+    let retirementInventory = null;
     if (operation.mode === 'retire-owner') {
       if (operation.fencedGeneration == null) {
         const state = await db.setCloudOwnerActive(
@@ -331,6 +334,7 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
           '无法确认待清理资源',
           503
         );
+      retirementInventory = inventory;
       const known = new Set(operation.knownResourceIds || []);
       operation.knownResourceVersions ||= {};
       operation.entries = inventory.entries.filter((entry) => {
@@ -362,7 +366,8 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
       // for legacy job inputs and outbox records.
       await save(db, userId, key, 'operation', operation, { leaseToken });
     }
-    const beforeBatch = await cloudInventory(ctx, db, userId, key);
+    const beforeBatch =
+      retirementInventory ?? (await cloudInventory(ctx, db, userId, key));
     if (!beforeBatch.complete)
       throw cloudError('CLOUD_INVENTORY_INCOMPLETE', '无法确认待清理资源', 503);
     const currentById = new Map(
@@ -402,7 +407,6 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
       delete entry.locator;
       operation.cursor++;
       operation.updatedAt = Date.now();
-      await save(db, userId, key, 'operation', operation, { leaseToken });
     }
     await renewLease();
     const current = await cloudInventory(ctx, db, userId, key);
@@ -413,10 +417,11 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
         503
       );
     const selected = new Set(operation.entries.map((e) => e.resource.id));
+    const knownIds = new Set(operation.knownResourceIds || []);
     const remaining = current.entries.filter((e) =>
       operation.mode === 'retire-owner'
         ? ownerEquals(e.resource.owner, operation.owner) ||
-          (operation.knownResourceIds || []).includes(e.resource.id)
+          knownIds.has(e.resource.id)
         : selected.has(e.resource.id)
     );
     for (const count of operation.counts)

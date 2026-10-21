@@ -45,6 +45,52 @@ function objectOrText(value) {
   }
 }
 
+function utf8ByteLength(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return /[^\x00-\x7f]/.test(text) ? encoder.encode(text).length : text.length;
+}
+
+function rowByteSize(row) {
+  if (typeof row.byte_size === 'number') return row.byte_size;
+  return utf8ByteLength(
+    String(
+      row.value ??
+        row.encrypted_payload ??
+        row.encrypted_value ??
+        row.payload ??
+        row.subscription ??
+        ''
+    )
+  );
+}
+
+const STORAGE_PREFIX_RE = /^[0-9a-f]{32}:[0-9a-f]{24,32}:[0-9a-f]*$/i;
+const HEX_RE = /^[0-9a-f]*$/i;
+
+function isValidStorageCiphertext(fullText, prefix, suffix, byteSize) {
+  if (typeof fullText === 'string') {
+    if (!STORAGE_PREFIX_RE.test(fullText)) return false;
+    const secondColon = fullText.indexOf(':', 33);
+    return secondColon > 32 && (fullText.length - secondColon - 1) % 2 === 0;
+  }
+  if (typeof prefix === 'string' && typeof byteSize === 'number') {
+    if (!STORAGE_PREFIX_RE.test(prefix)) return false;
+    if (typeof suffix === 'string' && !HEX_RE.test(suffix)) return false;
+    const secondColon = prefix.indexOf(':', 33);
+    return secondColon > 32 && (byteSize - secondColon - 1) % 2 === 0;
+  }
+  return false;
+}
+
+function hasCompleteStoredMetadata(stored) {
+  return Boolean(
+    stored &&
+      safeOwner(stored.owner) !== null &&
+      typeof stored.kind === 'string' &&
+      stored.kind.length > 0
+  );
+}
+
 /**
  * Internal entries retain exact encrypted snapshots for conditional deletion.
  * Only `entry.resource` may cross the API response boundary.
@@ -61,6 +107,20 @@ export async function buildCloudDataInventory({
   const metadata = new Map(
     (raw.metadata || []).map((row) => [row.resource_key, row.encrypted_value])
   );
+  const readStoredMetadata = async (metadataKey) => {
+    const encryptedMetadata = metadata.get(metadataKey) || null;
+    if (!encryptedMetadata) {
+      return { encryptedMetadata: null, stored: null, unreadable: false };
+    }
+    try {
+      const stored = JSON.parse(
+        await decryptFromStorage(encryptedMetadata, userKey)
+      );
+      return { encryptedMetadata, stored, unreadable: false };
+    } catch {
+      return { encryptedMetadata, stored: null, unreadable: true };
+    }
+  };
   const taskPayloads = new Map();
   const taskByUuid = new Map();
   for (const row of raw.task || []) {
@@ -89,23 +149,19 @@ export async function buildCloudDataInventory({
     status = null,
     namespace,
     key,
-    credId
+    credId,
+    metadataInfo
   }) => {
     const metadataKey = JSON.stringify([type, ...identity]);
     const id = await cloudDataHash(JSON.stringify([userId, metadataKey]));
-    let stored = null;
-    const encryptedMetadata = metadata.get(metadataKey);
-    if (encryptedMetadata) {
-      try {
-        stored = JSON.parse(
-          await decryptFromStorage(encryptedMetadata, userKey)
-        );
-      } catch {
-        unreadable = true;
-      }
-    }
+    const {
+      encryptedMetadata,
+      stored,
+      unreadable: metadataUnreadable
+    } = metadataInfo ?? (await readStoredMetadata(metadataKey));
+    if (metadataUnreadable) unreadable = true;
     let resolved = null;
-    if (resolveOwner) {
+    if (resolveOwner && !hasCompleteStoredMetadata(stored)) {
       try {
         resolved = await resolveOwner({
           type,
@@ -145,21 +201,7 @@ export async function buildCloudDataInventory({
     const times = rows
       .map((row) => timestamp(row.updated_at ?? row.created_at))
       .filter((time) => time !== null);
-    const byteSize = rows.reduce(
-      (sum, row) =>
-        sum +
-        encoder.encode(
-          String(
-            row.value ??
-              row.encrypted_payload ??
-              row.encrypted_value ??
-              row.payload ??
-              row.subscription ??
-              ''
-          )
-        ).length,
-      0
-    );
+    const byteSize = rows.reduce((sum, row) => sum + rowByteSize(row), 0);
     const label =
       type === 'state'
         ? `${namespace}/${key}`
@@ -225,24 +267,95 @@ export async function buildCloudDataInventory({
     const slices = chunks.get(group) || [];
     chunks.delete(group);
     const rows = [row, ...slices.sort((a, b) => a.key.localeCompare(b.key))];
+    const metadataKey = JSON.stringify(['state', row.namespace, row.key]);
+    const metadataInfo = await readStoredMetadata(metadataKey);
+    const skipFullDecrypt =
+      !metadataInfo.unreadable &&
+      hasCompleteStoredMetadata(metadataInfo.stored);
     let value,
-      unreadable = false;
+      unreadable = metadataInfo.unreadable;
     try {
-      const count = parseChunkedRootCount(row.value);
-      if (count === null) value = await decryptFromStorage(row.value, userKey);
-      else {
+      const rootMarker = row.value ?? row.value_prefix ?? '';
+      const count = parseChunkedRootCount(rootMarker);
+      if (count === null) {
+        if (
+          typeof row.value === 'string' &&
+          (!skipFullDecrypt || row.value.length <= 1024)
+        ) {
+          value = await decryptFromStorage(row.value, userKey);
+        } else if (skipFullDecrypt) {
+          if (
+            !isValidStorageCiphertext(
+              row.value,
+              row.value_prefix,
+              row.value_suffix,
+              row.byte_size
+            )
+          ) {
+            throw new Error('Invalid state ciphertext');
+          }
+        } else {
+          const fetched =
+            typeof db.getClientState === 'function'
+              ? await db.getClientState(userId, row.namespace, { key: row.key })
+              : [];
+          const rawValue = fetched?.[0]?.value;
+          if (typeof rawValue !== 'string') {
+            throw new Error('Missing state value');
+          }
+          value = await decryptFromStorage(rawValue, userKey);
+        }
+      } else {
         // Validate counts against physically present slices before allocating/looping.
         if (count > slices.length) throw new Error('Missing state chunks');
-        const parts = [];
+        const sliceByKey = new Map(
+          slices.map((candidate) => [candidate.key, candidate])
+        );
+        const orderedSlices = [];
         for (let i = 0; i < count; i++) {
-          const slice = slices.find(
-            (candidate) => candidate.key === chunkKeyFor(row.key, i)
-          );
+          const slice = sliceByKey.get(chunkKeyFor(row.key, i));
           if (!slice || slice.updated_at !== row.updated_at)
             throw new Error('Mismatched state chunks');
-          parts.push(await decryptFromStorage(slice.value, userKey));
+          if (
+            !isValidStorageCiphertext(
+              slice.value,
+              slice.value_prefix,
+              slice.value_suffix,
+              slice.byte_size
+            )
+          ) {
+            throw new Error('Corrupt state chunk');
+          }
+          orderedSlices.push(slice);
         }
-        value = parts.join('');
+        if (!skipFullDecrypt) {
+          let fetchedByKey = null;
+          if (orderedSlices.some((slice) => typeof slice.value !== 'string')) {
+            const fetchedSlices =
+              typeof db.getClientState === 'function'
+                ? await db.getClientState(
+                    userId,
+                    CHUNK_NAMESPACE_PREFIX + row.namespace,
+                    { keyPrefix: `${row.key}\u001f` }
+                  )
+                : [];
+            fetchedByKey = new Map(
+              fetchedSlices.map((candidate) => [candidate.key, candidate.value])
+            );
+          }
+          const parts = [];
+          for (const slice of orderedSlices) {
+            const rawSliceValue =
+              typeof slice.value === 'string'
+                ? slice.value
+                : fetchedByKey?.get(slice.key);
+            if (typeof rawSliceValue !== 'string') {
+              throw new Error('Missing state chunk value');
+            }
+            parts.push(await decryptFromStorage(rawSliceValue, userKey));
+          }
+          value = parts.join('');
+        }
       }
     } catch {
       unreadable = true;
@@ -255,7 +368,8 @@ export async function buildCloudDataInventory({
       rows,
       value,
       unreadable,
-      status: null
+      status: null,
+      metadataInfo
     });
   }
   for (const [group, rows] of chunks) {
@@ -280,10 +394,40 @@ export async function buildCloudDataInventory({
     });
   }
   for (const row of raw.outbox || []) {
+    const metadataKey = JSON.stringify(['outbox', row.message_id]);
+    const metadataInfo = await readStoredMetadata(metadataKey);
+    const skipFullDecrypt =
+      !metadataInfo.unreadable &&
+      hasCompleteStoredMetadata(metadataInfo.stored);
     let payload,
-      unreadable = false;
+      unreadable = metadataInfo.unreadable;
     try {
-      payload = objectOrText(await decryptFromStorage(row.payload, userKey));
+      if (
+        typeof row.payload === 'string' &&
+        (!skipFullDecrypt || row.payload.length <= 1024)
+      ) {
+        payload = objectOrText(await decryptFromStorage(row.payload, userKey));
+      } else if (skipFullDecrypt) {
+        if (
+          !isValidStorageCiphertext(
+            row.payload,
+            row.payload_prefix,
+            row.payload_suffix,
+            row.byte_size
+          )
+        ) {
+          throw new Error('Invalid outbox ciphertext');
+        }
+      } else {
+        const rawPayload =
+          typeof db.getOutboxPayload === 'function'
+            ? await db.getOutboxPayload(userId, row.message_id)
+            : null;
+        if (typeof rawPayload !== 'string') {
+          throw new Error('Missing outbox payload');
+        }
+        payload = objectOrText(await decryptFromStorage(rawPayload, userKey));
+      }
     } catch {
       unreadable = true;
     }
@@ -299,7 +443,8 @@ export async function buildCloudDataInventory({
           ? 'acked'
           : row.delivered_at != null
           ? 'delivered'
-          : 'pending'
+          : 'pending',
+      metadataInfo
     });
   }
   for (const row of raw.subscription || []) {

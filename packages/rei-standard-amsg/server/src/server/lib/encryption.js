@@ -31,15 +31,34 @@ import {
 const base64ToBytes = base64UrlToBytes;
 
 const TAG_LENGTH_BYTES = 16; // AES-GCM auth tag emitted on encrypt
+const AES_KEY_CACHE_MAX = 128;
+const aesKeyCache = new Map();
 
 function importAesKey(hexKey, usage) {
-  return globalThis.crypto.subtle.importKey(
-    'raw',
-    hexToBytes(hexKey),
-    { name: 'AES-GCM' },
-    false,
-    [usage]
-  );
+  const cacheKey = `${usage}:${hexKey}`;
+  const cached = aesKeyCache.get(cacheKey);
+  if (cached) return cached;
+  let promise;
+  try {
+    promise = globalThis.crypto.subtle.importKey(
+      'raw',
+      hexToBytes(hexKey),
+      { name: 'AES-GCM' },
+      false,
+      [usage]
+    ).catch((err) => {
+      aesKeyCache.delete(cacheKey);
+      throw err;
+    });
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  if (aesKeyCache.size >= AES_KEY_CACHE_MAX) {
+    const oldest = aesKeyCache.keys().next().value;
+    if (oldest !== undefined) aesKeyCache.delete(oldest);
+  }
+  aesKeyCache.set(cacheKey, promise);
+  return promise;
 }
 
 /** AES-256-GCM encrypt; returns the ciphertext and the detached 16-byte tag. */

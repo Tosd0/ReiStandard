@@ -97,3 +97,110 @@ test('latest cloud owner label fills missing labels across resource types withou
  assert.equal(result.entries.find(e=>e.resource.type==='credential').resource.owner.label,'Current name');
  assert.equal(result.entries.find(e=>e.resource.label==='char:one/older').resource.owner.label,'Old name');
 });
+
+test('large chunked state and outbox rows with metadata avoid full payload loading/decryption while preserving byteSize and snapshot guards',async()=>{
+ const {db}=await fresh();
+ const chunk0=await encrypt('x'.repeat(5000));
+ const chunk1=await encrypt('y'.repeat(5000));
+ const rootMarker='\u001famsg-chunked\u001fv1\u001f2';
+ const metaState=await encrypt(JSON.stringify({owner:{type:'character',id:'char-heavy',label:'Heavy'},kind:'instant-input'}));
+ const outboxCipher=await encrypt(JSON.stringify({content:'z'.repeat(2000)}));
+ const metaOutbox=await encrypt(JSON.stringify({owner:{type:'character',id:'char-heavy',label:'Heavy'},kind:'outbox-message'}));
+ await db.upsertClientState('u',[
+  {namespace:'amsg:instant-input',key:'in-1',value:rootMarker,updatedAt:100,encryptedCloudMetadata:metaState},
+  {namespace:'\u001famsg-chunks\u001famsg:instant-input',key:'in-1\u001f0',value:chunk0,updatedAt:100},
+  {namespace:'\u001famsg-chunks\u001famsg:instant-input',key:'in-1\u001f1',value:chunk1,updatedAt:100}
+ ]);
+ await db.appendOutboxMessages('u',[
+  {message_id:'msg-heavy',payload:outboxCipher,created_at:100,encryptedCloudMetadata:metaOutbox}
+ ]);
+ const rawRows=await db.listCloudResourceRows('u');
+ for (const slice of rawRows.state.filter(r=>r.namespace.startsWith('\u001famsg-chunks\u001f'))) {
+  assert.equal(slice.value,null);
+  assert.ok(slice.byte_size > 10000);
+ }
+ assert.equal(rawRows.outbox[0].payload,null);
+ assert.equal(rawRows.outbox[0].byte_size,outboxCipher.length);
+
+ let decryptCalls=0;
+ let importKeyCalls=0;
+ const origDecrypt=globalThis.crypto.subtle.decrypt.bind(globalThis.crypto.subtle);
+ const origImportKey=globalThis.crypto.subtle.importKey.bind(globalThis.crypto.subtle);
+ globalThis.crypto.subtle.decrypt=async(...args)=>{decryptCalls++;return origDecrypt(...args);};
+ globalThis.crypto.subtle.importKey=async(...args)=>{importKeyCalls++;return origImportKey(...args);};
+ let built;
+ try {
+  built=await inventory.buildCloudDataInventory({
+   db,
+   userId:'u',
+   userKey:key,
+   resolveOwner:()=>{throw new Error('resolveOwner must not be called when stored metadata already has owner and kind');}
+  });
+ } finally {
+  globalThis.crypto.subtle.decrypt=origDecrypt;
+  globalThis.crypto.subtle.importKey=origImportKey;
+ }
+ assert.equal(built.complete,true);
+ // Only the 2 small metadata sidecars should be decrypted, not the 2 state chunks or the outbox payload.
+ assert.equal(decryptCalls,2);
+ assert.ok(importKeyCalls<=1);
+
+ const stateEntry=built.entries.find(e=>e.resource.type==='state');
+ const outboxEntry=built.entries.find(e=>e.resource.type==='outbox');
+ assert.equal(stateEntry.resource.byteSize,Buffer.byteLength(rootMarker)+chunk0.length+chunk1.length);
+ assert.equal(stateEntry.resource.owner.id,'char-heavy');
+ assert.equal(stateEntry.resource.kind,'instant-input');
+ assert.equal(stateEntry.resource.status,null);
+ assert.equal(outboxEntry.resource.byteSize,outboxCipher.length);
+ assert.equal(outboxEntry.resource.owner.id,'char-heavy');
+ assert.equal(outboxEntry.resource.kind,'outbox-message');
+
+ // Mutating a large chunk after inventory snapshot must cause deleteCloudResourceRows to reject as changed.
+ const replacementChunk1=await encrypt('w'.repeat(5000));
+ await db.upsertClientState('u',[
+  {namespace:'\u001famsg-chunks\u001famsg:instant-input',key:'in-1\u001f1',value:replacementChunk1,updatedAt:100}
+ ]);
+ assert.deepEqual(await db.deleteCloudResourceRows('u',[stateEntry.locator]),{deleted:0,changed:1});
+
+ // Re-building inventory and deleting unchanged large rows succeeds cleanly.
+ const freshBuilt=await inventory.buildCloudDataInventory({db,userId:'u',userKey:key});
+ assert.deepEqual(
+  await db.deleteCloudResourceRows('u',freshBuilt.entries.map(e=>e.locator)),
+  {deleted:2,changed:0}
+ );
+ assert.equal((await db.listCloudResourceRows('u')).state.length,0);
+ assert.equal((await db.listCloudResourceRows('u')).outbox.length,0);
+});
+
+test('large state and outbox rows without stored metadata still lazy-load and decrypt for resolveOwner',async()=>{
+ const {db}=await fresh();
+ const chunk0=await encrypt(JSON.stringify({charId:'lazy-char',pad:'a'.repeat(1500)}).slice(0,800));
+ const chunk1=await encrypt(JSON.stringify({charId:'lazy-char',pad:'a'.repeat(1500)}).slice(800));
+ const outboxCipher=await encrypt(JSON.stringify({owner:{type:'character',id:'lazy-outbox'},kind:'outbox-kind',pad:'b'.repeat(1500)}));
+ await db.upsertClientState('u',[
+  {namespace:'amsg:instant-input',key:'lazy-1',value:'\u001famsg-chunked\u001fv1\u001f2',updatedAt:50},
+  {namespace:'\u001famsg-chunks\u001famsg:instant-input',key:'lazy-1\u001f0',value:chunk0,updatedAt:50},
+  {namespace:'\u001famsg-chunks\u001famsg:instant-input',key:'lazy-1\u001f1',value:chunk1,updatedAt:50}
+ ]);
+ await db.appendOutboxMessages('u',[
+  {message_id:'lazy-msg',payload:outboxCipher,created_at:50}
+ ]);
+ const built=await inventory.buildCloudDataInventory({
+  db,
+  userId:'u',
+  userKey:key,
+  resolveOwner:({type,value})=>{
+   if (type==='state' && value) {
+    const parsed=JSON.parse(value);
+    return {owner:{type:'character',id:parsed.charId},kind:'instant-input'};
+   }
+   return null;
+  }
+ });
+ const stateEntry=built.entries.find(e=>e.resource.type==='state');
+ const outboxEntry=built.entries.find(e=>e.resource.type==='outbox');
+ assert.equal(stateEntry.resource.owner.id,'lazy-char');
+ assert.equal(stateEntry.resource.kind,'instant-input');
+ assert.equal(outboxEntry.resource.owner.id,'lazy-outbox');
+ assert.equal(outboxEntry.resource.kind,'outbox-kind');
+});

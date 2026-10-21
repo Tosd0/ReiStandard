@@ -248,12 +248,38 @@ export class D1Adapter {
     return row?.encrypted_value ?? null;
   }
 
+  async getOutboxPayload(userId, messageId) {
+    const row = await this._db.prepare(
+      'SELECT payload FROM message_outbox WHERE user_id = ? AND message_id = ? LIMIT 1'
+    ).bind(userId, messageId).first();
+    return row?.payload ?? null;
+  }
+
   async listCloudResourceRows(userId) {
-    const tables = {task:'scheduled_messages', state:'client_state', credential:'llm_credentials', outbox:'message_outbox', subscription:'push_subscriptions', metadata:'cloud_resource_metadata'};
+    const queries = {
+      task: 'SELECT * FROM scheduled_messages WHERE user_id = ?',
+      state: `SELECT user_id, namespace, key,
+        CASE WHEN LENGTH(value) <= 1024 THEN value ELSE NULL END AS value,
+        LENGTH(CAST(value AS BLOB)) AS byte_size,
+        substr(value, 1, 128) AS value_prefix,
+        CASE WHEN LENGTH(value) > 128 THEN substr(value, -64) ELSE '' END AS value_suffix,
+        updated_at
+        FROM client_state WHERE user_id = ?`,
+      credential: 'SELECT * FROM llm_credentials WHERE user_id = ?',
+      outbox: `SELECT id, user_id, message_id, task_uuid, session_id, message_index, total_messages,
+        CASE WHEN LENGTH(payload) <= 1024 THEN payload ELSE NULL END AS payload,
+        LENGTH(CAST(payload AS BLOB)) AS byte_size,
+        substr(payload, 1, 128) AS payload_prefix,
+        CASE WHEN LENGTH(payload) > 128 THEN substr(payload, -64) ELSE '' END AS payload_suffix,
+        created_at, delivered_at, acked_at
+        FROM message_outbox WHERE user_id = ?`,
+      subscription: 'SELECT * FROM push_subscriptions WHERE user_id = ?',
+      metadata: 'SELECT * FROM cloud_resource_metadata WHERE user_id = ?'
+    };
     const result = {gaps:[]};
-    await Promise.all(Object.entries(tables).map(async ([type, table]) => {
+    await Promise.all(Object.entries(queries).map(async ([type, sql]) => {
       try {
-        const response = await this._db.prepare(`SELECT * FROM ${table} WHERE user_id = ?`).bind(userId).all();
+        const response = await this._db.prepare(sql).bind(userId).all();
         result[type] = response.results || [];
       } catch {
         result[type] = [];
@@ -317,7 +343,10 @@ export class D1Adapter {
     if (idempotencyKey) {
       return this._cloudRecord(await this._db.prepare(`SELECT * FROM cloud_data_records WHERE user_id=? AND kind=? AND idempotency_key=?`).bind(userId,kind,idempotencyKey).first());
     }
-    return this.getCloudDataRecord(userId,kind,id);
+    if (createOnly) {
+      return this.getCloudDataRecord(userId,kind,id);
+    }
+    return {id,userId,kind,data,updatedAt:now};
   }
 
   async getCloudDataRecord(userId, kind, id) {
@@ -539,6 +568,34 @@ export class D1Adapter {
     return !!row?.valid;
   }
 
+  _rowSnapshotMatch(spec, row) {
+    const clauses = [];
+    const args = [];
+    for (const column of spec.columns) {
+      if (!Object.hasOwn(row, column)) continue;
+      if (
+        (column === 'value' || column === 'payload') &&
+        row[column] === null &&
+        typeof row.byte_size === 'number'
+      ) {
+        clauses.push(
+          `LENGTH(CAST(${column} AS BLOB)) IS ?`,
+          `substr(${column}, 1, 128) IS ?`,
+          `(CASE WHEN LENGTH(${column}) > 128 THEN substr(${column}, -64) ELSE '' END) IS ?`
+        );
+        args.push(
+          row.byte_size,
+          row[`${column}_prefix`] ?? null,
+          row[`${column}_suffix`] ?? ''
+        );
+      } else {
+        clauses.push(`${column} IS ?`);
+        args.push(row[column]);
+      }
+    }
+    return { predicate: clauses.join(' AND '), values: args };
+  }
+
   /** Delete only the exact physical snapshot; no untrusted SQL identifiers. */
   async deleteCloudResourceRows(userId,locators,{operationId,leaseToken} = {}) {
     const specs = {
@@ -584,9 +641,7 @@ export class D1Adapter {
         ).bind(userId,namespace,key,'\u001famsg-chunks\u001f'+namespace,key+'\u001f',key+' ',identities));
       }
       for (const row of locator.rows) {
-        const columns=spec.columns.filter((column)=>Object.hasOwn(row,column));
-        const predicate=columns.map((column)=>`${column} IS ?`).join(' AND ');
-        const values=columns.map((column)=>row[column]);
+        const { predicate, values } = this._rowSnapshotMatch(spec, row);
         const identity=spec.keys.map((column)=>`${column} IS ?`).join(' AND ');
         // Missing rows are already deleted; a row at the same key with changed bytes is a stale plan.
         statements.push(this._db.prepare(`INSERT INTO cloud_guard_assertions (allowed)
@@ -595,8 +650,8 @@ export class D1Adapter {
         ).bind(...spec.keys.map((column)=>row[column]),...values));
       }
       for (const row of locator.rows) {
-        const columns=spec.columns.filter((column)=>Object.hasOwn(row,column));
-        statements.push(this._db.prepare(`DELETE FROM ${spec.table} WHERE ${columns.map((column)=>`${column} IS ?`).join(' AND ')}`).bind(...columns.map((column)=>row[column])));
+        const { predicate, values } = this._rowSnapshotMatch(spec, row);
+        statements.push(this._db.prepare(`DELETE FROM ${spec.table} WHERE ${predicate}`).bind(...values));
       }
       if (locator.metadataKey) statements.push(this._db.prepare('DELETE FROM cloud_resource_metadata WHERE user_id=? AND resource_key=?').bind(userId,locator.metadataKey));
       try {
