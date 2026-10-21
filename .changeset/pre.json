@@ -11,6 +11,7 @@
     "@rei-standard/blob-store": "0.1.0"
   },
   "changesets": [
-    "amsg-audit-inputs-and-sync"
+    "amsg-audit-inputs-and-sync",
+    "amsg-server-cloud-data-perf"
   ]
 }
