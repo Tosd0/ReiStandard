@@ -1007,7 +1007,7 @@ const result = await runTask(ctx, uuid);
 | `stage` | 在哪一段炸的：`config` = 构建配置时（少了 binding、环境变量丢了），`request` = 路由或处理器抛错 |
 | `name` | 错误类型（`error.name`，认不出来时是 `Error`） |
 | `message` | 错误消息，长得像凭据的串已遮掉、超长截断到 500 字符。`stage: 'config'` 的响应回给跨域调用方时没有这个字段，见下 |
-| `code` | 错误自带的 `code` 字符串，有才带 |
+| `code` | 错误自带的 `code` 字符串；没有时，D1 限额报错带 `D1_STORAGE_FULL`（库已满）、`D1_DAILY_READ_LIMIT`、`D1_DAILY_WRITE_LIMIT`（免费版当日读 / 写额度用完），其余情况不带 |
 
 只带错误类型和消息文本：密钥、用户数据、任务正文都不在 `error.message` 上，也不往这里放。
 
