@@ -397,8 +397,16 @@ export function sanitizeErrorSummary(reason) {
  *   路）回给跨域调用方时不带这个字段——那条路的 CORS 头是回显来访 Origin 的，任
  *   意第三方页面都能读，而构建期异常原文里常有 binding 名、内网域名、环境变量
  *   名。同源 / 无 Origin 的请求照旧带全文，`wrangler tail` 里也一直有。
- * @property {string} [code] - 错误自带的 `code` 字符串（有才带）
+ * @property {string} [code] - 错误自带的 `code` 字符串；没有时，认得出的 D1 限额
+ *   报错带 `D1_STORAGE_FULL` / `D1_DAILY_READ_LIMIT` / `D1_DAILY_WRITE_LIMIT`
  */
+
+// D1 这几种报错只有英文原文，没有错误码。
+const D1_LIMIT_CODES = [
+  [/Exceeded maximum DB size/i, 'D1_STORAGE_FULL'],
+  [/daily row read limit/i, 'D1_DAILY_READ_LIMIT'],
+  [/daily row write limit/i, 'D1_DAILY_WRITE_LIMIT']
+];
 
 /**
  * 把一个异常整理成能随响应体一起回给调用方的机读原因。
@@ -431,6 +439,9 @@ export function summarizeErrorCause(error, stage) {
   };
   if (typeof raw.code === 'string' && raw.code) {
     cause.code = sanitizeErrorSummary(raw.code).slice(0, 100);
+  } else {
+    const limit = D1_LIMIT_CODES.find(([pattern]) => pattern.test(rawMessage));
+    if (limit) cause.code = limit[1];
   }
   return cause;
 }

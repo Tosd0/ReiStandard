@@ -301,9 +301,22 @@ export async function deriveSerializeGroup(userKey, rawKey) {
 }
 
 export async function runScheduledTick(ctx) {
-  const tasks = await ctx.db.getPendingTasks(50);
-  const summary = await deliverTasks(ctx, tasks);
-  await ctx.db.cleanupOldTasks(7);
+  try {
+    const tasks = await ctx.db.getPendingTasks(50);
+    return await deliverTasks(ctx, tasks);
+  } finally {
+    // 投递出错时也要清：库快满时，清理正是让下一跳恢复的办法。
+    await runTickCleanup(ctx);
+  }
+}
+
+/** 一跳收尾的库存清理。每项各自 best-effort，这里不向外抛错。 */
+async function runTickCleanup(ctx) {
+  try {
+    await ctx.db.cleanupOldTasks(7);
+  } catch (error) {
+    console.warn('[amsg-server] cleanupOldTasks 失败（已忽略）:', error && error.message);
+  }
   // outbox 的顺手清理（适配器支持才做）：已 ack 的留 7 天，未 ack 的留 28 天
   // （Web Push 的 TTL 上限四周，比它更老的推送客户端也永远收不到了）。
   if (typeof ctx.db.cleanupOutbox === 'function') {
@@ -317,7 +330,6 @@ export async function runScheduledTick(ctx) {
     }
   }
   await cleanupExpiredClientState(ctx);
-  return summary;
 }
 
 /**
