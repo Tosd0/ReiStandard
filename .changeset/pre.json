@@ -12,6 +12,7 @@
   },
   "changesets": [
     "amsg-audit-inputs-and-sync",
-    "amsg-server-cloud-data-perf"
+    "amsg-server-cloud-data-perf",
+    "amsg-server-tick-cleanup-errors"
   ]
 }

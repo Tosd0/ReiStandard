@@ -1,5 +1,14 @@
 # Changelog — @rei-standard/amsg-server
 
+## 3.1.0-next.2
+
+### Patch Changes
+
+- 8f3fdbf: Keep cron cleanup running when delivery or another cleanup step fails, and add machine-readable D1 limit codes to `error.cause`:
+
+  - `runScheduledTick` now runs task, outbox and `client_state` cleanup after every tick; each step fails independently and is logged without affecting the delivery result.
+  - `summarizeErrorCause` adds `D1_STORAGE_FULL`, `D1_DAILY_READ_LIMIT` or `D1_DAILY_WRITE_LIMIT` when the error has no code of its own.
+
 ## 3.1.0-next.1
 
 ### Patch Changes
