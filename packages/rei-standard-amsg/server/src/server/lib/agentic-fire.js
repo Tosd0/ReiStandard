@@ -1314,9 +1314,10 @@ async function awaitWithinBudget(run, remainingMs, { hookController, makeError }
   if (remainingMs <= 0) throw expire();
   let timer;
   const expired = new Promise((_, reject) => {
-    // setTimeout 的上限是 2^31-1 ms，超了会立刻触发。
+    // setTimeout 的上限是 2^31-1 ms，超了会立刻触发。这个定时器不能 unref：
+    // hook 永不返回时它是事件循环里唯一还活着的东西，unref 掉进程就直接退出，
+    // fire 永远不会按超时收场。
     timer = setTimeout(() => reject(expire()), Math.min(remainingMs, 2_147_483_647));
-    if (typeof timer?.unref === 'function') timer.unref();
   });
   try {
     return await Promise.race([run(), expired]);
