@@ -188,12 +188,16 @@ export {
 // 阶梯（见 lib/errors.js）。DeploymentConfigError 是它旁边那一档——坏的是整个
 // 部署而不是这条任务，照旧走退避阶梯，配置修好后还在阶梯上的任务能自己发出去。
 // summarizeErrorCause 是 500 响应体里 error.cause 的组装口（宿主自己包一层路
-// 由、想回同样形状时用同一份）。
+// 由、想回同样形状时用同一份）。StoredDataUndecryptableError 是
+// decryptFromStorage 解不开时抛的那个（换过主密钥），宿主按 code 判断。
 export {
   NonRetryableError,
   DeploymentConfigError,
   isNonRetryableError,
   summarizeErrorCause,
+  StoredDataUndecryptableError,
+  isStoredDataUndecryptableError,
+  STORED_DATA_UNDECRYPTABLE_CODE,
 } from './lib/errors.js';
 // Schema 自查 / 补齐：升级后老部署的表没跟上时，cron 会每分钟静默挂在缺的那
 // 一列上（见 lib/schema-version.js）。

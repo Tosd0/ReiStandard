@@ -24,6 +24,7 @@ import {
   bytesToHex,
   hexToBytes
 } from './webcrypto-utils.js';
+import { StoredDataUndecryptableError } from './errors.js';
 
 // Decoder for the wire formats' base64 fields. base64UrlToBytes normalizes
 // the url-safe alphabet and padding first, so it accepts both standard and
@@ -161,12 +162,16 @@ export async function encryptForStorage(text, encryptionKey) {
  * @returns {Promise<string>} Plaintext string.
  */
 export async function decryptFromStorage(encryptedText, encryptionKey) {
-  const [ivHex, authTagHex, encryptedDataHex] = encryptedText.split(':');
-  const plain = await aesGcmOpen(
-    encryptionKey,
-    hexToBytes(ivHex),
-    hexToBytes(encryptedDataHex),
-    hexToBytes(authTagHex)
-  );
-  return utf8Decode(plain);
+  try {
+    const [ivHex, authTagHex, encryptedDataHex] = encryptedText.split(':');
+    const plain = await aesGcmOpen(
+      encryptionKey,
+      hexToBytes(ivHex),
+      hexToBytes(encryptedDataHex),
+      hexToBytes(authTagHex)
+    );
+    return utf8Decode(plain);
+  } catch (error) {
+    throw new StoredDataUndecryptableError({ cause: error });
+  }
 }

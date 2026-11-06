@@ -25,6 +25,7 @@
  */
 
 import { chunkReasoningByUtf8Bytes } from '@rei-standard/amsg-shared';
+import { isStoredDataUndecryptableError } from './errors.js';
 
 // 每个切片行的 plaintext 上限 = 历史单条上限，沿用已验证的行大小。
 export const STATE_CHUNK_SLICE_BYTES = 200 * 1024;
@@ -107,9 +108,12 @@ export function splitStateValue(value) {
  * @param {() => Promise<Array<{ key: string, value: string, updated_at: number }>>} fetchChunkRows
  *   取该 namespace 对应保留 namespace 的全部切片行（最多调用一次）。
  * @param {(value: string) => Promise<string>} decryptValue
+ * @param {(row: { key: string, updated_at: number }) => void} [onUndecryptable]
+ *   传了它，密文解不开（STORED_DATA_UNDECRYPTABLE）的 key 报给它、不进结果，
+ *   别的 key 照常返回；不传则原样抛出。
  * @returns {Promise<Array<{ namespace: string, key: string, value: string, updatedAt: number }>>}
  */
-export async function resolveClientStateEntries(rows, fetchChunkRows, decryptValue) {
+export async function resolveClientStateEntries(rows, fetchChunkRows, decryptValue, onUndecryptable) {
   let chunkMap = null;
   const loadChunks = async () => {
     if (chunkMap === null) {
@@ -122,34 +126,31 @@ export async function resolveClientStateEntries(rows, fetchChunkRows, decryptVal
   const entries = [];
   for (const row of rows) {
     const count = parseChunkedRootCount(row.value);
-    if (count === null) {
-      entries.push({
-        namespace: row.namespace,
-        key: row.key,
-        value: await decryptValue(row.value),
-        updatedAt: row.updated_at,
-      });
+    let valueSources = [row.value];
+    if (count !== null) {
+      const map = await loadChunks();
+      const chunkRows = [];
+      for (let i = 0; i < count; i++) {
+        const chunk = map.get(chunkKeyFor(row.key, i));
+        if (!chunk || chunk.updated_at !== row.updated_at) break;
+        chunkRows.push(chunk);
+      }
+      if (chunkRows.length !== count) continue; // 写到一半断了 → 该 key 视为不存在
+      valueSources = chunkRows.map((chunk) => chunk.value);
+    }
+
+    let value;
+    try {
+      value = (await Promise.all(valueSources.map(decryptValue))).join('');
+    } catch (error) {
+      if (!onUndecryptable || !isStoredDataUndecryptableError(error)) throw error;
+      onUndecryptable(row);
       continue;
     }
-
-    const map = await loadChunks();
-    const chunkRows = [];
-    let intact = true;
-    for (let i = 0; i < count; i++) {
-      const chunk = map.get(chunkKeyFor(row.key, i));
-      if (!chunk || chunk.updated_at !== row.updated_at) {
-        intact = false;
-        break;
-      }
-      chunkRows.push(chunk);
-    }
-    if (!intact) continue; // 写到一半断了 → 该 key 视为不存在
-
-    const parts = await Promise.all(chunkRows.map((chunk) => decryptValue(chunk.value)));
     entries.push({
       namespace: row.namespace,
       key: row.key,
-      value: parts.join(''),
+      value,
       updatedAt: row.updated_at,
     });
   }

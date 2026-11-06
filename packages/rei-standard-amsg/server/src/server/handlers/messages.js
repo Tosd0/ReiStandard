@@ -5,9 +5,9 @@
  * @returns {{ GET: function }}
  */
 
-import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../lib/encryption.js';
+import { deriveUserEncryptionKey, encryptPayload } from '../lib/encryption.js';
 import { requireUserId } from '../lib/request.js';
-import { projectTask } from '../lib/task-projection.js';
+import { projectStoredTask } from '../lib/task-projection.js';
 
 const TASK_STATUS_FILTERS = ['all', 'pending', 'sent', 'failed'];
 
@@ -48,10 +48,8 @@ export function createMessagesHandler(ctx) {
 
     // 投影形状住在 lib/task-projection.js —— fire-time hook 的
     // ctx.scheduleTask() 撞 uuid 时回给宿主的那条任务用的是同一份，两边不会漂。
-    const decryptedTasks = await Promise.all(tasks.map(async task => {
-      const decrypted = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
-      return projectTask(task, decrypted);
-    }));
+    // 解不开的任务照样列出来（带 error 和 uuid），不连累整页。
+    const decryptedTasks = await Promise.all(tasks.map((task) => projectStoredTask(task, userKey)));
 
     const responsePayload = {
       tasks: decryptedTasks,

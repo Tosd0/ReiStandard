@@ -1081,7 +1081,7 @@ async function deliverTasks(ctx, tasks) {
     // recurrenceType 是过期判定、终审失败处置的依据。解密不了的话投递也无从
     // 谈起（投递用的就是这份解密结果），按投递失败走既有的重试/终态逻辑。
     if (!decrypted.ok) {
-      await handleDeliveryFailure(task, (decrypted.error && decrypted.error.message) || '任务载荷解密失败', null, null, null);
+      await handleDeliveryFailure(task, (decrypted.error && decrypted.error.message) || '任务载荷解密失败', null, null, null, { errorCode: decrypted.error?.code });
       return;
     }
     const recurrenceType = decryptedPayload.recurrenceType;
