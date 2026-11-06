@@ -64,3 +64,14 @@ test('validateLlmMessagesShape: tool messages need tool_call_id, allow empty con
   assert.deepEqual(validateLlmMessagesShape([{ role: 'tool', tool_call_id: 'c', content: 42 }]),
     { code: LLM_MESSAGES_ERROR.TOOL_CONTENT_INVALID, index: 0 });
 });
+
+test('validateLlmMessagesShape: OpenAI developer role is accepted', () => {
+  assert.equal(validateLlmMessagesShape([
+    { role: 'developer', content: 'be terse' },
+    { role: 'user', content: 'hi' },
+  ]), null);
+  assert.deepEqual(
+    validateLlmMessagesShape([{ role: 'function', content: 'x' }]),
+    { code: LLM_MESSAGES_ERROR.INVALID_ROLE, index: 0 },
+  );
+});

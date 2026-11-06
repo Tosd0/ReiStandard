@@ -359,6 +359,24 @@ function requireField(kind, field, value) {
 }
 
 /**
+ * Like {@link requireField}, but the value must also be one of `allowed`'s values.
+ *
+ * @param {string} kind
+ * @param {string} field
+ * @param {unknown} value
+ * @param {Record<string, string>} allowed
+ */
+function requireEnumField(kind, field, value, allowed) {
+  requireField(kind, field, value);
+  const values = Object.values(allowed);
+  if (!values.includes(/** @type {string} */ (value))) {
+    throw new Error(
+      `[amsg-shared] ${kind}: '${field}' must be one of ${values.map((v) => `'${v}'`).join(' | ')}`
+    );
+  }
+}
+
+/**
  * Build a {@link ContentPush}. Use this for legacy sentence-split
  * bursts (set `messageIndex` 1-based + `totalMessages`) or for a
  * single content push (omit both).
@@ -387,8 +405,8 @@ function requireField(kind, field, value) {
  * @returns {ContentPush}
  */
 export function buildContentPush(args) {
-  requireField('ContentPush', 'messageType', args.messageType);
-  requireField('ContentPush', 'source', args.source);
+  requireEnumField('ContentPush', 'messageType', args.messageType, MESSAGE_TYPE);
+  requireEnumField('ContentPush', 'source', args.source, PUSH_SOURCE);
   requireField('ContentPush', 'messageId', args.messageId);
   requireField('ContentPush', 'sessionId', args.sessionId);
   if (typeof args.message !== 'string') {
@@ -453,8 +471,8 @@ export function buildContentPush(args) {
  * @returns {ReasoningPush}
  */
 export function buildReasoningPush(args) {
-  requireField('ReasoningPush', 'messageType', args.messageType);
-  requireField('ReasoningPush', 'source', args.source);
+  requireEnumField('ReasoningPush', 'messageType', args.messageType, MESSAGE_TYPE);
+  requireEnumField('ReasoningPush', 'source', args.source, PUSH_SOURCE);
   requireField('ReasoningPush', 'messageId', args.messageId);
   requireField('ReasoningPush', 'sessionId', args.sessionId);
   if (typeof args.reasoningContent !== 'string' || !args.reasoningContent) {
@@ -514,8 +532,8 @@ export function buildReasoningPush(args) {
  * @returns {ToolRequestPush}
  */
 export function buildToolRequestPush(args) {
-  requireField('ToolRequestPush', 'messageType', args.messageType);
-  requireField('ToolRequestPush', 'source', args.source);
+  requireEnumField('ToolRequestPush', 'messageType', args.messageType, MESSAGE_TYPE);
+  requireEnumField('ToolRequestPush', 'source', args.source, PUSH_SOURCE);
   requireField('ToolRequestPush', 'messageId', args.messageId);
   requireField('ToolRequestPush', 'sessionId', args.sessionId);
   if (!Array.isArray(args.toolCalls) || args.toolCalls.length === 0) {
@@ -606,8 +624,8 @@ function validateNotificationArg(kind, value) {
  * @returns {ErrorPush}
  */
 export function buildErrorPush(args) {
-  requireField('ErrorPush', 'messageType', args.messageType);
-  requireField('ErrorPush', 'source', args.source);
+  requireEnumField('ErrorPush', 'messageType', args.messageType, MESSAGE_TYPE);
+  requireEnumField('ErrorPush', 'source', args.source, PUSH_SOURCE);
   requireField('ErrorPush', 'messageId', args.messageId);
   requireField('ErrorPush', 'sessionId', args.sessionId);
   requireField('ErrorPush', 'code', args.code);
@@ -662,8 +680,8 @@ export function buildResultPush(args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     throw new Error('[amsg-shared] ResultPush: payload must be a plain object');
   }
-  requireField('ResultPush', 'messageType', args.messageType);
-  requireField('ResultPush', 'source', args.source);
+  requireEnumField('ResultPush', 'messageType', args.messageType, MESSAGE_TYPE);
+  requireEnumField('ResultPush', 'source', args.source, PUSH_SOURCE);
   requireField('ResultPush', 'messageId', args.messageId);
   requireField('ResultPush', 'sessionId', args.sessionId);
   if (typeof args.resultKind !== 'string' || !args.resultKind.trim()) {
@@ -691,7 +709,8 @@ export function buildResultPush(args) {
  */
 export function isContentPush(value) {
   return !!value && typeof value === 'object'
-    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'content';
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'content'
+    && typeof /** @type {{message?: unknown}} */ (value).message === 'string';
 }
 
 /**
@@ -702,7 +721,8 @@ export function isContentPush(value) {
  */
 export function isReasoningPush(value) {
   return !!value && typeof value === 'object'
-    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'reasoning';
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'reasoning'
+    && typeof /** @type {{reasoningContent?: unknown}} */ (value).reasoningContent === 'string';
 }
 
 /**
@@ -713,7 +733,8 @@ export function isReasoningPush(value) {
  */
 export function isToolRequestPush(value) {
   return !!value && typeof value === 'object'
-    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'tool_request';
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'tool_request'
+    && Array.isArray(/** @type {{toolCalls?: unknown}} */ (value).toolCalls);
 }
 
 /**
@@ -724,7 +745,9 @@ export function isToolRequestPush(value) {
  */
 export function isErrorPush(value) {
   return !!value && typeof value === 'object'
-    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'error';
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'error'
+    && typeof /** @type {{code?: unknown}} */ (value).code === 'string'
+    && typeof /** @type {{message?: unknown}} */ (value).message === 'string';
 }
 
 /**
@@ -735,7 +758,8 @@ export function isErrorPush(value) {
  */
 export function isResultPush(value) {
   return !!value && typeof value === 'object'
-    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'result';
+    && /** @type {{messageKind?: unknown}} */ (value).messageKind === 'result'
+    && typeof /** @type {{resultKind?: unknown}} */ (value).resultKind === 'string';
 }
 
 // ─── Reasoning byte chunker ─────────────────────────────────────────────
@@ -1023,7 +1047,7 @@ export function stripReasoningTags(content) {
 
 /**
  * @typedef {Object} ChatMessage
- * @property {'system' | 'user' | 'assistant' | 'tool'} role
+ * @property {'system' | 'developer' | 'user' | 'assistant' | 'tool'} role
  * @property {string | unknown[] | null} [content]
  * @property {Array<{ id: string, type: 'function', function: { name: string, arguments: string } }>} [tool_calls]
  * @property {string} [tool_call_id]

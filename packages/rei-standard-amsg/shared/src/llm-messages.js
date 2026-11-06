@@ -12,7 +12,7 @@
  * server 英文），公开 API 的措辞与返回形状因此保持不变。
  */
 
-const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
+const VALID_LLM_MESSAGE_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool']);
 
 /**
  * {@link validateLlmMessagesShape} 可能返回的稳定错误码。枚举固定 —
@@ -55,7 +55,7 @@ export const LLM_MESSAGES_ERROR = Object.freeze({
  * Validate an OpenAI-style messages array. Pure（无副作用）。
  *
  * 接受的形状（与 OpenAI chat.completions 协议对齐）：
- *   - system / user / assistant: content 为非空字符串或长度 ≥ 1 的数组
+ *   - system / developer / user / assistant: content 为非空字符串或长度 ≥ 1 的数组
  *     （数组元素 schema 故意不校验 — 原样透传给上游 LLM）。
  *   - assistant 带非空 `tool_calls`: content 可为 null / 空串 / 缺省；
  *     每个 tool_call 需满足 `{ id: string, function }` 的轻量形状
@@ -105,7 +105,7 @@ export function validateLlmMessagesShape(messages) {
       continue;
     }
 
-    // system / user / 不带 tool_calls 的 assistant.
+    // system / developer / user / 不带 tool_calls 的 assistant.
     if (typeof m.content === 'string') {
       if (!m.content) {
         return { code: LLM_MESSAGES_ERROR.CONTENT_EMPTY_STRING, index: i };

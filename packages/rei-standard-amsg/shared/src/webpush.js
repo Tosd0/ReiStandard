@@ -3,7 +3,7 @@
  *           + RFC 8292 (VAPID).
  *
  * Pure-WebCrypto implementation. Zero runtime dependencies. Runs natively on
- * Cloudflare Workers, Vercel Edge, Netlify Edge, Deno, Bun, and Node ≥ 19.
+ * Cloudflare Workers, Vercel Edge, Netlify Edge, Deno, Bun, and Node ≥ 20.3.
  * Node 18 deployments must polyfill `globalThis.crypto` from
  * `node:crypto.webcrypto` before importing (amsg-instant 的 `adapters/node`
  * 入口就是干这个的)。
@@ -40,6 +40,11 @@ const NONCE_INFO = utf8('Content-Encoding: nonce\0');
 const VAPID_DEFAULT_TTL = 60;          // seconds — short, matches single-shot instant.
 const VAPID_TOKEN_LIFETIME = 12 * 3600; // 12h — comfortably under the 24h RFC 8292 cap.
 const RECORD_SIZE = 4096;               // arbitrary — must be ≥ ciphertext length.
+const SEND_DEFAULT_TIMEOUT_MS = 30000;
+const VAPID_MAX_TOKEN_LIFETIME = 24 * 3600; // RFC 8292 §2: exp must be within 24h.
+// Push services normally answer with an empty body; a bigger one is kept
+// only as an error excerpt, so cap what we buffer.
+const RESPONSE_BODY_MAX_BYTES = 16 * 1024;
 
 /**
  * Send a single Web Push notification.
@@ -57,10 +62,14 @@ const RECORD_SIZE = 4096;               // arbitrary — must be ≥ ciphertext 
  * @param {string}   args.vapid.privateKey - base64url, 32 B scalar.
  * @param {number}  [args.ttl=60]       - Push service TTL header, seconds.
  * @param {typeof fetch} [args.fetch]   - Override fetch impl (testing / proxy).
+ * @param {AbortSignal} [args.signal]   - Caller-side cancellation; merged with the timeout.
+ * @param {number}  [args.timeoutMs=30000] - Abort the push-service request after this long.
  * @returns {Promise<{ statusCode: number, body: string, headers: Headers }>}
- * @throws  {Error}  err.code = 'PUSH_SEND_FAILED' on push-service error.
+ * @throws  {Error}  err.code = 'PUSH_SEND_FAILED' on push-service error
+ *                   (`err.statusCode` set) and on transport failure / timeout /
+ *                   abort (`err.cause` is the underlying error).
  */
-export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl }) {
+export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl, signal, timeoutMs }) {
   if (!subscription || typeof subscription.endpoint !== 'string') {
     throw new Error('sendWebPush: invalid subscription');
   }
@@ -94,16 +103,27 @@ export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fe
     throw new Error('sendWebPush: no fetch implementation available');
   }
 
-  const res = await fetchFn(subscription.endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Encoding': 'aes128gcm',
-      'TTL': String(Number.isFinite(ttl) ? ttl : VAPID_DEFAULT_TTL),
-      'Authorization': `vapid t=${jwt}, k=${vapid.publicKey}`,
-    },
-    body: encryptedBody,
-  });
+  const timeoutSignal = AbortSignal.timeout(
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : SEND_DEFAULT_TIMEOUT_MS
+  );
+  let res;
+  try {
+    res = await fetchFn(subscription.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Encoding': 'aes128gcm',
+        'TTL': String(Number.isFinite(ttl) ? ttl : VAPID_DEFAULT_TTL),
+        'Authorization': `vapid t=${jwt}, k=${vapid.publicKey}`,
+      },
+      body: encryptedBody,
+      signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+    });
+  } catch (cause) {
+    const err = new Error(`Web Push delivery failed: ${cause?.message || cause}`, { cause });
+    err.code = 'PUSH_SEND_FAILED';
+    throw err;
+  }
 
   // Push services return 201 (RFC 8030) or 200/202 depending on implementation.
   if (!res.ok) {
@@ -292,13 +312,16 @@ export async function buildVapidJwt({ audience, subject, publicKey, privateKey }
 
 /**
  * Verify a VAPID JWT signature. Exported for tests / advanced consumers.
- * Returns the decoded payload if the signature and `exp` are valid.
+ * Returns the decoded payload if the signature and `exp` are valid
+ * (`exp` must be in the future and no more than 24h ahead, RFC 8292 §2).
  *
  * @param {string} jwt
  * @param {string} publicKey  - VAPID public key (base64url, 65 B).
+ * @param {Object} [options]
+ * @param {string} [options.expectedAudience] - When given, `aud` must equal it exactly.
  * @returns {Promise<{ aud: string, exp: number, sub: string }>}
  */
-export async function verifyVapidJwt(jwt, publicKey) {
+export async function verifyVapidJwt(jwt, publicKey, { expectedAudience } = {}) {
   const parts = String(jwt).split('.');
   if (parts.length !== 3) throw new Error('VAPID JWT: malformed (expected three segments)');
   const [h, p, s] = parts;
@@ -331,8 +354,15 @@ export async function verifyVapidJwt(jwt, publicKey) {
   if (!ok) throw new Error('VAPID JWT: signature mismatch');
 
   const payload = JSON.parse(utf8Decode(base64UrlToBytes(p)));
-  if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!payload.exp || payload.exp <= now) {
     throw new Error('VAPID JWT: expired');
+  }
+  if (payload.exp > now + VAPID_MAX_TOKEN_LIFETIME) {
+    throw new Error('VAPID JWT: exp more than 24h ahead');
+  }
+  if (expectedAudience !== undefined && payload.aud !== expectedAudience) {
+    throw new Error('VAPID JWT: audience mismatch');
   }
   return payload;
 }
@@ -352,7 +382,22 @@ function writeUint32BE(buf, offset, value) {
 
 async function safeReadText(res) {
   try {
-    return await res.text();
+    const body = res.body;
+    if (!body || typeof body.getReader !== 'function') {
+      return (await res.text()).slice(0, RESPONSE_BODY_MAX_BYTES);
+    }
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < RESPONSE_BODY_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(toUint8(value));
+      total += value.byteLength;
+    }
+    // Stop pulling once we have enough; a closed stream ignores this.
+    reader.cancel().catch(() => {});
+    return utf8Decode(concatBytes(...chunks).subarray(0, RESPONSE_BODY_MAX_BYTES));
   } catch {
     return '';
   }

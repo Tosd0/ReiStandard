@@ -320,6 +320,12 @@ const result = buildResultPush({
 });
 ```
 
+All five builders check `messageType` against `MESSAGE_TYPE` and `source`
+against `PUSH_SOURCE` and throw a plain `Error` (no `code`) on a value outside
+the enum, e.g. `[amsg-shared] ContentPush: 'messageType' must be one of
+'instant' | 'fixed' | 'prompted' | 'auto'`. A missing field throws
+`[amsg-shared] ContentPush: 'messageType' is required`.
+
 ### Type guards
 
 ```js
@@ -329,6 +335,20 @@ if (isContentPush(push)) {
   // push.message is `string`
 }
 ```
+
+Each guard checks `messageKind` plus the field that kind cannot do without,
+so a narrowed value is safe to read right away:
+
+| Guard | Also requires |
+|---|---|
+| `isContentPush` | `message` is a string |
+| `isReasoningPush` | `reasoningContent` is a string |
+| `isToolRequestPush` | `toolCalls` is an array |
+| `isErrorPush` | `code` and `message` are strings |
+| `isResultPush` | `resultKind` is a string |
+
+Common fields (`messageType`, `source`, `messageId`, …) are not checked by the
+guards; the builders are where those are enforced.
 
 ---
 
@@ -370,6 +390,11 @@ the full contract.
 `timingSafeEqualBytes` — WebCrypto-friendly byte/encoding helpers for
 base64url, hex, UUID v4 generation, HMAC, and constant-time comparison.
 
+`toUint8` / `concatBytes` accept `ArrayBuffer`, `Uint8Array` and any other
+`ArrayBufferView` (a `subarray`, a `DataView`, …). A view is read through its
+own `byteOffset` / `byteLength`, so only that window of the underlying buffer
+is used. Anything else throws `TypeError`.
+
 ### LLM call
 
 | Export | What it is |
@@ -377,7 +402,7 @@ base64url, hex, UUID v4 generation, HMAC, and constant-time comparison.
 | `callLlm(...)` | Call an OpenAI-compatible chat-completions endpoint with timeout / abort handling (default 300 000 ms, injectable `fetch`). |
 | `buildLlmRequestBody(...)` | Build the request body for prompt mode or `messages` mode (with optional `llmExtraBody`). |
 | `normalizeAiApiUrl(apiUrl)` | Normalize a base URL to its chat-completions endpoint without doubling `/v1`; unrecognized paths pass through unchanged. |
-| `validateLlmMessagesShape(...)` | Validate a `messages` array, including assistant `tool_calls` and `role: 'tool'` entries. |
+| `validateLlmMessagesShape(...)` | Validate a `messages` array, including assistant `tool_calls` and `role: 'tool'` entries. Accepted roles: `system` / `developer` / `user` / `assistant` / `tool`. Returns `null` when valid, otherwise `{ code, index?, toolCallIndex? }` (it does not throw). |
 | `LLM_MESSAGES_ERROR` | Stable error codes emitted by that validation. |
 | `redactCredentials(text)` | Redact `Bearer ...`, `sk-...`, and long opaque credential tokens from error strings while keeping model names intact. |
 
@@ -385,9 +410,25 @@ base64url, hex, UUID v4 generation, HMAC, and constant-time comparison.
 
 | Export | What it is |
 |---|---|
-| `sendWebPush(...)` | RFC 8291 payload encryption + RFC 8292 VAPID auth + POST to the push service (`err.code = 'PUSH_SEND_FAILED'` on failure). |
-| `buildVapidJwt(...)` / `verifyVapidJwt(...)` | Build / verify the ES256 VAPID JWT. |
+| `sendWebPush({ subscription, payload, vapid, ttl?, fetch?, signal?, timeoutMs? })` | RFC 8291 payload encryption + RFC 8292 VAPID auth + POST to the push service. Resolves `{ statusCode, body, headers }`. |
+| `buildVapidJwt(...)` / `verifyVapidJwt(jwt, publicKey, { expectedAudience? })` | Build / verify the ES256 VAPID JWT. |
 | `normalizeVapidSubject(...)` | Normalize the VAPID subject (e.g. add the `mailto:` prefix). |
+
+`sendWebPush` options: `ttl` defaults to 60, `timeoutMs` to 30000; `signal`
+is merged with the timeout, so either one stops the request. Every failure
+throws an `Error` with `code: 'PUSH_SEND_FAILED'`:
+
+| Failure | On the error |
+|---|---|
+| Push service answered non-2xx | `statusCode` = the HTTP status; the (truncated) response text is in `message` |
+| `fetch` itself failed, timed out or was aborted | `cause` = the underlying error; no `statusCode` |
+
+The response body is read up to 16 KiB; anything past that is dropped, both
+on success and in the error message.
+
+`verifyVapidJwt` checks the signature, rejects an `exp` in the past, rejects
+an `exp` more than 24 h ahead, and compares `aud` to `expectedAudience` when
+that option is given. It returns the decoded payload.
 
 ### Wire-protocol constants
 
@@ -417,6 +458,11 @@ avatar-URL soft-strip rule shared by client / instant / server
 (standards §6.2).
 
 ---
+
+## Runtime
+
+Node `>=20.3.0` (`engines` in `package.json`); the Web Push and LLM helpers
+use `AbortSignal.any`. Browsers, Workers and Deno with Web Crypto are fine.
 
 ## Invariants
 
