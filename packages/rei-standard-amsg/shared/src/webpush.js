@@ -103,7 +103,11 @@ export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fe
     throw new Error('sendWebPush: no fetch implementation available');
   }
 
-  const timeoutSignal = AbortSignal.timeout(
+  // 自己持有超时定时器而不用 AbortSignal.timeout：Node 里后者的定时器是 unref 的，
+  // 请求方的 fetch 没有活句柄时（测试里的 mock）事件循环会先退出，超时永远不触发。
+  const timeoutController = new AbortController();
+  const timer = setTimeout(
+    () => timeoutController.abort(new DOMException('Web Push request timed out', 'TimeoutError')),
     Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : SEND_DEFAULT_TIMEOUT_MS
   );
   let res;
@@ -117,12 +121,14 @@ export async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fe
         'Authorization': `vapid t=${jwt}, k=${vapid.publicKey}`,
       },
       body: encryptedBody,
-      signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+      signal: signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal,
     });
   } catch (cause) {
     const err = new Error(`Web Push delivery failed: ${cause?.message || cause}`, { cause });
     err.code = 'PUSH_SEND_FAILED';
     throw err;
+  } finally {
+    clearTimeout(timer);
   }
 
   // Push services return 201 (RFC 8030) or 200/202 depending on implementation.
