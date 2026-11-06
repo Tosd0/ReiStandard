@@ -13,6 +13,7 @@
   "changesets": [
     "amsg-client-non-json-response",
     "amsg-instant-body-limit",
+    "amsg-server-custom-push-endpoints",
     "amsg-server-lease-token",
     "amsg-shared-push-send-options",
     "amsg-sw-flush-and-commit",
