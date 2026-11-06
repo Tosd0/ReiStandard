@@ -119,15 +119,20 @@ try {
 async function drainOutbox(client) {
   let since;
   for (;;) {
-    const { entries, cursor, hasMore } = await client.getOutbox({ since, limit: 100 });
-    if (entries.length === 0) return;
+    const page = await client.getOutbox({ since, limit: 100 });
+    if (!page.success) throw new Error(page.error?.message || 'getOutbox failed');
+    const { entries, cursor, hasMore } = page.data;
 
-    // entry.push 就是推送信封本身，与 Service Worker 收到的那份逐字一致，
-    // 交给已有的推送处理逻辑即可。
-    for (const entry of entries) await handlePush(entry.push);
+    // 服务端会跳过解不开的行但照样推进 cursor，一页可能是空的而后面还有，
+    // 所以翻页只看 hasMore / cursor，不拿 entries 是否为空来判断。
+    if (entries.length > 0) {
+      // entry.push 就是推送信封本身，与 Service Worker 收到的那份逐字一致，
+      // 交给已有的推送处理逻辑即可。
+      for (const entry of entries) await handlePush(entry.push);
 
-    // 先落库成功再销账。反过来的话账已经销了、落库半途失败，这条就补不回来了。
-    await client.ackOutbox(entries.map((entry) => entry.messageId));
+      // 先落库成功再销账。反过来的话账已经销了、落库半途失败，这条就补不回来了。
+      await client.ackOutbox(entries.map((entry) => entry.messageId));
+    }
 
     if (!hasMore) return;
     since = cursor;
@@ -589,7 +594,7 @@ const report = await sync.enqueue(entries);
 
 | 方法 | 行为 |
 |---|---|
-| `enqueue(entries)` | 先持久化各 key 的最新值，再开始上传；上传期间又保存了新值，会在当前请求结束后继续发送 |
+| `enqueue(entries)` | 先持久化各 key 的最新值，再开始上传；上传期间又保存了新值，会在当前请求结束后继续发送。同一 key 按 `updatedAt` 取新：晚入队但 `updatedAt` 更旧的快照不会顶掉还没发出的新快照 |
 | `flush()` | 等待恢复完成，重试待同步内容 |
 | `getPending()` | 返回当前待同步条目的副本 |
 | `discard(entrySnapshots)` | 放弃报告中的指定版本；完整快照仍匹配时才删除，之后保存的新值会留下 |
@@ -647,7 +652,7 @@ await sync.discard(report.outcomes
 
 对接 amsg-server 的配套方法：
 
-- `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`，单用户线），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛错
+- `getVapidPublicKey()` —— 拉 worker 自己的 VAPID 公钥（`GET /vapid-public-key`，单用户线），创建 Web Push 订阅时作 `applicationServerKey` 用；worker 没配公钥时抛 `Error`，带 `status` 和服务端的 `code`（`init()` 失败同样）
 - `getCapabilities()` —— 拉 worker 能力清单（`GET /capabilities`，单用户线），返回 `{ serverVersion, features }`；worker 太旧没有该端点（404 或非 JSON 响应）时返回 `null`，可以据此提示「worker 需要重新部署」而不是让新功能静默失效
 - `putClientState(entries)` —— 批量 upsert 客户端状态到云端镜像（`PUT /client-state`，单用户线）。entries 为 `[{ namespace, key, value, updatedAt, owner?, kind?, ownerGeneration? }]`（`value` 需自行序列化成字符串、`updatedAt` 为毫秒时间戳；`value` 传 `null` 表示删掉这个 key，server 特性位 `client-state-delete` 起认，老 server 按 `INVALID_STATE_VALUE` 逐条拒）；按 `updatedAt` last-write-wins，重发旧批次无害；返回 `{ success, data?: { upserted, skipped, deleted?, skippedEntries?, rejected?, unknown? }, error? }`，非法/超限条目只拒绝自己并写入 `data.rejected` 明细。单值超 200KB 时 worker 自动分片存储（用 `getCapabilities()` 探测 `features` 含 `client-state-chunking`，别判版本号）
 - `getClientState(namespace, { key }?)` —— 读回整个 namespace，或指定 key 的零至一条完整值（走加密响应信封，方法内解密并由服务器拼好分块）
@@ -659,8 +664,12 @@ await sync.discard(report.outcomes
 - `putLlmCredentials(credentials)` —— 批量登记 / 覆盖用户级 LLM 凭据（`PUT /llm-credentials`；worker 支不支持用 `getCapabilities()` 探测 features 含 `llm-credentials`，别判版本号）。credentials 为 `[{ credId, value: { apiUrl, apiKey, primaryModel } }]`；`credId` 由客户端起名（约定 `char:<charId>/<purpose>`、`global/<purpose>`）。登记后排程 payload 用 `credRefs: { chat: credId }` 引用它，任务到点现读——换 Key 覆盖对应行就够，所有引用它的任务（含角色自排的）自动跟随
 - `listLlmCredentials()` —— 云端凭据对账清单 `{ credentials: [{ credId, updatedAt }] }`，凭据本体永远不回传
 - `deleteLlmCredentials(opts)` —— 删凭据：`{ credIds: [...] }` 删指定那几行（如角色删除时清它名下的），`{ all: true }` 全删（「清空云端数据」）。两种删法互斥，`all: true` 和 `credIds` 同时传直接抛 TypeError、不发请求（跟服务端对这种 body 的 400 同一口径）——用两份状态拼 opts 时记得只留一个字段。删掉之后还引用着它的任务到点会失败并记 `CREDENTIAL_MISSING`，重新登记同名 credId 即恢复
-- `getOutbox(opts?)` —— 拉这个用户还没确认收到的服务端消息（`GET /outbox`，单用户线）。服务端在每条 Web Push 发出去之前先记进账本，「哪些消息还没收下」因此是查得出来的事实，不用拿本地最近几条去比对着猜。返回 `{ entries, cursor, hasMore }`（走加密响应信封，方法内解密）；每条 entry 形如 `{ id, messageId, taskUuid, sessionId, messageIndex, totalMessages, createdAt, deliveredAt, push }`，其中 **`push` 就是推送信封本身**——与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页把上一页的 `cursor` 当下一页的 `opts.since`，`opts.limit` 为 1–100（缺省由服务端定，50）
+- `getOutbox(opts?)` —— 拉这个用户还没确认收到的服务端消息（`GET /outbox`，单用户线）。服务端在每条 Web Push 发出去之前先记进账本，「哪些消息还没收下」因此是查得出来的事实，不用拿本地最近几条去比对着猜。返回 `{ success, data: { entries, cursor, hasMore } }`（走加密响应信封，方法内解密）；每条 entry 形如 `{ id, messageId, taskUuid, sessionId, messageIndex, totalMessages, createdAt, deliveredAt, push }`，其中 **`push` 就是推送信封本身**——与 Service Worker 收到的那一份逐字一致，可以原样交给已有的推送处理逻辑。翻页把上一页的 `cursor` 当下一页的 `opts.since`，`opts.limit` 为 1–100（缺省由服务端定，50）
 - `ackOutbox(messageIds)` —— 销账（`POST /outbox/ack`，请求体加密）：这些消息之后不再出现在 `getOutbox()` 的结果里。幂等，单次最多 200 条。顺序要紧——**先落库成功再 ack**，反过来的话账已经销了而落库半途失败，这条消息就补不回来了
+
+走 JSON 信封的方法（上面这些加 `schedule` / `update` / `cancel` / `list` / `get` / `putClientState` 等）对响应的处理是同一套：服务端回的是 JSON 就原样返回那个 `{ success, data?, error? }` 信封，非 2xx 也一样不抛；回的不是 JSON（网关的 HTML 错误页、空响应）才抛 `Error`，带 `status` 和 `code: 'NON_JSON_RESPONSE'`。`getCapabilities()` 是例外，非 JSON 直接返回 `null`。
+
+运行要求：浏览器或 Node `>=20.3.0`（`package.json` 的 `engines`）。
 
 以及从 `@rei-standard/amsg-shared` re-export 的运行时常量 / builder / type guard：
 

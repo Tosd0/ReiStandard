@@ -164,6 +164,10 @@ async function putDeduped(blob) {
 | `extractRefs` | `(str: string, prefix?: string) → string[]` | 从任意字符串提取全部令牌；自己拼 GC 的 `refSources` 时用得上 |
 | `DEFAULT_PREFIX` | `'blobref:'` | 默认令牌前缀常量 |
 
+## 运行环境
+
+浏览器（需要 IndexedDB 和安全上下文下的 `crypto.subtle`）；在 Node 里跑测试 / 打包要求 Node `>=20.3.0`（`package.json` 的 `engines`）。
+
 ## 错误哲学
 
 存储层错误不打断业务：读失败返回 null、删失败静默、GC 宁留勿删、迁移失败回退原串。`put` / `restore` 失败会上抛——调用方必须知道图没存进去。

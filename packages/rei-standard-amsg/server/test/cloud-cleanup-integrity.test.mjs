@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { deriveUserEncryptionKey, decryptFromStorage } from '../src/server/lib/encryption.js';
-import { cloudInventory, makeCleanupPlan, startCleanup, advanceCleanup, readCloudRecord, resumeCloudDataCleanups } from '../src/server/lib/cloud-data-cleanup.js';
+import { cloudInventory, makeCleanupPlan, startCleanup, advanceCleanup, readCloudRecord, resumeCloudDataCleanups, validCloudOwner } from '../src/server/lib/cloud-data-cleanup.js';
+import { validOwner } from '../src/server/lib/cloud-data-guard.js';
 const masterKey = 'cleanup-integrity-key';
 async function setup(count = 1) {
   const raw = createTestD1(); const db = createD1Adapter(raw); await db.initSchema();
@@ -116,4 +117,50 @@ test('retirement remembers legacy outbox ownership after deleting its source tas
     assert.equal((await db.listCloudResourceRows('u')).outbox.length,0);
     assert.equal((await db.getClientState('u','n')).length,1);
   }finally{raw.close();}
+});
+
+test('one cron tick finishes a 100-resource purge with one inventory before and one after, not two per 25', async () => {
+  const {raw,db,key,ctx,plan}=await setup(100);
+  const original=db.listCloudResourceRows.bind(db);let inventories=0;
+  db.listCloudResourceRows=async(...args)=>{inventories++;return original(...args);};
+  try {
+    const op=await startCleanup(ctx,db,'u',key,{planId:plan.id,idempotencyKey:'hundred'});
+    assert.equal(op.status,'pending');
+    inventories=0;
+    await resumeCloudDataCleanups(ctx);
+    const saved=await readCloudRecord(db,'u',key,'operation',op.id);
+    assert.equal(saved.status,'completed');
+    assert.equal(saved.counts.find(c=>c.type==='state').deleted,100);
+    assert.ok(inventories<=2,`inventory scanned ${inventories} times`);
+    assert.equal((await db.getClientState('u','n')).length,0);
+  } finally {raw.close();}
+});
+
+test('a lost lease stops the worker from saving or releasing the record and surfaces the original error', async () => {
+  const {raw,db,key,ctx,plan}=await setup(2);
+  const puts=[];const releases=[];
+  const originalPut=db.putCloudDataRecord.bind(db);
+  db.putCloudDataRecord=async(...args)=>{puts.push(args[1]);return originalPut(...args);};
+  db.releaseCloudDataRecord=async(...args)=>{releases.push(args[2]);return true;};
+  db.renewCloudDataRecordLease=async()=>false;
+  try {
+    await assert.rejects(startCleanup(ctx,db,'u',key,{planId:plan.id,idempotencyKey:'lost'}),{code:'CLOUD_LEASE_LOST'});
+    const operationSaves=puts.filter((kind)=>kind==='operation');
+    // Only the initial insert of the operation record; nothing written after the lease was lost.
+    assert.equal(operationSaves.length,1);
+    assert.deepEqual(releases,[]);
+    assert.equal((await db.getClientState('u','n')).length,2);
+  } finally {raw.close();}
+});
+
+test('cleanup owner validation is the guard rule: blank type is rejected and the label is bounded', async () => {
+  const {raw,db,key,ctx}=await setup();
+  try {
+    assert.equal(validCloudOwner,validOwner);
+    await assert.rejects(makeCleanupPlan(ctx,db,'u',key,{mode:'retire-owner',owner:{type:' ',id:'x'}}),{code:'INVALID_CLOUD_OWNER',status:400});
+    await assert.rejects(makeCleanupPlan(ctx,db,'u',key,{mode:'retire-owner',owner:{type:'character',id:'x',label:['nope']}}),{code:'INVALID_CLOUD_OWNER',status:400});
+    await assert.rejects(makeCleanupPlan(ctx,db,'u',key,{mode:'retire-owner',owner:{type:'character',id:'x',label:'l'.repeat(301)}}),{code:'INVALID_CLOUD_OWNER',status:400});
+    const plan=await makeCleanupPlan(ctx,db,'u',key,{mode:'retire-owner',owner:{type:'character',id:'x',label:'Fine'}});
+    assert.deepEqual(plan.owner,{type:'character',id:'x',label:'Fine'});
+  } finally {raw.close();}
 });

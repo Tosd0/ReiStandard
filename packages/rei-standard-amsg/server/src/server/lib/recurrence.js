@@ -16,6 +16,10 @@
  *     时刻（当地 3:30）。
  *   - 秋令时那天重复出现的墙钟（当地 1:30 出现两次）：取其中一个，不重复
  *     触发两次。
+ *
+ * 顺延过的落点不能当下一次推进的钟点基准（03:30 推下去就永远是 03:30 了），
+ * 所以各个推进函数都接受可选的 `anchorMs`——任务原本的首次触发时刻，钟点以
+ * 它为准（见 timeOfDayFor）。不传就只看落点自己的墙钟，老行为不变。
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -108,6 +112,23 @@ function epochFromWallParts({ year, month, day, hour, minute, second, ms }, tzId
   return refined;
 }
 
+/**
+ * 这次推进沿用的钟点（时分秒）。平时就是落点自己的墙钟；只有落点正好是锚点
+ * 的钟点被春令时跳过后顺延来的（纽约 02:30 → 03:30）才改用锚点的钟点，第二
+ * 天才回得到 02:30。锚点的钟点这天真实存在却跟落点不同（用户后来改过时间）
+ * → 以落点为准。
+ */
+function timeOfDayFor(occurrenceMs, wall, tzId, anchorMs) {
+  if (!Number.isFinite(anchorMs)) return wall;
+  const anchor = wallPartsOf(anchorMs, tzId);
+  if (anchor.hour === wall.hour && anchor.minute === wall.minute && anchor.second === wall.second) return wall;
+  const anchorOnThisDay = epochFromWallParts(
+    { year: wall.year, month: wall.month, day: wall.day, hour: anchor.hour, minute: anchor.minute, second: anchor.second, ms: occurrenceMs - Math.floor(occurrenceMs / 1000) * 1000 },
+    tzId
+  );
+  return anchorOnThisDay === occurrenceMs ? anchor : wall;
+}
+
 function periodDaysOf(recurrenceType) {
   return recurrenceType === 'weekly' ? 7 : 1;
 }
@@ -119,23 +140,26 @@ function periodDaysOf(recurrenceType) {
  * @param {'daily'|'weekly'} recurrenceType
  * @param {number} periods - 推几个周期（≥ 1）
  * @param {string|null} [tzId] - IANA 时区 id；缺省按 UTC 推进
+ * @param {number} [anchorMs] - 任务原本的首次触发时刻（epoch 毫秒）；给了的话被
+ *   春令时顺延过的落点推进时回到原钟点
  * @returns {number} 推进之后的时刻（epoch 毫秒）
  */
-export function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId) {
+export function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs) {
   const days = periodDaysOf(recurrenceType) * periods;
   if (!tzId) return occurrenceMs + days * DAY_MS;
 
   try {
     const p = wallPartsOf(occurrenceMs, tzId);
+    const time = timeOfDayFor(occurrenceMs, p, tzId, anchorMs);
     const shiftedDate = new Date(utcFromParts(p.year, p.month, p.day, 0, 0, 0, 0) + days * DAY_MS);
     return epochFromWallParts(
       {
         year: shiftedDate.getUTCFullYear(),
         month: shiftedDate.getUTCMonth() + 1,
         day: shiftedDate.getUTCDate(),
-        hour: p.hour,
-        minute: p.minute,
-        second: p.second,
+        hour: time.hour,
+        minute: time.minute,
+        second: time.second,
         ms: occurrenceMs - Math.floor(occurrenceMs / 1000) * 1000,
       },
       tzId
@@ -159,28 +183,29 @@ export function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId) {
  * @param {'daily'|'weekly'} recurrenceType
  * @param {number} nowMs
  * @param {string|null} [tzId]
+ * @param {number} [anchorMs] - 同 {@link advanceOccurrence}
  * @returns {{ nextMs: number, skippedCount: number, skippedOccurrences: number[], skippedTruncated: boolean }}
  *   `skippedCount` 含传进来的这一次（它自己就是没发出去的那一次）。
  *   `skippedOccurrences` 最多列 {@link MAX_LISTED_SKIPPED_OCCURRENCES} 个，
  *   超了只给首末两个并把 `skippedTruncated` 置 true。
  */
-export function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
+export function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs) {
   const periodMs = periodDaysOf(recurrenceType) * DAY_MS;
 
   // 先按固定周期估一个跨度，再修正——停摆几个月的 daily 任务不必一天一天
   // 地走 Intl 换算。DST 最多让估算差一个周期，修正循环跑一两轮就到位。
   let periods = nowMs > occurrenceMs ? Math.max(1, Math.floor((nowMs - occurrenceMs) / periodMs)) : 1;
-  let cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId);
+  let cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs);
 
   for (let step = 0; step < MAX_ADJUST_STEPS && periods > 1; step++) {
-    const previous = advanceOccurrence(occurrenceMs, recurrenceType, periods - 1, tzId);
+    const previous = advanceOccurrence(occurrenceMs, recurrenceType, periods - 1, tzId, anchorMs);
     if (previous <= nowMs) break;
     periods -= 1;
     cursor = previous;
   }
   for (let step = 0; step < MAX_ADJUST_STEPS && cursor <= nowMs; step++) {
     periods += 1;
-    cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId);
+    cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs);
   }
   if (cursor <= nowMs) {
     // 兜底：无论如何都要给出一个未来时刻。
@@ -194,10 +219,10 @@ export function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
   if (skippedCount <= MAX_LISTED_SKIPPED_OCCURRENCES) {
     skippedOccurrences = [occurrenceMs];
     for (let i = 1; i < skippedCount; i++) {
-      skippedOccurrences.push(advanceOccurrence(occurrenceMs, recurrenceType, i, tzId));
+      skippedOccurrences.push(advanceOccurrence(occurrenceMs, recurrenceType, i, tzId, anchorMs));
     }
   } else {
-    skippedOccurrences = [occurrenceMs, advanceOccurrence(occurrenceMs, recurrenceType, skippedCount - 1, tzId)];
+    skippedOccurrences = [occurrenceMs, advanceOccurrence(occurrenceMs, recurrenceType, skippedCount - 1, tzId, anchorMs)];
     skippedTruncated = true;
   }
 
@@ -211,8 +236,9 @@ export function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
  * @param {'daily'|'weekly'} recurrenceType
  * @param {number} nowMs
  * @param {string|null} [tzId]
+ * @param {number} [anchorMs] - 同 {@link advanceOccurrence}
  * @returns {string}
  */
-export function nextFutureOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
-  return new Date(planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId).nextMs).toISOString();
+export function nextFutureOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs) {
+  return new Date(planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs).nextMs).toISOString();
 }

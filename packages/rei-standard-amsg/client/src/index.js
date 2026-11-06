@@ -425,6 +425,7 @@ export class ReiClient {
     this._userId = config.userId || '';
     /** @private */
     this._userKey = null;
+    this._aesKeyCache = null;
     /** @private */
     this._instantEncryption = instantEncryption;
     /** @private */
@@ -491,8 +492,10 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error?.message || 'Failed to fetch user key');
+    const json = await this._readJson(res);
+    if (!json.success) {
+      throw Object.assign(new Error(json.error?.message || 'Failed to fetch user key'), { status: res.status, code: json.error?.code });
+    }
 
     const userKey = json?.data?.userKey;
     if (typeof userKey !== 'string' || !/^[0-9a-f]{64}$/i.test(userKey)) {
@@ -519,8 +522,10 @@ export class ReiClient {
       headers: this._withServerToken({})
     });
 
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error?.message || 'Failed to fetch VAPID public key');
+    const json = await this._readJson(res);
+    if (!json.success) {
+      throw Object.assign(new Error(json.error?.message || 'Failed to fetch VAPID public key'), { status: res.status, code: json.error?.code });
+    }
     return json.publicKey;
   }
 
@@ -550,7 +555,7 @@ export class ReiClient {
 
     let json;
     try {
-      json = await res.json();
+      json = await this._readJson(res);
     } catch {
       return null;
     }
@@ -613,7 +618,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -669,7 +674,7 @@ export class ReiClient {
     headers['Accept'] = 'application/json';
 
     const res = await fetch(url, { method: 'POST', headers, body });
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1046,7 +1051,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1061,7 +1066,7 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1091,7 +1096,7 @@ export class ReiClient {
       })
     });
 
-    const json = await res.json();
+    const json = await this._readJson(res);
     if (!json?.success || json?.encrypted !== true) return json;
 
     const decrypted = await this._decrypt(json.data);
@@ -1131,7 +1136,7 @@ export class ReiClient {
       })
     });
 
-    const json = await res.json();
+    const json = await this._readJson(res);
     if (!json?.success || json?.encrypted !== true) return json;
 
     return {
@@ -1295,7 +1300,7 @@ export class ReiClient {
     const response = await fetch(`${this._baseUrl}${path}`, {
       method: payload === undefined ? 'GET' : 'POST', headers, body
     });
-    const result = await response.json();
+    const result = await this._readJson(response);
     if (!result?.success || result.encrypted !== true) return result;
     return { ...result, data: await this._decrypt(result.data) };
   }
@@ -1358,7 +1363,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1392,7 +1397,7 @@ export class ReiClient {
       }
     );
 
-    const json = await res.json();
+    const json = await this._readJson(res);
     if (!json?.success || json?.encrypted !== true) return json;
 
     const decrypted = await this._decrypt(json.data);
@@ -1444,7 +1449,7 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   // ─── Push Subscription ──────────────────────────────────────────
@@ -1553,7 +1558,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1571,7 +1576,7 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1587,7 +1592,7 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   // ─── LLM Credentials ─────────────────────────────────────────────
@@ -1629,7 +1634,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1645,7 +1650,7 @@ export class ReiClient {
       headers: this._withServerToken({ 'X-User-Id': this._userId })
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   /**
@@ -1687,7 +1692,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   // ─── Message outbox（服务端投递账本） ─────────────────────────────
@@ -1747,7 +1752,7 @@ export class ReiClient {
       })
     });
 
-    const json = await res.json();
+    const json = await this._readJson(res);
     if (!json?.success || json?.encrypted !== true) return json;
 
     return {
@@ -1802,7 +1807,7 @@ export class ReiClient {
       body: JSON.stringify(encrypted)
     });
 
-    return res.json();
+    return this._readJson(res);
   }
 
   // ─── Local preflight (no network) ────────────────────────────────
@@ -1944,7 +1949,7 @@ export class ReiClient {
       return { kind: 'sse' };
     }
     if (kind === 'json') {
-      const json = await res.json();
+      const json = await this._readJson(res);
       return { kind: 'json', body: json };
     }
     const text = await res.text().catch(() => '');
@@ -2213,6 +2218,27 @@ export class ReiClient {
     );
   }
 
+  /**
+   * Parse a JSON response body. A non-JSON body (proxy / Cloudflare error
+   * page) throws an Error carrying `status` and `code: 'NON_JSON_RESPONSE'`
+   * instead of a bare SyntaxError. Non-2xx JSON envelopes are returned as-is
+   * so callers can read `error.code`.
+   * @private
+   * @param {Response} res
+   * @returns {Promise<any>}
+   */
+  async _readJson(res) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      const err = new Error(`[rei-standard-amsg-client] Non-JSON response: ${res.status} ${text.slice(0, 200)}`);
+      err.status = res.status;
+      err.code = 'NON_JSON_RESPONSE';
+      throw err;
+    }
+  }
+
   // ─── Crypto helpers (Web Crypto API) ────────────────────────────
 
   /**
@@ -2225,7 +2251,7 @@ export class ReiClient {
     if (!this._userKey) throw new Error('[rei-standard-amsg-client] Not initialised. Call init() first.');
 
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await crypto.subtle.importKey('raw', this._userKey, { name: 'AES-GCM' }, false, ['encrypt']);
+    const key = await this._aesKey();
     const encoded = TEXT_ENCODER.encode(plaintext);
     const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
 
@@ -2262,14 +2288,34 @@ export class ReiClient {
     cipherBytes.set(encryptedBytes);
     cipherBytes.set(authTagBytes, encryptedBytes.length);
 
-    const key = await crypto.subtle.importKey('raw', this._userKey, { name: 'AES-GCM' }, false, ['decrypt']);
+    const key = await this._aesKey();
     const plainBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, cipherBytes);
     return JSON.parse(new TextDecoder().decode(plainBuffer));
   }
 
+  /**
+   * Import the AES key once per key material; `init()` replacing `_userKey`
+   * invalidates the cache.
+   * @private
+   * @returns {Promise<CryptoKey>}
+   */
+  _aesKey() {
+    if (!this._aesKeyCache || this._aesKeyCache.raw !== this._userKey) {
+      const raw = this._userKey;
+      const key = crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+        .catch((err) => { if (this._aesKeyCache?.raw === raw) this._aesKeyCache = null; throw err; });
+      this._aesKeyCache = { raw, key };
+    }
+    return this._aesKeyCache.key;
+  }
+
   /** @private */
   _toBase64(uint8) {
-    const binary = Array.from(uint8, byte => String.fromCharCode(byte)).join('');
+    // Chunked so a multi-MB value does not allocate one string per byte.
+    let binary = '';
+    for (let i = 0; i < uint8.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, uint8.subarray(i, i + 0x8000));
+    }
     return btoa(binary);
   }
 

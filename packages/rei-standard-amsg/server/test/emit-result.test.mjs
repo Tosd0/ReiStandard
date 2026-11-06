@@ -221,9 +221,10 @@ describe('ctx.emitResult', () => {
     assert.deepEqual(await readOutbox(adapter), [], '取消了就别再补收回去');
   });
 
-  test('落行之后才发现任务被取消 → 自己把这一行撤掉，别等客户端补收回去', async () => {
-    // 取消动作发生在这条结果落库之前，取消侧扫不到它——这一行只能由 emitResult
-    // 自己撤，否则「取消接口回了成功，东西还是来了」。
+  test('落行之后才发现租约不在手里 → 只抛出，这一行留给 run-tick 确认行没了再按任务撤', async () => {
+    // 租约不在有两种原因：真取消，或者过期被别的 tick 接手。后者接手方正在投递
+    // 同一批行，emitResult 自己撤会删掉它的；所以这里不撤，run-tick 查过行确实
+    // 没了才按任务撤（见 run-tick 的 recordLostLease）。
     const { adapter, ctx } = await bootstrap({
       webpush: {
         async sendNotification() {
@@ -245,7 +246,11 @@ describe('ctx.emitResult', () => {
     await processSingleMessage(await makeTask(), { ...ctx, hooks });
 
     assert.equal(thrown && thrown.code, 'TASK_CANCELLED', '取消这个信号照旧往上抛');
-    assert.deepEqual(await readOutbox(adapter), [], '落进去的那一行也撤掉了');
+    const rows = await readOutbox(adapter);
+    assert.equal(rows.length, 1, '落进去的那一行不由 emitResult 撤');
+    // 真取消时 run-tick 按任务撤，这一行跟着没了。
+    await discardUndeliveredPushesForTask({ db: adapter, userId: USER, taskUuid: 'u7' });
+    assert.deepEqual(await readOutbox(adapter), []);
   });
 
   test('show:false + 任务已被取消：不落行、抛 TASK_CANCELLED', async () => {

@@ -69,22 +69,27 @@
  *   （可选）这条 uuid 现在是什么状态——不限用户，也不限状态。`runTask` 用它
  *   把「这条已经跑完进终态了」和「压根没这条」分开回报；不实现时两种都归
  *   `not_found`。
- * @property {(taskId: number, updates: Object) => Promise<TaskRow|null>} updateTaskById
+ * @property {(taskId: number, updates: Object, cloudGuard?: Object|null, options?: { leaseToken?: string|null }) => Promise<TaskRow|null>} updateTaskById
  *   Partially update a task row by its numeric id.
  *   实现了 `claimTask` 的适配器还要认 `lease_until` 和 `retry_after`（含写
  *   null）：投递收尾时 runScheduledTick 用前者把租约放掉，用后者写/清投递失败
  *   的退避时刻。
+ *   `options.leaseToken`（可选）：带上时只改 `lease_token` 仍等于它的行，改不到
+ *   回 null——这是投递收尾的写，租约过期后行被别的 tick 接手了就不该再落下去
+ *   （见 claimTask 的 leaseToken）。忽略这个参数的适配器退回按 id 直写。
  * @property {(uuid: string, userId: string, encryptedPayload: string, extraFields?: Object) => Promise<TaskRow|null>} updateTaskByUuid
  *   Update a pending task's encrypted_payload (and optional index fields) by uuid + user_id.
- * @property {(taskId: number) => Promise<boolean>} deleteTaskById
+ * @property {(taskId: number, options?: { leaseToken?: string|null }) => Promise<boolean>} deleteTaskById
  *   Delete a task by numeric id. Returns true if a row was affected.
+ *   `options.leaseToken`（可选）：语义同 updateTaskById——只删 `lease_token` 仍
+ *   等于它的行（一次性任务送达后的收尾删行走这里）。
  * @property {(uuid: string, userId: string) => Promise<boolean>} deleteTaskByUuid
  *   Delete a task by uuid + user_id. Returns true if a row was affected.
  * @property {(limit?: number) => Promise<TaskRow[]>} getPendingTasks
  *   Fetch pending tasks whose next_send_at <= NOW(), ordered ASC.
  *   跳过两种还不该动的行：租约没到期的（`lease_until`，有人正在跑）、退避没到
  *   点的（`retry_after`，上次投递失败在等重试）。两列都是空或已过期才算待发。
- * @property {(taskId: number, expectedNextSendAt: string|Date, leaseUntil: string|Date, serializeGroup?: string|null) => Promise<boolean>} [claimTask]
+ * @property {(taskId: number, expectedNextSendAt: string|Date, leaseUntil: string|Date, serializeGroup?: string|null, cloudGuard?: Object|null, options?: { leaseToken?: string|null, userId?: string|null }) => Promise<boolean>} [claimTask]
  *   领取一条到点的任务，返回是否领到。cron 每分钟一跳而一次投递可能跑几分
  *   钟，runScheduledTick 靠它保证同一行同时只被一个 tick 跑。
  *   三个条件同时成立才领得走：行仍是 pending；`lease_until` 为空或已过期
@@ -98,10 +103,22 @@
  *   自定义适配器可以不实现（runScheduledTick 会退回不占位的行为，代价是慢
  *   任务可能被下一跳重复触发）；实现了但忽略第四个参数的，分组串行退化成只在
  *   同一跳内生效。
+ *   `options.leaseToken`（可选）：这份租约的归属标识（调用方每次占位现生成的随
+ *   机串），领到时写进 `lease_token` 列。之后的 renewTaskLease / updateTaskById /
+ *   deleteTaskById 都带同一个值比对，所以租约过期后行被别的 tick 接手时，原执行
+ *   者迟到的心跳和收尾写库会落空，而不是把接手者的租约续上或改掉。忽略这个参
+ *   数（以及下面三个方法上的同名参数）的适配器退回今天的行为：心跳只看
+ *   `lease_until` 非空，写库按 id 直写。
+ *   `options.userId`（可选）：这行的 user_id。带 cloudGuard 的写要按它做归属断
+ *   言，调用方手里有就直接传，适配器不用再先 SELECT 一次。
  * @property {(userId: string, opts: {status?: string, limit?: number, offset?: number}) => Promise<{tasks: TaskRow[], total: number}>} listTasks
  *   List tasks for a user with optional filters and pagination.
+ *   排序要带主键作 tie-breaker（`ORDER BY next_send_at ASC, id ASC`）：同一触
+ *   发时刻的几行只按时间排，翻页时它们在两页之间的归属不稳定，会重复或漏行。
  * @property {(days?: number) => Promise<number>} cleanupOldTasks
  *   Delete completed / failed tasks older than `days` (default 7).
+ *   runScheduledTick 每跳都调；内置适配器一次最多删 `CLEANUP_BATCH_LIMIT`
+ *   （adapters/schema.js，100）条，积压多的话后面几跳接着清。
  * @property {(uuid: string, userId: string) => Promise<string|null>} getTaskStatus
  *   Return the status string of a task (used to distinguish 404 from 409).
  * @property {(userId: string, entries: Array<{namespace: string, key: string, value: string, updatedAt: number}>, cleanups?: Array<{namespace: string, key?: string, keyPrefix?: string, updatedAt: number}>, now?: number) => Promise<{upserted: number, skipped: number, outcomes?: boolean[], cleanupOutcomes?: Array<boolean|null>}>} [upsertClientState]
@@ -175,16 +192,18 @@
  *   llm_credentials 四个方法要么都实现、要么都不实现：缺任何一个，
  *   `PUT/GET/DELETE /llm-credentials` 返回 501，带 `credRefs` 的
  *   `POST /schedule-message` 也会被拒。内置的 D1 / pg / neon 适配器都实现了。
- * @property {(taskId: number, leaseUntil: string|Date) => Promise<boolean>} [renewTaskLease]
+ * @property {(taskId: number, leaseUntil: string|Date, cloudGuard?: Object|null, options?: { leaseToken?: string|null, userId?: string|null }) => Promise<boolean>} [renewTaskLease]
  *   （可选）投递期间的租约续期（runScheduledTick 的心跳）。只在行仍是
  *   pending 且 lease_until 非空时生效——收尾放掉租约之后，迟到的心跳不会把
- *   它复活。不实现 → 心跳自动关闭，退回一次性长租约（claimLeaseMs）。
+ *   它复活。带 `options.leaseToken` 时还要求 `lease_token` 等于它（见
+ *   claimTask）。不实现 → 心跳自动关闭，退回一次性长租约（claimLeaseMs）。
  *
- *   返回值现在还是「这条任务是不是被取消/顶替了」的信号：明确返回 `false`
- *   会中止这次投递剩下的推送（行已经不在了，再发就是「取消接口回了成功，
- *   消息照样送达」）。所以匹配不到行时必须返回 `false`，不能返回 undefined
- *   ——什么都不返回等于关掉这条信号，取消撞上投递时又会照发。抛错不算行没
- *   了，只当作这次没续上，下个心跳再试。
+ *   返回值是「这条任务还归不归我」的信号：明确返回 `false` 会中止这次投递剩
+ *   下的推送——行已经不在了（取消 / 顶替），或者租约过期后被别的 tick 接手，
+ *   再发都是重复送达。所以匹配不到行时必须返回 `false`，不能返回 undefined
+ *   ——什么都不返回等于关掉这条信号。两种情形调用方靠 `getTaskStatus` 再读一
+ *   次分开：行没了才撤 outbox，行还在就安静退出。抛错不算行没了，只当作这
+ *   次没续上，下个心跳再试。
  * @property {(uuid: string, userId: string) => Promise<{ status: string, last_error: string|null }|null>} [getTaskStatusInfo]
  *   （可选）状态 + last_error 列（脱敏失败摘要的 JSON 串）。GET /message 用
  *   它把「为什么失败」透给已失败的行；不实现时退回 getTaskStatus（409 里就

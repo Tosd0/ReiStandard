@@ -123,6 +123,30 @@ describe('instant 任务的重试判定', () => {
     assert.ok(lastError.reason, '给用户看的那句话照旧留着');
   });
 
+  // shared sendWebPush 把网络错 / 超时 / 中止包成 PUSH_SEND_FAILED，不带
+  // statusCode：推送服务根本没回话，说不清订阅有没有问题，照常重试。
+  it('PUSH_SEND_FAILED 且没有 statusCode（网络 / 超时）：照常重试满', async () => {
+    const task = await encryptTask(INSTANT_PAYLOAD);
+    const { db, lookups } = createUuidDb(task, ENCRYPTED_PUSH_SUB);
+
+    const result = await processMessagesByUuid(
+      'task-uuid',
+      createCtx(db, async () => {
+        const error = new Error('Web Push request failed: timeout', { cause: new Error('TimeoutError') });
+        error.code = 'PUSH_SEND_FAILED';
+        throw error;
+      }),
+      2,
+      TEST_USER_ID,
+      TEST_MASTER_KEY
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.permanent, undefined);
+    assert.equal(result.error.retriesAttempted, 2);
+    assert.equal(lookups.count, 3);
+  });
+
   it('普通的推送失败照常重试满', async () => {
     const task = await encryptTask(INSTANT_PAYLOAD);
     const { db, lookups } = createUuidDb(task, ENCRYPTED_PUSH_SUB);

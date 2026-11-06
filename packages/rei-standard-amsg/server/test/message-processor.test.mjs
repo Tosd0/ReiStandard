@@ -5,6 +5,8 @@ import { buildAiRequestBody } from '../src/server/lib/llm.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl } from '../src/server/lib/validation.js';
 import { encryptTestSubscription, withPushSubscriptionStore } from './helpers/push-subscription.mjs';
+import { createTestD1 } from './helpers/sqlite-d1.mjs';
+import { createD1Adapter } from '../src/server/adapters/d1.js';
 
 const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_MASTER_KEY = 'a'.repeat(64);
@@ -217,6 +219,138 @@ describe('message processor AI apiUrl handling', () => {
 
 // Direct unit coverage for normalizeAiApiUrl. Keep these in lockstep with
 // `@rei-standard/amsg-instant`'s url-and-cors.test.mjs.
+describe('推送阶段的配置与取消信号', () => {
+  const PAYLOAD = {
+    contactName: 'Rei',
+    messageType: 'prompted',
+    completePrompt: 'say hi',
+    apiUrl: 'https://api.example.com/v1/chat/completions',
+    apiKey: 'secret',
+    primaryModel: 'model-x',
+  };
+  function stubLlm() {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, async json() { return { choices: [{ message: { content: 'hello world' } }] }; } });
+    return () => { globalThis.fetch = originalFetch; };
+  }
+
+  // 旧代码读 ctx.vapid.email 时 ctx.vapid 是 undefined → TypeError，报出来的是
+  // 「Cannot read properties of undefined」而不是「VAPID 没配」。
+  it('ctx.vapid 整个缺失：报 VAPID_CONFIG_MISSING，不是 TypeError', async () => {
+    const task = await createEncryptedTask(PAYLOAD);
+    const restore = stubLlm();
+    try {
+      const ctx = createContext();
+      delete ctx.vapid;
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, false);
+      assert.equal(result.errorCode, 'VAPID_CONFIG_MISSING');
+      assert.match(result.error, /VAPID configuration missing/);
+      assert.equal(result.permanent, false, '是部署配置问题，照常重试');
+    } finally {
+      restore();
+    }
+  });
+
+  it('ctx.signal 绑到推送上：认第三个参数的 sender 收到同一个 signal', async () => {
+    const task = await createEncryptedTask(PAYLOAD);
+    const restore = stubLlm();
+    const controller = new AbortController();
+    const seen = [];
+    try {
+      const ctx = createContext();
+      ctx.signal = controller.signal;
+      ctx.webpush = { acceptsSendOptions: true, async sendNotification(_sub, _payload, options) { seen.push(options); } };
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].signal, controller.signal);
+    } finally {
+      restore();
+    }
+  });
+
+  it('不认第三个参数的 sender（npm web-push 那种）照旧只收两个参数', async () => {
+    const task = await createEncryptedTask(PAYLOAD);
+    const restore = stubLlm();
+    const argCounts = [];
+    try {
+      const ctx = createContext((...args) => { argCounts.push(args.length); });
+      ctx.signal = new AbortController().signal;
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.deepEqual(argCounts, [2]);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// 租约过期被别的 tick 接手时，原执行者看到的也是 TASK_CANCELLED（行还在，别人正
+// 在投同一批 message id）。投递侧分不清是接手还是真取消，所以一律不撤 outbox，
+// 撤不撤由 run-tick 查过行在不在之后决定。
+describe('推送中途收到 TASK_CANCELLED：投递侧不撤 outbox', () => {
+  const TASK_UUID = 'cancel-vs-handover';
+  async function makeFixedTask() {
+    const task = await createEncryptedTask({ contactName: 'Rei', messageType: 'fixed', userMessage: '第一句。第二句。' });
+    return { ...task, uuid: TASK_UUID, next_send_at: '2026-01-01T00:00:00.000Z' };
+  }
+  function countingAdapter() {
+    const adapter = createD1Adapter(createTestD1());
+    const discards = { byMessage: 0, byTask: 0 };
+    const db = new Proxy(adapter, {
+      get(target, prop) {
+        if (prop === 'discardOutboxMessages') return async (...args) => { discards.byMessage++; return target.discardOutboxMessages(...args); };
+        if (prop === 'discardUndeliveredOutboxForTask') return async (...args) => { discards.byTask++; return target.discardUndeliveredOutboxForTask(...args); };
+        const value = target[prop];
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    return { adapter, db, discards };
+  }
+  const cancelledError = () => Object.assign(new Error('任务在投递期间被取消或顶替，推送已中止'), { code: 'TASK_CANCELLED' });
+  async function undeliveredRows(adapter) {
+    const rows = await adapter.listOutboxForTask(TEST_USER_ID, TASK_UUID, { sinceMs: 0 });
+    return rows.filter(row => row.delivered_at == null);
+  }
+
+  it('首次投递：第二条被拦下，第一条标 delivered，第二条留在 outbox 里', async () => {
+    const { adapter, db, discards } = countingAdapter();
+    await adapter.initSchema();
+    let sends = 0;
+    const ctx = createContext(async () => { if (++sends === 2) throw cancelledError(); });
+    ctx.db = withPushSubscriptionStore(db, ENCRYPTED_PUSH_SUB);
+    ctx._agenticSleep = async () => {};
+
+    const result = await processSingleMessage(await makeFixedTask(), ctx);
+    assert.equal(result.success, false);
+    assert.equal(result.errorCode, 'TASK_CANCELLED');
+    assert.deepEqual(discards, { byMessage: 0, byTask: 0 });
+    assert.equal((await undeliveredRows(adapter)).length, 1, '没发出去的那条还在，归接手者 / run-tick 处置');
+  });
+
+  it('补推已落定的批次：同样只停发，不撤', async () => {
+    const { adapter, db, discards } = countingAdapter();
+    await adapter.initSchema();
+    const task = await makeFixedTask();
+    // 第一跳：整批落进 outbox，第二条推送挂了（普通网络错），留下一条待补推。
+    let sends = 0;
+    const first = createContext(async () => { if (++sends === 2) throw new Error('network hiccup'); });
+    first.db = withPushSubscriptionStore(db, ENCRYPTED_PUSH_SUB);
+    assert.equal((await processSingleMessage(task, first)).success, false);
+    assert.equal((await undeliveredRows(adapter)).length, 1);
+
+    // 第二跳走 redeliverCommittedBatch，推送时被拦下。
+    const second = createContext(async () => { throw cancelledError(); });
+    second.db = withPushSubscriptionStore(db, ENCRYPTED_PUSH_SUB);
+    const result = await processSingleMessage(task, second);
+    assert.equal(result.success, false);
+    assert.equal(result.errorCode, 'TASK_CANCELLED');
+    assert.deepEqual(discards, { byMessage: 0, byTask: 0 });
+    assert.equal((await undeliveredRows(adapter)).length, 1);
+  });
+});
+
 describe('normalizeAiApiUrl', () => {
   it('appends /v1/chat/completions for a bare host', () => {
     assert.equal(

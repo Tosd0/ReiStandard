@@ -1952,3 +1952,51 @@ test('self-heal: a re-run that fails again keeps businessError persisted and rep
   assert.equal(calls, 3, 'a still-failing record keeps the retry channel open');
   assert.equal(third.value[0].businessError, 'inbox write failed #3');
 });
+
+// --- push 没带 payload 也欠用户一条可见通知 ----------------------------------
+
+for (const [label, data] of [
+  ['没有 data', null],
+  ['data 解析出来是 null', { json: () => null }],
+  ['data 解析出来是空字符串', { json: () => '' }],
+]) {
+  test(`push: ${label} 的 push 也在 waitUntil 里弹一条默认通知`, async () => {
+    const { sw, listeners, notifications } = createSwMock();
+    installReiSW(sw);
+
+    const pending = [];
+    listeners.get('push')({
+      data,
+      waitUntil(work) { pending.push(Promise.resolve(work)); },
+    });
+    assert.equal(pending.length, 1, '通知要挂在 waitUntil 上，不然 SW 可能先被杀掉');
+    await Promise.all(pending);
+
+    assert.equal(notifications.length, 1, 'userVisibleOnly 订阅：每条 push 都得弹点什么');
+    assert.equal(notifications[0].title, 'New notification');
+    assert.equal(notifications[0].options.body, 'New message');
+  });
+}
+
+test('generic multipart: TTL 清扫放弃的 id，迟到的分片不再二次报 expired（内存分支）', async () => {
+  const { sw, postedMessages, triggerPush } = createSwMock();
+  installReiSW(sw, { multipart: { cleanupIntervalMs: 0 } });
+
+  const payload = { ...COMMON, messageKind: 'reasoning', reasoningContent: 'late '.repeat(80) };
+  const ttlMs = 40;
+  const parts = buildMultipartPayloads(payload, { id: 'mp_sw_sweep_late', maxChunkBytes: 80, ttlMs });
+  assert.ok(parts.length >= 3);
+
+  await triggerPush(parts[0]);
+  await new Promise((resolve) => setTimeout(resolve, ttlMs + 20));
+  await triggerPush({ ...COMMON, messageKind: 'error', code: 'NOOP', message: 'tick cleanup' });
+  const expiredOf = () => postedMessages.filter((entry) =>
+    entry.message.event === REI_SW_EVENT.MULTIPART_EXPIRED);
+  assert.equal(expiredOf().length, 1);
+
+  // 迟到的第二片不能重新开一份 pending，否则下一轮清扫会把同一条再报一次。
+  await triggerPush(parts[1]);
+  await new Promise((resolve) => setTimeout(resolve, ttlMs + 20));
+  await triggerPush({ ...COMMON, messageKind: 'error', code: 'NOOP', message: 'tick cleanup' });
+  assert.equal(expiredOf().length, 1, '同一条消息只报一次 MULTIPART_EXPIRED');
+});

@@ -10,9 +10,11 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
   message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
   next_send_at TEXT NOT NULL,
   -- lease_until：这条正在跑（某个 tick 占位时写，投递收尾放掉）
+  -- lease_token：占位的那个 tick 持有的随机串，续租和收尾写库只认它
   -- retry_after：这条没在跑，上次没发成，在等重试
   -- serialize_group：这条属于哪个串行分组（serializeBy 算出来的派生值）
   lease_until TEXT,
+  lease_token TEXT,
   retry_after TEXT,
   serialize_group TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
@@ -26,6 +28,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 -- 老库缺哪列就补哪列（新库会报「列已存在」，忽略即可）。走
 -- POST /init-tenant 的话服务端会自动处理，这几句只给手工维护表结构的人用。
 -- ALTER TABLE scheduled_messages ADD COLUMN lease_until TEXT;
+-- ALTER TABLE scheduled_messages ADD COLUMN lease_token TEXT;
 -- ALTER TABLE scheduled_messages ADD COLUMN retry_after TEXT;
 -- ALTER TABLE scheduled_messages ADD COLUMN serialize_group TEXT;
 -- ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT;

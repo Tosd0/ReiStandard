@@ -839,3 +839,44 @@ describe('/client-state endpoints', () => {
     assert.ok((await res.json()).features.includes('client-state-delete'));
   });
 });
+
+describe('PUT /client-state 的云端归属字段', () => {
+  test('owner / ownerGeneration 形状不对的条目逐条拒绝，其余条目照常入库', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'good', value: 'v', updatedAt: 100 },
+      { namespace: 'n', key: 'owned', value: 'v', updatedAt: 100, owner: { type: 'character', id: 'a' } },
+      // null 与缺省同义（落库按 0），和 owner: null 同一口径。
+      { namespace: 'n', key: 'null-gen', value: 'v', updatedAt: 100, owner: null, ownerGeneration: null },
+      { namespace: 'n', key: 'blank-owner', value: 'v', updatedAt: 100, owner: { type: ' ', id: 'a' } },
+      { namespace: 'n', key: 'long-label', value: 'v', updatedAt: 100, owner: { type: 'character', id: 'a', label: 'x'.repeat(301) } },
+      { namespace: 'n', key: 'bad-gen', value: 'v', updatedAt: 100, owner: { type: 'character', id: 'a' }, ownerGeneration: -1 },
+    ]);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.data.upserted, 3);
+    assert.deepEqual(
+      body.data.rejected.map((r) => [r.key, r.code]),
+      [['blank-owner', 'INVALID_CLOUD_OWNER'], ['long-label', 'INVALID_CLOUD_OWNER'], ['bad-gen', 'INVALID_CLOUD_OWNER_GENERATION']]
+    );
+  });
+
+  test('归属已停用：整批 409 CLOUD_OWNER_RETIRED，不是 500', async () => {
+    const d1 = createTestD1();
+    const worker = makeWorker(d1);
+    const env = { DB: d1 };
+    await worker.fetch(new Request('https://w.dev/init-tenant', { method: 'POST' }), env);
+    const owner = { type: 'character', id: 'retired' };
+    await createD1Adapter(d1).setCloudOwnerActive(USER, owner, false);
+    const res = await putState(worker, env, [
+      { namespace: 'n', key: 'k', value: 'v', updatedAt: 100, owner },
+    ]);
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.success, false);
+    assert.equal(body.error.code, 'CLOUD_OWNER_RETIRED');
+  });
+});

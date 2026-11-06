@@ -172,7 +172,9 @@ export class PgAdapter {
     return rows[0] ? { status: rows[0].status } : null;
   }
 
-  async updateTaskById(taskId, updates) {
+  // 第三个参数留给 cloudGuard（云端数据管理只有 D1 实现，这里不用）；
+  // options.leaseToken 见 interface.js：带上时只改仍持有这份租约的行。
+  async updateTaskById(taskId, updates, _cloudGuard = null, options = {}) {
     const sets = [];
     const values = [];
     let idx = 1;
@@ -186,11 +188,19 @@ export class PgAdapter {
       idx++;
     }
 
-    sets.push('updated_at = NOW()');
+    // Callers may pass updated_at explicitly (tests); otherwise stamp now.
+    if (!Object.prototype.hasOwnProperty.call(updates, 'updated_at')) {
+      sets.push('updated_at = NOW()');
+    }
     values.push(taskId);
+    let tokenGate = '';
+    if (options?.leaseToken) {
+      values.push(options.leaseToken);
+      tokenGate = ` AND lease_token = $${idx + 1}`;
+    }
 
     const rows = await this._query(
-      `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
+      `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE id = $${idx}${tokenGate} RETURNING *`,
       values
     );
     return rows[0] || null;
@@ -235,8 +245,14 @@ export class PgAdapter {
     return rows[0] || null;
   }
 
-  async deleteTaskById(taskId) {
-    const rows = await this._query('DELETE FROM scheduled_messages WHERE id = $1 RETURNING id', [taskId]);
+  async deleteTaskById(taskId, options = {}) {
+    const params = [taskId];
+    let tokenGate = '';
+    if (options?.leaseToken) {
+      params.push(options.leaseToken);
+      tokenGate = ' AND lease_token = $2';
+    }
+    const rows = await this._query(`DELETE FROM scheduled_messages WHERE id = $1${tokenGate} RETURNING id`, params);
     return rows.length > 0;
   }
 
@@ -263,13 +279,13 @@ export class PgAdapter {
 
   // 领取一条到点的任务。SQL 与并发语义在 pg-shared.js（pg / neon 共用一份，
   // 语义说明也在那里）。
-  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null) {
-    return pgShared.claimTask((text, params) => this._query(text, params), taskId, expectedNextSendAt, leaseUntil, serializeGroup);
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, _cloudGuard = null, options = {}) {
+    return pgShared.claimTask((text, params) => this._query(text, params), taskId, expectedNextSendAt, leaseUntil, serializeGroup, options);
   }
 
   // 投递期间的租约续期（run-tick 心跳；语义见 pg-shared.js）。
-  async renewTaskLease(taskId, leaseUntil) {
-    return pgShared.renewTaskLease((text, params) => this._query(text, params), taskId, leaseUntil);
+  async renewTaskLease(taskId, leaseUntil, _cloudGuard = null, options = {}) {
+    return pgShared.renewTaskLease((text, params) => this._query(text, params), taskId, leaseUntil, options);
   }
 
   async listTasks(userId, opts = {}) {
@@ -298,7 +314,7 @@ export class PgAdapter {
       `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
-       ORDER BY next_send_at ASC
+       ORDER BY next_send_at ASC, id ASC
        LIMIT $${idx} OFFSET $${idx + 1}`,
       taskParams
     );
@@ -306,16 +322,9 @@ export class PgAdapter {
     return { tasks, total };
   }
 
+  // 分批清旧任务（每跳最多 CLEANUP_BATCH_LIMIT 条；SQL 见 pg-shared.js）。
   async cleanupOldTasks(days = 7) {
-    const safeDays = Math.max(1, Math.floor(Number(days)));
-    const rows = await this._query(
-      `DELETE FROM scheduled_messages
-       WHERE status IN ('sent', 'failed')
-         AND updated_at < NOW() - make_interval(days => $1)
-       RETURNING id`,
-      [safeDays]
-    );
-    return rows.length;
+    return pgShared.cleanupOldTasks((text, params) => this._query(text, params), days);
   }
 
   async getTaskStatus(uuid, userId) {

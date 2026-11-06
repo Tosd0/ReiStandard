@@ -4,7 +4,7 @@
  * Everything in here is implemented on top of WHATWG-standard primitives
  * (`globalThis.crypto.subtle`, `TextEncoder`, `Uint8Array`) so the code
  * runs on Cloudflare Workers, Vercel Edge, Netlify Edge, Deno, Bun, and
- * Node ≥ 19 with zero polyfills. amsg-instant 的 Node adapter 会在这些
+ * Node ≥ 20.3 with zero polyfills. amsg-instant 的 Node adapter 会在这些
  * 帮手被触达之前为 Node 18 部署 polyfill `globalThis.crypto`。
  *
  * 这是全生态唯一一份实现 — instant 的 `src/utils.js` 与 server 的
@@ -37,7 +37,7 @@ export function concatBytes(...chunks) {
   const out = new Uint8Array(total);
   let offset = 0;
   for (const c of chunks) {
-    out.set(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c), offset);
+    out.set(toUint8(c), offset);
     offset += c.byteLength;
   }
   return out;

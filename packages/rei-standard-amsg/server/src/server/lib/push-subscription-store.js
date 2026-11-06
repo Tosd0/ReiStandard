@@ -11,6 +11,7 @@
  */
 
 import { decryptFromStorage, encryptForStorage } from './encryption.js';
+import { isValidPushEndpoint } from './validation.js';
 
 /** 适配器支不支持用户级订阅存储。 */
 export function supportsPushSubscriptionStore(db) {
@@ -21,8 +22,9 @@ export function supportsPushSubscriptionStore(db) {
 }
 
 /**
- * 一个对象长得像不像 Web Push 订阅。只看投递必需的部分：没有 endpoint 就
- * 谈不上往哪推。keys 缺失留给推送服务去拒，这里不替它判。
+ * 一个对象长得像不像 Web Push 订阅。只看投递必需的部分：endpoint 得是服务端
+ * 愿意去调的 https 地址（见 validation.js 的 isValidPushEndpoint）。keys 缺失
+ * 留给推送服务去拒，这里不替它判。
  *
  * @param {unknown} subscription
  * @returns {boolean}
@@ -31,8 +33,7 @@ export function isPushSubscriptionShape(subscription) {
   return !!subscription
     && typeof subscription === 'object'
     && !Array.isArray(subscription)
-    && typeof (/** @type {{ endpoint?: unknown }} */ (subscription).endpoint) === 'string'
-    && /** @type {{ endpoint: string }} */ (subscription).endpoint.trim().length > 0;
+    && isValidPushEndpoint(/** @type {{ endpoint?: unknown }} */ (subscription).endpoint);
 }
 
 /**

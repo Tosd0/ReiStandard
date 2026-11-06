@@ -28,6 +28,8 @@
  *     （`compression({ filter: (req) => req.path !== '/instant' })`）。
  */
 
+import { RequestBodyTooLargeError, MAX_REQUEST_BODY_BYTES } from '../errors.js';
+
 /**
  * Lazy Web Crypto polyfill for Node 18.
  *
@@ -90,6 +92,17 @@ export function toNodeHandler(fetchHandler, options = {}) {
       const fetchResponse = await fetchHandler(fetchRequest, resolveNodeRuntime(options, req, res));
       await writeFetchResponseToNode(fetchResponse, res);
     } catch (err) {
+      if (err instanceof RequestBodyTooLargeError && !res.headersSent) {
+        res.statusCode = 413;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        // 没读完的 body 还堵在连接上，不能复用：响应写完由 Node 把这条连接关掉。
+        res.setHeader('Connection', 'close');
+        res.end(JSON.stringify({
+          success: false,
+          error: { code: err.code, message: err.message, details: { maxBytes: err.maxBytes } }
+        }));
+        return;
+      }
       // 能走到这里的都是服务端自己的故障——客户端提前断开在
       // writeFetchResponseToNode 里就当成正常收场了。先留一行能归因的日志再说：
       // SSE 中途炸掉时响应头早就发出去了，状态码这条路已经用不上，不记日志的话
@@ -166,7 +179,19 @@ async function nodeRequestToFetchRequest(req) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
+    let total = 0;
+    const onData = (chunk) => {
+      total += chunk.length;
+      if (total > MAX_REQUEST_BODY_BYTES) {
+        // 停止消费但不销毁 socket：响应还要从同一条连接上回 413。
+        req.off('data', onData);
+        req.pause();
+        reject(new RequestBodyTooLargeError(MAX_REQUEST_BODY_BYTES));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on('data', onData);
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });

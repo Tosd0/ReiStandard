@@ -210,3 +210,16 @@ test('legacy physical-row receipts only clear a fully written batch, including U
   const partial = sdk.createLatestStateSync({ send() { return { success: true, data: { upserted: 3, skipped: 1 } }; } });
   assert.equal((await partial.enqueue([large])).pending.length, 1);
 });
+
+test('enqueue keeps the newer queued snapshot when an older updatedAt arrives late', async () => {
+  const uploads = [];
+  const sync = sdk.createLatestStateSync({
+    send(entries) { uploads.push(entries.map(item => item.value)); return { success: true, data: { upserted: entries.length, skipped: 0 } }; },
+  });
+  const newer = sync.enqueue([entry('newer', 200)]);
+  const stale = sync.enqueue([entry('stale', 150)]);
+  await Promise.all([newer, stale]);
+  assert.ok(!uploads.flat().includes('stale'), `stale snapshot was uploaded: ${JSON.stringify(uploads)}`);
+  assert.ok(uploads.flat().includes('newer'));
+  assert.deepEqual(await sync.getPending(), []);
+});

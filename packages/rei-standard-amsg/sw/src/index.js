@@ -88,6 +88,8 @@ const REI_AMSG_DEDUPE_STORE = 'delivery-dedupe';
 const DEFAULT_DEDUPE_TTL_MS = 10 * 60_000;
 const DEFAULT_DEDUPE_CLEANUP_INTERVAL_MS = 60_000;
 const REI_SW_SYNC_TAG = 'rei-sw-flush-request-outbox';
+// 4xx 里按临时失败留在队列重试的两个：408 Request Timeout、429 Too Many Requests。
+const RETRYABLE_CLIENT_ERROR_STATUSES = new Set([408, 429]);
 // 通知正文的兜底文案（opts.defaultBody 可覆盖），见 resolveNotificationBody。
 const DEFAULT_NOTIFICATION_BODY = 'New message';
 // multipart 的 kind / encoding / version 与限额默认值来自
@@ -199,7 +201,17 @@ export function installReiSW(sw, opts = {}) {
 
   sw.addEventListener('push', (event) => {
     const payload = readPushPayload(event);
-    if (!payload) return;
+    if (!payload) {
+      // 订阅按 userVisibleOnly 建的：没有 payload 也欠用户一条可见通知，否则
+      // 浏览器会替我们弹一条「此网站已在后台更新」。
+      const fallback = createNotificationFromPayload(null, { defaultIcon, defaultBadge, defaultBody });
+      event.waitUntil(
+        sw.registration.showNotification(fallback.title, fallback.options).catch((error) => {
+          console.error('[rei-standard-amsg-sw] showNotification rejected:', error);
+        })
+      );
+      return;
+    }
 
     event.waitUntil(handlePushPayload(sw, payload, makeDeliveryContext('webpush')));
   });
@@ -788,12 +800,18 @@ async function claimDedupe(payload, ctx) {
     return { duplicate: false, key, record };
   }
 
-  const existing = await readDedupeRecord(ctx.dedupe, key);
+  let existing = await readDedupeRecord(ctx.dedupe, key);
   if (existing && existing.expiresAt <= now) {
     await deleteDedupeRecord(ctx.dedupe, key);
+    existing = null;
+  }
+  if (!existing) {
+    // 读不到记录：要么刚被过期清扫删掉，要么是上面那条过期的——坑空出来了，
+    // 再占一次；否则这条 push 会被当成「已有人处理」而谁也不处理。
     if (await addDedupeRecord(ctx.dedupe, record)) {
       return { duplicate: false, key, record };
     }
+    existing = await readDedupeRecord(ctx.dedupe, key);
   }
 
   return {
@@ -1334,34 +1352,38 @@ async function acceptMultipartChunkInternal(sw, normalized, options) {
 
   const chunkId = `${normalized.id}_${normalized.index}`;
   const chunkExists = await hasMultipartChunk(chunkId);
-  if (chunkExists) return null;
 
-  base.receivedCount++;
-  base.receivedBytes = positiveIntegerOrDefault(base.receivedBytes, 0) +
-    normalized.chunkBytes.byteLength;
+  if (!chunkExists) {
+    base.receivedBytes = positiveIntegerOrDefault(base.receivedBytes, 0) +
+      normalized.chunkBytes.byteLength;
 
-  if (base.receivedBytes > options.maxTotalBytes) {
-    // 累计字节已经超过上限，再收也不会变小，剩下的分片没必要等。
-    console.error(
-      '[rei-standard-amsg-sw] multipart payload exceeds maxTotalBytes; giving up on this multipart id:',
-      {
-        id: normalized.id,
-        receivedBytes: base.receivedBytes,
-        maxTotalBytes: options.maxTotalBytes,
-      }
-    );
-    await giveUpMultipartId(
-      sw, base, base.total, options, MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED
-    );
-    return null;
+    if (base.receivedBytes > options.maxTotalBytes) {
+      // 累计字节已经超过上限，再收也不会变小，剩下的分片没必要等。
+      console.error(
+        '[rei-standard-amsg-sw] multipart payload exceeds maxTotalBytes; giving up on this multipart id:',
+        {
+          id: normalized.id,
+          receivedBytes: base.receivedBytes,
+          maxTotalBytes: options.maxTotalBytes,
+        }
+      );
+      await giveUpMultipartId(
+        sw, base, base.total, options, MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED
+      );
+      return null;
+    }
+
+    await writeMultipartChunk({
+      id_index: chunkId,
+      id: normalized.id,
+      index: normalized.index,
+      chunk: normalized.chunk
+    });
   }
 
-  await writeMultipartChunk({
-    id_index: chunkId,
-    id: normalized.id,
-    index: normalized.index,
-    chunk: normalized.chunk
-  });
+  // 齐没齐直接数分片仓库，不靠 pending 里的计数：分片落了库、pending 那笔写
+  // 却失败时，计数会永远少一，重投的同一片也补不回来。
+  base.receivedCount = await countMultipartChunks(normalized.id, base.total);
 
   if (base.receivedCount < base.total) {
     await writeMultipartPending(base);
@@ -1583,7 +1605,7 @@ async function maybeCleanupMultipart(sw, ctx) {
   if (last && now - last < ctx.multipart.cleanupIntervalMs) return;
   ctx.setLastMultipartCleanupAt(now);
   try {
-    await cleanupMultipartStores(sw, now);
+    await cleanupMultipartStores(sw, now, ctx.multipart);
   } catch (_error) {
     // Cleanup is observability/housekeeping; never block a fresh push.
   }
@@ -1610,37 +1632,36 @@ async function multipartIdAlreadySettled(id, now) {
   return !!done && done.expiresAt > now;
 }
 
-async function cleanupMultipartStores(sw, now) {
-  if (!hasIndexedDB()) {
-    for (const [id, record] of memoryMultipartPending.entries()) {
-      if (record.expiresAt <= now) {
-        memoryMultipartPending.delete(id);
-        await deleteMultipartChunks(id, record.total);
-        if (await multipartIdAlreadySettled(id, now)) continue;
-        await dispatchMultipartExpired(sw, record);
-      }
+async function cleanupMultipartStores(sw, now, options) {
+  const pendingExpired = hasIndexedDB()
+    ? await withDatabaseStore(REI_SW_MULTIPART_STORE, 'readonly', (store, resolve, reject) => {
+      const index = store.index('expiresAt');
+      const range = IDBKeyRange.upperBound(now);
+      const req = index.getAll(range);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    })
+    : Array.from(memoryMultipartPending.values()).filter((record) => record.expiresAt <= now);
+
+  for (const record of pendingExpired) {
+    if (await multipartIdAlreadySettled(record.id, now)) {
+      // 收尾没清干净的残留：结论早有了，只补扫，不再广播。
+      await deleteMultipartPending(record.id);
+      await deleteMultipartChunks(record.id, record.total);
+      continue;
     }
+    // 跟中途放弃走同一条路，连 done 墓碑一起写：不写的话迟到的分片会重新开
+    // 一份 pending，页面收到第二次 MULTIPART_EXPIRED。
+    await giveUpMultipartId(sw, record, record.total, options, MULTIPART_FAILURE_REASON.TTL_EXPIRED);
+  }
+
+  if (!hasIndexedDB()) {
     for (const [id, record] of memoryMultipartDone.entries()) {
       if (record.expiresAt <= now) {
         memoryMultipartDone.delete(id);
       }
     }
     return;
-  }
-
-  const pendingExpired = await withDatabaseStore(REI_SW_MULTIPART_STORE, 'readonly', (store, resolve, reject) => {
-    const index = store.index('expiresAt');
-    const range = IDBKeyRange.upperBound(now);
-    const req = index.getAll(range);
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-
-  for (const record of pendingExpired) {
-    await deleteStoreRecord(REI_SW_MULTIPART_STORE, record.id);
-    await deleteMultipartChunks(record.id, record.total);
-    if (await multipartIdAlreadySettled(record.id, now)) continue;
-    await dispatchMultipartExpired(sw, record);
   }
 
   const doneExpiredKeys = await withDatabaseStore(REI_SW_MULTIPART_DONE_STORE, 'readonly', (store, resolve, reject) => {
@@ -1796,6 +1817,8 @@ function normalizeRequestBody(bodyInput) {
   }
 }
 
+let flushInFlight = null;
+
 /**
  * 冲刷 outbox，并把每条记录这一轮的结局报回给调用方。
  *
@@ -1804,7 +1827,19 @@ function normalizeRequestBody(bodyInput) {
  *   key 是入队时拿到的 queueId。没出现在 map 里的记录 = 这一轮没轮到它，还在
  *   队列里等下次。
  */
-async function flushQueuedRequests(sw) {
+function flushQueuedRequests(sw) {
+  // 同一时刻只跑一轮：页面发的 FLUSH_QUEUE 和 Background Sync 撞上时，两轮都
+  // list 到同一条记录就会发两次。后来的调用排在当前这轮后面再跑一轮，而不是
+  // 直接共用结果——它可能是为刚入队、当前这轮没 list 到的那条来的。
+  const run = () => flushQueuedRequestsOnce(sw);
+  const flush = flushInFlight ? flushInFlight.then(run, run) : run();
+  flushInFlight = flush;
+  const clear = () => { if (flushInFlight === flush) flushInFlight = null; };
+  flush.then(clear, clear);
+  return flush;
+}
+
+async function flushQueuedRequestsOnce(sw) {
   const queuedRequests = await listQueuedRequests();
   const outcomes = new Map();
 
@@ -1850,7 +1885,7 @@ function settleQueueOutcome(outcomes, queueId, outcome) {
 /**
  * 一条队列请求被永久拒绝、即将从队列里删掉时的失败出口。
  *
- * 删记录这件事本身是有意的重试策略（4xx 重试多少次都是同一个结果），但删掉之
+ * 删记录这件事本身是有意的重试策略（这类 4xx 重试多少次都是同一个结果），但删掉之
  * 后必须留下痕迹：页面这边最常见的触发是 token 轮换（还拿着旧 token → 401）、
  * X-User-Id 不合法（400）、payload 超限（413）、路由改名（404），排的定时消息
  * 就此消失，事后连查都没得查。所以这里同时给两个出口：一条能归因的
@@ -1883,9 +1918,9 @@ async function reportDroppedRequest(sw, queuedRequest, outcome) {
 /**
  * 发一条队列请求，返回这次的结局：
  *  - `sent`    发出去了，服务端收下了，可以从队列删掉；
- *  - `dropped` 被 4xx 永久拒绝，删掉不再重试，但要报出去（见
- *              reportDroppedRequest）；
- *  - `retry`   网络错误或 5xx，留在队列里等下一次 sync。
+ *  - `dropped` 被 4xx 永久拒绝（408 / 429 除外），删掉不再重试，但要报出去
+ *              （见 reportDroppedRequest）；
+ *  - `retry`   网络错误、5xx 或 408 / 429，留在队列里等下一次 sync。
  */
 async function trySendQueuedRequest(queuedRequest) {
   try {
@@ -1898,7 +1933,9 @@ async function trySendQueuedRequest(queuedRequest) {
     if (response.ok) return { state: 'sent' };
 
     // 4xx is usually a permanent issue for this payload, so do not retry forever.
-    if (response.status >= 400 && response.status < 500) {
+    // 408 / 429 are the server asking for a retry, not refusing the payload.
+    if (response.status >= 400 && response.status < 500 &&
+        !RETRYABLE_CLIENT_ERROR_STATUSES.has(response.status)) {
       return {
         state: 'dropped',
         status: response.status,
@@ -1949,23 +1986,15 @@ async function addDedupeRecord(dedupe, record) {
   }
 
   return withDedupeStore(dedupe, 'readwrite', (store, resolve, reject) => {
-    let settled = false;
     const request = store.add(record);
-    request.onsuccess = () => {
-      settled = true;
-      resolve(true);
-    };
+    request.onsuccess = () => resolve(true);
     request.onerror = (event) => {
-      settled = true;
       if (request.error && request.error.name === 'ConstraintError') {
         if (event && typeof event.preventDefault === 'function') event.preventDefault();
         resolve(false);
         return;
       }
       reject(request.error || new Error('Failed to add dedupe record'));
-    };
-    store.transaction.onerror = () => {
-      if (!settled) reject(store.transaction.error || new Error('Dedupe transaction failed'));
     };
   });
 }
@@ -2042,6 +2071,31 @@ async function hasMultipartChunk(id_index) {
     const request = store.count(id_index);
     request.onsuccess = () => resolve(request.result > 0);
     request.onerror = () => reject(request.error);
+  });
+}
+
+/** 这条 id 的 1..total 里已经落库的分片数。 */
+async function countMultipartChunks(id, total) {
+  if (!hasIndexedDB()) {
+    let count = 0;
+    for (let index = 1; index <= total; index++) {
+      if (memoryMultipartChunks.has(`${id}_${index}`)) count++;
+    }
+    return count;
+  }
+  return withDatabaseStore(REI_SW_MULTIPART_CHUNK_STORE, 'readonly', (store, resolve, reject) => {
+    let count = 0;
+    let pending = total;
+    for (let index = 1; index <= total; index++) {
+      const request = store.count(`${id}_${index}`);
+      request.onsuccess = () => {
+        count += request.result;
+        pending--;
+        if (pending === 0) resolve(count);
+      };
+      request.onerror = () => reject(request.error);
+    }
+    if (total === 0) resolve(0);
   });
 }
 
@@ -2196,8 +2250,13 @@ async function withConnectionRetry(open, invalidate, run) {
   throw new Error('[rei-standard-amsg-sw] store connection retry exhausted');
 }
 
-function withDatabaseStore(storeName, mode, handler) {
-  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) => new Promise((resolve, reject) => {
+/**
+ * 在 `db` 上开一个事务跑 `handler`。handler 收到的 `resolve` 只是把结果记下来，
+ * 兑现要等 `transaction.oncomplete`：请求自己 onsuccess 了，提交阶段还可能因为
+ * 配额 / I/O 失败而 abort（QuotaExceededError），那时记录并没有落盘。
+ */
+function runStoreTransaction(db, storeName, mode, handler, failureMessage) {
+  return new Promise((resolve, reject) => {
     let transaction;
     try {
       transaction = db.transaction(storeName, mode);
@@ -2206,27 +2265,27 @@ function withDatabaseStore(storeName, mode, handler) {
       return;
     }
     const store = transaction.objectStore(storeName);
-    transaction.onerror = () => reject(transaction.error || new Error('Database transaction failed'));
-    Promise.resolve(handler(store, resolve, reject)).catch(reject);
-  }));
+    let result;
+    const fail = () => reject(transaction.error || new Error(failureMessage));
+    transaction.oncomplete = () => resolve(result);
+    // 请求级的 error 事件会冒泡到事务上，preventDefault 只拦下 abort、拦不住冒泡：
+    // handler 已经处理过的（比如 add 撞 ConstraintError 当「已存在」）不算事务失败。
+    transaction.onerror = (event) => { if (!(event && event.defaultPrevented)) fail(); };
+    transaction.onabort = fail;
+    Promise.resolve(handler(store, (value) => { result = value; }, reject)).catch(reject);
+  });
+}
+
+function withDatabaseStore(storeName, mode, handler) {
+  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) =>
+    runStoreTransaction(db, storeName, mode, handler, 'Database transaction failed'));
 }
 
 function withDedupeStore(dedupe, mode, handler) {
   return withConnectionRetry(
     () => openDedupeDatabase(dedupe),
     (db) => invalidateDedupeCache(dedupe, db),
-    (db) => new Promise((resolve, reject) => {
-      let transaction;
-      try {
-        transaction = db.transaction(dedupe.storeName, mode);
-      } catch (error) {
-        reject(error);
-        return;
-      }
-      const store = transaction.objectStore(dedupe.storeName);
-      transaction.onerror = () => reject(transaction.error || new Error('Dedupe transaction failed'));
-      Promise.resolve(handler(store, resolve, reject)).catch(reject);
-    }),
+    (db) => runStoreTransaction(db, dedupe.storeName, mode, handler, 'Dedupe transaction failed'),
   );
 }
 
@@ -2339,21 +2398,8 @@ function createObjectStoreIfMissing(db, tx, name, options) {
 }
 
 function withQueueStore(mode, handler) {
-  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) => new Promise((resolve, reject) => {
-    let transaction;
-    try {
-      transaction = db.transaction(REI_SW_DB_STORE, mode);
-    } catch (error) {
-      reject(error);
-      return;
-    }
-    const store = transaction.objectStore(REI_SW_DB_STORE);
-
-    transaction.oncomplete = () => resolve(undefined);
-    transaction.onerror = () => reject(transaction.error || new Error('Queue transaction failed'));
-
-    Promise.resolve(handler(store, resolve, reject)).catch(reject);
-  }));
+  return withConnectionRetry(openQueueDatabase, invalidateQueueCache, (db) =>
+    runStoreTransaction(db, REI_SW_DB_STORE, mode, handler, 'Queue transaction failed'));
 }
 
 async function addQueuedRequest(request) {

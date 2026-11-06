@@ -15,7 +15,10 @@ function guardError(code, message) {
   return Object.assign(new Error(message), { code, status: 409 });
 }
 
-function validOwner(owner) {
+export const MAX_OWNER_LABEL_CHARS = 300;
+
+/** The one definition of a well-formed cloud owner, shared by every input boundary. */
+export function validOwner(owner) {
   return (
     owner &&
     typeof owner.type === 'string' &&
@@ -23,14 +26,21 @@ function validOwner(owner) {
     owner.type.length <= 100 &&
     typeof owner.id === 'string' &&
     owner.id.trim().length > 0 &&
-    owner.id.length <= 300
+    owner.id.length <= 300 &&
+    (owner.label == null ||
+      (typeof owner.label === 'string' &&
+        owner.label.length <= MAX_OWNER_LABEL_CHARS))
   );
+}
+
+export function validOwnerGeneration(generation) {
+  return Number.isSafeInteger(generation) && generation >= 0;
 }
 
 function validateGuard(guard) {
   if (!validOwner(guard?.owner))
     throw guardError('INVALID_CLOUD_OWNER', 'Cloud owner is invalid');
-  if (!Number.isSafeInteger(guard.generation) || guard.generation < 0) {
+  if (!validOwnerGeneration(guard.generation)) {
     throw guardError(
       'INVALID_CLOUD_OWNER_GENERATION',
       'Cloud owner generation must be a non-negative integer'
@@ -205,6 +215,20 @@ export function createCloudGuardedAdapter(
   const wrap = (name, fn) => {
     if (typeof db[name] === 'function') methods.set(name, fn);
   };
+  // The sidecar compare-and-set works on ciphertext, which changes on every
+  // write (fresh IV), so a concurrent writer fails it even when ownership is
+  // unchanged. Recomputing from the new sidecar keeps last-write-wins while the
+  // ownership rules above still decide what the retry may write.
+  const withSidecarRetry = async (attempt) => {
+    for (let tries = 0; ; tries++) {
+      try {
+        return await attempt();
+      } catch (error) {
+        if (error?.code !== 'CLOUD_RESOURCE_CHANGED') throw error;
+        if (tries >= 2) throw Object.assign(error, { status: error.status ?? 409 });
+      }
+    }
+  };
 
   for (const method of ['createTask', 'createTaskSuperseding']) {
     wrap(method, async (params, supersedesUuid) => {
@@ -234,7 +258,7 @@ export function createCloudGuardedAdapter(
 
   wrap(
     'upsertClientState',
-    async (userId, entries, cleanups = [], now = Date.now()) => {
+    (userId, entries, cleanups = [], now = Date.now()) => withSidecarRetry(async () => {
       const key = await keyFor(userId);
       const roots = new Map();
       const rows = [];
@@ -303,10 +327,10 @@ export function createCloudGuardedAdapter(
         now,
         inheritedGuard
       );
-    }
+    })
   );
 
-  wrap('upsertLlmCredentials', async (userId, entries) => {
+  wrap('upsertLlmCredentials', (userId, entries) => withSidecarRetry(async () => {
     const key = await keyFor(userId);
     const rows = [];
     for (const entry of entries) {
@@ -322,7 +346,7 @@ export function createCloudGuardedAdapter(
       rows.push({ ...entry, ...metadata });
     }
     return db.upsertLlmCredentials(userId, rows, inheritedGuard);
-  });
+  }));
 
   wrap('appendOutboxMessages', async (userId, entries) => {
     const key = await keyFor(userId);

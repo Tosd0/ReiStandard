@@ -80,6 +80,8 @@ navigator.serviceWorker.addEventListener('message', (e) => {
 
 正文一路取下来是空的（或只有空白字符）时，SW 用兜底文案顶上，默认 `New message`，`installReiSW(self, { defaultBody })` 可以换成自己的。这里不能改成「干脆不弹」：订阅是按 `userVisibleOnly: true` 建的，每条 push 都欠用户一次可见反馈，代价见下面那节。弹一条只有标题、正文空白的横幅同样不行——用户在锁屏上看到一条什么都没有的消息、未读 +1，点进去也是空的。
 
+`push` 事件没带 data、或 data 解析出来是空值时，同样弹一条通知：标题 `New notification`，正文就是 `defaultBody`。
+
 #### 不展示通知的代价
 
 订阅是按 `userVisibleOnly: true` 建的——那是跟浏览器约好「每条 push 都会给用户可见反馈」。收到 push 却不弹通知就是违约，各家的处理不一样：
@@ -187,7 +189,7 @@ installReiSW(self, {
 });
 ```
 
-实现使用 IndexedDB 的 `add()` + keyPath 做原子 claim：第一次 add 成功才放行；几乎同时到达的同 key payload，后到者会命中 `ConstraintError` 并作为 duplicate 返回。TTL 清理是懒清理，不需要 KV / D1 / Durable Object。
+实现使用 IndexedDB 的 `add()` + keyPath 做原子 claim：第一次 add 成功才放行；几乎同时到达的同 key payload，后到者会命中 `ConstraintError` 并作为 duplicate 返回。占坑失败后读不到记录的（那条记录刚被过期清理删掉），再占一次坑，这条 payload 按首投处理。TTL 清理是懒清理，不需要 KV / D1 / Durable Object。
 
 ### 页面 -> SW 业务投递
 
@@ -303,7 +305,7 @@ installReiSW(self, {
 }
 ```
 
-SW 收到 `_multipart` 后会先写 IndexedDB，支持乱序、重复分片和 SW 重启恢复。未收齐时不 `postMessage`、不 `showNotification`。收齐后按 `index` 拼回原始 JSON payload，删除 pending，写短期 done 标记避免推送服务重投递造成二次业务事件，然后递归走普通 `messageKind` 分发。
+SW 收到 `_multipart` 后会先写 IndexedDB，支持乱序、重复分片和 SW 重启恢复。未收齐时不 `postMessage`、不 `showNotification`。齐没齐按分片仓库里实际落库的分片数算，不靠 pending 记录里的计数。收齐后按 `index` 拼回原始 JSON payload，写短期 done 标记避免推送服务重投递造成二次业务事件，删除 pending 和分片，然后递归走普通 `messageKind` 分发。
 
 配置：
 
@@ -364,7 +366,9 @@ pending 并广播：
 重组窗口从**本地收到第一片**起算（长度取发送端标的 `ttlMs` 与本地
 `multipart.ttlMs` 里更紧的那个）。窗口过完之后才到的分片，会连同这条 id 已落
 库的分片一起清掉，之后同 id 的分片静默丢弃——留着旧分片的话，新窗口的计数从零
-重来，而旧分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。
+重来，而旧分片会被「这一片已经有了」挡在门外，这条 id 再也收不齐。定期清扫（间隔
+`multipart.cleanupIntervalMs`）扫到过期的 pending 记录时走同一套收尾：清掉分片、写 done
+标记、广播一次 `'ttl-expired'`；之后迟到的分片静默丢弃，不再报第二次。
 
 业务应用只订阅普通事件即可。`content` multipart 收齐后照常弹通知；`reasoning` / `tool_request` / `error` 仍默认不弹通知（代价见「不展示通知的代价」一节）。
 
@@ -376,6 +380,16 @@ dedupe 库、queue / multipart 库都把 IndexedDB 连接缓存复用。浏览�
 
 - **`onclose` 清缓存**：连接被强关时把它从缓存里剔除，下次访问自动重开。
 - **事务级一次重开**：因为 `close` 事件可能晚于下一次事务调用、而 `db.transaction()` 是同步抛错，所以发事务时若命中「连接 closing/closed」，会清缓存、重开一次、重试一次；第二次仍失败才如实抛出（重试上限 1 次，不会无限循环）。
+
+### IndexedDB 写入以事务提交为准
+
+入队、去重占坑、分片落库这些写操作，等事务 `oncomplete` 才算成功。请求本身 `onsuccess` 了、提交阶段因为配额或 I/O 出错 abort 的（典型是 `QuotaExceededError`），记录并没有落盘，按写失败处理：
+
+| 写操作 | 失败时 |
+|---|---|
+| 入队 | 入队回执 `ok: false`，带 `error` |
+| 去重占坑 | 按首投照常分发，DELIVER ack 带 `dedupeError` |
+| 分片落库 | 广播 `MULTIPART_EXPIRED`，`reason` 为 `'storage-failed'` |
 
 ### 升级注意事项
 
@@ -461,9 +475,9 @@ export async function enqueueRequestToSW(requestPayload) {
 
 - `REI_SW_MESSAGE_TYPE.DELIVER`（同 `REI_AMSG_DELIVER_MESSAGE_TYPE`）：页面把 SSE / 补拉收到的业务 payload 转交给 SW，共用 SW 的 dedupe、通知展示与 `onBusinessPayload` 管线
 - `REI_SW_MESSAGE_TYPE.ENQUEUE_REQUEST`：添加请求到离线发送队列，并立即尝试发送
-- `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送
-- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果。点对点，一次入队一条。`ok: true` 表示已入队；`delivered: true` 表示这条已经真的发出去了（自己入队触发的冲刷、或恰好并发在跑的另一轮冲刷发的都算）；`delivered: false` 且没有 `dropped` 表示还在队列里等下次冲刷；被服务端 4xx 永久拒掉时带 `dropped: true` / `status` / `error`
-- `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
+- `REI_SW_MESSAGE_TYPE.FLUSH_QUEUE`：主动触发一次队列发送。冲刷同一时刻只跑一轮：页面的 `FLUSH_QUEUE`、入队后的立即冲刷和 Background Sync 撞上时，每个后来的调用各在当前这轮后面排一轮、串行跑（不合并），同一条记录不会被两轮各发一次
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT`：SW 返回入队结果。点对点，一次入队一条。`ok: true` 表示已入队；`delivered: true` 表示这条已经真的发出去了（自己入队触发的冲刷、或恰好并发在跑的另一轮冲刷发的都算）；`delivered: false` 且没有 `dropped` 表示还在队列里等下次冲刷；被服务端 4xx 永久拒掉时带 `dropped: true` / `status` / `error`（408 / 429 不算永久拒绝，和 5xx、网络错误一样按临时失败留在队列里等下次冲刷）
+- `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`：某条队列请求被服务端永久拒绝（408 / 429 以外的 4xx）、已从队列删掉。广播给所有窗口，带 `queueId` / `status` / `error` / `request: { url, method }`
 
 `QUEUE_DROPPED` 单独占一个 type，是因为它跟 `QUEUE_RESULT` 的收信人不是一回事：它是广播，可能来自后台 `sync` 冲刷、说的也可能是另一条早就排在队列里的旧请求。页面等自己那条入队回执时，不会被它打岔。
 
@@ -526,6 +540,7 @@ export async function enqueueRequestToSW(requestPayload) {
 
 - Service Worker 环境
 - 需支持 `indexedDB`
+- 在 Node 里跑测试 / 打包要求 Node `>=20.3.0`（`package.json` 的 `engines`）
 - Background Sync 不可用时会降级为手动冲刷队列
 - 建议项目可对 SW 文件做模块打包（支持包名 import）
 

@@ -53,8 +53,12 @@ function createInMemoryStore(namespace) {
     async get(key) {
       return namespaceMap.has(key) ? namespaceMap.get(key) : null;
     },
-    async set(key, value) {
+    async set(key, value, options = {}) {
+      if (options.onlyIfNew && namespaceMap.has(key)) {
+        return { modified: false };
+      }
       namespaceMap.set(key, value);
+      return { modified: true };
     },
     async delete(key) {
       namespaceMap.delete(key);
@@ -109,10 +113,24 @@ export function createTenantBlobStore(options) {
       return decryptConfig(encrypted, kekBuffer);
     },
 
-    async setTenantConfig(config) {
+    /**
+     * @param {TenantConfig} config
+     * @param {{ onlyIfNew?: boolean }} [options] onlyIfNew：键已存在就抛
+     *   TENANT_ALREADY_INITIALIZED，不覆盖。
+     */
+    async setTenantConfig(config, options = {}) {
       const store = await resolveBlobStore(namespace);
       const encrypted = encryptConfig(config, kekBuffer);
-      await store.set(getTenantKey(config.tenantId), encrypted);
+      const result = await store.set(
+        getTenantKey(config.tenantId),
+        encrypted,
+        options.onlyIfNew ? { onlyIfNew: true } : undefined
+      );
+      // 支持条件写的 store（@netlify/blobs 新版、内存实现）回 { modified }；
+      // 旧版 / 自定义 store 回 undefined，只能靠调用方的先查后写兜底。
+      if (options.onlyIfNew && result && result.modified === false) {
+        throw new Error('TENANT_ALREADY_INITIALIZED');
+      }
     },
 
     async deleteTenantConfig(tenantId) {

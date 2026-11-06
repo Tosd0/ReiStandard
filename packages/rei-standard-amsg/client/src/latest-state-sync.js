@@ -190,7 +190,13 @@ export function createLatestStateSync({ send, loadPending, savePending, maxReque
      * @param {StateSyncEntry[]} entries @returns {Promise<StateSyncReport>} */
     async enqueue(entries) {
       const normalized = normalize(entries);
-      await commit((next) => { for (const entry of normalized) next.set(identity(entry), entry); });
+      await commit((next) => {
+        for (const entry of normalized) {
+          // A late-arriving older snapshot must not replace a newer one still queued.
+          const queued = next.get(identity(entry));
+          if (!queued || entry.updatedAt >= queued.updatedAt) next.set(identity(entry), entry);
+        }
+      });
       return flush();
     },
     /** Drop only still-matching snapshots from a previous report. Bare keys are

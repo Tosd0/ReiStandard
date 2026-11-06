@@ -100,11 +100,15 @@ export function measurePushPayload(payload, options) {
  * payload 发出去只会被推送服务 413 掉，用户什么也收不到。加密之前就拦下
  * 来，让调用方拿到一个说得清的错误（宿主可以退回一条短消息 + 引用键）。
  *
- * @param {Object} args - 同 shared `sendWebPush`：{ subscription, payload, vapid, ttl, fetch }。
+ * @param {Object} args - 同 shared `sendWebPush`：{ subscription, payload, vapid, ttl, fetch, signal, timeoutMs }。
+ *   `signal`（AbortSignal）是调用方的取消信号，`timeoutMs`（默认 30000）是等推送
+ *   服务回应的上限，两者都原样透传。
  * @returns {Promise<{ statusCode: number, body: string, headers: Headers }>}
  * @throws  {Error}  err.code = 'PUSH_PAYLOAD_TOO_LARGE' when the payload
  *                   exceeds MAX_PUSH_PAYLOAD_BYTES (nothing is sent);
- *                   err.code = 'PUSH_SEND_FAILED' on push-service error.
+ *                   err.code = 'PUSH_SEND_FAILED' on push-service error
+ *                   (`err.statusCode` set) and on transport failure / timeout /
+ *                   abort (no statusCode, `err.cause` is the fetch error).
  */
 export async function sendWebPush(args) {
   const { payload } = args || {};
@@ -137,14 +141,20 @@ const SCHEDULED_DEFAULT_TTL = 2419200; // 4 weeks, in seconds
  * message-processor calls `ctx.webpush.sendNotification(subscription, payloadString)`,
  * so we only need that one method. VAPID keys are baked in at construction.
  *
+ * `sendNotification` 还认可选的第三个参数 `{ signal, timeoutMs }`（同
+ * {@link sendWebPush}）。npm `web-push` 见到不认识的 option 会直接抛，所以
+ * 返回的对象带 `acceptsSendOptions: true` 做标记，库只给带标记的 sender 传
+ * 第三个参数（见 {@link withPushSignal}）。
+ *
  * @param {{ email: string, publicKey: string, privateKey: string }} [vapid]
  * @param {{ ttl?: number }} [options] - Push TTL in seconds; defaults to 4 weeks
  *   (matches the web-push backend) so scheduled pushes outlive an offline device.
- * @returns {{ sendNotification: (subscription: Object, payload: string) => Promise<any> }}
+ * @returns {{ acceptsSendOptions: true, sendNotification: (subscription: Object, payload: string, options?: { signal?: AbortSignal, timeoutMs?: number }) => Promise<any> }}
  */
 export function createWebCryptoWebPush(vapid = {}, { ttl = SCHEDULED_DEFAULT_TTL } = {}) {
   return {
-    async sendNotification(subscription, payload) {
+    acceptsSendOptions: true,
+    async sendNotification(subscription, payload, { signal, timeoutMs } = {}) {
       return sendWebPush({
         subscription,
         payload,
@@ -154,8 +164,51 @@ export function createWebCryptoWebPush(vapid = {}, { ttl = SCHEDULED_DEFAULT_TTL
           publicKey: vapid.publicKey,
           privateKey: vapid.privateKey
         },
-        fetch: globalThis.fetch
+        fetch: globalThis.fetch,
+        signal,
+        timeoutMs,
       });
     }
   };
+}
+
+/**
+ * 把取消信号绑到一个 sender 上：之后每次 `sendNotification(subscription, payload)`
+ * 都会带上 `{ signal }`。只对 `acceptsSendOptions: true` 的 sender 生效（npm
+ * `web-push` 见到未知 option 会抛），其余原样返回。
+ *
+ * 用原型链包一层而不是展开复制：run-tick 的租约守卫、cloud 守卫也是这样包的，
+ * 标记顺着原型链还读得到，外层再绑一次（agentic fire 要换成带总预算的信号）
+ * 时新信号盖掉旧的。
+ *
+ * @template T
+ * @param {T} webpush
+ * @param {AbortSignal|undefined|null} signal
+ * @returns {T}
+ */
+export function withPushSignal(webpush, signal) {
+  if (!signal || !webpush || /** @type {any} */ (webpush).acceptsSendOptions !== true) return webpush;
+  const bound = Object.create(/** @type {any} */ (webpush));
+  Object.defineProperty(bound, 'sendNotification', {
+    value: (subscription, payload, options) =>
+      /** @type {any} */ (webpush).sendNotification(subscription, payload, { signal, ...options }),
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  return bound;
+}
+
+/**
+ * 发推送前确认 VAPID 三件套齐了。缺了抛 `VAPID_CONFIG_MISSING`（部署配置错误，
+ * 走常规重试、不判终态）。message-processor 的两条投递路和 agentic fire 共用。
+ *
+ * @param {{ email?: string, publicKey?: string, privateKey?: string }|null|undefined} vapid
+ */
+export function assertVapidConfigured(vapid) {
+  if (!vapid || !vapid.email || !vapid.publicKey || !vapid.privateKey) {
+    const err = new Error('VAPID configuration missing - push notifications cannot be sent');
+    err.code = 'VAPID_CONFIG_MISSING';
+    throw err;
+  }
 }

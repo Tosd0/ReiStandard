@@ -18,9 +18,42 @@ export { isValidUrl };
  * @param {string} dateString
  * @returns {boolean}
  */
+// Shape first: `new Date(x)` also accepts numbers and loose strings, which the
+// pg adapters bind to a timestamptz column as-is and then fail at the database.
+const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
 export function isValidISO8601(dateString) {
-  const date = new Date(dateString);
-  return date instanceof Date && !isNaN(date.getTime());
+  return typeof dateString === 'string'
+    && ISO_8601_RE.test(dateString)
+    && !Number.isNaN(Date.parse(dateString));
+}
+
+/**
+ * A Web Push endpoint the server may deliver to: https only, no credentials,
+ * and never a loopback name or an IP literal (the server would otherwise be
+ * talked into calling its own network).
+ * @param {unknown} endpoint
+ * @returns {boolean}
+ */
+/** 排期时刻必须在未来：过去的时刻落库后会被下一跳的过期守卫直接标 failed，
+ *  200 等于骗调用方「排上了」。POST 的 firstSendTime 和 PUT 的 nextSendAt 同一条规则。 */
+export function isFutureTimestamp(value) {
+  return new Date(value) > new Date();
+}
+
+export function isValidPushEndpoint(endpoint) {
+  if (typeof endpoint !== 'string') return false;
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) return false;
+  const host = url.hostname;
+  return host !== 'localhost'
+    && !host.endsWith('.localhost')
+    && !host.startsWith('[')
+    && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
 }
 
 /**
@@ -245,9 +278,15 @@ export function validateScheduleMessagePayload(payload) {
       return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间格式无效', details: { field: 'firstSendTime' } };
     }
 
-    if (payload.firstSendTime && new Date(payload.firstSendTime) <= new Date()) {
+    if (!isFutureTimestamp(payload.firstSendTime)) {
       return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间必须在未来', details: { field: 'firstSendTime', reason: 'must be in the future' } };
     }
+  }
+
+  // metadata 整体存进任务，形状只认普通对象：字符串 / 数组落进去投影时 charId
+  // 等会静默变 null。PUT 替换 metadata 时同一条规则。
+  if (payload.metadata != null && (typeof payload.metadata !== 'object' || Array.isArray(payload.metadata))) {
+    return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: 'metadata 必须是普通对象', details: { invalidFields: ['metadata'] } };
   }
 
   // supersedesUuid：建这条的同时取消旧的那条（同一用户）。与「先 DELETE 再

@@ -92,13 +92,15 @@ export function createTenantContextManager(options) {
     const masterKey = randomBytes(32).toString('hex');
     const now = new Date().toISOString();
 
+    // 上面的存在性检查和这次写入之间可能插进另一次同 tenantId 的 init，
+    // 落盘用条件写：谁先写成谁算，后到的 409，masterKey 不会被盖掉。
     await tenantStore.setTenantConfig({
       tenantId,
       db: dbConfig,
       masterKey,
       createdAt: now,
       updatedAt: now
-    });
+    }, { onlyIfNew: true });
 
     const tenantToken = createTenantToken({ tenantId, type: 'tenant' }, tokenSigningKey);
     const cronToken = createTenantToken({ tenantId, type: 'cron' }, tokenSigningKey);

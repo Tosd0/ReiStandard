@@ -222,12 +222,86 @@ test('initSchema 给老表补上 lease_until 列', async () => {
 
   const [row] = await adapter.getPendingTasks(50);
   assert.equal(row.uuid, 'old');
+  // 补上的列里也包括 lease_token：带归属标识的占位在老表上同样写得进去。
   assert.equal(
-    await adapter.claimTask(row.id, row.next_send_at, new Date(Date.now() + 600_000).toISOString()),
+    await adapter.claimTask(row.id, row.next_send_at, new Date(Date.now() + 600_000).toISOString(), null, null, { leaseToken: 'tok' }),
     true
   );
+  assert.equal(db._raw.prepare('SELECT lease_token FROM scheduled_messages WHERE id = ?').get(row.id).lease_token, 'tok');
   // initSchema 跑第二遍不该因为列已存在就炸。
   await adapter.initSchema();
+});
+
+test('initSchema 回报的 columnsCreated 是建表语句里真实的列数', async () => {
+  const { adapter, db } = await freshAdapter();
+  const res = await adapter.initSchema();
+  const actual = db._raw.prepare('PRAGMA table_info(scheduled_messages)').all().length;
+  assert.equal(res.columnsCreated, actual);
+});
+
+// 租约归属：续租、收尾写库、删行都只认占位时写下的那份 lease_token。原执行者
+// 的租约过期、被别的 tick 接手之后，它迟到的心跳和写库都要落空，不能把接手者
+// 的租约续上或改掉。
+test('带 leaseToken 的续租 / 写库 / 删行只认自己那份租约', async () => {
+  const { adapter, db } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'owned', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  const due = '2020-01-01T00:00:00.000Z';
+  const later = () => new Date(Date.now() + 600_000).toISOString();
+
+  // A 领到；租约过期后 B 接手，lease_token 换成 B 的。
+  assert.equal(await adapter.claimTask(row.id, due, new Date(Date.now() - 1000).toISOString(), null, null, { leaseToken: 'A' }), true);
+  assert.equal(await adapter.claimTask(row.id, due, later(), null, null, { leaseToken: 'B' }), true);
+
+  // A 的心跳续不上，B 的续得上。
+  assert.equal(await adapter.renewTaskLease(row.id, later(), null, { leaseToken: 'A' }), false);
+  assert.equal(await adapter.renewTaskLease(row.id, later(), null, { leaseToken: 'B' }), true);
+
+  // A 收尾想放掉租约 / 标状态：改不到行，回 null，B 的租约原样在。
+  assert.equal(await adapter.updateTaskById(row.id, { lease_until: null, retry_count: 1 }, null, { leaseToken: 'A' }), null);
+  const held = db._raw.prepare('SELECT lease_until, retry_count FROM scheduled_messages WHERE id = ?').get(row.id);
+  assert.ok(held.lease_until, 'B 的租约不该被 A 放掉');
+  assert.equal(held.retry_count, 0);
+
+  // A 删不掉这行；B 自己的写库和删行照常。
+  assert.equal(await adapter.deleteTaskById(row.id, { leaseToken: 'A' }), false);
+  assert.ok(await adapter.updateTaskById(row.id, { retry_count: 1 }, null, { leaseToken: 'B' }));
+  assert.equal(await adapter.deleteTaskById(row.id, { leaseToken: 'B' }), true);
+});
+
+test('不带 leaseToken 的调用方维持老行为：按 id 直写', async () => {
+  const { adapter } = await freshAdapter();
+  const row = await adapter.createTask(baseTask({ uuid: 'legacy', next_send_at: '2020-01-01T00:00:00.000Z' }));
+  assert.equal(await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', new Date(Date.now() + 600_000).toISOString(), null, null, { leaseToken: 'A' }), true);
+  assert.equal(await adapter.renewTaskLease(row.id, new Date(Date.now() + 600_000).toISOString()), true);
+  assert.ok(await adapter.updateTaskById(row.id, { lease_until: null }));
+  assert.equal(await adapter.deleteTaskById(row.id), true);
+});
+
+test('带 cloudGuard 的占位 / 续租：调用方给了 userId 就不再先查一遍 user_id', async () => {
+  const { db, calls } = createSpyD1();
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+  const guard = { owner: { type: 'character', id: 'one' }, generation: 0 };
+  const row = await adapter.createTask(baseTask({ uuid: 'guarded', next_send_at: '2020-01-01T00:00:00.000Z' }), guard);
+  const lookups = () => calls.filter((c) => /SELECT user_id FROM scheduled_messages/i.test(c.sql)).length;
+
+  const before = lookups();
+  await adapter.claimTask(row.id, '2020-01-01T00:00:00.000Z', new Date(Date.now() + 600_000).toISOString(), null, guard, { leaseToken: 'A', userId: USER });
+  await adapter.renewTaskLease(row.id, new Date(Date.now() + 600_000).toISOString(), guard, { leaseToken: 'A', userId: USER });
+  assert.equal(lookups(), before, '调用方手里已经有 user_id，适配器不该再查');
+
+  // 不给 userId 时照旧自己查（老调用方）。
+  await adapter.renewTaskLease(row.id, new Date(Date.now() + 600_000).toISOString(), guard);
+  assert.equal(lookups(), before + 1);
+});
+
+test('listTasks 分页带主键作 tie-breaker，同一触发时刻的行翻页不重不漏', async () => {
+  const { db, calls } = createSpyD1();
+  const adapter = createD1Adapter(db);
+  await adapter.initSchema();
+  await adapter.listTasks(USER, { limit: 2, offset: 0 });
+  const sql = calls.at(-1).sql.replace(/\s+/g, ' ');
+  assert.match(sql, /ORDER BY next_send_at ASC, id ASC/);
 });
 
 test('claimTask 领不动非 pending 的行', async () => {

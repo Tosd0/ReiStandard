@@ -437,3 +437,37 @@ test('chunkReasoningByUtf8Bytes — rejects non-string text', () => {
   assert.throws(() => chunkReasoningByUtf8Bytes(undefined, 100), /text must be a string/);
   assert.throws(() => chunkReasoningByUtf8Bytes(42, 100), /text must be a string/);
 });
+
+// ─── messageType / source enum validation ───────────────────────────────
+
+test('builders reject messageType / source outside the enums', () => {
+  const cases = [
+    [buildContentPush, { message: 'x' }],
+    [buildReasoningPush, { reasoningContent: 'x' }],
+    [buildToolRequestPush, { toolCalls: [{}] }],
+    [buildErrorPush, { code: 'E', message: 'x' }],
+    [buildResultPush, { resultKind: 'r' }],
+  ];
+  for (const [build, fields] of cases) {
+    assert.throws(() => build({ ...COMMON, ...fields, messageType: 'bogus' }), /'messageType' must be one of 'instant' \| 'fixed' \| 'prompted' \| 'auto'/);
+    assert.throws(() => build({ ...COMMON, ...fields, source: 'bogus' }), /'source' must be one of 'instant' \| 'scheduled'/);
+    assert.throws(() => build({ ...COMMON, ...fields, messageType: '' }), /'messageType' is required/);
+    assert.doesNotThrow(() => build({ ...COMMON, ...fields, messageType: 'auto', source: 'scheduled' }));
+  }
+});
+
+// ─── type guards check the kind's required fields ───────────────────────
+
+test('type guards reject a bare messageKind without the required fields', () => {
+  assert.equal(isContentPush({ messageKind: 'content' }), false);
+  assert.equal(isReasoningPush({ messageKind: 'reasoning' }), false);
+  assert.equal(isToolRequestPush({ messageKind: 'tool_request' }), false);
+  assert.equal(isErrorPush({ messageKind: 'error', code: 'E' }), false);
+  assert.equal(isResultPush({ messageKind: 'result' }), false);
+
+  assert.equal(isContentPush(buildContentPush({ ...COMMON, message: 'x' })), true);
+  assert.equal(isReasoningPush(buildReasoningPush({ ...COMMON, reasoningContent: 'x' })), true);
+  assert.equal(isToolRequestPush(buildToolRequestPush({ ...COMMON, toolCalls: [{}] })), true);
+  assert.equal(isErrorPush(buildErrorPush({ ...COMMON, code: 'E', message: 'x' })), true);
+  assert.equal(isResultPush(buildResultPush({ ...COMMON, resultKind: 'r' })), true);
+});

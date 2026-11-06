@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { nextFutureOccurrence } from '../src/server/lib/recurrence.js';
 import { runScheduledTick } from '../src/server/lib/run-tick.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
@@ -127,6 +128,123 @@ test('daily task: delivered then rescheduled +24h, retry reset', async () => {
   const row = await adapter.getTaskByUuidOnly('daily');
   assert.equal(row.next_send_at, plusMs(dueAt, DAY));
   assert.equal(row.retry_count, 0);
+});
+
+test('春令时顺延过的每日任务，tick 推进时按 payload 的首发钟点回到原时刻', async () => {
+  // 纽约 2026-03-08 02:30 不存在（春令时跳过），这条任务的落点是顺延后的 03:30
+  // EDT（07:30Z）。payload 里的 firstSendTime 是前一天的 02:30 EST（07:30Z）。
+  // 不带锚点推进的话从此天天 03:30；带锚点第二天就回到 02:30。
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, {
+    uuid: 'dst',
+    recurrenceType: 'daily',
+    nextSendAt: '2026-03-08T07:30:00.000Z',
+    payload: { tzId: 'America/New_York', firstSendTime: '2026-03-07T07:30:00.000Z' }
+  });
+
+  const res = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+  assert.ok(res.successCount + (res.details.staleTasks?.length ?? 0) >= 1, JSON.stringify(res));
+
+  // 从没被顺延过的 02:30 起点推进到现在之后，就是「每天 02:30 纽约时间」的正确落点。
+  const expected = nextFutureOccurrence(Date.parse('2026-03-07T07:30:00.000Z'), 'daily', Date.now(), 'America/New_York');
+  const row = await adapter.getTaskByUuidOnly('dst');
+  assert.equal(row.next_send_at, expected);
+});
+
+test('租约被接手后原执行者的投递失败：收尾写库扑空，不记失败、不排重试、不动接手者的行', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, { uuid: 'handover-fail', recurrenceType: 'daily', nextSendAt: dueAt });
+
+  const gate = () => {
+    let open;
+    const promise = new Promise((resolve) => { open = resolve; });
+    return { promise, open };
+  };
+  const gateA = gate();
+  const insideA = gate();
+  let sends = 0;
+  const webpush = {
+    async sendNotification() {
+      const nth = ++sends;
+      if (nth === 1) {
+        insideA.open();
+        await gateA.promise;
+        throw new Error('push service hiccup');
+      }
+    }
+  };
+  // A 的心跳一直扣着：它还不知道租约没了，失败收尾时才第一次撞上。
+  const holdA = gate();
+  const dbA = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'renewTaskLease') return async (...args) => { await holdA.promise; return target.renewTaskLease(...args); };
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const tickA = runScheduledTick({ db: dbA, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10 });
+  await insideA.promise;
+  d1._raw.prepare('UPDATE scheduled_messages SET lease_until = ?').run(new Date(Date.now() - 1000).toISOString());
+  const resB = await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10 });
+  assert.equal(resB.successCount, 1, 'B 接手后照常送达');
+  const rowAfterB = await adapter.getTaskByUuidOnly('handover-fail');
+
+  gateA.open();
+  const resA = await tickA;
+  holdA.open();
+
+  assert.equal(resA.failedCount, 0, 'A 的失败不该记：行已经归 B');
+  assert.deepEqual(resA.details.failedTasks, []);
+  assert.deepEqual(resA.details.leaseLostTasks.map((t) => t.status), ['cancelled_mid_delivery']);
+  const row = await adapter.getTaskByUuidOnly('handover-fail');
+  assert.equal(row.retry_count, 0, 'A 的重试计数没写到 B 推进过的行上');
+  assert.equal(row.next_send_at, rowAfterB.next_send_at);
+  assert.equal(row.last_error ?? null, rowAfterB.last_error ?? null);
+});
+
+test('心跳撞上归属停用：按取消收尾（撤 outbox），不记成被别的 tick 接手', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, { uuid: 'retired-mid', recurrenceType: 'daily', nextSendAt: dueAt, payload: { userMessage: '第一句。第二句。' } });
+
+  let discards = 0;
+  let retire = false;
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'renewTaskLease') {
+        return async (...args) => {
+          if (retire) throw Object.assign(new Error('retired'), { code: 'CLOUD_OWNER_RETIRED' });
+          return target.renewTaskLease(...args);
+        };
+      }
+      if (prop === 'discardUndeliveredOutboxForTask') {
+        return async (...args) => { discards++; return target.discardUndeliveredOutboxForTask(...args); };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  let sends = 0;
+  const webpush = {
+    async sendNotification() {
+      sends++;
+      // 第一句发出去之后归属被停用，心跳下一次续租就会撞上。
+      retire = true;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+  };
+  const res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10 });
+
+  assert.equal(sends, 1, '归属停用后剩下的那句不发');
+  assert.deepEqual(res.details.leaseLostTasks, [], '这不是被接手');
+  assert.deepEqual(res.details.cancelledTasks.map((t) => t.status), ['owner_retired']);
+  assert.equal(discards, 1, '归属停用要撤掉没发出去的 outbox 行');
 });
 
 test('delivery failure increments retry_count', async () => {
@@ -1877,4 +1995,180 @@ test('cancelled hook cannot write more state but settlement can release resource
   assert.equal(writeError?.code, 'TASK_CANCELLED');
   assert.deepEqual((await adapter.getClientState(USER, 'cancel-test')).map(row => row.key), ['cleanup']);
   assert.equal(result.details.cancelledTasks.length, 1);
+});
+
+// ── 租约归属 ───────────────────────────────────────────────────────────────
+//
+// 执行者 A 的租约过期（isolate 挂起、心跳没跟上），tick B 把任务接手。A 醒来之
+// 后的心跳和收尾写库带的都是自己那份租约的标识，必须落空：续上了就是两边各发
+// 一遍；A 把「续不上」当成「任务被取消」去撤 outbox，撤掉的是 B 正在投递的行。
+test('租约过期后被别的 tick 接手：原执行者心跳落空、剩下的推送不发、outbox 不撤，接手者照常跑完', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const dueAt = recentDue();
+  await seed(adapter, {
+    uuid: 'handover', recurrenceType: 'daily', nextSendAt: dueAt,
+    payload: { userMessage: '第一句。第二句。' }
+  });
+
+  const gate = () => {
+    let open;
+    const promise = new Promise((resolve) => { open = resolve; });
+    return { promise, open };
+  };
+  // 两跳各自的第一条推送都卡住，模拟「投递跑到一半」。
+  const gateA = gate();
+  const gateB = gate();
+  const insideA = gate();
+  const insideB = gate();
+  let sends = 0;
+  const webpush = {
+    async sendNotification() {
+      const nth = ++sends;
+      if (nth === 1) { insideA.open(); await gateA.promise; }
+      if (nth === 2) { insideB.open(); await gateB.promise; }
+    }
+  };
+
+  // A 的心跳在交接期间先扣住（不扣的话它会在 B 接手前把租约续回去）；交接完
+  // 放行，这时它带的还是自己的 token，该落空。
+  const handover = gate();
+  const renews = { A: [], B: [] };
+  const discards = { A: 0, B: 0 };
+  const tickDb = (name, hold) => new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'renewTaskLease') {
+        return async (...args) => {
+          if (hold) await hold.promise;
+          const renewed = await target.renewTaskLease(...args);
+          renews[name].push(renewed);
+          return renewed;
+        };
+      }
+      if (prop === 'discardUndeliveredOutboxForTask') {
+        return async (...args) => { discards[name]++; return target.discardUndeliveredOutboxForTask(...args); };
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const tickA = runScheduledTick({ db: tickDb('A', handover), masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10 });
+  await insideA.promise;
+
+  // A 的租约过期，B 这一跳把任务捞走。
+  d1._raw.prepare('UPDATE scheduled_messages SET lease_until = ?').run(new Date(Date.now() - 1000).toISOString());
+  const tickB = runScheduledTick({ db: tickDb('B', null), masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 10 });
+  await insideB.promise;
+  await waitUntil(() => renews.B.includes(true), 'B 的心跳没续上');
+
+  handover.open();
+  await waitUntil(() => renews.A.includes(false), 'A 的心跳没落空：续租没校验租约归属');
+  gateA.open();
+  const resA = await tickA;
+
+  assert.equal(sends, 2, 'A 剩下的那句不能再发');
+  assert.equal(resA.successCount, 0);
+  assert.equal(resA.failedCount, 0);
+  assert.deepEqual(resA.details.cancelledTasks, [], '行还在，这不是取消');
+  assert.deepEqual(resA.details.leaseLostTasks.map((t) => t.status), ['cancelled_mid_delivery']);
+  // 这条任务名下的 outbox 行现在归 B 管，A 不能按任务整批撤掉。
+  assert.equal(discards.A, 0, 'A 把接手者的 outbox 行撤掉了');
+  // B 的租约还在，没被 A 的收尾放掉。
+  assert.ok(d1._raw.prepare('SELECT lease_until FROM scheduled_messages').get().lease_until);
+
+  gateB.open();
+  const resB = await tickB;
+  assert.equal(sends, 3);
+  assert.equal(resB.successCount, 1);
+  assert.deepEqual(resB.details.cancelledTasks, []);
+  assert.deepEqual(resB.details.leaseLostTasks, []);
+  const row = await adapter.getTaskByUuidOnly('handover');
+  assert.equal(row.next_send_at, plusMs(dueAt, DAY));
+});
+
+// 心跳 60s 时租约只盖两拍就贴着到期线走：一次续租失败加上定时器漂移就会被抢走。
+test('滚动租约至少盖住三个心跳', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'ttl', recurrenceType: 'daily', nextSendAt: recentDue() });
+
+  let leaseDuringDelivery = null;
+  const webpush = {
+    async sendNotification() {
+      leaseDuringDelivery = Date.parse(d1._raw.prepare('SELECT lease_until FROM scheduled_messages').get().lease_until);
+    }
+  };
+  await runScheduledTick({ db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush, leaseHeartbeatMs: 60_000 });
+  const ttl = leaseDuringDelivery - Date.now();
+  assert.ok(ttl > 170_000 && ttl <= 181_000, `租期该是三个心跳（180s）上下，实际 ${ttl}ms`);
+});
+
+// 过期收场之前几轮落进 outbox 却没推出去的行也是过期内容，不撤的话客户端会从
+// GET /outbox 把它们补收回去（取消那条路早就这么做了，过期这条路要一致）。
+test('过期收场撤掉没发出去的 outbox 行，已发出去的和 hook 里 emitResult 落的回执留着', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'stale-outbox', recurrenceType: 'none', nextSendAt: new Date(Date.now() - 2 * DAY).toISOString() });
+
+  const outboxRow = (messageId, index) => ({
+    message_id: messageId, task_uuid: 'stale-outbox', session_id: 'sess',
+    message_index: index, total_messages: 2, payload: 'enc', created_at: Date.now()
+  });
+  await adapter.appendOutboxMessages(USER, [outboxRow('old-1', 1), outboxRow('old-2', 2)]);
+  await adapter.markOutboxDelivered(USER, ['old-1'], Date.now());
+
+  let emitted = null;
+  const res = await runScheduledTick({
+    db: adapter, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush(),
+    onStaleSkip: async (_task, info) => {
+      emitted = await info.emitResult({ resultKind: 'ledger', notification: { show: false } });
+    }
+  });
+  assert.deepEqual(res.details.staleTasks.map((t) => t.action), ['expired']);
+  assert.ok(emitted?.messageId);
+
+  const ids = d1._raw.prepare('SELECT message_id FROM message_outbox ORDER BY id').all().map((r) => r.message_id);
+  assert.ok(!ids.includes('old-2'), '没发出去的旧行要撤掉');
+  assert.ok(ids.includes('old-1'), '已经推出去的行照旧留着让客户端 ack');
+  assert.ok(ids.includes(emitted.messageId), 'hook 里落的「错过了」回执不能被一起撤掉');
+});
+
+// 一条任务的处理 reject 了（这里是适配器 reject 了一个不是 Error 的值，老代码在
+// catch 里读 .message 当场 TypeError）：不能让 Promise.race 把整跳带崩，更不能留一
+// 个没人接的 rejection 把 Node 进程带走。
+test('一条任务的处理 reject 了：同跳其他任务照常跑完，没有 unhandledRejection', async () => {
+  const adapter = createD1Adapter(createTestD1());
+  await adapter.initSchema();
+  await seed(adapter, { uuid: 'boom', recurrenceType: 'none', nextSendAt: recentDue() });
+  await seed(adapter, { uuid: 'fine', recurrenceType: 'none', nextSendAt: recentDue() });
+  const boomId = (await adapter.getTaskByUuidOnly('boom')).id;
+  const db = new Proxy(adapter, {
+    get(target, prop) {
+      if (prop === 'claimTask') {
+        return async (id, ...rest) => (id === boomId ? Promise.reject(null) : target.claimTask(id, ...rest));
+      }
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+
+  const unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  let res;
+  try {
+    res = await runScheduledTick({ db, masterKey: MASTER_KEY, vapid: VAPID, webpush: fakeWebpush() });
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+
+  assert.deepEqual(unhandled, []);
+  assert.equal(res.successCount, 1, '另一条任务该照常送达');
+  assert.deepEqual(res.details.failedTasks.map((t) => t.status), ['claim_failed']);
+  assert.equal(await adapter.getTaskByUuidOnly('fine'), null, '一次性任务发完即删');
 });

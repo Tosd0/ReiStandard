@@ -23,11 +23,18 @@
 import { validateInstantPayload, validateContinuePayload } from './validation.js';
 import { processInstantMessage, sendPushWithMaybeBlob, ensureStableMessageId, DEFAULT_MAX_LOOP_ITERATIONS } from './message-processor.js';
 import { MESSAGE_TYPE, PUSH_SOURCE, buildErrorPush } from '@rei-standard/amsg-shared';
-import { HookError, PayloadTooLargeError, LlmCallError } from './errors.js';
+import {
+  HookError,
+  PayloadTooLargeError,
+  LlmCallError,
+  RequestBodyTooLargeError,
+  MAX_REQUEST_BODY_BYTES,
+} from './errors.js';
 import {
   utf8,
   utf8Decode,
   base64UrlToBytes,
+  concatBytes,
   hmacSha256,
   timingSafeEqualBytes,
   randomUUID,
@@ -38,6 +45,7 @@ import {
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
   DEFAULT_MULTIPART_TTL_MS,
   assertChunkBytesFitPushLimit,
+  assertInlineBytesFitPushLimit,
 } from './multipart.js';
 
 const BLOB_KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -51,6 +59,29 @@ const SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(': keepalive\n\n');
 const SSE_DONE_BYTES = SSE_ENCODER.encode('event: done\ndata: {}\n\n');
 const DEFAULT_SSE_KEEPALIVE_MS = 1000;
 const MIN_SSE_KEEPALIVE_MS = 250;
+const BACKUP_PUSH_CONCURRENCY = 4;
+
+/**
+ * 最多同时跑 `max` 个任务的小队列。任务自己兜住异常，这里不区分成败。
+ *
+ * @param {number} max
+ * @returns {(task: () => Promise<void>) => Promise<void>} 任务跑完才 resolve
+ */
+function createConcurrencyLimiter(max) {
+  let active = 0;
+  const waiting = [];
+  const next = () => {
+    if (active >= max || waiting.length === 0) return;
+    active++;
+    waiting.shift()();
+  };
+  return (task) => new Promise((resolve) => {
+    waiting.push(async () => {
+      try { await task(); } finally { active--; resolve(); next(); }
+    });
+    next();
+  });
+}
 
 /**
  * True when the caller asked exclusively for JSON. Any Accept value
@@ -203,6 +234,7 @@ export function createInstantHandler(options) {
   const onBeforeLoop = typeof options.onBeforeLoop === 'function' ? options.onBeforeLoop : null;
   const onAfterLoop = typeof options.onAfterLoop === 'function' ? options.onAfterLoop : null;
   const blobStore = options.blobStore || null;
+  if (blobStore) assertInlineBytesFitPushLimit(blobStore.maxInlineBytes);
   const maxLoopIterations = Number.isInteger(options.maxLoopIterations) && options.maxLoopIterations > 0
     ? options.maxLoopIterations
     : DEFAULT_MAX_LOOP_ITERATIONS;
@@ -269,6 +301,12 @@ export function createInstantHandler(options) {
     try {
       rawBody = await readRequestBodyText(request);
     } catch (err) {
+      if (err && err.code === 'REQUEST_BODY_TOO_LARGE') {
+        return respond(413, {
+          success: false,
+          error: { code: 'REQUEST_BODY_TOO_LARGE', message: err.message, details: { maxBytes: err.maxBytes } }
+        });
+      }
       return respond(400, {
         success: false,
         error: {
@@ -422,6 +460,9 @@ export function createInstantHandler(options) {
       registerWaitUntil(startDone, resolveWaitUntil(envOrRuntime, runtime, options), onEvent);
 
       const backupWork = new Set();
+      // 备份推送不全开：Workers 对同时打开的出站连接有上限（6 条），长回复
+      // 一口气几十条会排队甚至被判失败。排队发，总数不变。
+      const runBackupPush = createConcurrencyLimiter(BACKUP_PUSH_CONCURRENCY);
       let streamUsable = true;
       let keepaliveTimer = null;
       let activeController = null;
@@ -446,14 +487,14 @@ export function createInstantHandler(options) {
       const scheduleBackupPush = (body) => {
         const messageId = messageIdOf(body);
         onEvent({ type: 'backup_push_scheduled', sessionId, messageId });
-        const work = (async () => {
+        const work = runBackupPush(async () => {
           try {
             await sendPushWithMaybeBlob(body, payload, processorCtx, sessionId);
             onEvent({ type: 'backup_push_sent', sessionId, messageId });
           } catch (pushErr) {
             onEvent({ type: 'backup_push_failed', sessionId, messageId, cause: pushErr });
           }
-        })();
+        });
         trackBackupWork(work);
       };
       const enqueueKeepalive = () => {
@@ -518,6 +559,15 @@ export function createInstantHandler(options) {
                   if (onFallbackFail) onFallbackFail(pushErr);
                 }
               };
+              // 序列化放在 enqueue 的 try 外面：不可序列化是 hook 的契约违反，
+              // 不是流坏了——混进下面的 catch 会把流误标成不可用、再在兜底推送里
+              // 被当成普通推送失败吞掉，客户端既收不到 error 也收不到 done。
+              let data;
+              try {
+                data = JSON.stringify(stableBody);
+              } catch (err) {
+                throw new HookError(`pushPayload is not JSON-serializable: ${err?.message ?? err}`, { cause: err });
+              }
               if (!streamUsable || request.signal.aborted) {
                 streamUsable = false;
                 stopKeepalive();
@@ -525,7 +575,7 @@ export function createInstantHandler(options) {
                 return;
               }
               try {
-                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${JSON.stringify(stableBody)}\n\n`));
+                controller.enqueue(SSE_ENCODER.encode(`event: ${eventName}\ndata: ${data}\n\n`));
                 onEvent({ type: 'sse_payload_enqueued', sessionId, messageId, eventName });
                 scheduleBackupPush(stableBody);
               } catch (err) {
@@ -548,12 +598,13 @@ export function createInstantHandler(options) {
                 try { controller.enqueue(SSE_DONE_BYTES); } catch { /* race with abort */ }
               }
             } catch (err) {
-              // HookError carries an in-loop ErrorPush that already
-              // shipped via `deliver` (as event: payload) before the
-              // throw — don't echo a second `event: error` for the
-              // same logical failure. Other errors (LlmCallError,
-              // unexpected) had no in-loop diagnostic and DO need one.
-              if (!(err instanceof HookError)) {
+              // A HookError from `onLLMOutput` carries an in-loop ErrorPush
+              // that already shipped via `deliver` (as event: payload)
+              // before the throw — don't echo a second `event: error` for
+              // the same logical failure. Every other error (LlmCallError,
+              // a non-serializable pushPayload, unexpected) had no in-loop
+              // diagnostic and DOES need one.
+              if (!(err instanceof HookError && err.diagnosticDelivered)) {
                 const code = err?.code || 'INTERNAL_ERROR';
                 const diag = buildErrorPush({
                   messageType: MESSAGE_TYPE.INSTANT,
@@ -730,14 +781,19 @@ function resolvePositiveInt(value, fallback, fieldName) {
  *
  * @param {unknown} err
  * @param {string} code
- * @returns {{ pushStatus?: number, llmStatus?: number, providerCode?: string }}
+ * @returns {{ pushStatus?: number, llmStatus?: number, providerCode?: string, failedMessageIndex?: number }}
  */
 function describeUpstreamFailure(err, code) {
-  const raw = /** @type {{ statusCode?: unknown, llmStatus?: unknown, providerCode?: unknown }} */ (err || {});
-  /** @type {{ pushStatus?: number, llmStatus?: number, providerCode?: string }} */
+  const raw = /** @type {{ statusCode?: unknown, llmStatus?: unknown, providerCode?: unknown, messageIndex?: unknown }} */ (err || {});
+  /** @type {{ pushStatus?: number, llmStatus?: number, providerCode?: string, failedMessageIndex?: number }} */
   const upstream = {};
   if (code === 'PUSH_SEND_FAILED' && Number.isInteger(raw.statusCode)) {
     upstream.pushStatus = /** @type {number} */ (raw.statusCode);
+  }
+  // 不叫 messageIndex：这份标注也会挂到 ErrorPush 上，而 push 自己的
+  // messageIndex 是「我是第几条」，撞名会被 SW 读成另一个意思。
+  if (code === 'PUSH_SEND_FAILED' && Number.isInteger(raw.messageIndex)) {
+    upstream.failedMessageIndex = /** @type {number} */ (raw.messageIndex);
   }
   if (Number.isInteger(raw.llmStatus)) {
     upstream.llmStatus = /** @type {number} */ (raw.llmStatus);
@@ -875,9 +931,39 @@ async function readRequestBodyText(request) {
     err.unsupportedEncoding = true;
     throw err;
   }
-  const compressed = await request.arrayBuffer();
-  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return new Response(stream).text();
+  const compressed = request.body
+    ? await readStreamBounded(request.body, MAX_REQUEST_BODY_BYTES)
+    : new Uint8Array(0);
+  const inflated = await readStreamBounded(
+    new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip')),
+    MAX_REQUEST_BODY_BYTES
+  );
+  return utf8Decode(inflated);
+}
+
+/**
+ * 边读边数字节，超过上限当场 cancel 并抛 RequestBodyTooLargeError——不把整份
+ * 展开的数据先读进内存再判断。
+ *
+ * @param {ReadableStream<Uint8Array>} stream
+ * @param {number} maxBytes
+ * @returns {Promise<Uint8Array>}
+ */
+async function readStreamBounded(stream, maxBytes) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new RequestBodyTooLargeError(maxBytes);
+    }
+    chunks.push(value);
+  }
+  return concatBytes(...chunks);
 }
 
 /**
@@ -1061,7 +1147,14 @@ export {
 } from './message-processor.js';
 export { buildMultipartPushPayloads } from './multipart.js';
 export { sendWebPush, buildVapidJwt, verifyVapidJwt } from './webpush.js';
-export { HookError, PayloadTooLargeError, LlmCallError, MemoryStoreFullError } from './errors.js';
+export {
+  HookError,
+  PayloadTooLargeError,
+  LlmCallError,
+  MemoryStoreFullError,
+  RequestBodyTooLargeError,
+  MAX_REQUEST_BODY_BYTES,
+} from './errors.js';
 export { buildSessionContext, extractAssistantMessage } from './session-context.js';
 
 // Re-export the shared push schema so hook authors can import builders

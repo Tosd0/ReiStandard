@@ -29,6 +29,8 @@ npm install @rei-standard/amsg-instant
 
 > 0.3.0 起不再需要 `web-push` 依赖。所有 Web Push 加密/签名都用 `globalThis.crypto.subtle` 完成。
 
+跑在 Node 上（`adapters/node` / `adapters/netlify` / `adapters/vercel` 的 Node 形态）要求 Node ≥ 20.3.0（`package.json` 的 `engines`）。Cloudflare Workers / Vercel Edge / Deno 不受这条约束。
+
 ## 配置项
 
 | 选项                | 类型      | 必填 | 说明 |
@@ -47,9 +49,9 @@ npm install @rei-standard/amsg-instant
 | `onLLMOutput`       | function  | ❌   | **0.7.0+**：每轮 LLM 输出后的决策钩子。配了它就进 agentic loop 模式；不配则走 v0.6 老路径（字节级兼容）。见 [Agentic Loop](#agentic-loop070) |
 | `onBeforeLoop`      | function  | ❌   | **0.9.0+**：主 LLM loop 启动前调用，约定同步启动副任务并返回 handle 对象。返回值透传给 `onAfterLoop` 的 `pending`。SSE / 纯 Push 两种传输模式都生效。见 [生命周期 hooks](#生命周期-hooks-onbeforeloop--onafterloop090) |
 | `onAfterLoop`       | function  | ❌   | **0.9.0+**：主 loop 结束后、流关闭前调用，从 `pending` 拿到 `onBeforeLoop` 返回的副任务 handle，await 完用 `deliver(payload)` 追加 push |
-| `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
+| `blobStore`         | object    | ❌   | **0.7.0+**：可选 blob 后端。push payload UTF-8 字节超过 `maxInlineBytes`（默认 2600，上限 3993，超过上限 `createInstantHandler` 抛 `TypeError`）时自动把 body 写进 store、改推 200 B envelope。见 [BlobStore](#blobstore070) |
 | `multipart`         | object    | ❌   | **0.8.0+**：通用 multipart transport。超出 inline、且没配 BlobStore 时，任意 JSON-safe payload 都可拆成 `_multipart` 分片。默认 `enabled:true`、`maxChunkBytes:1800`、`ttlMs:60000`、`maxChunks:128`、`maxTotalBytes:256000`。见 [Generic multipart transport](#generic-multipart-transport080)。 |
-| `sse`               | object    | ❌   | **0.9.0+**：SSE 传输配置。`backupPush` 固定为 `'on'`，每条 SSE payload enqueue 成功后也发送同 `messageId` 的 Web Push backup；`keepaliveMs` 默认 1000、最小 250；`immediateKeepalive` 默认 true。 |
+| `sse`               | object    | ❌   | **0.9.0+**：SSE 传输配置。`backupPush` 固定为 `'on'`，每条 SSE payload enqueue 成功后也发送同 `messageId` 的 Web Push backup（同一条流内同一时刻最多 4 条在飞，其余排队）；`keepaliveMs` 默认 1000、最小 250；`immediateKeepalive` 默认 true。 |
 | `maxLoopIterations` | number    | ❌   | **0.7.0+**：单次 worker 调用内 `decision:'continue'` 的硬上限，默认 10。仅防本进程内 hook 反复 continue 失控；跨请求的 `/continue` 洪水攻击由上游 auth/rate-limit 处理 |
 | `autoEmitReasoning` | boolean   | ❌   | **0.8.0+**：默认 `true`。`true` 时框架在调 hook 前自动 emit `ReasoningPush`（如果 LLM 响应带非空 `reasoning_content`，或 `content` 内含 `<thinking>` 等标签）。`false` 把 reasoning emit 完全交给 hook 自己负责（hook 可读 `ctx.llmResponse.choices[0].message.reasoning_content` 并用 `buildReasoningPush` + 自己 dispatch）。legacy 路径忽略此项始终自动 emit。 |
 | `reasoningChunkBytes` | number \| null | ❌ | **Deprecated in 0.8.0**：旧 reasoning 专用字节切配置。保留为 `multipart.maxChunkBytes` 的兼容别名；`null` 仅在未显式配置 `multipart` 时禁用 generic multipart。不会再产生 `chunkIndex` / `totalChunks` reasoning wire fields。 |
@@ -154,7 +156,7 @@ event: done            ← 流正常结束的最终信号；客户端可用 stre
 data: {}
 ```
 
-业务错误（LLM 调用失败、未知异常等）在流已开后通过 `event: error\ndata: <完整 ErrorPush>` 投递，HTTP 状态始终是 200——SSE 模式下不能再靠 HTTP 状态码表达错误。`HookError` 例外：诊断 ErrorPush 已经作为 `event: payload` 送出，不重复发 `event: error`。
+业务错误（LLM 调用失败、未知异常等）在流已开后通过 `event: error\ndata: <完整 ErrorPush>` 投递，HTTP 状态始终是 200——SSE 模式下不能再靠 HTTP 状态码表达错误。唯一不发 `event: error` 的情况：`onLLMOutput` 抛错 / 返回非法 decision 时，诊断 ErrorPush 已经在循环内作为 `event: payload` 送出，不再重复发一条（诊断那条本身没送出去的话，照样发 `event: error`）。hook 返回的 push 不可 JSON 序列化属于另一种情况——它在写入流的时候才被发现，循环内没有送过诊断，客户端会收到 `code: 'HOOK_THREW'` 的 `event: error`。
 
 > 客户端实现见 [`@rei-standard/amsg-client`](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/client/README.md) 的 `consumeInstantStream()`。验证非 SSE 响应（含错误页 / 非 2xx）必须先看 `Content-Type` + status，再进 stream parser。
 
@@ -166,7 +168,7 @@ data: {}
 
 | 配置 | 默认值 | 行为 | 生产建议 |
 |------|--------|------|----------|
-| `backupPush` | `'on'` | SSE payload enqueue 成功后，立即发送同 `messageId` 的 Web Push backup | 固定开启；`off` / `delayed` 会被拒绝，避免正式部署误入已知可能丢 payload 的模式 |
+| `backupPush` | `'on'` | SSE payload enqueue 成功后，立即发送同 `messageId` 的 Web Push backup；同一条流内同一时刻最多 4 条在飞，其余排队 | 固定开启；`off` / `delayed` 会被拒绝，避免正式部署误入已知可能丢 payload 的模式 |
 | `keepaliveMs` | `1000` | SSE 空闲 keepalive 间隔，最小 250ms | 保持默认 |
 | `immediateKeepalive` | `true` | stream start 后立即发送第一条 keepalive | 保持默认 |
 
@@ -223,7 +225,7 @@ Content-Type: application/json
   // === 提示词，二选一恰好一个（0.5.0+）===
   completePrompt?: string;         // 简单推送场景：单 user 消息
   messages?: Array<{               // 多轮 / 带 system role：原样转发给 LLM
-    role: 'system' | 'user' | 'assistant' | 'tool';
+    role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
     content: string | unknown[];   // 数组形态留给多模态，元素不强校验
   }>;
 
@@ -239,16 +241,35 @@ Content-Type: application/json
   iteration?: number;              // 可选：当前轮号（0..maxLoopIterations - 1；/continue 必填）
 
   pushSubscription: {              // Web Push 标准订阅
-    endpoint: string;
-    keys: { p256dh: string; auth: string };
+    endpoint: string;              // 不带凭据的 https URL（非 localhost / IP 字面量）
+    keys: { p256dh: string; auth: string };   // 两项都必填、非空
   };
   metadata?: Record<string, any>;  // 透传到 push payload
 }
 ```
 
-`completePrompt` 和 `messages` 必须**恰好提供一个**；同时给或都不给都会返回 `400 INVALID_PAYLOAD_FORMAT`。`messages` 数组不能为空，每条 `role` 必须是 `system / user / assistant / tool`。handler **不会**对 `messages` 做任何自动注入或重排——上游传什么就发什么。
+`completePrompt` 和 `messages` 必须**恰好提供一个**；同时给或都不给都会返回 `400 INVALID_PAYLOAD_FORMAT`。`messages` 数组不能为空，每条 `role` 必须是 `system / developer / user / assistant / tool`。handler **不会**对 `messages` 做任何自动注入或重排——上游传什么就发什么。
+
+`pushSubscription` 在 `/instant` 和 `/continue` 上都按同一套规则校验，不合格直接 `400 INVALID_PAYLOAD_FORMAT`，`details.invalidFields` 指出是哪个字段（整个对象缺失或没有 `endpoint` 时是 `details.missingFields: ['pushSubscription.endpoint']`）：
+
+| 字段 | 要求 |
+|---|---|
+| `endpoint` | `https://` URL；URL 里不能带用户名 / 密码；`http://`、`localhost`、`*.localhost`、IP 字面量都拒（内网域名不另外拦） |
+| `keys.p256dh` | 非空 string |
+| `keys.auth` | 非空 string |
+
+`endpoint` 是 handler 随后要主动 POST 的地址，所以只收 https，回环地址和 IP 字面量在这里就拦下。`keys` 两项要到推送加密那一步才用到，提前校验是为了不让整轮 LLM 跑完（计费、最长 300 s）才在推送这一步失败。
 
 `firstSendTime` 以及非 `'none'` 的 `recurrenceType` 在 `amsg-instant` 上是**非法字段**，会直接返回 `400 INVALID_PAYLOAD_FORMAT`。
+
+#### 请求体上限
+
+请求体最多 32 MiB（`MAX_REQUEST_BODY_BYTES`），超过回 `413 REQUEST_BODY_TOO_LARGE`，`details.maxBytes` 是这个上限的字节数。两处会计：
+
+- 带 `X-Amsg-Request-Encoding: gzip` 的请求（`@rei-standard/amsg-client` 的 `deliver({ compressRequest })` 会这样发）：压缩前的字节数和解压后的字节数各自计，任一超过就是 413。解压是边读边数，超限当场停，不会把整份展开的数据先读进内存。
+- `adapters/node` 读到的原始请求体，不论有没有压缩，超过同样 413。
+
+没压缩的请求体只有 `adapters/node` 会计数；Cloudflare Workers / Vercel Edge / Netlify（`adapters/netlify` 直接透传 Request）以及其它非 Node 运行时上，由平台自己的上限管。
 
 #### `messages` 模式 curl 示例
 
@@ -332,10 +353,11 @@ curl -X POST https://instant.example.com/instant \
 | `METHOD_NOT_ALLOWED`                          | 405  | 0.1 | 非 POST（`/blob/:key` GET 例外，见下） |
 | `UNAUTHORIZED`                                | 401  | 0.1 | `tokenSigningKey` 校验失败 |
 | `INVALID_CLIENT_TOKEN`                        | 401  | 0.1 | `clientToken` 校验失败（缺头或不匹配） |
-| `INVALID_PAYLOAD_FORMAT`                      | 400  | 0.1 | body 不是合法 JSON 或字段缺失/非法 |
+| `INVALID_PAYLOAD_FORMAT`                      | 400  | 0.1 | body 不是合法 JSON 或字段缺失/非法；字段级错误带 `details.invalidFields`（或 `details.missingFields`）列出字段名 |
+| `REQUEST_BODY_TOO_LARGE`                      | 413  | 0.12 | 请求体超过 32 MiB（gzip 压缩前 / 解压后任一超限，或 Node 适配器读到的原始 body 超限）；`details.maxBytes` 是上限字节数。见 [请求体上限](#请求体上限) |
 | `VAPID_CONFIG_ERROR`                          | 500  | 0.1 | VAPID 配置缺失 |
 | `LLM_CALL_FAILED`                             | 502  | 0.1 | 上游 LLM 请求失败 |
-| `PUSH_SEND_FAILED`                            | 502  | 0.1 | Web Push 派送失败 |
+| `PUSH_SEND_FAILED`                            | 502  | 0.1 | Web Push 派送失败。`message` 是推送服务回的原文，先遮掉像凭据的串再截到 300 字符；`failedMessageIndex` 指出失败的是第几条（1-based） |
 | `COMPLETE_PROMPT_NOT_SUPPORTED_ON_HOOK_PATH`  | 400  | 0.7 | 配了 `onLLMOutput` 之后 `/instant` 或 `/continue` 还传 `completePrompt`；hook 路径只接受 `messages` 数组 |
 | `HOOK_THREW`                                  | 500  | 0.7 | `onLLMOutput` 抛错或返了非法 decision（`null` / 不识别的 `decision` 值 / `pushPayloads` 不是数组或为空 / 单个 push 不可 JSON-serialize）。同时会推一条诊断 `ErrorPush`（`{ messageKind:'error', code:'HOOK_THREW', message, iteration? }`） |
 | `PAYLOAD_TOO_LARGE`                           | 500  | 0.7 | hook 返的 `pushPayloads` 中某个 push UTF-8 字节超 `maxInlineBytes`，且没有 BlobStore、generic multipart 也被禁用或超过 multipart 上限。配上 BlobStore 会优先走 envelope；没配 BlobStore 时默认走 generic multipart |
@@ -355,6 +377,9 @@ curl -X POST https://instant.example.com/instant \
 | `llmStatus` | `LLM_CALL_FAILED` | 上游 LLM 回的 HTTP 状态码（`401` / `429` / `400`…） |
 | `providerCode` | `LLM_CALL_FAILED` | provider 自己的错误码（`invalid_api_key` / `context_length_exceeded` / `RESOURCE_EXHAUSTED`…） |
 | `pushStatus` | `PUSH_SEND_FAILED`（0.11.0+） | Web Push 推送服务回的 HTTP 状态码（`410` / `404` / `413` / `503`…） |
+| `failedMessageIndex` | `PUSH_SEND_FAILED`（0.12.0+） | 失败的是本次投递的第几条 push，1-based，与 push payload 自己的 `messageIndex` 同一套编号 |
+
+`PUSH_SEND_FAILED` 的 `message` 是推送服务回的原文：先把空白压平、长得像 API Key / Bearer token 的串遮成 `[redacted]`，再截到 300 字符。
 
 三条路上带的是同一组：JSON 信封里挂在 `error` 对象上，SSE 的 `event: error` 和掉线兜底的 Web Push 挂在 `ErrorPush` 顶层，`onEvent` 的 `type: 'error'` 事件也带。网络层断开（上游还没返回 HTTP 状态码）时对应字段不出现。
 
@@ -936,11 +961,13 @@ createInstantHandler({
   onLLMOutput,
   blobStore: {
     adapter,
-    maxInlineBytes: 2600,   // 可省，默认 2600
+    maxInlineBytes: 2600,   // 可省，默认 2600；上限 3993
     ttlSeconds: 60,         // 可省，默认 60
   },
 });
 ```
+
+`maxInlineBytes` 的上限是单条 push 的明文上限 3993 字节（推送服务限的是 4096 字节的密文，减去 aes128gcm 固定开销 103 字节）。配超了 `createInstantHandler` 当场抛 `TypeError`——否则中等大小的 payload 会跳过 BlobStore 直推，再被推送服务 413 拒收。
 
 ### 自定义 adapter（任何后端）
 
@@ -1132,7 +1159,7 @@ Node / Express 本身没有标准 `waitUntil`。如果你的宿主环境额外�
 
 ### Netlify Functions
 
-> Netlify Functions 默认仍是 Node 18，0.3.0 起 `adapters/node` 在请求入口处自动检测并 polyfill `globalThis.crypto`，无需 caller 做任何事。如果想原生 Web Crypto，把 Function 切到 Netlify Edge 即可。
+> Netlify Functions 的 Node 版本要设到 20.3.0 以上（本包 `engines` 要求，见 [安装](#安装)）。`adapters/node` 在请求入口处会检测 `globalThis.crypto`，缺了就自动 polyfill，无需 caller 做任何事。如果想原生 Web Crypto，把 Function 切到 Netlify Edge 即可。
 
 ```js
 // netlify/functions/instant.js
@@ -1219,7 +1246,8 @@ await client.sendInstant({
 - `sendWebPush({ subscription, payload, vapid, ttl?, fetch? })` — 0.3.0 新增，纯 Web Crypto 实现
 - `buildVapidJwt({ audience, subject, publicKey, privateKey })` / `verifyVapidJwt(jwt, publicKey)` — 0.3.0 新增
 - `buildMultipartPushPayloads(payload, { maxChunkBytes?, id?, ttlMs? })` — 0.8.0 新增，构造 generic `_multipart` transport payloads
-- 错误类：`HookError` / `PayloadTooLargeError` / `LlmCallError` / `MemoryStoreFullError`
+- 错误类：`HookError` / `PayloadTooLargeError` / `LlmCallError` / `RequestBodyTooLargeError` / `MemoryStoreFullError`
+- `MAX_REQUEST_BODY_BYTES`（`32 * 1024 * 1024`）— 请求体字节上限，`RequestBodyTooLargeError.maxBytes` 和 413 响应里的 `details.maxBytes` 都是它
 - 从 `@rei-standard/amsg-shared` 透传导出：`MESSAGE_KIND` / `MESSAGE_TYPE` / `PUSH_SOURCE`、`buildContentPush` / `buildReasoningPush` / `buildToolRequestPush` / `buildErrorPush` / `buildResultPush`、`isContentPush` / `isReasoningPush` / `isToolRequestPush` / `isErrorPush` / `isResultPush`、`chunkReasoningByUtf8Bytes`
 
 子路径：

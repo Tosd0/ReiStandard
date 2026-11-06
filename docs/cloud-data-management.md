@@ -36,6 +36,25 @@ existing per-user key. Legacy ownership is resolved from cloud records on
 read and guard checks, without a browser-side migration dependency. Unknown
 ownership remains unknown. Shared/global data should return `owner: null`.
 
+`owner.type` and `owner.id` are non-blank strings (`type` at most 100
+characters, `id` at most 300). `owner.label` is optional; when present it is a
+string of at most 300 characters. `ownerGeneration` is a non-negative integer.
+The explicit `owner` of a cleanup plan and of a task follows the same rule; a
+cleanup plan with a malformed owner is rejected with 400 `INVALID_CLOUD_OWNER`,
+a task write with 409. On `PUT /client-state`, an entry whose `owner` or
+`ownerGeneration` has the wrong shape is listed in `data.rejected`
+(`INVALID_CLOUD_OWNER` / `INVALID_CLOUD_OWNER_GENERATION`) and the other
+entries are written as usual; a guard failure rejects the whole batch with 409
+(`CLOUD_OWNER_RETIRED`, `CLOUD_OWNER_IMMUTABLE`, `CLOUD_CROSS_OWNER_WRITE`,
+`CLOUD_GUARD_UNSUPPORTED`, or `INVALID_CLOUD_OWNER` when the host's owner
+resolver returns a malformed owner). The single-user Worker returns any guard
+error that carries a 4xx `status` and a `code` with that status.
+
+Concurrent client-state and credential writes to the same key are
+last-write-wins: the later write lands and the existing ownership is kept. A
+write that collides three times in a row fails with 409
+`CLOUD_RESOURCE_CHANGED`.
+
 The resources endpoint creates a 15-minute encrypted snapshot. Its opaque
 cursor is bound to the user and filters; page through `nextCursor` until null.
 `complete` reports source readability, independently of pagination. Failed
@@ -44,7 +63,10 @@ plans. Refresh to see writes that happened after the snapshot was created.
 
 ## Routes
 
-All routes use the existing user authentication/encryption protocol.
+All routes use the existing user authentication/encryption protocol. Errors
+raised by the management code carry their own `code` and HTTP status. Any
+other failure under `/cloud-data/*` returns 500 with top-level
+`code: 'CLOUD_DATA_FAILED'`; driver error codes are not exposed.
 
 | Method | Route | Meaning |
 | --- | --- | --- |
@@ -108,8 +130,9 @@ or unreadable resources remain available for explicit selection.
 
 ## Demand-driven D1 maintenance
 
-Schema `2.6.0-cloud-data.2` adds `cloud_data_work`, `cloud_data_maintenance`, two
-partial scheduling/expiry indexes and deletion triggers. `ensureSchema` checks
+The schema (`SCHEMA_VERSION` is `3.2.0-lease-token`) includes
+`cloud_data_work`, `cloud_data_maintenance`, two partial scheduling/expiry
+indexes and deletion triggers. `ensureSchema` checks
 these indexes and triggers, so existing deployments install them once after an
 upgrade. The work index stores opaque identities and absolute execution/expiry
 times; resource contents, labels and operation details stay encrypted.
@@ -129,8 +152,11 @@ A legacy operation record that cannot be read is indexed as due with no expiry,
 so it stays available for inspection and is retried. The repair leaves an
 operation's schedule alone when the operation changed after the batch was read.
 
-Each tick continues at most 25 due unfinished operations, oldest first, read
-through the work index. Operations waiting for a later retry, operations under
+Each tick reads up to 25 due unfinished operations, oldest first, through the
+work index, and spends about 20 seconds on them, running each operation as
+far as that budget allows (the budget is checked between resources; the
+index repair and expiry sweep before it are not counted). The HTTP request
+that starts an operation still handles at most 25 resources. Operations waiting for a later retry, operations under
 an active lease and completed history are outside that lookup. An operation
 that cannot be read is retried 15 minutes later, behind the operations still
 waiting. A failed attempt on a readable operation records its own retry time,
@@ -139,10 +165,10 @@ TTL is 30 days from completion/failure. Pending/running operations have no
 expiry. Task, state and outbox retention deletes at most 100 rows per retention
 predicate per tick, with unchanged cutoffs.
 
-A cron tick runs cloud maintenance first, then message delivery. When
+A cron tick delivers due messages first, then runs cloud maintenance. When
 maintenance throws, for example because the schema has yet to be upgraded, the
-tick reports it through `onError` with stage `cloud-cleanup` and still delivers
-due messages. `ok` in the `scheduled()` return value reflects delivery only; the
+tick reports it through `onError` with stage `cloud-cleanup`; delivery is not
+affected. `ok` in the `scheduled()` return value reflects delivery only; the
 maintenance failure is in `cloudCleanupCause`.
 
 `GET /cloud-data/resources` includes an optional `summary` from the same inventory

@@ -2,6 +2,8 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createWebCryptoWebPush,
+  withPushSignal,
+  assertVapidConfigured,
   verifyVapidJwt,
   measurePushPayload,
   MAX_PUSH_PAYLOAD_BYTES,
@@ -75,6 +77,64 @@ test('sendNotification honours a custom ttl override', async () => {
     globalThis.fetch = original;
   }
   assert.equal(captured.init.headers['TTL'], '120');
+});
+
+describe('取消信号透传', () => {
+  test('sendNotification 的 signal / timeoutMs 一路传到 fetch，调用方中止 → PUSH_SEND_FAILED 且不带 statusCode', async () => {
+    const { publicKey, privateKey } = await genVapid();
+    const sub = await genSubscription();
+    const controller = new AbortController();
+    let captured = null;
+    const original = globalThis.fetch;
+    // 像真 fetch 一样：信号一中止就 reject。
+    globalThis.fetch = (url, init) => new Promise((_, reject) => {
+      captured = { url, init };
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    });
+    try {
+      const sender = createWebCryptoWebPush({ email: 'mailto:x@example.com', publicKey, privateKey });
+      const pending = sender.sendNotification(sub, '{"a":1}', { signal: controller.signal, timeoutMs: 60_000 });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.ok(captured.init.signal instanceof AbortSignal, 'fetch 收到了 signal');
+      assert.equal(captured.init.signal.aborted, false);
+      controller.abort();
+      await assert.rejects(pending, (err) => err.code === 'PUSH_SEND_FAILED' && err.statusCode === undefined && !!err.cause);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test('withPushSignal：认第三个参数的 sender 绑上信号，不认的原样返回，外层绑定盖过内层', async () => {
+    const seen = [];
+    const marked = { acceptsSendOptions: true, async sendNotification(_s, _p, options) { seen.push(options); } };
+    const inner = new AbortController();
+    const outer = new AbortController();
+    const bound = withPushSignal(marked, inner.signal);
+    await bound.sendNotification({}, 'x');
+    assert.equal(seen[0].signal, inner.signal);
+    assert.equal(bound.acceptsSendOptions, true, '标记顺着原型链还在');
+
+    // 像 run-tick 的租约守卫那样再包一层，外面再绑一次：新信号要赢。
+    const guarded = Object.create(bound);
+    Object.defineProperty(guarded, 'sendNotification', { value: (...args) => bound.sendNotification(...args), writable: true, enumerable: true, configurable: true });
+    await withPushSignal(guarded, outer.signal).sendNotification({}, 'x');
+    assert.equal(seen[1].signal, outer.signal);
+
+    // npm web-push 这种不认未知 option 的 sender：不碰。
+    const plain = { async sendNotification(_s, _p, options) { if (options) throw new Error('invalid option'); seen.push('plain'); } };
+    assert.equal(withPushSignal(plain, inner.signal), plain);
+    await withPushSignal(plain, inner.signal).sendNotification({}, 'x');
+    assert.equal(seen[2], 'plain');
+    assert.equal(withPushSignal(null, inner.signal), null);
+    assert.equal(withPushSignal(marked, undefined), marked);
+  });
+
+  test('assertVapidConfigured：缺整个 vapid 或缺任一项都抛 VAPID_CONFIG_MISSING', () => {
+    for (const vapid of [undefined, null, {}, { email: 'e', publicKey: 'p' }, { email: 'e', privateKey: 'k' }, { publicKey: 'p', privateKey: 'k' }]) {
+      assert.throws(() => assertVapidConfigured(vapid), (err) => err.code === 'VAPID_CONFIG_MISSING');
+    }
+    assert.doesNotThrow(() => assertVapidConfigured({ email: 'e', publicKey: 'p', privateKey: 'k' }));
+  });
 });
 
 describe('payload 大小护栏', () => {

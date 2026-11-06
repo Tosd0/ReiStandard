@@ -786,3 +786,58 @@ test('multipart: 墓碑写失败也不能把放弃的原因盖成「存储故障
     `收尾挂掉这件事本身不能被吞掉，得留下能归因的日志：${JSON.stringify(lines)}`,
   );
 });
+
+// --- 分片落了库、pending 计数没跟上 ------------------------------------------
+
+test('multipart: 分片落了库、pending 计数没跟上时，重投的那片也能把这条凑齐', async () => {
+  const { sw, triggerPush } = createSwMock();
+  const business = install(sw);
+
+  const original = { messageKind: 'content', messageId: 'msg_mp_recount', message: 'r'.repeat(300) };
+  const parts = buildMultipartPayloads(original, { id: 'mp_recount', maxChunkBytes: 80 });
+  assert.ok(parts.length >= 3);
+
+  await triggerPush(parts[0]);
+  await triggerPush(parts[1]);
+
+  // 第二片的分片写成功了，紧跟着的 pending 自增那笔写没落盘（SW 随后重启，内存
+  // 里的拒收记录也没了）：仓库里有两片，pending 却只记着一片。
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  conn._meta.stores.get(MULTIPART_PENDING_STORE).records.get('mp_recount').receivedCount = 1;
+
+  // 推送服务重投第二片，然后剩下的照常到。
+  await triggerPush(parts[1]);
+  for (const part of parts.slice(2)) await triggerPush(part);
+
+  assert.equal(business.length, 1, '分片明明都在仓库里，不能因为计数少一而永远凑不齐');
+  assert.equal(business[0].messageId, 'msg_mp_recount');
+});
+
+// --- TTL 清扫放弃的 id，迟到的分片不能再开一份 pending --------------------------
+
+test('multipart: TTL 清扫放弃的 id，迟到的分片不再开新 pending、不再二次报 expired', async () => {
+  const { sw, postedMessages, triggerPush } = createSwMock();
+  const PENDING_TTL_MS = 40;
+  const business = install(sw, { ttlMs: PENDING_TTL_MS });
+
+  const original = { messageKind: 'content', messageId: 'msg_mp_sweep_late', message: 'l'.repeat(300) };
+  const parts = buildMultipartPayloads(original, { id: 'mp_sweep_late', maxChunkBytes: 80 });
+  assert.ok(parts.length >= 3);
+
+  await triggerPush(parts[0]);
+  await sleep(PENDING_TTL_MS + 20);
+  // 无关的 push 顺手触发清扫，这条 id 被判过期。
+  await captureErrors(() => triggerPush({ messageKind: 'content', messageId: 'sweep_1', message: 'tick' }));
+  assert.equal(expiredEvents(postedMessages).length, 1);
+
+  // 迟到的第二片：结论已经下了，不能重新开一份 pending 从零攒。
+  await triggerPush(parts[1]);
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  assert.equal(storeHas(conn, MULTIPART_PENDING_STORE, 'mp_sweep_late'), false, '清扫放弃过的 id 不该再有 pending');
+  assert.equal(storeHas(conn, MULTIPART_CHUNK_STORE, 'mp_sweep_late_2'), false, '迟到的分片也不该落库');
+
+  await sleep(PENDING_TTL_MS + 20);
+  await captureErrors(() => triggerPush({ messageKind: 'content', messageId: 'sweep_2', message: 'tick' }));
+  assert.equal(expiredEvents(postedMessages).length, 1, '同一条消息不能报第二次 MULTIPART_EXPIRED');
+  assert.equal(business.length, 2, '两条无关的 push 照常交付');
+});

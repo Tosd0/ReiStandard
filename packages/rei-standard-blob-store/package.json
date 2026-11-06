@@ -46,7 +46,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "peerDependencies": {
     "react": ">=17"

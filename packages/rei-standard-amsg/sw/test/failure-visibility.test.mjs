@@ -484,3 +484,142 @@ test('push: a broken multipart store gives up on the id instead of hanging the p
   assert.equal(expired[0].payload.id, 'mp_broken_store');
   assert.equal(expired[0].payload.total, parts.length);
 });
+
+// --- 离线队列：两轮 flush 撞上、429 / 408、提交阶段才失败 ----------------------
+
+test('queue: 两轮 flush 撞上时，同一条记录只发一次', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw);
+
+  // 先离线入队，让记录留在队列里。
+  const offline = stubFetch(() => { throw new TypeError('Failed to fetch'); });
+  await triggerMessage({ type: ENQUEUE_REQUEST, request: QUEUED_REQUEST });
+  offline.restore();
+
+  // 页面的 FLUSH_QUEUE 和 Background Sync 同时到：两轮都去 list 的话会各发一次。
+  const online = stubFetch(() => ({ ok: true, status: 200 }));
+  await Promise.all([
+    triggerMessage({ type: FLUSH_QUEUE }),
+    triggerMessage({ type: FLUSH_QUEUE }),
+  ]);
+  online.restore();
+
+  assert.equal(online.calls.length, 1, '并发的两轮 flush 不能把同一条请求发两次');
+});
+
+for (const status of [429, 408]) {
+  test(`queue: HTTP ${status} 留在队列里重试，不当永久拒绝`, async () => {
+    const { sw, postedMessages, triggerMessage } = createSwMock();
+    installReiSW(sw);
+
+    const throttled = stubFetch(() => ({ ok: false, status }));
+    let replies;
+    const { lines } = await captureErrors(async () => {
+      replies = await triggerMessage({ type: ENQUEUE_REQUEST, request: QUEUED_REQUEST });
+    });
+    throttled.restore();
+
+    assert.equal(replies[0].ok, true);
+    assert.equal(replies[0].delivered, false);
+    assert.equal(replies[0].dropped, undefined, `${status} 是「稍后再来」，不是拒收这条 payload`);
+    assert.deepEqual(postedMessages, [], '没被丢，不该广播 QUEUE_DROPPED');
+    assert.deepEqual(lines, []);
+
+    // 下一次冲刷照常重发。
+    const recovered = stubFetch(() => ({ ok: true, status: 200 }));
+    await triggerMessage({ type: FLUSH_QUEUE });
+    recovered.restore();
+    assert.equal(recovered.calls.length, 1, '记录仍在队列里，下次冲刷重发');
+  });
+}
+
+test('queue: 入队事务提交阶段的 QuotaExceededError 不能当入队成功', async () => {
+  const { sw, triggerMessage } = createSwMock();
+  installReiSW(sw);
+
+  // 先跑一轮空冲刷把库打开，才拿得到连接。
+  await triggerMessage({ type: FLUSH_QUEUE });
+  const conn = fake.lastConnection(QUEUE_DB_NAME);
+  const restore = conn._failCommits('request-outbox', new FakeDOMException('quota exceeded', 'QuotaExceededError'));
+  const fetchStub = stubFetch(() => ({ ok: true, status: 200 }));
+  let replies;
+  try {
+    replies = await triggerMessage({ type: ENQUEUE_REQUEST, request: QUEUED_REQUEST });
+  } finally {
+    restore();
+    fetchStub.restore();
+  }
+
+  // add 请求自己 onsuccess 了，提交时才因为配额被 abort：记录并没落盘。
+  assert.equal(replies[0].ok, false, '没写进去就不能回「已入队」');
+  assert.match(replies[0].error, /quota exceeded/);
+});
+
+test('deliver: 去重记录提交阶段失败时，按首投照常投递并带 dedupeError', async () => {
+  const { sw, notifications, triggerMessage } = createSwMock();
+  const business = [];
+  const dbName = 'dedupe_commit_failure';
+  installReiSW(sw, {
+    dedupe: { dbName, cleanupIntervalMs: 0 },
+    onBusinessPayload: (payload) => { business.push(payload); },
+  });
+
+  // 先投一条无关的，把去重库打开。
+  await triggerMessage({ type: DELIVER, payload: { messageKind: 'content', messageId: 'warm_up', message: 'x' } });
+  const restore = fake.lastConnection(dbName)._failCommits(
+    'delivery-dedupe',
+    new FakeDOMException('quota exceeded', 'QuotaExceededError'),
+  );
+  let replies;
+  try {
+    ({ value: replies } = await captureErrors(() => triggerMessage({
+      type: DELIVER,
+      payload: { messageKind: 'content', messageId: 'msg_dedupe_commit_failed', message: 'hi' },
+    })));
+  } finally {
+    restore();
+  }
+
+  assert.equal(replies[0].ok, true);
+  assert.match(replies[0].dedupeError, /quota exceeded/, '占坑那笔写没落盘，回执要如实说没走去重');
+  assert.equal(notifications.length, 2);
+  assert.equal(business.length, 2, '降级成首投照常投递');
+});
+
+// --- 去重：占坑失败、再读却读不到记录 ----------------------------------------
+
+test('push: 占坑撞上已有记录、再读时记录刚被清掉，要重新占坑而不是谁也不处理', async () => {
+  const { sw, notifications, triggerPush } = createSwMock();
+  const business = [];
+  const dbName = 'dedupe_reclaim';
+  installReiSW(sw, {
+    dedupe: { dbName, cleanupIntervalMs: 0 },
+    onBusinessPayload: (payload) => { business.push(payload); },
+  });
+
+  const payload = { messageKind: 'content', messageId: 'msg_reclaim', message: 'hello' };
+  await triggerPush(payload);
+  assert.equal(business.length, 1);
+
+  // 第二次占坑时记录还在（add 撞 ConstraintError），紧接着去读它的那一刻，并发
+  // 的过期清扫刚好把它删了。
+  const conn = fake.lastConnection(dbName);
+  const records = conn._meta.stores.get('delivery-dedupe').records;
+  const realTransaction = conn.transaction;
+  conn.transaction = function patchedTransaction(storeName, mode) {
+    if (mode === 'readonly') {
+      records.delete('msg_reclaim');
+      conn.transaction = realTransaction;
+    }
+    return realTransaction.call(this, storeName, mode);
+  };
+  try {
+    await triggerPush(payload);
+  } finally {
+    conn.transaction = realTransaction;
+  }
+
+  assert.equal(notifications.length, 2, '记录已经没了，这条就是一次新的首投，要弹通知');
+  assert.equal(business.length, 2, '业务回调也要跑');
+  assert.ok(records.has('msg_reclaim'), '坑要重新占上');
+});

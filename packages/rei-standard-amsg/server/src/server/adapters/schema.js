@@ -4,6 +4,9 @@
  * 定时触发用的三列各管一件事，别把它们混着读（见 lib/run-tick.js）：
  *   - `lease_until`：**这条正在跑**。某个 tick 占位时写「归我管到什么时候」，
  *     投递收尾时放掉。捞取待发任务时跳过租约未到期的行。
+ *   - `lease_token`：这份租约是谁的。占位时和 `lease_until` 一起写，续租和收尾
+ *     写库都带着它比对——租约过期后被别的 tick 接手时，原执行者迟到的心跳和
+ *     写库才会落空，而不是把接手者的租约续上或改掉。
  *   - `retry_after`：**这条没在跑，等着重试**。投递失败的退避时刻，到点之前
  *     捞不到这行。跟租约分开写，是因为「正在跑」会挡住同分组的其他任务，而
  *     一条正在等重试的任务其实闲着，不该连累别人。
@@ -22,6 +25,7 @@ export const TABLE_SQL = `
     message_type VARCHAR(50) NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TIMESTAMP WITH TIME ZONE NOT NULL,
     lease_until TIMESTAMP WITH TIME ZONE,
+    lease_token VARCHAR(64),
     retry_after TIMESTAMP WITH TIME ZONE,
     serialize_group VARCHAR(64),
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
@@ -60,8 +64,17 @@ export const MIGRATIONS = [
     // 解密失败时也写得进去，GET /message 对已失败的行也读得出来。
     sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS last_error TEXT',
     description: 'Sanitized last delivery-failure summary (2.6.0)'
+  },
+  {
+    name: 'add_lease_token',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS lease_token VARCHAR(64)',
+    description: 'Lease ownership token (claimTask / renewTaskLease)'
   }
 ];
+
+// 每跳最多清掉多少条已终态的旧任务。D1 单条语句的行数有配额，Postgres 这边
+// 一条无上限的 DELETE 也会在表积压时把一跳的时间预算吃光；三个适配器同一个数。
+export const CLEANUP_BATCH_LIMIT = 100;
 
 export const INDEXES = [
   {

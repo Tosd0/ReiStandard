@@ -22,8 +22,10 @@ function createInMemoryBlobStore() {
     async get(key) {
       return map.has(key) ? map.get(key) : null;
     },
-    async set(key, value) {
+    async set(key, value, options = {}) {
+      if (options.onlyIfNew && map.has(key)) return { modified: false };
       map.set(key, value);
+      return { modified: true };
     },
     async delete(key) {
       map.delete(key);
@@ -300,6 +302,23 @@ describe('validation utilities', () => {
   });
 });
 
+describe('validateScheduleMessagePayload supersedesUuid', () => {
+  it('rejects supersedesUuid equal to the task uuid', () => {
+    const uuid = '750e8400-e29b-41d4-a716-446655440000';
+    const result = validateScheduleMessagePayload({
+      contactName: 'Rei',
+      messageType: 'fixed',
+      userMessage: 'hi',
+      firstSendTime: '2999-01-01T00:00:00.000Z',
+      uuid,
+      supersedesUuid: uuid
+    });
+    assert.equal(result.valid, false);
+    assert.equal(result.errorCode, 'INVALID_PARAMETERS');
+    assert.deepEqual(result.details?.invalidFields, ['supersedesUuid']);
+  });
+});
+
 // ─── Server tests ──────────────────────────────────────────────
 
 describe('createReiServer v2.0.1 flow', () => {
@@ -383,6 +402,31 @@ describe('createReiServer v2.0.1 flow', () => {
     );
     assert.equal(duplicated.status, 409);
     assert.equal(duplicated.body.error.code, 'TENANT_ALREADY_INITIALIZED');
+  });
+
+  it('initTenant rejects missing X-Init-Secret when initSecret is configured', async () => {
+    const result = await server.handlers.initTenant.POST(
+      {},
+      { driver: 'neon', databaseUrl: 'postgres://tenant-db' }
+    );
+    assert.equal(result.status, 401);
+    assert.equal(result.body.error.code, 'INVALID_INIT_AUTH');
+  });
+
+  it('messages.GET 打回不在枚举里的 status', async () => {
+    const initResult = await server.handlers.initTenant.POST(
+      { 'x-init-secret': 'init-secret' },
+      { driver: 'neon', databaseUrl: 'postgres://tenant-db' }
+    );
+    const headers = {
+      authorization: `Bearer ${initResult.body.data.tenantToken}`,
+      'x-user-id': TEST_USER_ID
+    };
+    const bad = await server.handlers.messages.GET('/api/v1/messages?status=pendng', headers);
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, 'INVALID_PARAMETERS');
+    const ok = await server.handlers.messages.GET('/api/v1/messages?status=pending', headers);
+    assert.equal(ok.status, 200);
   });
 
   it('protected endpoint rejects missing tenant token', async () => {

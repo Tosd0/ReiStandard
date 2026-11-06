@@ -176,3 +176,66 @@ test('PUT /update-message：任务正在投递时改排期回 409 TASK_IN_FLIGHT
   );
   assert.equal(missing.status, 404);
 });
+
+// 改排期时 payload 里的首发时刻跟着走：循环任务推进用它当锚点（春令时顺延后
+// 靠它回到用户要的钟点），和 hook 的 renewTask 同口径。
+test('PUT /update-message 改 nextSendAt 时 payload 的 firstSendTime 跟着改', async () => {
+  const { server, db } = await makeServer();
+  const uuid = await scheduleFixed(server);
+  const res = await server.handlers.updateMessage.PUT(
+    `/update-message?id=${uuid}`,
+    HEADERS,
+    await encBody({ nextSendAt: '2999-06-01T00:00:00.000Z' })
+  );
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal((await readStoredPayload(db, uuid)).firstSendTime, '2999-06-01T00:00:00.000Z');
+  assert.equal((await db.getTaskByUuid(uuid, USER)).next_send_at, '2999-06-01T00:00:00.000Z');
+});
+
+// 过去的 nextSendAt 落库后会被下一跳的过期守卫直接标 failed，这里不能回 200。
+test('PUT /update-message 打回过去的 nextSendAt', async () => {
+  const { server } = await makeServer();
+  const uuid = await scheduleFixed(server);
+
+  const updated = await server.handlers.updateMessage.PUT(
+    `/update-message?id=${uuid}`,
+    HEADERS,
+    await encBody({ nextSendAt: '2000-01-01T00:00:00.000Z' })
+  );
+  assert.equal(updated.status, 400);
+  assert.equal(updated.body.error.code, 'INVALID_UPDATE_DATA');
+  assert.deepEqual(updated.body.error.details.invalidFields, ['nextSendAt']);
+});
+
+// metadata 整体替换，不是普通对象的话投影时 charId 等会静默变 null。
+test('POST /schedule-message 与 PUT /update-message 打回不是普通对象的 metadata', async () => {
+  const { server } = await makeServer();
+  for (const metadata of ['oops', ['a'], 42]) {
+    const created = await server.handlers.scheduleMessage.POST(HEADERS, await encBody({
+      contactName: 'Rei',
+      messageType: 'fixed',
+      userMessage: '原文。',
+      firstSendTime: '2999-01-01T00:00:00.000Z',
+      metadata
+    }));
+    assert.equal(created.status, 400, JSON.stringify(metadata));
+    assert.equal(created.body.error.code, 'INVALID_PARAMETERS');
+  }
+
+  const uuid = await scheduleFixed(server, { metadata: { charId: 'c1' } });
+  for (const metadata of ['oops', ['a'], 42]) {
+    const updated = await server.handlers.updateMessage.PUT(
+      `/update-message?id=${uuid}`,
+      HEADERS,
+      await encBody({ metadata })
+    );
+    assert.equal(updated.status, 400, JSON.stringify(metadata));
+    assert.equal(updated.body.error.code, 'INVALID_UPDATE_DATA');
+  }
+  const replaced = await server.handlers.updateMessage.PUT(
+    `/update-message?id=${uuid}`,
+    HEADERS,
+    await encBody({ metadata: { charId: 'c2' } })
+  );
+  assert.equal(replaced.status, 200, JSON.stringify(replaced.body));
+});

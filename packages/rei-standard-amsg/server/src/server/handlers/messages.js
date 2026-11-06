@@ -9,6 +9,8 @@ import { deriveUserEncryptionKey, decryptFromStorage, encryptPayload } from '../
 import { requireUserId } from '../lib/request.js';
 import { projectTask } from '../lib/task-projection.js';
 
+const TASK_STATUS_FILTERS = ['all', 'pending', 'sent', 'failed'];
+
 export function createMessagesHandler(ctx) {
   async function GET(url, headers) {
     const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
@@ -27,6 +29,10 @@ export function createMessagesHandler(ctx) {
     const status = u.searchParams.get('status') || 'all';
     const limit = Math.min(parseInt(u.searchParams.get('limit') || '20', 10), 100);
     const offset = parseInt(u.searchParams.get('offset') || '0', 10);
+
+    if (!TASK_STATUS_FILTERS.includes(status)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_PARAMETERS', message: `status 参数无效，必须是 ${TASK_STATUS_FILTERS.join(' / ')} 之一` } } };
+    }
 
     if (isNaN(limit) || limit < 1) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_PARAMETERS', message: 'limit 参数无效，必须为正整数' } } };

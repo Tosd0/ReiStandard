@@ -87,7 +87,7 @@ class FakeIndex {
   getAll(range) {
     const req = new FakeRequest();
     const rows = this._matching(range);
-    schedule(() => {
+    this._store.transaction._track(() => {
       req.result = rows.map((r) => r.value);
       fire(req.onsuccess);
     });
@@ -97,7 +97,7 @@ class FakeIndex {
   getAllKeys(range) {
     const req = new FakeRequest();
     const rows = this._matching(range);
-    schedule(() => {
+    this._store.transaction._track(() => {
       req.result = rows.map((r) => r.primaryKey);
       fire(req.onsuccess);
     });
@@ -111,7 +111,7 @@ class FakeIndex {
     let i = 0;
 
     const step = () => {
-      schedule(() => {
+      store.transaction._track(() => {
         if (i >= keys.length) {
           req.result = null;
           fire(req.onsuccess);
@@ -121,7 +121,7 @@ class FakeIndex {
         const cursor = {
           delete() {
             const dreq = new FakeRequest();
-            schedule(() => {
+            store.transaction._track(() => {
               store._data.records.delete(primaryKey);
               dreq.result = undefined;
               fire(dreq.onsuccess);
@@ -166,21 +166,22 @@ class FakeObjectStore {
   add(record) {
     const req = new FakeRequest();
     const key = this._key(record);
-    schedule(() => {
+    this.transaction._track(() => {
       if (this._data.records.has(key)) {
         req.error = new FakeDOMException('Key already exists', 'ConstraintError');
         const event = {
-          _prevented: false,
-          preventDefault() { this._prevented = true; },
+          defaultPrevented: false,
+          preventDefault() { this.defaultPrevented = true; },
         };
         fire(req.onerror, event);
-        if (!event._prevented) this.transaction._fail(req.error);
+        // 真 IndexedDB 里 error 事件会从请求冒泡到事务，preventDefault 拦不住冒泡。
+        fire(this.transaction.onerror, event);
+        if (!event.defaultPrevented) this.transaction._fail(req.error);
         return;
       }
       this._data.records.set(key, record);
       req.result = key;
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
@@ -188,54 +189,49 @@ class FakeObjectStore {
   put(record) {
     const req = new FakeRequest();
     const key = this._key(record);
-    schedule(() => {
+    this.transaction._track(() => {
       this._data.records.set(key, record);
       req.result = key;
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
 
   get(key) {
     const req = new FakeRequest();
-    schedule(() => {
+    this.transaction._track(() => {
       req.result = this._data.records.has(key) ? this._data.records.get(key) : undefined;
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
 
   delete(key) {
     const req = new FakeRequest();
-    schedule(() => {
+    this.transaction._track(() => {
       this._data.records.delete(key);
       req.result = undefined;
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
 
   count(key) {
     const req = new FakeRequest();
-    schedule(() => {
+    this.transaction._track(() => {
       req.result = key === undefined
         ? this._data.records.size
         : (this._data.records.has(key) ? 1 : 0);
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
 
   getAll() {
     const req = new FakeRequest();
-    schedule(() => {
+    this.transaction._track(() => {
       req.result = Array.from(this._data.records.values());
       fire(req.onsuccess);
-      this.transaction._settleSimple();
     });
     return req;
   }
@@ -263,6 +259,9 @@ class FakeTransaction {
     this._storeNames = Array.isArray(storeNames) ? storeNames : [storeNames];
     this._completed = false;
     this._failed = false;
+    this._pendingRequests = 0;
+    // A transaction nobody placed a request on still commits on its own.
+    schedule(() => this._maybeCommit());
   }
 
   objectStore(name) {
@@ -271,12 +270,32 @@ class FakeTransaction {
     return new FakeObjectStore(this, data);
   }
 
-  // Fire oncomplete once the simple (non-cursor) request that drove this
-  // transaction has resolved. Good enough for the single-op transactions
-  // the queue store relies on (`withQueueStore`).
-  _settleSimple() {
-    if (this._completed || this._failed) return;
+  // Run one request's callback on a later microtask and, like real IDB,
+  // commit the transaction once no request is outstanding any more (a
+  // handler that issues another request keeps it alive).
+  _track(fn) {
+    this._pendingRequests += 1;
+    schedule(() => {
+      fn();
+      this._pendingRequests -= 1;
+      this._maybeCommit();
+    });
+  }
+
+  _maybeCommit() {
+    if (this._completed || this._failed || this._pendingRequests > 0) return;
     this._completed = true;
+    // Commit-phase failure hook: every request already reported success,
+    // the write itself fails while flushing to disk (quota, I/O) — the
+    // browser then aborts the transaction with that error.
+    const commitError = this.mode === 'readwrite'
+      ? this._storeNames.map((name) => this.db._commitFailures.get(name)).find(Boolean)
+      : undefined;
+    if (commitError) {
+      this.error = commitError;
+      schedule(() => fire(this.onabort));
+      return;
+    }
     schedule(() => fire(this.oncomplete));
   }
 
@@ -284,7 +303,10 @@ class FakeTransaction {
     if (this._failed || this._completed) return;
     this._failed = true;
     this.error = error;
-    schedule(() => fire(this.onerror));
+    schedule(() => {
+      fire(this.onerror);
+      fire(this.onabort);
+    });
   }
 
   abort() {
@@ -298,6 +320,8 @@ class FakeDatabase {
     this._meta = meta;
     this._closed = false;
     this._dead = false;
+    // storeName -> error: readwrite transactions on that store abort at commit.
+    this._commitFailures = new Map();
     this.onversionchange = null;
     this.onclose = null;
     this.objectStoreNames = {
@@ -341,6 +365,16 @@ class FakeDatabase {
   /** Test hook: dispatch the `close` event the way the browser would. */
   _emitClose() {
     fire(this.onclose);
+  }
+
+  /**
+   * Test hook: make every readwrite transaction on `storeName` abort at
+   * commit with `error` (requests still report success first, exactly like
+   * a real quota failure). Returns a function that lifts it again.
+   */
+  _failCommits(storeName, error) {
+    this._commitFailures.set(storeName, error);
+    return () => { this._commitFailures.delete(storeName); };
   }
 }
 

@@ -38,6 +38,7 @@ import {
   DEFAULT_MULTIPART_TTL_MS,
   MULTIPART_MESSAGE_KIND,
   assertChunkBytesFitPushLimit,
+  assertInlineBytesFitPushLimit,
   buildMultipartPushPayloads,
 } from './multipart.js';
 
@@ -542,12 +543,15 @@ async function runAgenticLoop(payload, ctx) {
         iteration,
         timestamp: new Date().toISOString(),
       });
+      const hookError = new HookError(`onLLMOutput threw: ${err?.message ?? err}`, { cause: err });
       try {
         await deliverPush(diagnostic, payload, ctx, sessionId);
+        // SSE 据此决定要不要再补一条 event: error——诊断已经到了就别重复。
+        hookError.diagnosticDelivered = true;
       } catch (pushErr) {
         onEvent({ type: 'diagnostic_push_failed', code: 'HOOK_THREW', sessionId, cause: pushErr });
       }
-      throw new HookError(`onLLMOutput threw: ${err?.message ?? err}`, { cause: err });
+      throw hookError;
     }
 
     if (decision.decision === 'continue') {
@@ -658,6 +662,8 @@ async function sendPushWithMaybeBlob(pushPayload, payload, ctx, sessionId) {
   }
 
   const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(serialized).byteLength;
+  // 跟 multipart 一样在运行时再拦一次，给直接调本函数、自己攒 ctx 的调用方兜底。
+  if (ctx.blobStore) assertInlineBytesFitPushLimit(ctx.blobStore.maxInlineBytes);
   const maxInline = (ctx.blobStore && Number.isInteger(ctx.blobStore.maxInlineBytes) && ctx.blobStore.maxInlineBytes > 0)
     ? ctx.blobStore.maxInlineBytes
     : DEFAULT_MAX_INLINE_BYTES;

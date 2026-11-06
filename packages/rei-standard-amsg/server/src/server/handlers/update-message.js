@@ -7,7 +7,7 @@
 
 import { deriveUserEncryptionKey, decryptPayload, encryptForStorage, decryptFromStorage } from '../lib/encryption.js';
 import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../lib/request.js';
-import { isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize, taskPayloadByteLength } from '../lib/validation.js';
+import { isFutureTimestamp, isValidISO8601, isValidTimeZoneId, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, validateTaskPayloadSize, taskPayloadByteLength } from '../lib/validation.js';
 import { supportsLlmCredentialsStore, findMissingCredIds, validateCredRefs, hasChatCredRef } from '../lib/llm-credentials-store.js';
 
 /**
@@ -81,6 +81,15 @@ export function createUpdateMessageHandler(ctx) {
 
     if (updates.nextSendAt && !isValidISO8601(updates.nextSendAt)) {
       return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: '更新数据格式错误', details: { invalidFields: ['nextSendAt'] } } } };
+    }
+    if (updates.nextSendAt && !isFutureTimestamp(updates.nextSendAt)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'nextSendAt 必须在未来', details: { invalidFields: ['nextSendAt'] } } } };
+    }
+
+    // metadata 整体替换，形状只认普通对象（口径同 POST）：字符串 / 数组落进去
+    // 投影时 charId 等会静默变 null。
+    if (updates.metadata != null && !isPlainObject(updates.metadata)) {
+      return { status: 400, body: { success: false, error: { code: 'INVALID_UPDATE_DATA', message: 'metadata 必须是普通对象', details: { invalidFields: ['metadata'] } } } };
     }
 
     // contactName：用户给角色改了名之后，已经排好的任务推送出来的通知标题
@@ -271,6 +280,9 @@ export function createUpdateMessageHandler(ctx) {
       ...promptUpdates,
       ...(Object.prototype.hasOwnProperty.call(updates, 'contactName') && { contactName: updates.contactName }),
       ...(updates.userMessage && { userMessage: updates.userMessage }),
+      // 改排期时 payload 里的首发时刻跟着走（与 hook 的 renewTask 同口径）：循环
+      // 任务推进用它当锚点，不同步的话春令时顺延后回不到用户改过的钟点。
+      ...(updates.nextSendAt && { firstSendTime: updates.nextSendAt }),
       ...(updates.recurrenceType && { recurrenceType: updates.recurrenceType }),
       ...(Object.prototype.hasOwnProperty.call(updates, 'tzId') && { tzId: updates.tzId ?? null }),
       // avatarUrl 走 truthy spread：显式传 null 只是「不改」，不是「清空」。

@@ -91,6 +91,25 @@ const rei = await createReiServer({
 // DELETE /api/v1/llm-credentials    -> rei.handlers.llmCredentials.DELETE
 ```
 
+## 升级到 3.2 先补列
+
+`scheduled_messages` 多了一列 `lease_token`，占位 SQL 一律写这列。老库没补列的话每条到期任务都会占位失败、一条不发：tick 汇总里每条都进 `details.failedTasks`、`status: 'claim_failed'`，而前端界面一切正常。
+
+| 部署 | 列怎么补 |
+|---|---|
+| 多租户（`createReiServer`） | 进程首次拿到租户适配器时自动跑 `initSchema`，不用动手 |
+| 单用户 D1 | 升级后重跑一次 `POST /init-tenant`，或宿主调 `worker.ensureSchema(env)` |
+| 手工维护表结构 | 照 `examples/cloudflare-single-user/schema.sql` 加列 |
+
+`getSchemaVersion` 在缺列时返回 `ok: false`、`missing` 里有 `column:scheduled_messages.lease_token`，可以用来自检；`SCHEMA_VERSION` 是 `3.2.0-lease-token`。
+
+同一版还有几条升级时要留意的：
+
+- **推送订阅的 `endpoint` 收紧**：新登记时 `http`、`localhost` / `*.localhost`、IP 字面量一律 `400 INVALID_PUSH_SUBSCRIPTION`。已登记的用户级订阅不重新校验、照常投递。升级前排的任务 payload 里冻结的老订阅走兜底读取时按同一规则判，不合格视为没有，这时用户级存储里也没有的话任务以 `PUSH_SUBSCRIPTION_MISSING` 失败。本地开发用 `http` 推送 mock 的环境要换成 `https` 域名。
+- **`firstSendTime` / `nextSendAt` 只收 ISO 8601 字符串**：`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`（时区可省，`±hhmm` 也认，小数秒最多 9 位；以 `isValidISO8601` 为准）。空格分隔的日期时间、RFC 2822、数字时间戳都不收。
+- **过期收场也撤收件箱**：错过触发时刻太久按过期收场（`expired` / `fast_forwarded`）的任务，名下所有还没投递、没 ack 的收件箱行都撤掉，包括之前几次 occurrence 留下的。
+- **租户 token 默认不过期**：`/init-tenant` 新签的 `tenantToken` / `cronToken` 不带 `exp`。升级前签发的、带过期时间的 token 不会自动延长，到期前要重签（删租户配置后重新 init，或用 `createTenantToken` 自己签）。
+
 ## 从 2.x 升级
 
 从 2.5.3 升级到 3.0.0 的多租户部署（`createReiServer`）和排程客户端需按以下顺序迁移：
@@ -105,7 +124,7 @@ const rei = await createReiServer({
 - **推送订阅改为用户级登记**：`POST /schedule-message` 和 `PUT /update-message` 带 `pushSubscription` 字段返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`；用户未通过 `PUT /push-subscription` 登记过订阅时，`POST /schedule-message` 返回 `409 PUSH_SUBSCRIPTION_MISSING`。
 - **包根加密工具函数改为 async**：`deriveUserEncryptionKey`、`decryptPayload`、`encryptForStorage`、`decryptFromStorage` 底层改为 Web Crypto API，全部返回 `Promise`，直接调用处需补 `await`；密文格式不变。
 - **自定义数据库适配器接口补充**：通过 `tenant.adapterFactory` 自定义适配器时，需实现 `getPushSubscription` / `upsertPushSubscription` / `deletePushSubscription`（否则返 `501`），以及按需补齐 `claimTask`、`renewTaskLease`、`createTaskSuperseding`、`getTaskStatusInfo`、`getTaskStatusByUuidOnly`、`llm_credentials` 四方法等。内置 `pg` / `neon` 适配器已全部实现。
-- **表结构自动补齐与投递语义更新**：每个进程首次拿到租户适配器时会幂等执行建表（`push_subscriptions`、`llm_credentials`）、`scheduled_messages` 补列（`lease_until`、`retry_after`、`serialize_group`、`last_error`）与建索引（`idx_serialize_group_lease`），数据库账号需有 DDL 权限；错过触发时刻超过 60 分钟的任务不再补发；LLM 上游 `400/401/402/403/404/405/413/422` 与推送服务 `404/410/413` 直接终审不再重试；默认 `messageId` 和 `sessionId` 带 `@<occurrenceMs>` 后缀。
+- **表结构自动补齐与投递语义更新**：每个进程首次拿到租户适配器时会幂等执行建表（`push_subscriptions`、`llm_credentials`）、`scheduled_messages` 补列（`lease_until`、`lease_token`、`retry_after`、`serialize_group`、`last_error`）与建索引（`idx_serialize_group_lease`），数据库账号需有 DDL 权限；错过触发时刻超过 60 分钟的任务不再补发；LLM 上游 `400/401/402/403/404/405/413/422` 与推送服务 `404/410/413` 直接终审不再重试；默认 `messageId` 和 `sessionId` 带 `@<occurrenceMs>` 后缀。
 
 完整的改前/改后代码示例、自定义适配器方法清单及新老版本混用兼容表见 [CHANGELOG.md](./CHANGELOG.md) 的 `3.0.0` 条目。
 
@@ -264,7 +283,7 @@ createSingleUserCloudflareWorker((env) => ({ …, multipart }));  // CF Worker�
 
 | 端点 | 语义 |
 |---|---|
-| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription` 至少要有非空 `endpoint` |
+| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription.endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都不收（内网域名不另外拦），否则 `400 INVALID_PUSH_SUBSCRIPTION` |
 | `GET /push-subscription` | `{ exists, updatedAt, endpoint }`。不含订阅的密钥部分——判断「登记过没有、是不是我手里这一个」用 `endpoint` 就够 |
 | `DELETE /push-subscription` | 删掉（设置页的「停止接收推送」） |
 
@@ -340,12 +359,15 @@ ctx / metadata / push 上）。
 
 `GET /message` 只读得到还没发出去的任务；已完成 / 已失败的返回 `409 TASK_ALREADY_COMPLETED`，不存在返回 `404 TASK_NOT_FOUND`（与 `PUT /update-message` 同一口径）。响应和列表一样是加密的，客户端侧对应 `client.getMessage(uuid)`。
 
+`GET /messages` 的 `status` 参数只认 `all` / `pending` / `sent` / `failed`（不传按 `all`），别的值返回 `400 INVALID_PARAMETERS`；`limit` 默认 20、最多 100（超过按 100 截），`offset` 默认 0，小于 1 的 `limit`、负的 `offset` 或非数字同样 `400 INVALID_PARAMETERS`。列表按 `next_send_at` 升序、同一时刻再按 `id` 升序排，翻页时同一触发时刻的几条不会在两页之间重复或漏掉。
+
 ## 更新任务时能改哪些字段
 
 `PUT /update-message` 的可写字段：`contactName` / `avatarUrl` / `userMessage` / `completePrompt` / `messages` / `nextSendAt` / `recurrenceType` / `tzId` / `metadata` / `messageSubtype` / `maxTokens` / `temperature` / `splitPattern` / `llmExtraBody`、凭据三件套 `apiUrl` / `apiKey` / `primaryModel`，以及凭据引用 `credRefs`。
 
 - `contactName` 必须是非空字符串（口径与排程时一致），空串 / `null` / 非字符串一律 `400`。用户给角色改了名之后，之前排的任务推送出来的通知标题（「来自 <contactName>」）靠它跟着改。
-- `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。
+- `nextSendAt` 必须是 ISO 8601 字符串，而且在未来；不满足返回 `400 INVALID_UPDATE_DATA`（`details.invalidFields` 为 `['nextSendAt']`）。改了排期后，任务 payload 里的 `firstSendTime` 跟着写成同一个值。排程时 `POST /schedule-message` 的 `firstSendTime` 是同一条规则，不满足返回 `400 INVALID_TIMESTAMP`（`immediate: true` 时 `firstSendTime` 可省，传了只查格式、不要求在未来）。「ISO 8601」按 `YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]` 这个形状判，时区可省。
+- `metadata` 是整体替换，不深合并——只改一个子字段的读-改-写流程见上一节。它只认普通对象：`null` 按「不改」，数组、字符串等返回 `400 INVALID_UPDATE_DATA`（`POST /schedule-message` 同一规则，返回 `400 INVALID_PARAMETERS`）。
 - `taskInput` 只在创建或替换任务时设置。更新请求带这个字段（包括 `null`）返回 `400 INVALID_UPDATE_DATA`，`details.invalidFields` 为 `['taskInput']`；整份请求被拒，同传的其他字段也不会修改。
 - `avatarUrl` 显式传 `null` 是「不改」而不是「清空」（§6.2 的软清空策略要求非法头像被摘掉时保留旧头像，「摘掉」和「传了个 null」在这一层是同一件事）。
 - 凭据三件套传 `null` 同样只是忽略：清掉任何一个，任务到点就发不出去。
@@ -361,6 +383,10 @@ ctx / metadata / push 上）。
 适配器实现了 outbox 那组方法（内置 D1 有）时，每条 push 在发出去之前会先落一行 `message_outbox`，客户端离线或推送服务抽风时靠 `GET /outbox` 补收。这就带来一个收尾问题：一条任务投递到一半失败过的话，没发出去的那几段还留在 outbox 里等补收，光删任务行它们不会跟着走。
 
 所以 `DELETE /cancel-message` 和 `POST /schedule-message` 的 `supersedesUuid` 顶替，都会顺手把该任务名下还没发出去的行撤掉。已经推到设备上的分段不动——取消的意思是「别再发后面的」，不是「把用户已经收到的从收件箱里抹掉」，那几条留着让客户端照常 ack。
+
+错过触发时刻超过 `staleAfterMs` 而按过期收场的任务（见下面的 `onStaleSkip`）同样撤掉名下还没投递、没 ack 的行，之前几次 occurrence 留下的也算：这次本来就不发了，留着只会被客户端补收回去。
+
+投递中途发现租约不在自己手里时，撤不撤由 `runScheduledTick` 收尾时决定：先读一次任务行，行已经不在（取消 / 顶替）才按任务撤掉未投递的行；行还在说明租约过期后被别的 tick 接手了，那些行归接手者管，这边一行不动。直接调 `processSingleMessage`、不经 `runScheduledTick` 的宿主要自己做这一步。
 
 清理是 best-effort：适配器没实现 outbox、或者清理本身出错，都不影响取消 / 顶替的成功返回（任务行已经删掉了）。
 
@@ -685,7 +711,7 @@ const { messageId, pushed } = await ctx.emitResult({
 
 因为坏的不是这条任务，是这个部署：同一个坏部署下每条到点的任务都会撞同一个错，判终态等于把那段时间里每一条一次性任务都永久标 `failed`，配置改好重新部署也捞不回来（行已不在 `pending`，`PUT /update-message` 回 409）。留在阶梯上的话，配置一修好，下一跳就正常发出去。VAPID 配错回的 400 / 401 / 403 是同一个道理，见下面的推送失败分级。
 
-`AGENTIC_TOTAL_TIMEOUT`（整条 fire 链超出 `totalTimeoutMs`）也走退避重试：这一轮慢不代表下一轮也慢。
+`AGENTIC_TOTAL_TIMEOUT`（整条 fire 链超出 `totalTimeoutMs`）也走退避重试：这一轮慢不代表下一轮也慢。`totalTimeoutMs` 默认 240000（`DEFAULT_TOTAL_TIMEOUT_MS`），在 `createSingleUserServer` / 单用户 Worker 的 config 里设，`onBeforeFire` 的返回值可以按次覆盖；`onBeforeFire`、`onLLMOutput`、`executeToolCalls` 三个 hook 都受它约束。预算用完时宿主拿到的 `ctx.signal` 会中止，任务按可重试失败收场，`last_error.errorCode` 是 `AGENTIC_TOTAL_TIMEOUT`。工具内部的 `fetch` 要带上 `ctx.signal`，不然超时之后工具还会自己跑完。
 
 `GET /capabilities` 的 features 里有 `agentic-schedule-task`，前端可以据此判断部署的 worker 认不认这条链路。
 
@@ -706,6 +732,8 @@ const { messageId, pushed } = await ctx.emitResult({
 2. 租户调用 `POST /api/v1/init-tenant` 提交自己的 `databaseUrl`
 3. 服务端自动完成：建表 + 生成 masterKey + 写入 Blob + 返回 `tenantToken`/`cronToken`
 4. 前端使用 `tenantToken`，cron 使用 `cronToken`
+
+`/init-tenant` 返回的两个 token 不带过期时间，长期有效；要吊销就删掉该租户的 Blob 配置，token 随之失效。自己用 `createTenantToken(payload, secret, { expiresInSeconds })` 签的 token 才有过期时间，`verifyTenantToken` 两种都认。同一个 `tenantId` 并发初始化时先写进 Blob 的一方成功，后到的返回 `409 TENANT_ALREADY_INITIALIZED`，已生成的 masterKey 不会被覆盖（这一步靠 `@netlify/blobs` 的条件写，需要 `^10.7.13`；自定义 Blob store 的 `set` 不支持 `onlyIfNew` 的话只剩「先查后写」这一道）。
 
 ## 端点鉴权
 
@@ -805,7 +833,9 @@ await client.scheduleMessage({
 
 `PUT /update-message` 也认这个字段：传时区 id 换一个，传 `null` 改回按 UTC 推进（`hasOwnProperty` 判断，不会被吞掉）。`GET /messages` 每条任务多返回一个 `tzId`（没设 → `null`）。
 
-两个边界情况的收敛规则：春令时被跳过的墙钟（例如纽约 2:30 不存在）落到切换之后的等价时刻（当地 3:30）；秋令时重复出现的墙钟（当地 1:30 出现两次）取其中一个，不触发两次。时区换算全部走 `Intl`，不手搓偏移加减。
+两个边界情况的收敛规则：春令时被跳过的墙钟（例如纽约 2:30 不存在）落到切换之后的等价时刻（当地 3:30），第二天回到原来的 2:30，不会从此停在 3:30；秋令时重复出现的墙钟（当地 1:30 出现两次）取其中一个，不触发两次。时区换算全部走 `Intl`，不手搓偏移加减。
+
+「回到原钟点」靠任务原始的首发时刻：`advanceOccurrence` / `planNextOccurrence` / `nextFutureOccurrence` 都有可选的第五个参数 `anchorMs`，库推进时传的是 payload 里 `firstSendTime` 的毫秒值（`PUT /update-message` 改了 `nextSendAt` 会一并改它）。宿主自己调这三个函数、又希望春令时顺延后能回到原钟点的，把首发时刻传进去；不传就按当前落点的墙钟推进。
 
 ## 触发任务时的占位
 
@@ -813,15 +843,65 @@ await client.scheduleMessage({
 
 租约写在自己的列上，`next_send_at` 全程不动——任务列表读到的一直是用户设的那个时刻，循环任务也按它推进到下一次。投递收尾时租约就放掉，失败重试的退避（2 分钟起）不会被租期压住。
 
-领了任务的那一跳中途没了（Worker 被回收之类）就没人来放租约，这条任务要等租约到期才会被后面的 tick 接手。把租期设得比最慢的一次投递长一点即可。
+领了任务的那一跳中途没了（Worker 被回收之类）就没人来放租约，这条任务要等租约到期才会被后面的 tick 接手。
 
-租期默认 10 分钟；配了 `totalTimeoutMs` 的话按它 + 2 分钟往上抬。想自己定就在 `runScheduledTick` 的 ctx（或单用户 Worker 的 config）里传 `claimLeaseMs`——注意 `createReiServer` 内置的 `/send-notifications` 处理器不透传这两个值，要调租期就自己调 `runScheduledTick`。`onBeforeFire` 里按次放宽的预算占位时看不到，那种情况也要显式设 `claimLeaseMs`。
+租约有两种走法，看适配器有没有 `renewTaskLease`：
+
+- **心跳续租**（内置 D1 / pg / neon 都是这条）：占位时只写一段短租约，投递期间每 `leaseHeartbeatMs`（默认 30000）续一次，每次续到「现在 + max(90 秒, 3 × heartbeatMs)」。跳崩了之后最多等这么久就会被接手，不用按最慢的一次投递估租期。`leaseHeartbeatMs` 设 0 关掉心跳，退回下面那条。
+- **一次性长租约**（适配器没实现 `renewTaskLease`，或心跳关了）：租期默认 10 分钟；配了 `totalTimeoutMs` 的话按它 + 2 分钟往上抬。想自己定就在 `runScheduledTick` 的 ctx（或单用户 Worker 的 config）里传 `claimLeaseMs`。`onBeforeFire` 里按次放宽的预算占位时看不到，那种情况也要显式设 `claimLeaseMs`。
+
+`createReiServer` 内置的 `/send-notifications` 处理器不透传这几个值，要调就自己调 `runScheduledTick`。
+
+占位时还会往 `lease_token` 列写一个随机 token，续租和收尾写库（改排期、删行、写失败）都带着它比对：租约过期后被别的 tick 接手的任务，原来那一跳的收尾写库会扑空，不会把接手者的进度盖掉。扑空的任务记在 tick 汇总的 `details.leaseLostTasks` 里（见下面[一跳跑完的汇总](#一跳跑完的汇总)）。
+
+### 自定义适配器的租约契约
+
+以 `src/server/adapters/interface.js` 为准，这里列对外有影响的几条。下面的 `options` 参数全部可选，老适配器忽略它们照样能跑，只是退回「没有 token 比对」的行为。
+
+| 方法 | `options` 里认什么 | 返回 |
+|---|---|---|
+| `claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup?, cloudGuard?, options?)` | `leaseToken`：领到时写进 `lease_token`；`userId`：给 cloudGuard 做归属断言，适配器不用再查一次 | 占到位 `true`，否则 `false` |
+| `renewTaskLease(taskId, leaseUntil, cloudGuard?, options?)` | `leaseToken`：只给 `lease_token` 仍等于它、且行仍是 pending 的续租 | 续到了 `true`；行没了或租约已归别人 `false`（必须是 `false`，不能是 `undefined`） |
+| `updateTaskById(taskId, updates, cloudGuard?, options?)` | `leaseToken`：只改 `lease_token` 仍等于它的行 | 改到的行；改不到 `null` |
+| `deleteTaskById(taskId, options?)` | `leaseToken`：只删 `lease_token` 仍等于它的行 | 删到 `true`，否则 `false` |
+
+`renewTaskLease` 回 `false` 之后库会再读一次任务行，区分「被取消 / 顶替」和「被别的 tick 接手」。`listTasks` 的排序要是 `next_send_at ASC, id ASC`，不然同一触发时刻的几条翻页时会重复或漏掉。`cleanupOldTasks` 一跳最多删 `CLEANUP_BATCH_LIMIT`（100）条。
 
 占位管的是定时触发这条路径。`messageType: 'instant'` 走的是「建行 → 当场投递」，不经过占位。
 
 内置适配器都实现了占位。自定义适配器可以不实现 `claimTask`，跑得动，只是回到不占位的行为。
 
 投递失败的退避记在 `retry_after` 上，租约同时放掉。两件事分两列记：`lease_until` 只表示「这条正在跑」，`retry_after` 表示「这条没在跑，在等重试」。挤在一列的话，下面的分组串行会把一条正在退避、其实闲着的任务当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。
+
+## 一跳跑完的汇总
+
+`runScheduledTick`（以及 `send-notifications` 响应的 `data`、单用户 Worker `scheduled()` 的返回值）长这样：
+
+```js
+{
+  totalTasks, successCount, failedCount, processedAt, executionTime,
+  details: {
+    failedTasks,            // [{ taskId, reason, status?, retryCount?, nextRetryAt?, nextSendAt?, permanent? }]
+    cancelledTasks,         // [{ taskId, reason, status }]
+    leaseLostTasks,         // [{ taskId, status }]
+    staleTasks,             // [{ taskId, reason: 'stale', action, nextSendAt?, skippedCount }]
+    deferredTasks, claimSkippedTasks, serializeSkippedTasks,
+    deletedOnceOffTasks, updatedRecurringTasks,
+    reasoningSkippedTasks,  // [{ taskId, reason }]
+    redeliveredTasks,       // [{ taskId, pushedCount }]
+  },
+}
+```
+
+`cancelledTasks` 和 `leaseLostTasks` 既不计成功也不计失败。前者是投递期间任务行被取消 / 顶替（或归属已停用，`status: 'owner_retired'`），后者是租约过期后被别的 tick 接手、这一跳不再写这条任务。两组的 `status` 说明是在哪一步发现的：
+
+| `status` | 发现时机 |
+|---|---|
+| `cancelled_before_delivery` | 过期收场写库时 |
+| `cancelled_mid_delivery` | 推送发出前，或推送发到一半 |
+| `cancelled_after_delivery` | 推送发完、收尾写库时 |
+
+老部署升级后没补 `lease_token` 列的，`claimTask` 写不进去，每条任务都进 `failedTasks`、`status: 'claim_failed'`，一条都不发；补列方式见[任务表用到的四列](#任务表用到的四列)。
 
 ## 投递失败怎么重试
 
@@ -918,9 +998,11 @@ await runScheduledTick({
 
 `createReiServer` 内置的 `/send-notifications` 处理器不透传 `serializeBy`（和 `claimLeaseMs` 一样），多租户部署要用就自己调 `runScheduledTick`。单用户 Worker 直接在 config 里写。
 
-## 任务表用到的三列
+## 任务表用到的四列
 
-`lease_until` / `retry_after` / `serialize_group`（都可空）。走 `POST /init-tenant`（或任何一次 `initSchema`）会自动给已有的表补上，跑几次都没事；手工维护表结构的看 `examples/cloudflare-single-user/schema.sql`，Postgres 侧对应三句 `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS …`。分组串行还多一个索引 `idx_serialize_group_lease`，`initSchema` 一并建。
+`lease_until` / `lease_token` / `retry_after` / `serialize_group`（都可空）。走 `POST /init-tenant`（或任何一次 `initSchema`）会自动给已有的表补上，跑几次都没事；手工维护表结构的看 `examples/cloudflare-single-user/schema.sql`，Postgres 侧对应四句 `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS …`。
+
+多租户部署每个进程首次拿到租户适配器时会跑一次 `initSchema`，列自动补齐。D1 单用户部署不会在请求里偷偷迁移：升级后要么 `POST /init-tenant` 一次，要么调 `worker.ensureSchema(env)`，不然 `claimTask` 往 `lease_token` 写不进去，任务一条都不发（见上面的汇总一节）。分组串行还多一个索引 `idx_serialize_group_lease`，`initSchema` 一并建。
 
 ## 表结构自查（`getSchemaVersion` / `ensureSchema`）
 
@@ -932,7 +1014,7 @@ await runScheduledTick({
 import { getSchemaVersion, ensureSchema } from '@rei-standard/amsg-server/cloudflare';
 
 const state = await getSchemaVersion(db);
-// → { current: '2.6.0-cloud-data.2' | null, required: '2.6.0-cloud-data.2', ok: true | false, missing: [] }
+// → { current: '3.2.0-lease-token' | null, required: '3.2.0-lease-token', ok: true | false, missing: [] }
 
 if (!state.ok) {
   const fixed = await ensureSchema(db); // 建表 + 补列 + 建索引，重复调没事
@@ -1044,14 +1126,14 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `summarizeErrorCause` — 把异常压成响应体里 `error.cause` 那个形状（自己包一层路由、想回同样形状时用同一份）
 - `NonRetryableError` / `DeploymentConfigError` / `isNonRetryableError` — hook 侧标注确定性失败（`permanent: true`）与部署配置缺失错误（走退避阶梯）
 - `readRequestBody` / `DEFAULT_MAX_REQUEST_BODY_BYTES` — 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原），自己包路由时代替 `await request.text()`
-- `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）
-- `createTenantToken` / `verifyTenantToken`
+- `createWebCryptoWebPush` — 纯 Web Crypto 的 Web Push 发送器（不依赖 `web-push` 包）。返回的对象带 `acceptsSendOptions: true`，`sendNotification(subscription, payload, { signal, timeoutMs })` 第三个参数可选：`signal` 中止就停发，`timeoutMs` 默认 30000。库在任务被取消或租约丢失时靠它停掉还没发出去的推送；`createReiServer` 默认用的 npm `web-push` 没有这个口，那条路上推送收不到取消信号，只在每条推送发出前检查一次租约。VAPID 三项没配齐时任务失败的 `last_error.errorCode` 是 `VAPID_CONFIG_MISSING`
+- `createTenantToken` / `verifyTenantToken` — 不传 `expiresInSeconds` 签出的 token 不过期，`verifyTenantToken` 有没有 `exp` 都认
 - `deriveUserEncryptionKey` / `decryptPayload` / `encryptPayload` / `encryptForStorage` / `decryptFromStorage` — 全部为 `async` 函数，返回 `Promise`
 - `validateScheduleMessagePayload` / `validateLlmMessagesArray` / `validateSplitPattern` / `validateAvatarUrl` / `MAX_TASK_PAYLOAD_BYTES`
 - `supportsLlmCredentialsStore` / `isValidCredId` / `validateCredRefs` / `validateCredValue` / `hasChatCredRef` / `resolveLlmCredential` / `CRED_ID_MAX_LENGTH` / `CRED_PUT_BATCH_MAX` / `CRED_ROWS_PER_USER_MAX` / `CRED_REFS_MAX_ENTRIES` — 用户级 LLM 凭据存储与 `credRefs` 校验/解析工具
 - `measurePushPayload` / `MAX_PUSH_PAYLOAD_BYTES` / `PUSH_ENVELOPE_RESERVED_BYTES` / `WEB_PUSH_MAX_BODY_BYTES` / `WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES`
 - `isValidISO8601` / `isValidUrl` / `isValidUUID` / `isValidUUIDv4` / `isValidTimeZoneId`
-- `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence` — 循环任务的时区感知推进（宿主想自己算「下次什么时候」时用同一份实现）
+- `advanceOccurrence` / `nextFutureOccurrence` / `planNextOccurrence` — 循环任务的时区感知推进（宿主想自己算「下次什么时候」时用同一份实现）；第五个参数 `anchorMs` 可选，传任务首发时刻，春令时顺延后能回到原钟点
 
 `@rei-standard/amsg-server/cloudflare` 子路径 —— 只含「单用户 + D1 + Web Crypto 推送」这条子图，不引用多租户装配线和 pg / neon / `web-push`，所以 D1-only 安装（不装可选数据库 peer）也能干净打包，Worker 不需要 `nodejs_compat` 兼容 flag：
 
@@ -1066,8 +1148,8 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 
 ## 运行环境与要求
 
-- Node.js `>=20`
-- 必须装：`web-push`、`@netlify/blobs`、以及至少一个数据库驱动（`@neondatabase/serverless` 或 `pg`）
+- Node.js `>=20.3.0`（`package.json` 的 `engines`）
+- 必须装：`web-push`、`@netlify/blobs`（`^10.7.13`）、以及至少一个数据库驱动（`@neondatabase/serverless` 或 `pg`）
 
 ### 环境变量
 
@@ -1122,7 +1204,7 @@ VERCEL_PROTECTION_BYPASS=YOUR_BYPASS_KEY
 
 `onBeforeFire`、`onLLMOutput`、`executeToolCalls` 的 context 以及 `onFireSettled` 回执新增：
 
-- `signal: AbortSignal`：传给工具内部的 `fetch`，与工具自己的超时信号合并。
+- `signal: AbortSignal`：传给工具内部的 `fetch`，与工具自己的超时信号合并。任务被取消、或整条 fire 链用完 `totalTimeoutMs` 时它都会中止；后者任务按可重试失败收场，不算取消。
 - `isCancelled(): boolean`：当前是否已收到取消信号。
 - `throwIfCancelled(): void`：已取消时抛出 `code: 'TASK_CANCELLED'` 的错误。每个副作用开始前检查，工具 catch 中也要先调用它，以免取消被转成普通工具失败后继续执行。
 
