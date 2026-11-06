@@ -1108,6 +1108,24 @@ export default createSingleUserCloudflareWorker(buildConfig, {
 - `onError` 放在工厂的第二个参数上，而不是 `buildConfig` 的返回值里：`buildConfig` 自己抛错时配置里的东西一个都读不到，而那恰恰是最需要被看见的一种故障。`stage` 在 cron 路径上是 `config`（配置构建失败 / VAPID 没配齐）、`tick`（那一跳抛错）或 `cloud-cleanup`（云端数据清理那一步抛错，这一跳的消息照常投递）。VAPID 没配齐这一支没有异常对象，`error` 为 `null`、`cause.name` 是 `VapidNotConfigured`。
 - `scheduled()` 现在有返回值：`{ ok: true, summary }` 或 `{ ok: false, cause }`，`ok` 只看消息投递这一段。云端数据清理那一步出错时，两种返回值上都会多一个 `cloudCleanupCause`。Cloudflare 不看它，是给「自己包一层再转调 `scheduled`」的宿主和测试用的。
 
+### 库里的数据解不开（换过主密钥）
+
+存储密钥由主密钥和 userId 派生，`AMSG_MASTER_KEY` 一换，换之前写进去的数据就全部解不开了。读到这样的数据时，单条读写返回 409：
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "STORED_DATA_UNDECRYPTABLE",
+    "message": "库里的数据是用另一把主密钥加密的，当前的 AMSG_MASTER_KEY 解不开。……"
+  }
+}
+```
+
+出路有两条：换回原来的 `AMSG_MASTER_KEY`，旧数据就能读了；或者清掉云端旧数据（`DELETE /client-state`、`DELETE /cancel-message` 这些删除接口不解密，换密钥后照常能用）。
+
+列表接口不会因为一条坏数据整页报错：`GET /messages` 里解不开的任务照样列出，只有行上的明文字段（`uuid`、`status`、`nextSendAt`、`lastError` 等），外加 `error: { code, message }`；`GET /client-state` 把解不开的 key 放进 `undecryptable: [{ key, updatedAt, code }]`，不进 `entries`。写入一个旧密钥写过的 key 时，旧的归属记录读不出来，按没有旧记录处理，这次写入照常成功。到点投递解不开的任务时，`lastError.errorCode` 是 `STORED_DATA_UNDECRYPTABLE`。
+
 ## 导出 API（Exports）
 
 包根（`@rei-standard/amsg-server`）：

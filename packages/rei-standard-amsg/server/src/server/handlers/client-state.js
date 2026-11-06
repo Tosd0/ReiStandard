@@ -19,6 +19,8 @@
  *                                        同一套 last-write-wins；删掉的条数在
  *                                        data.deleted）
  *   GET    /client-state?namespace=<ns>  one namespace's entries (decrypted, response re-encrypted)
+ *                                        （密文解不开的 key 不进 entries，列在
+ *                                        undecryptable: [{ key, updatedAt, code }]）
  *   DELETE /client-state                 wipe every entry of this user
  *   DELETE /client-state?namespace=<ns>  只清这一个命名空间（连它的大值切片行一起），
  *                                        返回 data.deleted = 删掉的行数
@@ -57,6 +59,7 @@ import {
   writeClientStateEntries,
 } from '../lib/client-state-store.js';
 import { validOwner, validOwnerGeneration } from '../lib/cloud-data-guard.js';
+import { STORED_DATA_UNDECRYPTABLE_CODE } from '../lib/errors.js';
 
 // 单个存储行的 plaintext 上限 = 分块切片大小：≤ 此值的 value 走历史单行路径
 // （存储字节级不变），超过的由服务端透明分块（见 lib/state-chunks.js）。
@@ -234,13 +237,21 @@ export function createClientStateHandler(ctx) {
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
     const rows = await db.getClientState(userId, namespace, key === null ? undefined : { key });
     // 分块存储的值在这里拼回原文；块不齐全的 key 视为不存在（不抛错）。
+    // 解不开的 key（换过主密钥前写的）不进 entries，单列在 undecryptable 里，
+    // 别的 key 照常返回；客户端可以拿这些 key 去 PUT value:null 删掉。
+    const undecryptable = [];
     const decrypted = await resolveClientStateEntries(
       key === null ? rows : rows.filter((row) => row.key === key),
       () => db.getClientState(userId, chunkNamespaceFor(namespace), key === null ? undefined : { keyPrefix: chunkKeyPrefixFor(key) }),
-      (value) => decryptFromStorage(value, userKey)
+      (value) => decryptFromStorage(value, userKey),
+      (row) => undecryptable.push({ key: row.key, updatedAt: row.updated_at, code: STORED_DATA_UNDECRYPTABLE_CODE })
     );
 
-    const encryptedResponse = await encryptPayload({ namespace, entries: decrypted }, userKey);
+    const encryptedResponse = await encryptPayload({
+      namespace,
+      entries: decrypted,
+      ...(undecryptable.length > 0 ? { undecryptable } : {})
+    }, userKey);
     return { status: 200, body: { success: true, encrypted: true, version: 1, data: encryptedResponse } };
   }
 

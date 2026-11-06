@@ -186,6 +186,8 @@ export const config = {
 
 `GET /messages` 的查询参数：`status` 取 `all` / `pending` / `sent` / `failed`（默认 `all`），`limit` 取正整数（默认 20，超过 100 按 100 截），`offset` 取非负整数（默认 0）；`status` 不在集合内、`limit` 小于 1 或非数字、`offset` 为负或非数字返回 `400 INVALID_PARAMETERS`。
 
+某条任务的密文解不开时（主密钥换过），`GET /messages` 照样列出它：只带行上的明文字段（`id`、`uuid`、`status`、`nextSendAt`、`lastError` 等），外加 `error: { code: 'STORED_DATA_UNDECRYPTABLE', message }`，其余任务不受影响。`GET /client-state` 同理：解不开的 key 不进 `entries`，列在 `undecryptable: [{ key, updatedAt, code }]` 里（没有时不带这个字段）。
+
 上表的 `tenantToken` / `cronToken` 是多租户线的鉴权（§5）。**单用户线**（§1.1）同样提供上表里两个 `send-notifications*` 之外的全部端点（它的定时投递不走 HTTP，由平台周期调度直接触发运行时的定时入口），鉴权换成可选的 `X-Client-Token` 共享密钥；并且额外提供以下端点：
 
 | 方法 | 路径 | 描述 |
@@ -629,6 +631,7 @@ Body:
 | 409 | `UPDATE_CONFLICT` | 任务更新失败（可能已被并发修改或删除） |
 | 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化（并发同 `tenantId` 初始化时后到的一方收到） |
 | 409 | `CLOUD_OWNER_RETIRED` / `CLOUD_OWNER_IMMUTABLE` / `CLOUD_CROSS_OWNER_WRITE` / `CLOUD_GUARD_UNSUPPORTED` / `INVALID_CLOUD_OWNER` / `INVALID_CLOUD_OWNER_GENERATION` / `CLOUD_RESOURCE_CHANGED` | 云端归属守卫拒绝写入：归属已停用、显式归属与已有归属不符、跨归属写入、适配器不支持守卫、宿主解析出的归属形状非法、同一资源连续三次撞上并发写入（单用户 Worker 按错误自带的 4xx 状态码返回；`PUT /client-state` 单条归属形状非法只进 `data.rejected`，`/cloud-data` 清理计划的归属形状非法回 400 `INVALID_CLOUD_OWNER`，见 [`docs/cloud-data-management.md`](../docs/cloud-data-management.md)） |
+| 409 | `STORED_DATA_UNDECRYPTABLE` | 库里的密文用当前主密钥解不开（常见于重新部署时换了 `AMSG_MASTER_KEY`）。换回原来的密钥即可恢复，或清掉云端旧数据。单条读写返回这个错误；`GET /messages` 与 `GET /client-state` 只把解不开的条目单独标出，其余照常返回（见 §6） |
 | 413 | `REQUEST_BODY_TOO_LARGE` | `Content-Encoding: gzip` 解压后超过 `maxRequestBodyBytes`（默认 32 MB，仅单用户线） |
 | 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding`（仅单用户线） |
 | 500 | `INIT_FAILED` | 单用户 `init-tenant` 建表失败 |

@@ -3,6 +3,7 @@ import {
   decryptFromStorage,
   encryptForStorage
 } from './encryption.js';
+import { isStoredDataUndecryptableError } from './errors.js';
 import {
   CHUNK_NAMESPACE_PREFIX,
   isChunkNamespace,
@@ -110,6 +111,26 @@ export async function captureCloudTaskGuard(
   return guard;
 }
 
+/**
+ * 读这个资源旧的归属记录。记录是换主密钥之前写的、解不开时按「没有旧记录」
+ * 处理，这次写入照常落库并用新密钥重写这条记录。
+ *
+ * 这等于对这个资源放弃 CLOUD_OWNER_IMMUTABLE 那道检查，放弃得起：同一把密钥加
+ * 密的资源本体也已经解不开，按归属清理时同样认不出它属于谁，旧归属在换密钥那
+ * 一刻就已经失效了。写入方显式带的 owner 照旧要过停用 / 代次检查（下面的
+ * assertCloudGuard）。反过来报错的话，这个 key 在用户清掉云端数据之前永远写不
+ * 进去。比较并写入（expectedCloudMetadata）仍然用读到的那份旧密文，并发语义不变。
+ */
+async function readPreviousMetadata(stored, userKey) {
+  try {
+    return JSON.parse(await decryptFromStorage(stored, userKey));
+  } catch (error) {
+    if (!isStoredDataUndecryptableError(error)) throw error;
+    console.warn('[amsg-server] 旧归属记录解不开（主密钥换过？），按没有旧记录覆盖写入');
+    return null;
+  }
+}
+
 /** Add ownership and transactional guard arguments at the storage boundary.
  * A task-scoped inherited guard always wins over caller-provided output fields. */
 export function createCloudGuardedAdapter(
@@ -141,8 +162,8 @@ export function createCloudGuardedAdapter(
       );
       expectedCloudMetadata = stored;
       if (stored) {
-        const previous = JSON.parse(await decryptFromStorage(stored, userKey));
-        if (previous.owner) {
+        const previous = await readPreviousMetadata(stored, userKey);
+        if (previous?.owner) {
           if (
             resolved.owner &&
             (previous.owner.type !== resolved.owner.type ||

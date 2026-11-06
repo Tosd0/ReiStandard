@@ -71,6 +71,44 @@ export class DeploymentConfigError extends Error {
   }
 }
 
+/** 存储里的密文解不开时的错误码（见 {@link StoredDataUndecryptableError}）。 */
+export const STORED_DATA_UNDECRYPTABLE_CODE = 'STORED_DATA_UNDECRYPTABLE';
+
+/**
+ * 库里存的密文用当前的存储密钥解不开。
+ *
+ * 存储密钥由主密钥（单用户部署里是 `AMSG_MASTER_KEY`）和 userId 派生，主密钥一
+ * 换，换之前写进去的数据就全部解不开了。`decryptFromStorage` 失败时一律抛这个
+ * 错，调用方按 `code` 判断，别去匹配 WebCrypto 的 `OperationError` 原文。
+ *
+ * `status: 409`：请求本身没毛病，是库里的数据跟当前配置对不上；重试也好不了，
+ * 所以不用 5xx。single-user worker 的顶层 catch 和 cloud-data 处理器都按
+ * `code` + 4xx `status` 原样回给调用方。
+ *
+ * 不带 `permanent`：跟 {@link DeploymentConfigError} 一个道理，换回原来的主密钥
+ * 就能恢复，不该把还在退避阶梯上的任务判死。
+ */
+export class StoredDataUndecryptableError extends Error {
+  /** @param {{ cause?: unknown }} [options] */
+  constructor(options = {}) {
+    super(
+      '库里的数据是用另一把主密钥加密的，当前的 AMSG_MASTER_KEY 解不开。常见原因是重新部署时换了 AMSG_MASTER_KEY：换回原来的密钥即可恢复，或者清掉云端的旧数据后重新写入。',
+      options.cause !== undefined ? { cause: options.cause } : undefined
+    );
+    this.name = 'StoredDataUndecryptableError';
+    this.code = STORED_DATA_UNDECRYPTABLE_CODE;
+    this.status = 409;
+  }
+}
+
+/**
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isStoredDataUndecryptableError(error) {
+  return !!error && typeof error === 'object' && /** @type {any} */ (error).code === STORED_DATA_UNDECRYPTABLE_CODE;
+}
+
 /**
  * 把一个已经构造好的错误标成确定性失败（就地改，原样返回），顺带补一个稳定
  * 的 `code`（错误自己带了 code 就不覆盖）。

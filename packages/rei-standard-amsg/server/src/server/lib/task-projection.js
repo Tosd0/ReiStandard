@@ -9,6 +9,9 @@
  * `pushSubscription` 等凭据，投影只挑下面列出的那几个，凭据一个都不出现。
  */
 
+import { decryptFromStorage } from './encryption.js';
+import { isStoredDataUndecryptableError } from './errors.js';
+
 /**
  * @typedef {Object} TaskProjection
  * @property {number|null}  id
@@ -27,6 +30,8 @@
  * @property {string|null}  clientTaskId  - 取自 metadata.amsgClientTaskId
  * @property {Object|null}  credRefs      - 凭据引用（{ <purpose>: <cred_id> }）；引用不是机密，客户端对账要看。没带 → null
  * @property {Object|null}  [metadata]    - 只有 includeMetadata 时才有，见下
+ * @property {{ code: string, message: string }} [error] - 只有这条任务的密文解不开时才有（见
+ *   {@link projectStoredTask}），此时除了行上的明文列，别的字段都是空的
  * @property {{ at: string, occurrence: string, reason: string, errorCode?: string, pushStatus?: number }|null} lastError
  *   `errorCode` 是底层错误的稳定 code（如 `PUSH_PAYLOAD_TOO_LARGE`），拿得到就
  *   带上；`pushStatus` 只在投递失败于推送这一步时出现，值是推送服务回的 HTTP
@@ -88,6 +93,25 @@ export function projectTask(row, decryptedPayload, options = {}) {
       ? parseRowLastError(row.last_error)
       : (payload.lastError ?? null),
   };
+}
+
+/**
+ * 解密任务行再投影；密文解不开（STORED_DATA_UNDECRYPTABLE）时不抛，只用行上的
+ * 明文列投影，外加 `error`。列表里一条坏了不连累其余，调用方也拿得到它的 uuid
+ * 去删。
+ *
+ * @param {Object} row
+ * @param {string} userKey
+ * @param {{ includeMetadata?: boolean }} [options]
+ * @returns {Promise<TaskProjection>}
+ */
+export async function projectStoredTask(row, userKey, options) {
+  try {
+    return projectTask(row, JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)), options);
+  } catch (error) {
+    if (!isStoredDataUndecryptableError(error)) throw error;
+    return { ...projectTask(row, null, options), error: { code: error.code, message: error.message } };
+  }
 }
 
 /**

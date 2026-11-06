@@ -139,7 +139,7 @@ import { isUniqueViolation } from './db-errors.js';
 import { callLlm } from './llm.js';
 import { createStateAccessors } from './state-accessors.js';
 import { createResultEmitter } from './result-emitter.js';
-import { projectTask } from './task-projection.js';
+import { projectTask, projectStoredTask } from './task-projection.js';
 import { isValidTimeZoneId } from './recurrence.js';
 import { resolvePushSubscription } from './push-subscription-store.js';
 import {
@@ -499,9 +499,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw new DeploymentConfigError('AGENTIC_TASK_VIEW_UNSUPPORTED: adapter has no listTasks', { code: 'AGENTIC_TASK_VIEW_UNSUPPORTED' });
     }
     const { tasks, total } = await ctx.db.listTasks(task.user_id, { status, limit, offset });
-    const projected = await Promise.all(tasks.map(async (row) => projectTask(
-      row, JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)), { includeMetadata }
-    )));
+    const projected = await Promise.all(tasks.map((row) => projectStoredTask(row, userKey, { includeMetadata })));
     return { tasks: projected, pagination: { total, limit, offset, hasMore: offset + tasks.length < total } };
   };
 
