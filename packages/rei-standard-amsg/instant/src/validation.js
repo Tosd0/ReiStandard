@@ -29,7 +29,7 @@ function validateMessagesArray(messages) {
     case 'MESSAGE_NOT_OBJECT':
       return `messages[${i}] 必须是对象`;
     case 'INVALID_ROLE':
-      return `messages[${i}].role 必须是 system / user / assistant / tool 之一`;
+      return `messages[${i}].role 必须是 system / developer / user / assistant / tool 之一`;
     case 'TOOL_CALL_MALFORMED':
       return `messages[${i}].tool_calls[${j}] 形状非法 (需要 { id, type:'function', function:{ name, arguments } })`;
     case 'TOOL_CONTENT_INVALID':
@@ -205,18 +205,8 @@ export function validateInstantPayload(payload, opts) {
     };
   }
 
-  if (
-    !payload.pushSubscription ||
-    typeof payload.pushSubscription !== 'object' ||
-    typeof payload.pushSubscription.endpoint !== 'string'
-  ) {
-    return {
-      valid: false,
-      errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: 'pushSubscription 必须是合法 Web Push 订阅对象',
-      details: { missingFields: ['pushSubscription.endpoint'] }
-    };
-  }
+  const subscriptionErr = validatePushSubscription(payload.pushSubscription);
+  if (subscriptionErr) return subscriptionErr;
 
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
@@ -372,17 +362,8 @@ export function validateContinuePayload(payload, opts) {
       errorMessage: 'temperature 必须是有限数字', details: { invalidFields: ['temperature'] }
     };
   }
-  if (
-    !payload.pushSubscription ||
-    typeof payload.pushSubscription !== 'object' ||
-    typeof payload.pushSubscription.endpoint !== 'string'
-  ) {
-    return {
-      valid: false, errorCode: 'INVALID_PAYLOAD_FORMAT',
-      errorMessage: 'pushSubscription 必须是合法 Web Push 订阅对象',
-      details: { missingFields: ['pushSubscription.endpoint'] }
-    };
-  }
+  const subscriptionErr = validatePushSubscription(payload.pushSubscription);
+  if (subscriptionErr) return subscriptionErr;
   const avatarErr = validateAvatarUrl(payload.avatarUrl);
   if (avatarErr) {
     // Soft-strip: same policy as /instant — drop the field, log, continue.
@@ -403,6 +384,55 @@ export function validateContinuePayload(payload, opts) {
   }
 
   return validateHookPathSharedFields(payload, opts) || { valid: true };
+}
+
+/**
+ * `pushSubscription` 的形状校验，`/instant` 与 `/continue` 共用。
+ *
+ * endpoint 是服务端随后要 POST 的 URL，所以只收公网 https：带凭据、localhost、
+ * IP 字面量一律拒掉，免得被当成内网探针。keys 两项在推送加密时才会用到，缺了
+ * 的话整轮 LLM 跑完（计费、最长 300s）才在推送这一步 502——放在这里提前拒。
+ *
+ * @param {unknown} subscription
+ * @returns {{ valid: false, errorCode: string, errorMessage: string, details: Object } | null}
+ */
+function validatePushSubscription(subscription) {
+  const invalid = (message, field) => ({
+    valid: false,
+    errorCode: 'INVALID_PAYLOAD_FORMAT',
+    errorMessage: message,
+    details: { invalidFields: [field] },
+  });
+  if (!subscription || typeof subscription !== 'object' || typeof subscription.endpoint !== 'string') {
+    return {
+      valid: false,
+      errorCode: 'INVALID_PAYLOAD_FORMAT',
+      errorMessage: 'pushSubscription 必须是合法 Web Push 订阅对象',
+      details: { missingFields: ['pushSubscription.endpoint'] }
+    };
+  }
+  let url;
+  try {
+    url = new URL(subscription.endpoint);
+  } catch {
+    return invalid('pushSubscription.endpoint 不是合法 URL', 'pushSubscription.endpoint');
+  }
+  const host = url.hostname;
+  const isIpLiteral = host.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+  if (
+    url.protocol !== 'https:' ||
+    url.username || url.password ||
+    host === 'localhost' || host.endsWith('.localhost') || isIpLiteral
+  ) {
+    return invalid('pushSubscription.endpoint 必须是不带凭据的公网 https URL', 'pushSubscription.endpoint');
+  }
+  const keys = subscription.keys;
+  for (const name of ['p256dh', 'auth']) {
+    if (!keys || typeof keys !== 'object' || typeof keys[name] !== 'string' || !keys[name]) {
+      return invalid(`pushSubscription.keys.${name} 必填且为非空字符串`, `pushSubscription.keys.${name}`);
+    }
+  }
+  return null;
 }
 
 /**

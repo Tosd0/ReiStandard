@@ -53,6 +53,20 @@ function base64UrlLength(n) {
 }
 
 /**
+ * blobStore.maxInlineBytes 的上限校验：内联直推的明文必须装得进单条 push。
+ * 配得更大的话，中等大小的 payload 会跳过 BlobStore 直推、被推送服务 413 拒收。
+ *
+ * @param {unknown} maxInlineBytes
+ */
+export function assertInlineBytesFitPushLimit(maxInlineBytes) {
+  if (!Number.isInteger(maxInlineBytes) || maxInlineBytes <= MAX_PUSH_PAYLOAD_BYTES) return;
+  throw new TypeError(
+    `[amsg-instant] blobStore.maxInlineBytes = ${maxInlineBytes} 超过单条 push 明文上限 `
+    + `${MAX_PUSH_PAYLOAD_BYTES} 字节，超限的内联推送会被推送服务拒收`
+  );
+}
+
+/**
  * maxChunkBytes 的上限校验：满载一片的**信封**（chunk 经 base64url 膨胀 4/3，
  * 再套上分片元数据的 JSON）必须仍装得进单条 push 的明文上限。
  *

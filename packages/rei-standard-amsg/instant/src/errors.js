@@ -70,6 +70,30 @@ export class LlmCallError extends Error {
 }
 
 /**
+ * 请求体字节上限（gzip 压缩前、解压后各自计；Node 适配器的原始 body 同样计）。
+ * gzip 能用几 KB 展开成几 GB，不设上限等于把内存交给调用方决定。数值与
+ * amsg-server 的 DEFAULT_MAX_REQUEST_BODY_BYTES 一致。
+ */
+export const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Thrown while reading the request body once it exceeds
+ * `MAX_REQUEST_BODY_BYTES`. Reading stops at the limit; the handler
+ * maps it to HTTP 413.
+ */
+export class RequestBodyTooLargeError extends Error {
+  /**
+   * @param {number} maxBytes
+   */
+  constructor(maxBytes) {
+    super(`请求体超过 ${maxBytes} 字节上限`);
+    this.name = 'RequestBodyTooLargeError';
+    this.code = 'REQUEST_BODY_TOO_LARGE';
+    this.maxBytes = maxBytes;
+  }
+}
+
+/**
  * Thrown by the in-memory blob adapter when `maxEntries` is reached.
  * Fail-fast over silent LRU eviction — silently dropping a key would
  * let a previously-pushed envelope's `/blob/:key` fetch land on a 404

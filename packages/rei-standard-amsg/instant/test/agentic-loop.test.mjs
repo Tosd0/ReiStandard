@@ -792,7 +792,7 @@ describe('validateInstantPayload hookPath flag', () => {
         apiUrl: LLM_URL,
         apiKey: 'k',
         primaryModel: 'm',
-        pushSubscription: { endpoint: 'https://p/x' },
+        pushSubscription: subKit.subscription,
       },
       { hookPath: true }
     );
@@ -807,7 +807,7 @@ describe('validateInstantPayload hookPath flag', () => {
       apiUrl: LLM_URL,
       apiKey: 'k',
       primaryModel: 'm',
-      pushSubscription: { endpoint: 'https://p/x' },
+      pushSubscription: subKit.subscription,
     });
     assert.equal(r.valid, true);
   });
