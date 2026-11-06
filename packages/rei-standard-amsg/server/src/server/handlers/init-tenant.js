@@ -7,13 +7,14 @@
 
 import { isValidUUIDv4 } from '../lib/validation.js';
 import { getHeader, parseJsonBody } from '../lib/request.js';
+import { constantTimeEqual } from '../lib/constant-time.js';
 
 export function createInitTenantHandler(ctx) {
   async function POST(headers, body) {
     const initSecret = getHeader(headers, 'x-init-secret');
 
     // If initSecret is configured, require a matching X-Init-Secret.
-    if (ctx.tenant.initSecret && initSecret !== ctx.tenant.initSecret) {
+    if (ctx.tenant.initSecret && !(await constantTimeEqual(initSecret, ctx.tenant.initSecret))) {
       return {
         status: 401,
         body: {

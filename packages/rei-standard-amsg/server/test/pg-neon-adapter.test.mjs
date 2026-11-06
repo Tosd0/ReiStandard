@@ -13,6 +13,7 @@ import { PgAdapter } from '../src/server/adapters/pg.js';
 import { NeonAdapter } from '../src/server/adapters/neon.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSpyD1 } from './helpers/sqlite-d1.mjs';
+import { CLEANUP_BATCH_LIMIT } from '../src/server/adapters/schema.js';
 
 /** 把 SQL 压成单行，断言时不用管缩进。 */
 const flat = (text) => text.replace(/\s+/g, ' ').trim();
@@ -175,7 +176,7 @@ for (const backend of BACKENDS) {
     );
     await adapter.initSchema();
 
-    for (const column of ['lease_until', 'retry_after', 'serialize_group']) {
+    for (const column of ['lease_until', 'retry_after', 'serialize_group', 'lease_token']) {
       const altered = calls.some((c) =>
         new RegExp(`ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS ${column}`, 'i').test(flat(c.text))
       );
@@ -238,6 +239,77 @@ for (const backend of BACKENDS) {
 
     await adapter.updateTaskByUuid('u', 'user-1', 'cipher', { retry_count: 0 });
     assert.doesNotMatch(flat(calls.at(-1).text), /lease_until/i, '不改排期的写入不该被租约挡住');
+  });
+
+  // 租约归属：占位时把 leaseToken 写进 lease_token，之后的续租 / 收尾写库 / 删行
+  // 都带同一个值比对。原执行者的租约过期、被别的 tick 接手之后，它迟到的心跳和
+  // 写库才会落空，而不是把接手者的租约续上或改掉。
+  test(`${backend.name}: 带 leaseToken 时占位写 lease_token，续租 / 写库 / 删行都按它比对`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 7 }]);
+
+    await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z', null, null, { leaseToken: 'tok' });
+    assert.match(setClauseOf(calls.at(-1).text), /lease_token = \$4/);
+    assert.deepEqual(calls.at(-1).params, ['2026-01-01T00:10:00.000Z', 7, '2026-01-01T00:00:00.000Z', 'tok']);
+
+    await adapter.renewTaskLease(7, '2026-01-01T00:20:00.000Z', null, { leaseToken: 'tok' });
+    assert.match(flat(calls.at(-1).text).split(/\bWHERE\b/i)[1], /lease_token = \$3/);
+    assert.deepEqual(calls.at(-1).params, ['2026-01-01T00:20:00.000Z', 7, 'tok']);
+
+    await adapter.updateTaskById(7, { lease_until: null }, null, { leaseToken: 'tok' });
+    assert.match(flat(calls.at(-1).text).split(/\bWHERE\b/i)[1], /id = \$2 AND lease_token = \$3/);
+    assert.deepEqual(calls.at(-1).params, [null, 7, 'tok']);
+
+    await adapter.deleteTaskById(7, { leaseToken: 'tok' });
+    assert.match(flat(calls.at(-1).text), /WHERE id = \$1 AND lease_token = \$2/);
+    assert.deepEqual(calls.at(-1).params, [7, 'tok']);
+  });
+
+  test(`${backend.name}: 不带 leaseToken 的调用方语句里没有 lease_token（老契约不变）`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 7 }]);
+    await adapter.claimTask(7, '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z');
+    assert.doesNotMatch(flat(calls.at(-1).text), /lease_token/);
+    await adapter.renewTaskLease(7, '2026-01-01T00:20:00.000Z');
+    assert.doesNotMatch(flat(calls.at(-1).text), /lease_token/);
+    await adapter.updateTaskById(7, { lease_until: null });
+    assert.doesNotMatch(flat(calls.at(-1).text), /lease_token/);
+    await adapter.deleteTaskById(7);
+    assert.doesNotMatch(flat(calls.at(-1).text), /lease_token/);
+  });
+
+  // 调用方自己传了 updated_at（cleanupOldTasks 的测试就这么做）时，不能再追加一个
+  // updated_at = NOW()：Postgres 对同一列的两次赋值直接报错，整条 UPDATE 不生效。
+  test(`${backend.name}: updateTaskById 传了 updated_at 就不再追加 updated_at = NOW()`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 7 }]);
+
+    await adapter.updateTaskById(7, { status: 'sent', updated_at: '2000-01-01T00:00:00.000Z' });
+    const explicit = setClauseOf(calls.at(-1).text);
+    assert.equal((explicit.match(/updated_at/g) || []).length, 1, `同一列赋了两次：${explicit}`);
+    assert.match(explicit, /updated_at = \$2/);
+    assert.deepEqual(calls.at(-1).params, ['sent', '2000-01-01T00:00:00.000Z', 7]);
+
+    await adapter.updateTaskById(7, { status: 'sent' });
+    assert.match(setClauseOf(calls.at(-1).text), /updated_at = NOW\(\)/);
+  });
+
+  // 没有 tie-breaker 的分页：同一触发时刻的几行在两页之间的归属不稳定，翻页会
+  // 重复或漏行。
+  test(`${backend.name}: listTasks 按 next_send_at 排序时带主键作 tie-breaker`, async () => {
+    const { adapter, calls } = backend.make(countAwareRows);
+    await adapter.listTasks('user-1', { limit: 20, offset: 0 });
+    assert.match(flat(calls.at(-1).text), /ORDER BY next_send_at ASC, id ASC/);
+  });
+
+  // 清旧任务每跳有上限（与 D1 同一个数）：无上限的 DELETE 在表积压时会把一跳的
+  // 时间预算吃光。
+  test(`${backend.name}: cleanupOldTasks 一次最多删 ${CLEANUP_BATCH_LIMIT} 条，返回值按删到的行数`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 1 }, { id: 2 }, { id: 3 }]);
+    assert.equal(await adapter.cleanupOldTasks(7), 3);
+    const text = flat(calls.at(-1).text);
+    assert.match(text, /^DELETE FROM scheduled_messages WHERE id IN \( SELECT id FROM scheduled_messages/);
+    assert.match(text, new RegExp(`LIMIT ${CLEANUP_BATCH_LIMIT} \\)`));
+    assert.match(text, /status IN \('sent', 'failed'\)/);
+    assert.match(text, /updated_at < NOW\(\) - make_interval\(days => \$1\)/);
+    assert.deepEqual(calls.at(-1).params, [7]);
   });
 }
 

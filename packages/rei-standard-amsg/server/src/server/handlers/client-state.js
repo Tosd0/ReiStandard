@@ -56,6 +56,7 @@ import {
   stateValueBytes,
   writeClientStateEntries,
 } from '../lib/client-state-store.js';
+import { validOwner, validOwnerGeneration } from '../lib/cloud-data-guard.js';
 
 // 单个存储行的 plaintext 上限 = 分块切片大小：≤ 此值的 value 走历史单行路径
 // （存储字节级不变），超过的由服务端透明分块（见 lib/state-chunks.js）。
@@ -116,6 +117,15 @@ function validateEntry(entry, index, maxValueBytes) {
   const guard = entry.version ?? entry.builtAt;
   if (guard !== undefined && (!Number.isInteger(guard) || guard <= 0)) {
     return rejectEntry(entry, index, 'INVALID_STATE_VERSION', `entries[${index}].version / builtAt 必须是正整数（毫秒时间戳或单调递增版本号）`);
+  }
+  // 云端归属（可选）：形状在这里按条拒，规则和 lib/cloud-data-guard.js 同一份；
+  // 归属是否已停用要查库，仍由落库时的事务守卫整批判定。
+  if (entry.owner !== undefined && entry.owner !== null && !validOwner(entry.owner)) {
+    return rejectEntry(entry, index, 'INVALID_CLOUD_OWNER', `entries[${index}].owner 必须是 { type, id, label? }（type ≤ 100、id ≤ 300、label ≤ 300 字符）`);
+  }
+  // null 与缺省同义（落库时按 0），和 owner 的 null 一个口径。
+  if (entry.ownerGeneration != null && !validOwnerGeneration(entry.ownerGeneration)) {
+    return rejectEntry(entry, index, 'INVALID_CLOUD_OWNER_GENERATION', `entries[${index}].ownerGeneration 必须是非负整数`);
   }
   return null;
 }

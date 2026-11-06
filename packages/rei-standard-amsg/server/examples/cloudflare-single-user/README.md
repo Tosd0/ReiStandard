@@ -393,15 +393,17 @@ export default createSingleUserCloudflareWorker((env) => ({
 
 cron 一分钟一跳，跳与跳之间互不相让；带工具的任务跑过一分钟是常态。所以 `scheduled()` 每条任务开跑前会先占位：在这一行的 `lease_until` 上写下「归我管到现在 + 租期为止」，本次投递期间下一跳领不走它，抢不到的那一跳直接跳过这条。
 
-租期默认 10 分钟，配了 `totalTimeoutMs` 就按它 + 2 分钟往上抬。想自己定就在 config 里加 `claimLeaseMs: 900_000`。`onBeforeFire` 里按次放宽的 `totalTimeoutMs` 占位时看不到，那种情况请显式设 `claimLeaseMs`。
+D1 适配器支持续租，所以默认是心跳租约：占位时只写一段短租约，投递期间每 `leaseHeartbeatMs`（默认 30000）续一次，每次续到「现在 + max(90 秒, 3 × heartbeatMs)」。Worker 中途被回收，最多等这么久就会被接手。config 里 `leaseHeartbeatMs: 0` 关掉心跳，退回一次性长租约：租期默认 10 分钟，配了 `totalTimeoutMs` 就按它 + 2 分钟往上抬，想自己定就在 config 里加 `claimLeaseMs: 900_000`。`onBeforeFire` 里按次放宽的 `totalTimeoutMs` 占位时看不到，那种情况请显式设 `claimLeaseMs`。
+
+占位时还会往 `lease_token` 列写一个随机 token，续租和收尾写库都带着它比对；租约过期后被别的 tick 接手的任务，原来那一跳的收尾写库会扑空，记在 `scheduled()` 返回值的 `details.leaseLostTasks` 里，不会盖掉接手者的进度。
 
 租约写在自己的列上，`next_send_at` 全程不动。`ctx.task.nextSendAt` 拿到的就是这条任务原本的触发时刻，拿它当时间锚点（窗口判断、缓存键）对得上；循环任务也按它推进到下一次。投递收尾时租约就放掉。
 
 投递失败的退避记在另一列 `retry_after` 上，租约同时放掉。两件事分开记：租约的意思只有「这条正在跑」，而正在等重试的任务其实闲着——挤在一列的话，`serializeBy` 会把它当成「这一组忙着」，同组别的任务白等一轮退避（最长 6 分钟）。
 
-Worker 中途被回收就没人来放租约，这条任务会等到租约到期才被后面的 tick 接手。所以租期要比最慢的一次投递长一点，但也别设太长——它同时也是「崩了之后多久能重来」的等待时间。
+关了心跳的话 Worker 中途被回收就没人来放租约，这条任务会等到租约到期才被后面的 tick 接手。所以租期要比最慢的一次投递长一点，但也别设太长——它同时也是「崩了之后多久能重来」的等待时间。
 
-任务表用到三列 `lease_until` / `retry_after` / `serialize_group`。部署后 `POST /init-tenant` 会自动给已有的表补上（跑几次都没事）；手工建表的看 `schema.sql`。
+任务表用到四列 `lease_until` / `lease_token` / `retry_after` / `serialize_group`。部署后 `POST /init-tenant` 会自动给已有的表补上（跑几次都没事）；手工建表的看 `schema.sql`。缺 `lease_token` 列时占位写不进去，每条任务都进 `details.failedTasks`、`status: 'claim_failed'`，一条都不发——下一节的自查会把它列在 `missing` 里。
 
 ## 升级之后先看一眼表结构
 
@@ -411,7 +413,7 @@ Worker 上有两个方法可以查、可以补：
 
 ```js
 const state = await worker.getSchemaVersion(env);
-// → { current: '2.6.0-cloud-data.2' | null, required: '2.6.0-cloud-data.2', ok, missing: ['column:scheduled_messages.last_error', …] }
+// → { current: '3.2.0-lease-token' | null, required: '3.2.0-lease-token', ok, missing: ['column:scheduled_messages.lease_token', …] }
 
 if (!state.ok) await worker.ensureSchema(env); // 建表 + 补列 + 建索引，重复调没事
 ```

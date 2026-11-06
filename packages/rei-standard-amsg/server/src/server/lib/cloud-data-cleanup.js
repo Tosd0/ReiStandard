@@ -4,6 +4,7 @@ import {
   deriveUserEncryptionKey
 } from './encryption.js';
 import { buildCloudDataInventory } from './cloud-data-inventory.js';
+import { validOwner as validCloudOwner } from './cloud-data-guard.js';
 
 export const CLOUD_RESOURCE_TYPES = [
   'task',
@@ -15,17 +16,7 @@ export const CLOUD_RESOURCE_TYPES = [
 export function cloudError(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status });
 }
-export function validCloudOwner(owner) {
-  return (
-    owner &&
-    typeof owner.type === 'string' &&
-    owner.type.length > 0 &&
-    owner.type.length <= 100 &&
-    typeof owner.id === 'string' &&
-    owner.id.length > 0 &&
-    owner.id.length <= 300
-  );
-}
+export { validCloudOwner };
 const ownerEquals = (a, b) => a && b && a.type === b.type && a.id === b.id;
 export async function cloudInventory(ctx, db, userId, userKey) {
   return buildCloudDataInventory({
@@ -258,7 +249,16 @@ function assertRetirementAcknowledged(operation) {
     );
   }
 }
-export async function advanceCleanup(ctx, db, userId, key, operation) {
+/** One call processes up to `maxEntries` resources (25 for an HTTP start, so the
+ * response stays quick) and stops early at `deadline`; cron passes a tick budget. */
+export async function advanceCleanup(
+  ctx,
+  db,
+  userId,
+  key,
+  operation,
+  { maxEntries = 25, deadline = Infinity } = {}
+) {
   if (
     operation.status === 'completed' ||
     operation.status === 'failed' ||
@@ -295,6 +295,7 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
       );
     }
   };
+  let leaseLost = false;
   try {
     operation = await readCloudRecord(
       db,
@@ -373,11 +374,11 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
     const currentById = new Map(
       beforeBatch.entries.map((entry) => [entry.resource.id, entry])
     );
-    const batch = operation.entries.slice(
-      operation.cursor,
-      operation.cursor + 25
-    );
-    for (const entry of batch) {
+    // Locators only live in the inventory (saved entries drop them), so one
+    // inventory before and one after serves every entry processed in this call.
+    const end = Math.min(operation.entries.length, operation.cursor + maxEntries);
+    while (operation.cursor < end && Date.now() < deadline) {
+      const entry = operation.entries[operation.cursor];
       await renewLease();
       const currentEntry = currentById.get(entry.resource.id);
       if (currentEntry && currentEntry.version !== entry.version) {
@@ -451,7 +452,10 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
     operation.errors = [];
     operation.attempts = 0;
   } catch (error) {
-    if (error.code === 'CLOUD_LEASE_LOST') throw error;
+    if (error.code === 'CLOUD_LEASE_LOST') {
+      leaseLost = true;
+      throw error;
+    }
     operation.attempts = (operation.attempts || 0) + 1;
     const terminal =
       ['CLOUD_PLAN_CHANGED', 'CLOUD_OWNER_CHANGED'].includes(error.code) ||
@@ -474,15 +478,19 @@ export async function advanceCleanup(ctx, db, userId, key, operation) {
     if (terminal)
       for (const count of operation.counts) count.failed = count.remaining;
   } finally {
-    operation.updatedAt = Date.now();
-    await save(db, userId, key, 'operation', operation, { leaseToken });
-    if (typeof db.releaseCloudDataRecord === 'function')
-      await db.releaseCloudDataRecord(
-        userId,
-        'operation',
-        operation.id,
-        leaseToken
-      );
+    // After a lost lease the record belongs to the successor: saving would
+    // only fail again and hide the original error.
+    if (!leaseLost) {
+      operation.updatedAt = Date.now();
+      await save(db, userId, key, 'operation', operation, { leaseToken });
+      if (typeof db.releaseCloudDataRecord === 'function')
+        await db.releaseCloudDataRecord(
+          userId,
+          'operation',
+          operation.id,
+          leaseToken
+        );
+    }
   }
   return operation;
 }
@@ -493,6 +501,8 @@ const WORK_INDEX_METHODS = [
 ];
 // How long an operation that could not even be read waits before the next attempt.
 const UNREADABLE_RETRY_MS = 15 * 60000;
+// Wall-clock budget one cron tick spends on cleanup; the worker runs it after message delivery.
+const CLEANUP_TICK_BUDGET_MS = 20000;
 
 async function repairLegacyWorkIndex(ctx) {
   const db = ctx.db;
@@ -539,7 +549,9 @@ export async function resumeCloudDataCleanups(ctx) {
     await db.cleanupCloudDataRecords('plan',Date.now() - 3600000);
     rows = await db.listCloudDataRecordsAcrossUsers('operation');
   }
+  const deadline = Date.now() + CLEANUP_TICK_BUDGET_MS;
   for (const row of rows) {
+    if (Date.now() >= deadline) break;
     try {
       const key = await deriveUserEncryptionKey(row.userId,ctx.masterKey);
       const operation = JSON.parse(await decryptFromStorage(row.data,key));
@@ -555,7 +567,7 @@ export async function resumeCloudDataCleanups(ctx) {
         continue;
       }
       if (['pending','running'].includes(operation.status)) {
-        await advanceCleanup(ctx,db,row.userId,key,operation);
+        await advanceCleanup(ctx,db,row.userId,key,operation,{ maxEntries: Infinity, deadline });
       }
     } catch (error) {
       console.warn('[amsg] A cloud cleanup operation could not be resumed');

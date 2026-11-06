@@ -529,6 +529,33 @@ test('scheduled() 过期跳过后，GET /messages 透出 lastError', async () =>
   assert.equal(data.tasks[0].lastError.occurrence, missedAt);
 });
 
+test('scheduled() 先投递到期消息，再跑云端清理', async () => {
+  const d1 = createTestD1();
+  const adapter = createD1Adapter(d1);
+  await adapter.initSchema();
+  const userKey = await deriveUserEncryptionKey(USER, MASTER_KEY);
+  const enc = await encryptForStorage(JSON.stringify({
+    contactName: 'Rei', messageType: 'fixed', userMessage: 'hi', recurrenceType: 'none'
+  }), userKey);
+  await seedPushSubscription(adapter, USER, MASTER_KEY);
+  await adapter.createTask({ user_id: USER, uuid: 'due', encrypted_payload: enc, next_send_at: new Date(Date.now() - 30_000).toISOString(), message_type: 'fixed' });
+
+  // 记录投递和清理的先后；清理一跳最多跑 20 秒，排前面会拖住到期消息。
+  // listDueCloudDataOperations 只有清理这条链会调。
+  const order = [];
+  const listDue = adapter.listDueCloudDataOperations.bind(adapter);
+  adapter.listDueCloudDataOperations = async (...args) => { order.push('cleanup'); return listDue(...args); };
+  const worker = createSingleUserCloudflareWorker(() => ({
+    db: adapter,
+    masterKey: MASTER_KEY,
+    vapid: { email: 'mailto:x@example.com', publicKey: 'pub', privateKey: 'priv' },
+    webpush: { async sendNotification() { order.push('push'); } }
+  }));
+  const result = await worker.scheduled({}, { DB: d1 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(order, ['push', 'cleanup']);
+});
+
 test('scheduled() 云端清理出错时照常投递消息，出错原因另外上报', async () => {
   const d1 = createTestD1();
   const adapter = createD1Adapter(d1);

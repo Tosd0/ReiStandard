@@ -441,8 +441,9 @@ async function deliverTasks(ctx, tasks) {
   const heartbeatEnabled = heartbeatMs > 0
     && typeof db.claimTask === 'function'
     && typeof db.renewTaskLease === 'function';
-  // 滚动租约的时长：至少盖住两个心跳（一次续租失败不至于立刻被抢走）。
-  const heartbeatLeaseTtlMs = Math.max(DEFAULT_HEARTBEAT_LEASE_TTL_MS, heartbeatMs * 2);
+  // 滚动租约的时长：至少盖住三个心跳（连着两次续租失败也不至于立刻被抢走；
+  // 只盖两拍的话，一次失败加上定时器本身的漂移就贴着到期线走）。
+  const heartbeatLeaseTtlMs = Math.max(DEFAULT_HEARTBEAT_LEASE_TTL_MS, heartbeatMs * 3);
 
   const startTime = Date.now();
 
@@ -458,6 +459,7 @@ async function deliverTasks(ctx, tasks) {
     staleTasks: [],
     deferredTasks: [],
     cancelledTasks: [],
+    leaseLostTasks: [],
     reasoningSkippedTasks: [],
     redeliveredTasks: [],
     failedTasks: []
@@ -469,37 +471,51 @@ async function deliverTasks(ctx, tasks) {
   const groupsTakenThisTick = new Set();
   // Keep the generation captured before claim through retries and all lifecycle writes.
   const taskCloudGuards = new Map();
+  // 占位之后的每一笔写库都带上自己那份租约的标识（见 startLeaseHeartbeat 的
+  // leaseToken）：租约过期后行被别的 tick 接手时，这边迟到的写才会落空，而不是
+  // 把接手者的租约放掉、或把它刚写的状态盖回去。适配器不认这个参数就退回按
+  // id 直写的老行为。
+  const leaseOptions = (taskId) => {
+    const token = activeLeases.get(taskId)?.token;
+    return token ? { leaseToken: token } : null;
+  };
   const updateLifecycleTask = (taskId, fields) => {
-    const guard = taskCloudGuards.get(taskId);
-    return guard ? db.updateTaskById(taskId, fields, guard) : db.updateTaskById(taskId, fields);
+    const guard = taskCloudGuards.get(taskId) ?? null;
+    const options = leaseOptions(taskId);
+    if (!guard && !options) return db.updateTaskById(taskId, fields);
+    return db.updateTaskById(taskId, fields, guard, options ?? {});
   };
 
   // 适配器没实现 claimTask（自定义适配器）→ 退回不占位的老行为：跑得动，只是
   // 超过一跳间隔的慢任务仍可能被下一跳重复触发。
   const supportsClaim = typeof db.claimTask === 'function';
 
-  async function claimForThisTick(task, serializeGroup) {
+  async function claimForThisTick(task, serializeGroup, leaseToken) {
     if (!supportsClaim) return true;
     // 心跳可用时占位只写一小段滚动租约（isolate 死亡 → ~90s 内被接手）；
     // 不可用时保持一次性长租约的老行为。
     const leaseUntil = new Date(
       Date.now() + (heartbeatEnabled ? heartbeatLeaseTtlMs : claimLeaseMs)
     ).toISOString();
-    const guard = taskCloudGuards.get(task.id);
-    return !!(guard
-      ? await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup, guard)
-      : await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup));
+    const guard = taskCloudGuards.get(task.id) ?? null;
+    return !!(await db.claimTask(
+      task.id, task.next_send_at, leaseUntil, serializeGroup, guard,
+      { leaseToken, userId: task.user_id }
+    ));
   }
 
   /**
    * 投递期间的租约心跳：每 heartbeatMs 把 lease_until 推到 now + TTL，顺带盯着
    * 「这条还归不归我」。返回 { lost, stop }：
    *
-   *   - `lost`：续租的条件写没匹配到行。renewTaskLease 只更新「仍是 pending 且
-   *     还持有租约」的行，所以返回 false 的意思是这条任务已经不在原处了——
-   *     `DELETE /message` 取消、`supersedesUuid` 顶替，或者被别的执行者收尾。
-   *     从占位到推送之间投递侧不再读库，这是唯一能知道这件事的信号；丢掉它就
-   *     会出现「接口回了取消成功，消息照样发出去」。
+   *   - `lost`：续租的条件写没匹配到行。renewTaskLease 只更新「仍是 pending、
+   *     还持有租约、且租约仍是自己这份（leaseToken）」的行，所以返回 false 的
+   *     意思是这条任务已经不归自己管了——`DELETE /message` 取消、
+   *     `supersedesUuid` 顶替，或者租约过期后被别的 tick 接手。从占位到推送之
+   *     间投递侧不再读库，这是唯一能知道这件事的信号；丢掉它就会出现「接口回了
+   *     取消成功，消息照样发出去」或两个 tick 各发一遍。哪一种要到收尾时再分
+   *     （见 recordLostLease）：投递侧要做的都一样——剩下的推送一条不发。
+   *   - `token`：这份租约的标识（占位时写进 lease_token），收尾写库都带着它。
    *   - `stop`：投递收尾（不管成败）必须调，不然定时器抱着 db 绑定活到请求结
    *     束之后。
    *
@@ -507,9 +523,9 @@ async function deliverTasks(ctx, tasks) {
    * 成「租约到期被接手」，正是心跳想要的兜底方向。抛错不等于行没了，所以不置
    * lost；同理，只有明确的 false 才算行没了，什么都不返回的自定义适配器照旧。
    */
-  function startLeaseHeartbeat(task) {
+  function startLeaseHeartbeat(task, leaseToken) {
     const controller = new AbortController();
-    const lease = { lost: false, released: false, signal: controller.signal, stop: () => {} };
+    const lease = { lost: false, released: false, token: leaseToken, signal: controller.signal, stop: () => {} };
     if (!heartbeatEnabled) return lease;
     let stopped = false;
     let timer = null;
@@ -517,12 +533,17 @@ async function deliverTasks(ctx, tasks) {
       if (stopped) return;
       let renewed;
       try {
-        const guard = taskCloudGuards.get(task.id);
+        const guard = taskCloudGuards.get(task.id) ?? null;
         const until = new Date(Date.now() + heartbeatLeaseTtlMs).toISOString();
-        renewed = guard ? await db.renewTaskLease(task.id, until, guard) : await db.renewTaskLease(task.id, until);
+        renewed = await db.renewTaskLease(task.id, until, guard, { leaseToken, userId: task.user_id });
       } catch (error) {
-        if (error?.code === 'CLOUD_OWNER_RETIRED') renewed = false;
-        else console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
+        if (error?.code === 'CLOUD_OWNER_RETIRED') {
+          // 归属停用不是租约被接手：收尾按取消处置（撤 outbox），见 recordLostLease。
+          lease.ownerRetired = true;
+          renewed = false;
+        } else {
+          console.warn('[amsg-server] 租约续租失败（下个心跳再试）:', error && error.message);
+        }
       }
       if (renewed === false) {
         // 续不上有两种可能，`false` 本身分不出来：
@@ -537,7 +558,7 @@ async function deliverTasks(ctx, tasks) {
         const error = new Error('Task was cancelled or superseded');
         error.code = TASK_CANCELLED_CODE;
         controller.abort(error);
-        console.warn(`[amsg-server] 任务 ${task.id} 的租约已失效（行被取消或顶替），剩余推送将中止`);
+        console.warn(`[amsg-server] 任务 ${task.id} 的租约已失效（行被取消、顶替，或租约过期后被别的 tick 接手），剩余推送将中止`);
         return;
       }
       if (!stopped) schedule();
@@ -725,6 +746,12 @@ async function deliverTasks(ctx, tasks) {
    * 的（思考过程那条行按策略只落行不推送，delivered_at 一直是空的），这里不撤
    * 的话客户端下一次 `GET /outbox` 照样把已取消任务的内容补收回去。
    */
+  /** 循环任务推进用的锚点：任务原本的首发时刻，春令时顺延过的落点靠它回到原钟点。 */
+  function anchorMsOf(decryptedPayload) {
+    const ms = decryptedPayload && decryptedPayload.firstSendTime ? Date.parse(decryptedPayload.firstSendTime) : NaN;
+    return Number.isNaN(ms) ? undefined : ms;
+  }
+
   async function recordCancelled(task, status) {
     results.cancelledTasks.push({
       taskId: task.id,
@@ -733,6 +760,36 @@ async function deliverTasks(ctx, tasks) {
     });
     console.warn(`[amsg-server] 任务 ${task.id} 在投递期间被取消或顶替（${status}）`);
     await discardUndeliveredPushesForTask({ db, userId: task.user_id, taskUuid: task.uuid });
+  }
+
+  /**
+   * 租约没续上 / 收尾写库扑空：先分清是哪一种再收场。
+   *
+   * 行还在，就是租约过期后被别的 tick 接手了（心跳没跟上、isolate 挂起过
+   * 一阵）：这边只能安静退出，一个字段不写、outbox 也一行不撤——那些行现在
+   * 归接手者管，撤掉等于把它正在投递的内容从补收队列里抹掉。行不在了才是取
+   * 消 / 顶替，走 recordCancelled。读不到行时按「行还在」处理：宁可少撤一次，
+   * 也不能撤掉别人的。没有 uuid 的行分不出来，按老行为当取消计。
+   */
+  async function recordLostLease(task, status) {
+    if (activeLeases.get(task.id)?.ownerRetired) {
+      await recordCancelled(task, 'owner_retired');
+      return;
+    }
+    let rowGone = !task.uuid;
+    if (task.uuid) {
+      try {
+        rowGone = (await db.getTaskStatus(task.uuid, task.user_id)) === null;
+      } catch (_readError) {
+        rowGone = false;
+      }
+    }
+    if (rowGone) {
+      await recordCancelled(task, status);
+      return;
+    }
+    results.leaseLostTasks.push({ taskId: task.id, status });
+    console.warn(`[amsg-server] 任务 ${task.id} 的租约已被别的 tick 接手（${status}），本跳不再写这条任务`);
   }
 
   /**
@@ -860,24 +917,32 @@ async function deliverTasks(ctx, tasks) {
     // errorCode / pushStatus 是给下游判定用的。判终态的依据也在这两个字段里，
     // 不写出去的话下游只知道「失败了」，不知道该让用户重建订阅还是裁短内容。
     const errorExtra = buildErrorExtra(errorCode, pushStatus);
+    // 收尾写库带着租约 token：扑空说明行没了或租约已归别的 tick，这次失败不是
+    // 我们该记的（接手方会自己收尾），按租约丢失处置。
+    const landed = async (write) => {
+      if (!rowVanished(await write)) return true;
+      results.failedCount--;
+      await recordLostLease(task, 'cancelled_mid_delivery');
+      return false;
+    };
     try {
       if (permanent || failure.willRetry === false || task.retry_count >= (failure.retryLimit ?? maxDeliveryRetries)) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
         if (isRecurringType(recurrenceType)) {
-          const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
-          await updateAndRelease(task.id, {
+          const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload));
+          if (!await landed(updateAndRelease(task.id, {
             next_send_at: nextSendAt,
             retry_count: 0,
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'occurrence_skipped', nextSendAt, ...(permanent ? { permanent: true } : {}) });
         } else {
-          await updateAndRelease(task.id, {
+          if (!await landed(updateAndRelease(task.id, {
             status: 'failed',
             ...(encrypted ? { encrypted_payload: encrypted } : {}),
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: 'permanently_failed', ...(permanent ? { permanent: true } : {}) });
         }
       } else {
@@ -885,23 +950,23 @@ async function deliverTasks(ctx, tasks) {
         if (supportsClaim) {
           // 等重试的行也带上 last_error：客户端不用等三轮跑完才知道「为什么
           // 还没来」，中途查 GET /message 就看得到当前的失败原因。
-          await updateTaskWithLastError(task.id, {
+          if (!await landed(updateTaskWithLastError(task.id, {
             retry_after: nextRetryTime.toISOString(),
             lease_until: null,
             retry_count: task.retry_count + 1,
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
         } else {
-          await updateTaskWithLastError(task.id, {
+          if (!await landed(updateTaskWithLastError(task.id, {
             next_send_at: nextRetryTime.toISOString(),
             retry_count: task.retry_count + 1,
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
         }
         results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count + 1, nextRetryAt: nextRetryTime.toISOString() });
       }
     } catch (updateError) {
-      results.failedTasks.push({ taskId: task.id, reason, status: 'retry_update_failed', updateError: updateError.message });
+      results.failedTasks.push({ taskId: task.id, reason, status: 'retry_update_failed', updateError: updateError?.message ?? String(updateError) });
     }
   }
 
@@ -912,14 +977,21 @@ async function deliverTasks(ctx, tasks) {
    * pending，租约到期后会被重发这个 occurrence（推送 id 掺了名义时刻，已
    * 送达的段会在客户端被去重）。
    */
-  async function handlePostSendPersistenceFailure(task, reason, recurrenceType, tzId) {
+  async function handlePostSendPersistenceFailure(task, reason, recurrenceType, tzId, anchorMs) {
     results.failedCount++;
+    // 带 token 的写扑空 = 租约已不在手里，这条由接手方收尾（见 recordLostLease）。
+    const vanished = async (write) => {
+      if (!rowVanished(await write)) return false;
+      results.failedCount--;
+      await recordLostLease(task, 'cancelled_after_delivery');
+      return true;
+    };
     if (isRecurringType(recurrenceType)) {
       let advanced = false;
       let nextSendAt = null;
       try {
-        nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
-        await updateAndRelease(task.id, { next_send_at: nextSendAt, retry_count: 0 });
+        nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId, anchorMs);
+        if (await vanished(updateAndRelease(task.id, { next_send_at: nextSendAt, retry_count: 0 }))) return;
         advanced = true;
       } catch (_advanceError) {
         advanced = false;
@@ -934,7 +1006,7 @@ async function deliverTasks(ctx, tasks) {
     }
     let markedSent = false;
     try {
-      await updateAndRelease(task.id, { status: 'sent', retry_count: 0 });
+      if (await vanished(updateAndRelease(task.id, { status: 'sent', retry_count: 0 }))) return;
       markedSent = true;
     } catch (_markSentError) {
       markedSent = false;
@@ -961,13 +1033,15 @@ async function deliverTasks(ctx, tasks) {
       ? await deriveSerializeGroup(userKey, serializeKey)
       : null;
 
+    // 这份租约的标识：占位时写进行里，心跳和收尾写库都带着它比对。
+    const leaseToken = supportsClaim ? globalThis.crypto.randomUUID() : null;
     let claimed;
     try {
       if (decrypted.ok) {
         const guard = await captureCloudTaskGuard(db, task.user_id, decryptedPayload, ctx.cloudData?.resolveOwner, task);
         if (guard) taskCloudGuards.set(task.id, guard);
       }
-      claimed = await claimForThisTick(task, serializeGroup);
+      claimed = await claimForThisTick(task, serializeGroup, leaseToken);
     } catch (error) {
       if (error?.code === 'CLOUD_OWNER_RETIRED') {
         await recordCancelled(task, 'owner_retired');
@@ -976,7 +1050,7 @@ async function deliverTasks(ctx, tasks) {
       // 占位这一步就出错，说明库有问题——此时不知道别人有没有在跑这条，宁可
       // 不发。行还是 pending，下一跳会重新捞。
       results.failedCount++;
-      results.failedTasks.push({ taskId: task.id, reason: error.message || '任务占位失败', status: 'claim_failed' });
+      results.failedTasks.push({ taskId: task.id, reason: error?.message || '任务占位失败', status: 'claim_failed' });
       return;
     }
     if (!claimed) {
@@ -988,7 +1062,7 @@ async function deliverTasks(ctx, tasks) {
 
     // 占位成功，投递期间滚动续租（见 startLeaseHeartbeat）。收尾必须停心跳，
     // 不管下面哪条路径退出——finally 兜住。
-    const lease = startLeaseHeartbeat(task);
+    const lease = startLeaseHeartbeat(task, leaseToken);
     activeLeases.set(task.id, lease);
     try {
       await deliverClaimedTask(task, decrypted, lease);
@@ -1071,7 +1145,7 @@ async function deliverTasks(ctx, tasks) {
         // 差异全部收进 plan 里，尾部只写一遍——两个近似复制的分支各改各的，
         // 漏改一边是迟早的事。
         const recurring = isRecurringType(recurrenceType);
-        const plan = recurring ? planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId) : null;
+        const plan = recurring ? planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload)) : null;
         const nextSendAt = recurring ? new Date(plan.nextMs).toISOString() : null;
         const action = recurring ? 'fast_forwarded' : 'expired';
         const skippedCount = recurring ? plan.skippedCount : 1;
@@ -1079,11 +1153,19 @@ async function deliverTasks(ctx, tasks) {
           task, decryptedPayload, userKey, 'stale',
           recurring ? { skippedCount, nextSendAt } : undefined
         );
-        await updateAndRelease(task.id, {
+        const settled = await updateAndRelease(task.id, {
           ...(recurring ? { next_send_at: nextSendAt, retry_count: 0 } : { status: 'failed' }),
           ...(encrypted ? { encrypted_payload: encrypted } : {}),
           last_error: lastErrorJson(task, 'stale', recurring ? { skippedCount, nextSendAt } : undefined)
         });
+        if (rowVanished(settled)) {
+          await recordLostLease(task, 'cancelled_before_delivery');
+          return;
+        }
+        // 之前几轮落进 outbox 却没推出去的行也是过期内容，不撤的话客户端会从
+        // GET /outbox 把它们补收回去。放在 hook 前面：hook 里 emitResult 落的
+        // 「错过了」回执要留着。
+        await discardUndeliveredPushesForTask({ db, userId: task.user_id, taskUuid: task.uuid });
         results.staleTasks.push({
           taskId: task.id,
           reason: 'stale',
@@ -1111,7 +1193,7 @@ async function deliverTasks(ctx, tasks) {
         });
       } catch (error) {
         results.failedCount++;
-        results.failedTasks.push({ taskId: task.id, reason: error.message || '过期任务处理失败', status: 'stale_update_failed' });
+        results.failedTasks.push({ taskId: task.id, reason: error?.message || '过期任务处理失败', status: 'stale_update_failed' });
       }
     };
 
@@ -1155,7 +1237,7 @@ async function deliverTasks(ctx, tasks) {
           lease_until: null
         });
         if (rowVanished(updated)) {
-          await recordCancelled(task, 'cancelled_mid_delivery');
+          await recordLostLease(task, 'cancelled_mid_delivery');
           return;
         }
         results.deferredTasks.push({ taskId: task.id, retryAfter });
@@ -1163,7 +1245,7 @@ async function deliverTasks(ctx, tasks) {
         // 推迟没写进去：行还是 pending，租约到期后下一跳会把它重新捞起来，
         // 等于提前再问一次 onBeforeFire。
         results.failedCount++;
-        results.failedTasks.push({ taskId: task.id, reason: error.message || '推迟写库失败', status: 'defer_update_failed' });
+        results.failedTasks.push({ taskId: task.id, reason: error?.message || '推迟写库失败', status: 'defer_update_failed' });
       }
     };
 
@@ -1191,7 +1273,7 @@ async function deliverTasks(ctx, tasks) {
       );
     } catch (error) {
       if (lease.lost) {
-        await recordCancelled(task, 'cancelled_mid_delivery');
+        await recordLostLease(task, 'cancelled_mid_delivery');
         return;
       }
       // 兜底分支：processSingleMessage 自己把整个流程包在 try/catch 里，失败
@@ -1200,7 +1282,7 @@ async function deliverTasks(ctx, tasks) {
       // 么状态码」，任何来路的 `statusCode` 都不该冒充它（404 / 410 会让任务
       // 被判成订阅失效、永久 failed）。
       await handleDeliveryFailure(
-        task, error.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
+        task, error?.message || '消息发送失败', recurrenceType, decryptedPayload, userKey,
         { errorCode: error.code || null, permanent: error.permanent === true, pushStatus: null }
       );
       return;
@@ -1210,7 +1292,7 @@ async function deliverTasks(ctx, tasks) {
     // success，但它不是失败。
     if (sendResult.deferred) {
       if (lease.lost) {
-        await recordCancelled(task, 'cancelled_mid_delivery');
+        await recordLostLease(task, 'cancelled_mid_delivery');
         return;
       }
       await handleDeferred(sendResult.retryAfter);
@@ -1225,7 +1307,7 @@ async function deliverTasks(ctx, tasks) {
       // 取消是拦下来的，不是发失败——按失败走会给一条已经不存在的行排重试，
       // 也会把这件事混进 failedTasks 里。
       if (lease.lost) {
-        await recordCancelled(task, 'cancelled_mid_delivery');
+        await recordLostLease(task, 'cancelled_mid_delivery');
         return;
       }
       await handleDeliveryFailure(
@@ -1261,8 +1343,9 @@ async function deliverTasks(ctx, tasks) {
       if (recurrenceType === 'none') {
         // 行删掉之后租约当然也续不上了，跟收尾写库一样先标一下（见 markLeaseReleased）。
         markLeaseReleased(task.id);
-        if (rowVanished(await db.deleteTaskById(task.id))) {
-          await recordCancelled(task, 'cancelled_after_delivery');
+        const deleteOptions = leaseOptions(task.id);
+        if (rowVanished(deleteOptions ? await db.deleteTaskById(task.id, deleteOptions) : await db.deleteTaskById(task.id))) {
+          await recordLostLease(task, 'cancelled_after_delivery');
           return;
         }
         results.deletedOnceOffTasks++;
@@ -1276,7 +1359,7 @@ async function deliverTasks(ctx, tasks) {
         // payload 那一份只在真有 lastError 时才重写（正常投递不会每次都重新加
         // 密整份正文），而且重写前会确认行上的密文还是手里这一份，见
         // encryptPayloadWithoutLastError。
-        const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
+        const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload));
         const clearedPayload = (decryptedPayload && decryptedPayload.lastError)
           ? await encryptPayloadWithoutLastError(task, decryptedPayload, userKey)
           : null;
@@ -1287,7 +1370,7 @@ async function deliverTasks(ctx, tasks) {
           ...(clearedPayload ? { encrypted_payload: clearedPayload } : {})
         });
         if (rowVanished(updated)) {
-          await recordCancelled(task, 'cancelled_after_delivery');
+          await recordLostLease(task, 'cancelled_after_delivery');
           return;
         }
         results.updatedRecurringTasks++;
@@ -1295,7 +1378,7 @@ async function deliverTasks(ctx, tasks) {
 
       results.successCount++;
     } catch (error) {
-      await handlePostSendPersistenceFailure(task, error.message || '发送后状态更新失败', recurrenceType, tzId);
+      await handlePostSendPersistenceFailure(task, error?.message || '发送后状态更新失败', recurrenceType, tzId, anchorMsOf(decryptedPayload));
     }
   }
 
@@ -1326,9 +1409,14 @@ async function deliverTasks(ctx, tasks) {
   while (taskQueue.length > 0 || processing.length > 0) {
     while (processing.length < MAX_CONCURRENT && taskQueue.length > 0) {
       const entry = taskQueue.shift();
-      const promise = processTask(entry);
+      // processTask 自己兜住了各条路径的错误，这里是最后一道：它真的 reject 了
+      // 也只记成这一条失败，别让 Promise.race 把整跳带崩、同跳里其他任务半途而废。
+      const promise = processTask(entry).catch((error) => {
+        results.failedCount++;
+        results.failedTasks.push({ taskId: entry.task.id, reason: error?.message || '任务处理异常', status: 'unexpected_error' });
+      });
       processing.push(promise);
-      promise.finally(() => {
+      promise.then(() => {
         const index = processing.indexOf(promise);
         if (index > -1) processing.splice(index, 1);
       });
@@ -1359,8 +1447,12 @@ async function deliverTasks(ctx, tasks) {
       deferredTasks: results.deferredTasks,
       // 投递期间行被取消 / 顶替的任务。`cancelled_mid_delivery` = 推送在发出去
       // 之前被拦下；`cancelled_after_delivery` = 推送已经发完，收尾写库才发现
-      // 行没了。两种都不计入 successCount / failedCount。
+      // 行没了；`cancelled_before_delivery` = 过期收场写库时发现行没了。三种都
+      // 不计入 successCount / failedCount。
       cancelledTasks: results.cancelledTasks,
+      // 租约过期后被别的 tick 接手的任务（{ taskId, status }，status 与上面同一
+      // 套：说明是在哪一步发现的）。这边没再写过这条任务，也不计成功 / 失败。
+      leaseLostTasks: results.leaseLostTasks,
       // 正文送到了、只有思考过程没发出去的任务（{ taskId, reason }）。这些任务
       // 照常计入 successCount——列在这里只是让「这次没有思考过程」看得见。
       reasoningSkippedTasks: results.reasoningSkippedTasks,

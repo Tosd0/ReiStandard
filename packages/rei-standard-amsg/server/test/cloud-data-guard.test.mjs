@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { deriveUserEncryptionKey, encryptForStorage, decryptFromStorage } from '../src/server/lib/encryption.js';
-import { createCloudGuardedAdapter, captureCloudTaskGuard, assertCloudGuard } from '../src/server/lib/cloud-data-guard.js';
+import { createCloudGuardedAdapter, captureCloudTaskGuard, assertCloudGuard, validOwner, MAX_OWNER_LABEL_CHARS } from '../src/server/lib/cloud-data-guard.js';
 import { chunkNamespaceFor, chunkKeyFor, buildChunkedRootValue } from '../src/server/lib/state-chunks.js';
 
 const owner = { type: 'character', id: 'one', label: 'Private name' };
@@ -155,16 +155,59 @@ test('task-scoped wrapper over the configured wrapper keeps the restored task ge
   } finally { raw.close(); }
 });
 
-test('unowned write cannot overwrite ownership assigned concurrently after metadata lookup', async () => {
+test('unowned write racing an ownership assignment lands last-write-wins and keeps that ownership', async () => {
   const { raw, db, wrapped, key } = await setup();
   try {
     const originalUpsert = db.upsertClientState.bind(db);
+    let injected = false;
     db.upsertClientState = async (...args) => {
-      await originalUpsert('u', [{ namespace: 'race', key: 'k', value: await encryptForStorage('owned', key), updatedAt: 1,
-        encryptedCloudMetadata: await encryptForStorage(JSON.stringify({ owner, kind: null, generation: 0 }), key) }]);
+      if (!injected) {
+        injected = true;
+        await originalUpsert('u', [{ namespace: 'race', key: 'k', value: await encryptForStorage('owned', key), updatedAt: 1,
+          encryptedCloudMetadata: await encryptForStorage(JSON.stringify({ owner, kind: null, generation: 0 }), key) }]);
+      }
       return originalUpsert(...args);
     };
-    await assert.rejects(wrapped.upsertClientState('u', [{ namespace: 'race', key: 'k', value: await encryptForStorage('unowned', key), updatedAt: 2 }]), { code: 'CLOUD_RESOURCE_CHANGED' });
-    assert.equal(await decryptFromStorage((await db.getClientState('u', 'race'))[0].value, key), 'owned');
+    await wrapped.upsertClientState('u', [{ namespace: 'race', key: 'k', value: await encryptForStorage('unowned', key), updatedAt: 2 }]);
+    assert.equal(await decryptFromStorage((await db.getClientState('u', 'race'))[0].value, key), 'unowned');
+    const sidecar = await db.getCloudResourceMetadata('u', JSON.stringify(['state', 'race', 'k']));
+    assert.deepEqual(JSON.parse(await decryptFromStorage(sidecar, key)).owner, owner);
   } finally { raw.close(); }
+});
+
+test('two devices writing the same unowned key concurrently both succeed instead of one failing with 500', async () => {
+  const { raw, db, wrapped, key } = await setup();
+  try {
+    await wrapped.upsertClientState('u', [{ namespace: 'shared', key: 'k', value: await encryptForStorage('v0', key), updatedAt: 1 }]);
+    const originalUpsert = db.upsertClientState.bind(db);
+    let injected = false;
+    db.upsertClientState = async (...args) => {
+      if (!injected) {
+        injected = true;
+        // The other device's write commits between this request's sidecar lookup and its own write.
+        await wrapped.upsertClientState('u', [{ namespace: 'shared', key: 'k', value: await encryptForStorage('other-device', key), updatedAt: 2 }]);
+      }
+      return originalUpsert(...args);
+    };
+    const result = await wrapped.upsertClientState('u', [{ namespace: 'shared', key: 'k', value: await encryptForStorage('this-device', key), updatedAt: 3 }]);
+    assert.equal(result.upserted, 1);
+    assert.equal(await decryptFromStorage((await db.getClientState('u', 'shared'))[0].value, key), 'this-device');
+    // Three consecutive concurrent changes still surface as a conflict, but as 409 rather than an unmapped error.
+    db.upsertClientState = async (...args) => {
+      await originalUpsert('u', [{ namespace: 'shared', key: 'k', value: await encryptForStorage('busy', key), updatedAt: 9,
+        encryptedCloudMetadata: await encryptForStorage(JSON.stringify({ owner: null, kind: null, generation: 0 }), key) }]);
+      return originalUpsert(...args);
+    };
+    await assert.rejects(wrapped.upsertClientState('u', [{ namespace: 'shared', key: 'k', value: await encryptForStorage('late', key), updatedAt: 10 }]), { code: 'CLOUD_RESOURCE_CHANGED', status: 409 });
+  } finally { raw.close(); }
+});
+
+test('validOwner trims type and id and bounds the label like every other owner field', () => {
+  assert.ok(validOwner({ type: 'character', id: 'one' }));
+  assert.ok(validOwner({ type: 'character', id: 'one', label: 'x'.repeat(MAX_OWNER_LABEL_CHARS) }));
+  assert.ok(validOwner({ type: 'character', id: 'one', label: null }));
+  assert.ok(!validOwner({ type: ' ', id: 'one' }));
+  assert.ok(!validOwner({ type: 'character', id: '\t' }));
+  assert.ok(!validOwner({ type: 'character', id: 'one', label: 42 }));
+  assert.ok(!validOwner({ type: 'character', id: 'one', label: 'x'.repeat(MAX_OWNER_LABEL_CHARS + 1) }));
 });

@@ -151,7 +151,6 @@ import {
 } from './llm-credentials-store.js';
 import {
   appendPushesToOutbox,
-  discardUndeliveredPushes,
   discardUndeliveredPushesForTask,
   markPushesDelivered,
 } from './outbox-store.js';
@@ -165,6 +164,7 @@ import {
   sendTaggedPush,
 } from './errors.js';
 import { validateTaskPayloadSize } from './validation.js';
+import { withPushSignal, assertVapidConfigured } from './webpush-webcrypto.js';
 
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 export const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
@@ -381,17 +381,22 @@ function firstPositiveNumber(values, fallback) {
 export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
   // One cancellation identity flows through fetch, hooks and settlement.
-  const signal = ctx.signal || new AbortController().signal;
-  const isCancelled = () => signal.aborted || ctx.isTaskCancelled?.() === true;
+  const taskSignal = ctx.signal || new AbortController().signal;
+  const isCancelled = () => taskSignal.aborted || ctx.isTaskCancelled?.() === true;
   const throwIfCancelled = () => {
     if (!isCancelled()) return;
-    if (isTaskCancelledError(signal.reason)) throw signal.reason;
+    if (isTaskCancelledError(taskSignal.reason)) throw taskSignal.reason;
     const error = new Error('Task was cancelled or superseded');
     error.code = 'TASK_CANCELLED';
     throw error;
   };
-  const cancellation = { signal, isCancelled, throwIfCancelled };
-  ctx = { ...ctx, ...cancellation };
+  // 发给宿主 hook / fetch / 推送的 signal：任务取消和总预算超时都会把它中止掉。
+  // 「取消了没有」仍只看 taskSignal——超时是失败要重试，不能被当成取消。
+  const hookController = new AbortController();
+  if (taskSignal.aborted) hookController.abort(taskSignal.reason);
+  else taskSignal.addEventListener('abort', () => hookController.abort(taskSignal.reason), { once: true });
+  const cancellation = { signal: hookController.signal, isCancelled, throwIfCancelled };
+  ctx = { ...ctx, ...cancellation, webpush: withPushSignal(ctx.webpush, hookController.signal) };
 
   if (typeof hooks.onLLMOutput !== 'function') {
     throw new DeploymentConfigError(
@@ -914,7 +919,7 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
     const outcome = await runFireChain({
       task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
       readState, writeState, emitResult, storeAttachment, scratch, scheduleTask, listTasks, cancelTask, renewTask,
-      resolveLlmCredential, fireCtx, progress,
+      resolveLlmCredential, fireCtx, progress, hookController,
       sessionId, messageIdBase, occurrenceMs,
     });
     throwIfCancelled();
@@ -982,11 +987,16 @@ export async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
 async function runFireChain({
   task, decryptedPayload, userKey, ctx, hooks, nowFn, sleep,
   readState, writeState, emitResult, storeAttachment, scratch, scheduleTask, listTasks, cancelTask, renewTask,
-  resolveLlmCredential, fireCtx, progress,
+  resolveLlmCredential, fireCtx, progress, hookController,
   sessionId, messageIdBase, occurrenceMs,
 }) {
   ctx.throwIfCancelled();
-  const before = await hooks.onBeforeFire(fireCtx);
+  // onBeforeFire 自己也可能挂住，而它要返回了才知道这次 fire 的预算是多少，
+  // 先按 ctx 级的预算等它。
+  const beforeFireBudgetMs = firstPositiveNumber([ctx.totalTimeoutMs], DEFAULT_TOTAL_TIMEOUT_MS);
+  const before = await awaitWithinBudget(() => hooks.onBeforeFire(fireCtx), beforeFireBudgetMs, {
+    hookController, makeError: () => totalTimeoutError(beforeFireBudgetMs, 0),
+  });
   ctx.throwIfCancelled();
   if (before == null) return { handled: false };
 
@@ -1057,10 +1067,11 @@ async function runFireChain({
 
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
     ctx.throwIfCancelled();
-    if (nowFn() >= deadline) {
-      throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
-    }
+    if (nowFn() >= deadline) throw totalTimeoutError(totalTimeoutMs, iteration);
     progress.iterations = iteration + 1;
+    const withinDeadline = (run) => awaitWithinBudget(run, deadline - nowFn(), {
+      hookController, makeError: () => totalTimeoutError(totalTimeoutMs, iteration + 1),
+    });
 
     // Shrink each round's fetch timeout to the remaining wall-time budget
     // (capped at the legacy 300s single-call ceiling) — a hung LLM request
@@ -1124,7 +1135,7 @@ async function runFireChain({
       resolveLlmCredential,
     });
 
-    const decision = await hooks.onLLMOutput(sessionCtx);
+    const decision = await withinDeadline(() => hooks.onLLMOutput(sessionCtx));
     ctx.throwIfCancelled();
     // Repair model-produced call entries before validating the surrounding
     // hook decision. Invalid decision tags/containers still fail validation.
@@ -1219,14 +1230,16 @@ async function runFireChain({
     let toolResults;
     try {
       ctx.throwIfCancelled();
-      toolResults = permittedCalls.length > 0 ? await hooks.executeToolCalls(permittedCalls, sessionCtx) : [];
+      toolResults = permittedCalls.length > 0
+        ? await withinDeadline(() => hooks.executeToolCalls(permittedCalls, sessionCtx))
+        : [];
       ctx.throwIfCancelled();
       if (!Array.isArray(toolResults)) {
         throw new TypeError('executeToolCalls must resolve to an array of { tool_call_id, role: "tool", content }');
       }
     } catch (error) {
       ctx.throwIfCancelled();
-      if (isTaskCancelledError(error)) throw error;
+      if (isTaskCancelledError(error) || error?.code === TOTAL_TIMEOUT_CODE) throw error;
       // Feed the failure back as tool results and let the LLM talk its way
       // out, instead of failing the whole fire.
       toolResults = permittedCalls.map((toolCall) => ({
@@ -1268,6 +1281,48 @@ async function runFireChain({
     `AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`,
     'AGENTIC_LOOP_EXCEEDED'
   );
+}
+
+const TOTAL_TIMEOUT_CODE = 'AGENTIC_TOTAL_TIMEOUT';
+
+/** 总预算用完。留在退避阶梯里：下次重试多半是宿主工具 / 上游恢复了。 */
+function totalTimeoutError(totalTimeoutMs, rounds) {
+  return taggedRetryableError(
+    `${TOTAL_TIMEOUT_CODE}: fire chain exceeded ${totalTimeoutMs}ms after ${rounds} LLM round(s)`,
+    TOTAL_TIMEOUT_CODE
+  );
+}
+
+/**
+ * 等一个宿主 hook / 工具调用，但最多等到预算用完：超时就把发给宿主的 signal
+ * 中止掉，再按总预算超时的路径抛错。不这样的话一个挂住的宿主工具会让整次
+ * fire 永远不返回（Cloudflare 上 Worker 被杀、下一跳重跑，每隔十几分钟重烧一次
+ * LLM）。
+ *
+ * @template T
+ * @param {() => Promise<T>} run
+ * @param {number} remainingMs
+ * @param {{ hookController: AbortController, makeError: () => Error }} options
+ * @returns {Promise<T>}
+ */
+async function awaitWithinBudget(run, remainingMs, { hookController, makeError }) {
+  const expire = () => {
+    const error = makeError();
+    hookController.abort(error);
+    return error;
+  };
+  if (remainingMs <= 0) throw expire();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    // setTimeout 的上限是 2^31-1 ms，超了会立刻触发。
+    timer = setTimeout(() => reject(expire()), Math.min(remainingMs, 2_147_483_647));
+    if (typeof timer?.unref === 'function') timer.unref();
+  });
+  try {
+    return await Promise.race([run(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -1505,9 +1560,7 @@ async function sendHookPushPayloads({
     if (ctx._deliveryState) ctx._deliveryState.outboxed = outboxed;
     ctx.throwIfCancelled();
 
-    if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-      throw new Error('VAPID configuration missing - push notifications cannot be sent');
-    }
+    assertVapidConfigured(ctx.vapid);
     // 用户级订阅，投递时现读（任务行不携带它）。升级前创建的任务把订阅冻结
     // 在 payload 里，用户级存储没有时兜底用那一份。
     const pushSubscription = await resolvePushSubscription({
@@ -1549,14 +1602,9 @@ async function sendHookPushPayloads({
     markUnrecoverablePartialDelivery(error, { outboxed, pushedCount });
     // 部分失败：已发出的段在 outbox 里标 delivered（没标的正是要补收的），
     // 再让宿主知道已经发出去了几段——先通知，再把错误往上抛。
+    // 取消 / 租约丢失时这里不撤 outbox：行还在的话是被别的 tick 接手了，撤掉的
+    // 是接手者正在投的行。撤不撤由 run-tick 查过行在不在之后决定（recordLostLease）。
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-    if (isTaskCancelledError(error)) {
-      // 投递到一半任务被取消 / 顶替：剩下这几条不会再发了，行也别留着——留着
-      // 客户端会从 GET /outbox 把它们补收回去（见 lib/outbox-store.js）。
-      await discardUndeliveredPushes({
-        db: ctx.db, userId: task.user_id, pushes: finalized, sentIds,
-      });
-    }
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, pushedCount, outboxed, error });
     throw error;
   }

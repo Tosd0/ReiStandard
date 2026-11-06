@@ -11,6 +11,8 @@
  * @typedef {(text: string, params?: any[]) => Promise<any[]>} PgQuery
  */
 
+import { CLEANUP_BATCH_LIMIT } from './schema.js';
+
 /**
  * 领取一条到点的任务：在 lease_until 上写下「这条归我管到什么时候」，
  * 本次投递期间别的 tick 领不走它。
@@ -45,17 +47,19 @@
  * @param {string|Date} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
  * @param {string|Date} leaseUntil - 租期末尾
  * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
+ * @param {{ leaseToken?: string|null }} [options] - `leaseToken`：这份租约的归
+ *   属标识，随租约一起写进 lease_token；之后续租 / 收尾写库带同一个值比对
  * @returns {Promise<boolean>} true = 领到了；false = 已被别人领走、同分组有
  *   任务正在跑、排期被改过、或行已不是 pending
  */
-export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, serializeGroup = null) {
+export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, options = {}) {
   const grouped = typeof serializeGroup === 'string' && serializeGroup.length > 0;
   const params = [leaseUntil, taskId, expectedNextSendAt];
-  let setClause = 'lease_until = $1, updated_at = NOW()';
+  const sets = ['lease_until = $1'];
   let groupGuard = '';
   if (grouped) {
     params.push(serializeGroup); // $4
-    setClause = 'lease_until = $1, serialize_group = $4, updated_at = NOW()';
+    sets.push('serialize_group = $4');
     groupGuard = `
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_messages busy
@@ -63,9 +67,14 @@ export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, s
              AND busy.status = 'pending' AND busy.lease_until > NOW()
         )`;
   }
+  if (options?.leaseToken) {
+    params.push(options.leaseToken);
+    sets.push(`lease_token = $${params.length}`);
+  }
+  sets.push('updated_at = NOW()');
   const rows = await query(
     `UPDATE scheduled_messages
-        SET ${setClause}
+        SET ${sets.join(', ')}
       WHERE id = $2 AND status = 'pending'
         AND date_trunc('milliseconds', next_send_at)
           = date_trunc('milliseconds', $3::timestamptz)
@@ -96,21 +105,54 @@ export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, s
 /**
  * 投递期间的租约续期（run-tick 的心跳用）。只在行仍是 pending 且确实持有
  * 租约（lease_until 非空）时生效——收尾把租约放掉之后，迟到的心跳不会把
- * 租约复活。
+ * 租约复活。带 leaseToken 时还要求租约仍是自己那份：租约过期后被别的 tick
+ * 接手，原执行者的心跳就续不上了，不会把接手者的租约当成自己的续下去。
  *
  * @param {PgQuery} query
  * @param {number} taskId
  * @param {string|Date} leaseUntil - 新的租期末尾
+ * @param {{ leaseToken?: string|null }} [options]
  * @returns {Promise<boolean>} true = 续上了
  */
-export async function renewTaskLease(query, taskId, leaseUntil) {
+export async function renewTaskLease(query, taskId, leaseUntil, options = {}) {
+  const params = [leaseUntil, taskId];
+  let tokenGate = '';
+  if (options?.leaseToken) {
+    params.push(options.leaseToken);
+    tokenGate = ` AND lease_token = $${params.length}`;
+  }
   const rows = await query(
     `UPDATE scheduled_messages SET lease_until = $1
-      WHERE id = $2 AND status = 'pending' AND lease_until IS NOT NULL
+      WHERE id = $2 AND status = 'pending' AND lease_until IS NOT NULL${tokenGate}
      RETURNING id`,
-    [leaseUntil, taskId]
+    params
   );
   return rows.length > 0;
+}
+
+/**
+ * 清掉已终态（sent / failed）且 `days` 天没动过的旧任务，一次最多
+ * CLEANUP_BATCH_LIMIT 条——cron 每跳都调，分批删不会把一跳的时间预算吃光，
+ * 积压多的话后面几跳接着清。
+ *
+ * @param {PgQuery} query
+ * @param {number} days
+ * @returns {Promise<number>} 删掉的行数
+ */
+export async function cleanupOldTasks(query, days = 7) {
+  const safeDays = Math.max(1, Math.floor(Number(days)));
+  const rows = await query(
+    `DELETE FROM scheduled_messages
+      WHERE id IN (
+        SELECT id FROM scheduled_messages
+         WHERE status IN ('sent', 'failed')
+           AND updated_at < NOW() - make_interval(days => $1)
+         LIMIT ${CLEANUP_BATCH_LIMIT}
+      )
+     RETURNING id`,
+    [safeDays]
+  );
+  return rows.length;
 }
 
 /**

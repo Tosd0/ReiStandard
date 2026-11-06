@@ -101,6 +101,51 @@ describe('循环推进按墙钟走', () => {
     assert.ok(after > before, '推进之后必须是更晚的时刻');
     assert.equal(wallClock(after, 'America/New_York'), '2026-03-08 03:30:00');
   });
+
+  // 顺延过的落点如果直接当下一次推进的钟点基准，从此每天都是 03:30。带上任务
+  // 原本的首次触发时刻（anchorMs）之后，切换日之后的第二天要回到 02:30。
+  test('春令时顺延过的落点，带锚点推进时第二天回到原钟点', () => {
+    const anchor = Date.parse('2026-03-07T07:30:00.000Z'); // 2026-03-07 02:30 EST
+    const shifted = advanceOccurrence(anchor, 'daily', 1, 'America/New_York', anchor);
+    assert.equal(wallClock(shifted, 'America/New_York'), '2026-03-08 03:30:00');
+
+    const dayAfter = advanceOccurrence(shifted, 'daily', 1, 'America/New_York', anchor);
+    assert.equal(wallClock(dayAfter, 'America/New_York'), '2026-03-09 02:30:00');
+    // 不带锚点就是老行为：停在 03:30（这一行就是「旧实现下会永久偏移」的那个事实）。
+    assert.equal(wallClock(advanceOccurrence(shifted, 'daily', 1, 'America/New_York'), 'America/New_York'), '2026-03-09 03:30:00');
+
+    // 停摆补推同样回得到原钟点。
+    const plan = planNextOccurrence(shifted, 'daily', shifted + 10, 'America/New_York', anchor);
+    assert.equal(wallClock(plan.nextMs, 'America/New_York'), '2026-03-09 02:30:00');
+    assert.equal(
+      nextFutureOccurrence(shifted, 'daily', shifted + 10, 'America/New_York', anchor),
+      new Date(dayAfter).toISOString()
+    );
+  });
+
+  test('锚点的钟点跟落点不同但这天真实存在（用户改过时间）：以落点为准', () => {
+    const anchor = Date.parse('2026-03-07T07:30:00.000Z'); // 02:30 EST
+    const moved = Date.parse('2026-03-08T12:00:00.000Z'); // 用户改成了 08:00 EDT
+    const next = advanceOccurrence(moved, 'daily', 1, 'America/New_York', anchor);
+    assert.equal(wallClock(next, 'America/New_York'), '2026-03-09 08:00:00');
+  });
+
+  test('平常日子带不带锚点结果一样；秋令时重复的那小时也不受锚点影响', () => {
+    const base = Date.parse('2026-06-01T13:00:00.000Z');
+    assert.equal(advanceOccurrence(base, 'daily', 1, 'America/New_York', base), advanceOccurrence(base, 'daily', 1, 'America/New_York'));
+    // 2026-11-01 01:30 在纽约出现两次；10-31 01:30 EDT = 05:30Z。
+    const fallBack = Date.parse('2026-10-31T05:30:00.000Z');
+    const a = advanceOccurrence(fallBack, 'daily', 1, 'America/New_York', fallBack);
+    assert.equal(a, advanceOccurrence(fallBack, 'daily', 1, 'America/New_York'));
+    assert.equal(wallClock(a, 'America/New_York'), '2026-11-01 01:30:00');
+    assert.equal(wallClock(advanceOccurrence(a, 'daily', 1, 'America/New_York', fallBack), 'America/New_York'), '2026-11-02 01:30:00');
+    // 半小时时区照常。
+    const kolkata = Date.parse('2026-03-07T02:30:00.000Z'); // 08:00 IST
+    assert.equal(advanceOccurrence(kolkata, 'daily', 1, 'Asia/Kolkata', kolkata), kolkata + DAY);
+    // 月末、闰日。
+    assert.equal(wallClock(advanceOccurrence(Date.parse('2026-01-31T13:00:00.000Z'), 'daily', 1, 'America/New_York'), 'America/New_York'), '2026-02-01 08:00:00');
+    assert.equal(wallClock(advanceOccurrence(Date.parse('2028-02-28T13:00:00.000Z'), 'daily', 1, 'America/New_York'), 'America/New_York'), '2028-02-29 08:00:00');
+  });
 });
 
 describe('planNextOccurrence', () => {

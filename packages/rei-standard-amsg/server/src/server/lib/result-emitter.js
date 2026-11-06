@@ -33,7 +33,9 @@
  * 取消语义与聊天分段一致：行上写 `task_uuid`，所以 `DELETE /message` 取消、
  * `supersedesUuid` 顶替时，这条任务名下还没发出去的结果会一起撤掉（见
  * lib/outbox-store.js 的 discardUndeliveredPushesForTask）。取消恰好发生在
- * 落行**之前**、而这条结果落行在后的那个窗口，取消侧扫不到它，由这里自己撤。
+ * 落行**之前**、而这条结果落行在后的那个窗口，取消侧扫不到它：这里只抛出，
+ * run-tick 收尾时确认行已经不在，再按任务把它撤掉（租约只是被别的 tick 接手
+ * 时行还在，就不撤——那批行正由接手方投递）。
  */
 
 import { buildResultPush } from '@rei-standard/amsg-shared';
@@ -154,12 +156,15 @@ export function createResultEmitter({
         ? await sendResultPush({ db, task, userKey, decryptedPayload, webpush, push })
         : false;
     } catch (error) {
-      // 走到这里只有一种可能：这条任务已经被取消 / 顶替（上面的检查点，或
-      // sendResultPush 推送前的拦截）。取消动作发生在这一行落库之前，所以它清
-      // 不到这一行，得由这里自己撤——不撤的话客户端下次补收照样把它拉回去，用
-      // 户看到的就是「取消接口回了成功，东西还是来了」。与聊天分段那条路同一
-      // 个处置。
-      await discardUndeliveredPushes({ db, userId: task.user_id, pushes: [push], sentIds: [] });
+      // 推送前被拦下来了（上面的检查点，或 sendResultPush 的守卫）。
+      // 租约不在手里（TASK_CANCELLED）有两种原因：任务被取消 / 顶替，或者租约
+      // 过期被别的 tick 接手——后者接手方正在投递同一批行，这里撤会删掉它的。
+      // 所以这种只往上抛，撤不撤由 run-tick 查过行确实没了之后按任务统一撤
+      //（与聊天分段那条路同一个处置）。归属停用这类拦截不涉及租约，行照旧
+      // 由这里自己撤。
+      if (!isTaskCancelledError(error)) {
+        await discardUndeliveredPushes({ db, userId: task.user_id, pushes: [push], sentIds: [] });
+      }
       throw error;
     }
     if (pushed) {

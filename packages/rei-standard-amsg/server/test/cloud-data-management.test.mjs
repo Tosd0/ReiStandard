@@ -496,3 +496,18 @@ test('retirement at result push boundary retracts its outbox row and reports fai
     raw.close();
   }
 });
+
+test('driver error codes never surface as the top-level cloud-data error code', async () => {
+  const { raw, db, server, headers } = await setup();
+  try {
+    db.listCloudResourceRows = async () => {
+      throw Object.assign(new Error('relation "tasks" does not exist'), { code: '42P01' });
+    };
+    const result = await server.handlers.cloudData.GET('/cloud-data/summary', headers);
+    assert.equal(result.status, 500);
+    assert.equal(result.body.error.code, 'CLOUD_DATA_FAILED');
+    assert.ok(!result.body.error.message.includes('relation'));
+  } finally {
+    raw.close();
+  }
+});

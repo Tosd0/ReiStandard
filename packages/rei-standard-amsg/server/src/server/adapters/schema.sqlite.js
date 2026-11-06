@@ -24,6 +24,7 @@ export const SQLITE_TABLE_SQL = `
     message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TEXT NOT NULL,
     lease_until TEXT,
+    lease_token TEXT,
     retry_after TEXT,
     serialize_group TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
@@ -61,6 +62,11 @@ export const SQLITE_MIGRATIONS = [
     // 解密失败时也写得进去，GET /message 对已失败的行也读得出来。
     sql: 'ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT',
     description: 'Sanitized last delivery-failure summary (2.6.0)'
+  },
+  {
+    name: 'add_lease_token',
+    sql: 'ALTER TABLE scheduled_messages ADD COLUMN lease_token TEXT',
+    description: 'Lease ownership token (claimTask / renewTaskLease)'
   }
 ];
 

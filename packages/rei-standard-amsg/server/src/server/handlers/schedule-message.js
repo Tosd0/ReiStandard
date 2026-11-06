@@ -67,7 +67,6 @@ export function createScheduleMessageHandler(ctx) {
     if (!validationResult.valid) {
       return { status: 400, body: { success: false, error: { code: validationResult.errorCode, message: validationResult.errorMessage, details: validationResult.details } } };
     }
-
     // 到点要往哪推：用户级订阅必须已经登记过。没登记就建任务的话，这条任务
     // 到点只会失败一次又一次——早点说清楚比让它安静地烂在库里强。
     if (!supportsPushSubscriptionStore(db)) {

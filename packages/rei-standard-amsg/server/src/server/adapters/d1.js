@@ -17,11 +17,12 @@ import {
   LLM_CREDENTIALS_TABLE_SQL,
   MESSAGE_OUTBOX_TABLE_SQL,
   CLOUD_DATA_TABLES_SQL,
-  CLOUD_DATA_DELETE_TRIGGERS
+  CLOUD_DATA_DELETE_TRIGGERS,
+  SQLITE_REQUIRED_SCHEMA
 } from './schema.sqlite.js';
 // 列名不分方言：可写列的白名单、任务行的两套 SELECT 列集，三个适配器共用
 // schema.js 里的这一份，加列只改一处。
-import { UPDATABLE_COLUMNS, TASK_DELIVERY_COLUMNS, TASK_DETAIL_COLUMNS } from './schema.js';
+import { UPDATABLE_COLUMNS, TASK_DELIVERY_COLUMNS, TASK_DETAIL_COLUMNS, CLEANUP_BATCH_LIMIT } from './schema.js';
 
 /**
  * 「key 以 prefix 开头」的字典序上界：`key >= prefix AND key < prefixRangeEnd(prefix)`。
@@ -232,11 +233,13 @@ export class D1Adapter {
       return indexes.map((index) => results[index]);
     } catch (error) {
       if (/cloud_metadata_guard/.test(error.message || '')) {
-        throw Object.assign(new Error('Cloud resource ownership changed'), {code:'CLOUD_RESOURCE_CHANGED'});
+        // 409：这是请求撞上并发 / 守卫，不是服务端故障，worker 按 status 回而不是 500。
+        throw Object.assign(new Error('Cloud resource ownership changed'), {code:'CLOUD_RESOURCE_CHANGED', status: 409});
       }
       if (/cloud_owner_guard/.test(error.message || '')) {
         const denied = new Error('Cloud owner is retired or generation changed');
         denied.code = 'CLOUD_OWNER_RETIRED';
+        denied.status = 409;
         throw denied;
       }
       throw error;
@@ -709,7 +712,7 @@ export class D1Adapter {
     }
 
     return {
-      columnsCreated: 13,
+      columnsCreated: SQLITE_REQUIRED_SCHEMA.tables.scheduled_messages.length,
       indexesCreated: indexResults.filter((r) => r.status === 'success').length,
       indexesFailed: indexResults.filter((r) => r.status === 'failed').length,
       columns: [],
@@ -852,7 +855,9 @@ export class D1Adapter {
     return row ? { status: row.status } : null;
   }
 
-  async updateTaskById(taskId, updates, cloudGuard = null) {
+  // options.leaseToken 见 interface.js：带上时只改仍持有这份租约的行，改不到
+  // 回 null（行没了，或租约已经是别人的）。
+  async updateTaskById(taskId, updates, cloudGuard = null, options = {}) {
     const sets = [];
     const values = [];
     for (const [key, value] of Object.entries(updates)) {
@@ -868,13 +873,19 @@ export class D1Adapter {
       values.push(this._now());
     }
     values.push(taskId);
+    let tokenGate = '';
+    if (options?.leaseToken) {
+      tokenGate = ' AND lease_token = ?';
+      values.push(options.leaseToken);
+    }
 
     const statement = this._db.prepare(
-      `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE id = ?`
+      `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE id = ?${tokenGate}`
     ).bind(...values);
     const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
     if (cloudGuard && !ownerUser) return null;
-    await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    if (tokenGate && !(res.meta.changes > 0)) return null;
 
     return this._db.prepare('SELECT * FROM scheduled_messages WHERE id = ?').bind(taskId).first();
   }
@@ -919,8 +930,14 @@ export class D1Adapter {
     return { uuid, updated_at: now };
   }
 
-  async deleteTaskById(taskId) {
-    const res = await this._db.prepare('DELETE FROM scheduled_messages WHERE id = ?').bind(taskId).run();
+  async deleteTaskById(taskId, options = {}) {
+    const values = [taskId];
+    let tokenGate = '';
+    if (options?.leaseToken) {
+      tokenGate = ' AND lease_token = ?';
+      values.push(options.leaseToken);
+    }
+    const res = await this._db.prepare(`DELETE FROM scheduled_messages WHERE id = ?${tokenGate}`).bind(...values).run();
     return res.meta.changes > 0;
   }
 
@@ -976,10 +993,14 @@ export class D1Adapter {
    * @param {string} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
    * @param {string|Date} leaseUntil - 租期末尾
    * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
+   * @param {Object|null} [cloudGuard]
+   * @param {{ leaseToken?: string|null, userId?: string|null }} [options] -
+   *   `leaseToken` 随租约写进 lease_token，之后续租 / 收尾写库带同一个值比对；
+   *   `userId` 是这行的 user_id（调用方手里有就传，带 cloudGuard 时省掉一次查）
    * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、同分组
    *   有任务正在跑、排期被改过、或行已不是 pending
    */
-  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, cloudGuard = null) {
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, cloudGuard = null, options = {}) {
     const expected = typeof expectedNextSendAt === 'string'
       ? expectedNextSendAt
       : this._iso(expectedNextSendAt);
@@ -991,6 +1012,10 @@ export class D1Adapter {
     if (grouped) {
       sets.push('serialize_group = ?');
       values.push(serializeGroup);
+    }
+    if (options?.leaseToken) {
+      sets.push('lease_token = ?');
+      values.push(options.leaseToken);
     }
     sets.push('updated_at = ?');
     values.push(now);
@@ -1013,29 +1038,52 @@ export class D1Adapter {
     const statement = this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(', ')} WHERE ${where}`
     ).bind(...values);
-    const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
-    if (cloudGuard && !ownerUser) return false;
-    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    const ownerUserId = await this._taskOwnerForGuard(taskId, cloudGuard, options?.userId);
+    if (cloudGuard && !ownerUserId) return false;
+    const [res] = await this._cloudBatch([statement], ownerUserId, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
+  }
+
+  /**
+   * 带 cloudGuard 的写要知道这行归哪个用户（守卫断言按 user_id 查）。调用方手里
+   * 有就直接用，没有才去查一次。没有守卫时不查。
+   *
+   * @private
+   * @returns {Promise<string|null|undefined>} 守卫要用的 user_id；带守卫但行不存在 → null
+   */
+  async _taskOwnerForGuard(taskId, cloudGuard, userId) {
+    if (!cloudGuard) return undefined;
+    if (userId) return userId;
+    const row = await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first();
+    return row ? row.user_id : null;
   }
 
   /**
    * 投递期间的租约续期（run-tick 的心跳用）。只在行仍是 pending 且确实持有
    * 租约（lease_until 非空）时生效——收尾把租约放掉之后，迟到的心跳不会把
-   * 租约复活。
+   * 租约复活。带 leaseToken 时还要求租约仍是自己那份：租约过期后被别的 tick
+   * 接手，原执行者的心跳就续不上了，不会把接手者的租约当成自己的续下去。
    *
    * @param {number} taskId
    * @param {string|Date} leaseUntil - 新的租期末尾
+   * @param {Object|null} [cloudGuard]
+   * @param {{ leaseToken?: string|null, userId?: string|null }} [options] - 同 claimTask
    * @returns {Promise<boolean>} true = 续上了
    */
-  async renewTaskLease(taskId, leaseUntil, cloudGuard = null) {
+  async renewTaskLease(taskId, leaseUntil, cloudGuard = null, options = {}) {
+    const values = [this._iso(leaseUntil), taskId];
+    let tokenGate = '';
+    if (options?.leaseToken) {
+      tokenGate = ' AND lease_token = ?';
+      values.push(options.leaseToken);
+    }
     const statement = this._db.prepare(
       `UPDATE scheduled_messages SET lease_until = ?
-       WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL`
-    ).bind(this._iso(leaseUntil), taskId);
-    const ownerUser = cloudGuard ? await this._db.prepare('SELECT user_id FROM scheduled_messages WHERE id=?').bind(taskId).first() : null;
-    if (cloudGuard && !ownerUser) return false;
-    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+       WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL${tokenGate}`
+    ).bind(...values);
+    const ownerUserId = await this._taskOwnerForGuard(taskId, cloudGuard, options?.userId);
+    if (cloudGuard && !ownerUserId) return false;
+    const [res] = await this._cloudBatch([statement], ownerUserId, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
   }
 
@@ -1058,7 +1106,7 @@ export class D1Adapter {
       `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
-       ORDER BY next_send_at ASC
+       ORDER BY next_send_at ASC, id ASC
        LIMIT ? OFFSET ?`
     ).bind(...params, limit, offset).all();
 
@@ -1071,7 +1119,7 @@ export class D1Adapter {
     const res = await this._db.prepare(
       `DELETE FROM scheduled_messages
        WHERE rowid IN (SELECT rowid FROM scheduled_messages
-         WHERE status IN ('sent', 'failed') AND updated_at < ? LIMIT 100)`
+         WHERE status IN ('sent', 'failed') AND updated_at < ? LIMIT ${CLEANUP_BATCH_LIMIT})`
     ).bind(cutoff).run();
     return res.meta.changes || 0;
   }

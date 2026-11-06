@@ -274,7 +274,8 @@ export function createCloudDataHandler(ctx) {
         body: {
           success: false,
           error: {
-            code: error.code || 'CLOUD_DATA_FAILED',
+            // 只透出 cloudError 造的错（带 status）；驱动抛上来的 pg / D1 错误码不外露。
+            code: error.status ? error.code : 'CLOUD_DATA_FAILED',
             message: error.status
               ? error.message
               : '云端管理请求失败；未能确认操作结果。'

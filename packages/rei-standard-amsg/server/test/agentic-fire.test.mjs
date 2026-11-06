@@ -234,6 +234,136 @@ describe('agentic fire loop', () => {
     }
   });
 
+  // 宿主工具永不返回 = 旧实现下整次 fire 永远挂着（Worker 被杀后下一跳重跑、
+  // 每隔十几分钟重烧一次 LLM）。现在 fire 在 deadline 附近按总预算超时返回，
+  // 宿主拿到的 signal 已经中止，它自己也该收手。
+  test('executeToolCalls 永不返回：fire 在 deadline 附近返回，hook 拿到的 signal 已中止', async () => {
+    const { task } = await makeTask();
+    let hookSignal = null;
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'tool-request', toolCalls: [TOOL_CALL] }),
+      executeToolCalls: (_calls, sessionCtx) => {
+        hookSignal = sessionCtx.signal;
+        return new Promise(() => {});
+      },
+    };
+    const llm = stubLlm([toolRound]);
+    const started = Date.now();
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks, maxToolIterations: 5, totalTimeoutMs: 150 }));
+      assert.equal(result.success, false);
+      assert.match(result.error, /AGENTIC_TOTAL_TIMEOUT/);
+      assert.equal(result.errorCode, 'AGENTIC_TOTAL_TIMEOUT');
+      assert.equal(result.permanent, false, '总预算超时留在退避阶梯里');
+      assert.ok(Date.now() - started < 5_000, 'deadline 附近就该返回');
+      assert.equal(hookSignal.aborted, true);
+      assert.match(String(hookSignal.reason?.message), /AGENTIC_TOTAL_TIMEOUT/);
+      assert.equal(llm.calls.length, 1);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('onBeforeFire 永不返回：按 ctx 级预算超时，fireCtx.signal 已中止', async () => {
+    const { task } = await makeTask();
+    let fireSignal = null;
+    const hooks = {
+      onBeforeFire: (fireCtx) => { fireSignal = fireCtx.signal; return new Promise(() => {}); },
+      onLLMOutput: async () => ({ decision: 'finish', pushPayloads: [] }),
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, makeCtx({ hooks, totalTimeoutMs: 150 }));
+      assert.equal(result.success, false);
+      assert.match(result.error, /AGENTIC_TOTAL_TIMEOUT/);
+      assert.equal(fireSignal.aborted, true);
+      assert.equal(llm.calls.length, 0);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('任务被取消的信号也传到 hook 的 signal 上，而超时不会被当成取消', async () => {
+    const { task } = await makeTask();
+    const controller = new AbortController();
+    let hookSignal = null;
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async (sessionCtx) => {
+        hookSignal = sessionCtx.signal;
+        controller.abort();
+        return { decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'A' }] };
+      },
+    };
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, { ...makeCtx({ hooks }), signal: controller.signal });
+      assert.equal(result.success, false);
+      assert.equal(result.errorCode, 'TASK_CANCELLED');
+      assert.equal(hookSignal.aborted, true);
+    } finally {
+      llm.restore();
+    }
+  });
+
+  // 租约被别的 tick 接手时原执行者看到的也是 TASK_CANCELLED，而行还在、接手者
+  // 正在投同一批 message id——投递侧不撤 outbox，撤不撤由 run-tick 查过行再定。
+  test('finish 推送中途收到 TASK_CANCELLED：停发、抛出，不撤 outbox', async () => {
+    const { task } = await makeTask();
+    const adapter = createD1Adapter(createTestD1());
+    await adapter.initSchema();
+    const discards = { byMessage: 0, byTask: 0 };
+    const db = new Proxy(adapter, {
+      get(target, prop) {
+        if (prop === 'discardOutboxMessages') return async (...args) => { discards.byMessage++; return target.discardOutboxMessages(...args); };
+        if (prop === 'discardUndeliveredOutboxForTask') return async (...args) => { discards.byTask++; return target.discardUndeliveredOutboxForTask(...args); };
+        const value = target[prop];
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'A' }, { messageKind: 'content', message: 'B' }] }),
+    };
+    let sends = 0;
+    const ctx = makeCtx({ hooks, db, pushSpy: () => {
+      if (++sends === 2) throw Object.assign(new Error('任务在投递期间被取消或顶替，推送已中止'), { code: 'TASK_CANCELLED' });
+    } });
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, false);
+      assert.equal(result.errorCode, 'TASK_CANCELLED');
+      assert.deepEqual(discards, { byMessage: 0, byTask: 0 });
+      const rows = await adapter.listOutboxForTask(USER, task.uuid, { sinceMs: 0 });
+      assert.deepEqual(rows.map(row => row.delivered_at != null), [true, false], '发出去的标 delivered，没发的留着');
+    } finally {
+      llm.restore();
+    }
+  });
+
+  test('finish 的推送带着 fire 的取消信号（sender 认第三个参数时）', async () => {
+    const { task } = await makeTask();
+    const hooks = {
+      onBeforeFire: async () => [{ role: 'user', content: 'U' }],
+      onLLMOutput: async () => ({ decision: 'finish', pushPayloads: [{ messageKind: 'content', message: 'A' }] }),
+    };
+    const seen = [];
+    const ctx = makeCtx({ hooks });
+    ctx.webpush = { acceptsSendOptions: true, async sendNotification(_sub, _payload, options) { seen.push(options); } };
+    const llm = stubLlm([finishRound]);
+    try {
+      const result = await processSingleMessage(task, ctx);
+      assert.equal(result.success, true);
+      assert.equal(seen.length, 1);
+      assert.ok(seen[0].signal instanceof AbortSignal);
+      assert.equal(seen[0].signal.aborted, false);
+    } finally {
+      llm.restore();
+    }
+  });
+
   // A hung LLM request must not outlive totalTimeoutMs waiting for its own
   // legacy 300s abort: each round's fetch timeout shrinks to the remaining
   // wall-time budget.

@@ -35,7 +35,7 @@ import {
   DEFAULT_MULTIPART_MAX_TOTAL_BYTES,
   DEFAULT_MULTIPART_TTL_MS,
 } from '@rei-standard/amsg-shared';
-import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload } from './webpush-webcrypto.js';
+import { MAX_PUSH_PAYLOAD_BYTES, measurePushPayload, withPushSignal, assertVapidConfigured } from './webpush-webcrypto.js';
 
 import { captureCloudTaskGuard, createCloudGuardedAdapter, assertCloudGuard } from './cloud-data-guard.js';
 import { decryptFromStorage, deriveUserEncryptionKey } from './encryption.js';
@@ -45,7 +45,6 @@ import { resolvePushSubscription } from './push-subscription-store.js';
 import { hasChatCredRef, resolveFireCredentials } from './llm-credentials-store.js';
 import {
   appendPushesToOutbox,
-  discardUndeliveredPushes,
   findCommittedBatch,
   markPushesDelivered,
 } from './outbox-store.js';
@@ -350,6 +349,8 @@ function positiveIntegerOr(value, fallback) {
  * @property {number | ((task: Object) => number | undefined)} [maxGenerationRetries]
  * @property {Object}  webpush           - The web-push module instance (already VAPID-configured).
  * @property {Object}  vapid             - { email, publicKey, privateKey }
+ * @property {AbortSignal} [signal]      - 这次投递的取消信号：传给 LLM 请求，sender 认
+ *   第三个参数时也传给推送（见 webpush-webcrypto.js 的 withPushSignal）。
  * @property {import('../adapters/interface.js').DbAdapter} db
  * @property {{ maxChunkBytes?: number, maxChunks?: number, maxTotalBytes?: number, ttlMs?: number }} [multipart]
  *   分片传输的限额，宿主传给 `installReiSW` 的那一份原样传过来即可（见
@@ -391,9 +392,7 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
     return { success: true, messagesSent, redelivered: true, pushedCount: 0 };
   }
 
-  if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-    throw new Error('VAPID configuration missing - push notifications cannot be sent');
-  }
+  assertVapidConfigured(ctx.vapid);
   const pushSubscription = await resolvePushSubscription({
     db: ctx.db,
     userId: task.user_id,
@@ -402,23 +401,16 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
   });
 
   const sentIds = [];
-  let cancelled = false;
   try {
     for (let i = 0; i < pending.length; i++) {
       await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(pending[i]));
       sentIds.push(pending[i].messageId);
       if (i < pending.length - 1) await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS);
     }
-  } catch (error) {
-    cancelled = isTaskCancelledError(error);
-    throw error;
   } finally {
+    // 取消 / 租约丢失时这里不撤 outbox：行还在的话是被别的 tick 接手了，撤掉的
+    // 是接手者正在投的行。撤不撤由 run-tick 查过行在不在之后决定（recordLostLease）。
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-    if (cancelled) {
-      // 与首次投递同一个处置：取消只拦住了推送，剩下的行不撤掉，客户端下次
-      // GET /outbox 会照样把已取消任务的内容补收回去。
-      await discardUndeliveredPushes({ db: ctx.db, userId: task.user_id, pushes: pending, sentIds });
-    }
   }
   return { success: true, messagesSent, redelivered: true, pushedCount: sentIds.length };
 }
@@ -444,12 +436,15 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
   const deliveryState = {
     outboxed: false,
     deliveryLimit: resolveMaxDeliveryRetries(ctx),
+    // 按任务定的 generation 上限要等 payload 解出来才算得出；解密、云守卫这些更早
+    // 的失败也得有个上限可查，先按投递上限兜着。
     generationLimit: resolveMaxDeliveryRetries(ctx),
     retryCount: task.retry_count ?? 0,
     isCancelled: ctx.isTaskCancelled,
   };
   // One attempt owns this state; concurrent tasks never share their progress.
-  ctx = { ...ctx, _deliveryState: deliveryState };
+  // 推送也绑上这次投递的取消信号：任务被取消 / 顶替时挂着的推送请求一起中止。
+  ctx = { ...ctx, _deliveryState: deliveryState, webpush: withPushSignal(ctx.webpush, ctx.signal) };
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
@@ -468,13 +463,21 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       await assertCloudGuard(ctx.db, task.user_id, cloudGuard);
       const originalWebpush = ctx.webpush;
       const guardedDb = createCloudGuardedAdapter(ctx.db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard: cloudGuard, userId: task.user_id });
-      ctx = { ...ctx, db: guardedDb, webpush: originalWebpush && {
-        ...originalWebpush,
-        async sendNotification(...args) {
-          await assertCloudGuard(guardedDb, task.user_id, cloudGuard);
-          return originalWebpush.sendNotification(...args);
-        },
-      }};
+      let guardedWebpush = originalWebpush;
+      if (originalWebpush) {
+        // 原型链包一层（不展开复制）：sender 上的标记顺着原型链还读得到。
+        guardedWebpush = Object.create(originalWebpush);
+        Object.defineProperty(guardedWebpush, 'sendNotification', {
+          value: async (...args) => {
+            await assertCloudGuard(guardedDb, task.user_id, cloudGuard);
+            return originalWebpush.sendNotification(...args);
+          },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+      ctx = { ...ctx, db: guardedDb, webpush: guardedWebpush };
     }
 
     // 内容已经落定的话只补推送。放在所有生成路径（agentic 与冻结 prompt）之前，
@@ -643,9 +646,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // VAPID 与订阅排在落行之后：内容已经生成好了，之后哪一步失败都只该重试投递，
     // 而「只重试投递」的前提是这一批已经落定在 outbox 里（见
     // redeliverCommittedBatch）。
-    if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-      throw new Error('VAPID configuration missing - push notifications cannot be sent');
-    }
+    assertVapidConfigured(ctx.vapid);
 
     // 订阅是用户级的一份，投递时现读（任务行不携带它）。取不到就抛，走既有
     // 的失败/重试逻辑——静默不发会让任务「成功」地什么都没做。升级前创建的
@@ -666,7 +667,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     const contentToPush = contentPushes.filter(push => shouldSendPush(push, pushGate));
 
     const sentIds = [];
-    let cancelledMidBurst = false;
     // 思考过程是附赠内容，发不出去不算这条任务失败——但也不能一声不吭：调用方
     // 拿它决定要不要重发 / 要不要提示用户思考过程这次没到。按策略跳过的不算
     // 「没发成」，那条路上内容还在 outbox 里，不设这个字段。
@@ -693,7 +693,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
         }
       }
     } catch (error) {
-      cancelledMidBurst = isTaskCancelledError(error);
       // 这一批落进了 outbox 的话，重试只补推送（见 redeliverCommittedBatch）；没
       // 落进去、又已经推出去几条的，重试只能重新生成，客户端会拼出两份内容——就
       // 地判终审（思考过程那条推出去了也算：它是这次生成的一部分）。
@@ -701,16 +700,8 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     } finally {
       // 半途失败也把已发出的段标掉：delivered_at 为 null 的行就是客户端要补
       // 收的那部分，标多标少都会让补收失真。
+      // 取消 / 租约丢失时这里不撤 outbox，理由同 redeliverCommittedBatch。
       await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-      if (cancelledMidBurst) {
-        // 取消只拦住了 Web Push 这一路，可整批在发送前就落进 outbox 了。剩下
-        // 这几条不撤掉的话，客户端下一次 GET /outbox 会照样把它们拉回去——用户
-        // 看到的就是「取消接口回了成功，消息还是来了」。
-        // 投递失败不走这里：那种情况下这些行正是要留着补收的。
-        await discardUndeliveredPushes({
-          db: ctx.db, userId: task.user_id, pushes: pushesToSend, sentIds,
-        });
-      }
     }
 
     return {

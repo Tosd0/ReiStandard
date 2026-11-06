@@ -35,10 +35,10 @@
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "dependencies": {
-    "@netlify/blobs": "^8.1.0",
+    "@netlify/blobs": "^10.7.13",
     "@rei-standard/amsg-shared": "^0.4.0",
     "web-push": "^3.6.7"
   },

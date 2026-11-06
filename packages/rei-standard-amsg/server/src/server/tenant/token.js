@@ -29,12 +29,14 @@ function nowEpochSeconds() {
  */
 export function createTenantToken(params, secret) {
   const issuedAt = nowEpochSeconds();
-  const expiresInSeconds = Number(params.expiresInSeconds || 60 * 60 * 24 * 30);
+  // 租户 / cron token 是 server-to-server 凭证，没有续签路径，所以默认不带
+  // exp；调用方显式给 expiresInSeconds 才带。吊销靠删掉租户配置。
+  const expiresInSeconds = Number(params.expiresInSeconds);
   const payload = {
     tid: params.tenantId,
     typ: params.type,
     iat: issuedAt,
-    exp: issuedAt + expiresInSeconds,
+    ...(expiresInSeconds > 0 ? { exp: issuedAt + expiresInSeconds } : {}),
     v: 1
   };
 
@@ -91,11 +93,11 @@ export function verifyTenantToken(token, secret, options = {}) {
     throw new Error('INVALID_TENANT_AUTH');
   }
 
-  if (!payload.tid || !payload.typ || !payload.exp) {
+  if (!payload.tid || !payload.typ) {
     throw new Error('INVALID_TENANT_AUTH');
   }
 
-  if (payload.exp <= nowEpochSeconds()) {
+  if (payload.exp !== undefined && !(payload.exp > nowEpochSeconds())) {
     throw new Error('INVALID_TENANT_AUTH');
   }
 

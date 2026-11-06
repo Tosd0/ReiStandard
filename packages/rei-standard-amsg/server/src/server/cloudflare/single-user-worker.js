@@ -482,6 +482,11 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 
       return jsonResponse(result.status, result.body, cors);
     } catch (error) {
+      // 带 4xx status 的错误（云端归属守卫：INVALID_CLOUD_OWNER / CLOUD_OWNER_RETIRED
+      // 这类）是请求本身的问题，按它自己的状态码回，不当内部错误。
+      if (typeof error?.code === 'string' && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
+        return jsonResponse(error.status, { success: false, error: { code: error.code, message: error.message } }, cors);
+      }
       console.error('[amsg single-user] fetch() unhandled error:', error && error.message);
       const cause = summarizeErrorCause(error, 'request');
       await reportError({ stage: 'request', error, cause, path: pathOf(request) });
@@ -514,15 +519,19 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       await reportError({ stage: 'config', error, cause, path: null });
       return { ok: false, cause };
     }
-    // 云端清理这一步出错只上报，这一跳的消息照常投递。
-    const cleanup = {};
-    try {
-      await resumeCloudDataCleanups(buildTickContext(cfg));
-    } catch (error) {
-      console.error('[amsg single-user] scheduled(): cloud cleanup failed:', error && error.message);
-      cleanup.cloudCleanupCause = summarizeErrorCause(error, 'cloud-cleanup');
-      await reportError({ stage: 'cloud-cleanup', error, cause: cleanup.cloudCleanupCause, path: null });
-    }
+    // 云端清理排在投递后面：它一跳最多跑 20 秒，放前面会把到期消息拖后。
+    // 出错只上报，不影响这一跳的结果。
+    const runCleanup = async () => {
+      try {
+        await resumeCloudDataCleanups(buildTickContext(cfg));
+        return {};
+      } catch (error) {
+        console.error('[amsg single-user] scheduled(): cloud cleanup failed:', error && error.message);
+        const cloudCleanupCause = summarizeErrorCause(error, 'cloud-cleanup');
+        await reportError({ stage: 'cloud-cleanup', error, cause: cloudCleanupCause, path: null });
+        return { cloudCleanupCause };
+      }
+    };
     if (!pushConfigured(cfg)) {
       console.error('[amsg single-user] scheduled(): VAPID/webpush not configured; skipping tick');
       // 这一支没有异常对象，但对宿主来说和抛错一样是「这一跳没跑」，所以照样
@@ -532,19 +541,21 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         'config'
       );
       await reportError({ stage: 'config', error: null, cause, path: null });
-      return { ok: false, cause, ...cleanup };
+      return { ok: false, cause, ...(await runCleanup()) };
     }
     // Swallow tick failures: pending tasks stay pending, so the next cron tick
     // retries them. Logging keeps the failure visible in the tail log.
+    let tick;
     try {
       const summary = await runScheduledTick(buildTickContext(cfg));
-      return { ok: true, summary, ...cleanup };
+      tick = { ok: true, summary };
     } catch (error) {
       console.error('[amsg single-user] scheduled(): tick failed:', error && error.message);
       const cause = summarizeErrorCause(error, 'tick');
       await reportError({ stage: 'tick', error, cause, path: null });
-      return { ok: false, cause, ...cleanup };
+      tick = { ok: false, cause };
     }
+    return { ...tick, ...(await runCleanup()) };
   }
 
   /**
