@@ -5,8 +5,8 @@
 
 ## 版本信息
 
-- **版本号**: v2.4.0
-- **最后更新**: 2026-10-19
+- **版本号**: v2.5.0
+- **最后更新**: 2026-11-06
 - **状态**: Stable
 - **关联标准**: [主动消息API端点标准](./active-messaging-api.md)
 
@@ -1453,6 +1453,28 @@ self.addEventListener('notificationclick', (event) => {
 
 ## 15. 变更日志
 
+### v2.5.0 (2026-11-06)
+
+#### 改进优化
+
+**1. 离线队列：408 / 429 留在队列重试，冲刷单轮串行**
+- 服务端回 HTTP 408 / 429 的队列请求按临时失败处理，留在队列里等下一次冲刷；其余 4xx 仍作永久拒收，删掉并广播 `QUEUE_DROPPED`。
+- 队列冲刷同一时刻只跑一轮：页面 `FLUSH_QUEUE`、入队后的立即冲刷、Background Sync 撞上时，每个后来的调用各在当前这轮之后排一轮、串行跑，同一条记录不会被两轮各发一次。
+
+**2. IndexedDB 写入以事务提交为准**
+- 入队、去重占坑、分片落库这些写操作等事务 `oncomplete` 才算成功；提交阶段 abort（如 `QuotaExceededError`）按写失败处理：入队回执 `ok: false`，去重占坑失败按首投分发并在 DELIVER ack 带 `dedupeError`，分片落库失败广播 `MULTIPART_EXPIRED`（`reason: 'storage-failed'`）。
+- 去重记录在占坑途中被过期清理删掉时重新占坑，该 payload 按首投处理。
+
+**3. Multipart 收齐判定与 TTL 清扫**
+- 齐没齐按分片仓库里实际落库的分片数判定，不靠 pending 记录里的计数。
+- TTL 清扫放弃的 multipart `id` 同样写 done 标记：`MULTIPART_EXPIRED`（`'ttl-expired'`）只报一次，之后迟到的分片静默丢弃。
+
+**4. 空 push 的兜底通知**
+- `push` 事件没带 data、或解析出空值时，弹一条标题 `New notification`、正文 `defaultBody` 的通知。
+
+**5. 运行要求**
+- `@rei-standard/amsg-sw` 的 `engines.node` 为 `>=20.3.0`。
+
 ### v2.4.0 (2026-10-19)
 
 #### 改进优化
@@ -1474,8 +1496,8 @@ self.addEventListener('notificationclick', (event) => {
 - 重组窗口从本地收到第一片起算，当场判废的分片也会触发一次 `MULTIPART_EXPIRED`（同一 multipart `id` 只报一次）。
 
 **5. 离线队列回执与 4xx 丢弃广播**
-- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT` 新增 `delivered: boolean` 及 4xx 永久拒收时的 `dropped: true` / `status` / `error`。
-- 新增广播消息类型 `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`（`'REI_QUEUE_DROPPED'`），当队列请求在后台被服务端 4xx 永久拒收并移除时广播给所有窗口。
+- `REI_SW_MESSAGE_TYPE.QUEUE_RESULT` 新增 `delivered: boolean` 及 4xx 永久拒收时的 `dropped: true` / `status` / `error`（注：v2.5.0 起 408 / 429 不算永久拒收，按临时失败留在队列重试）。
+- 新增广播消息类型 `REI_SW_MESSAGE_TYPE.QUEUE_DROPPED`（`'REI_QUEUE_DROPPED'`），当队列请求在后台被服务端 4xx（v2.5.0 起 408 / 429 除外）永久拒收并移除时广播给所有窗口。
 
 ### v2.3.1 (2026-06-09)
 

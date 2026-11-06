@@ -54,7 +54,7 @@
 
 **v3.0 核心变更与增量**：
 
-- **推送订阅改为用户级登记（破坏性，`amsg-server` 3.0.0 · `amsg-client` 2.9.0）**：订阅按用户存进 `push_subscriptions` 表（`PUT / GET / DELETE /api/v1/push-subscription`）。`POST /api/v1/schedule-message` 与 `PUT /api/v1/update-message` 不再接受请求体里的 `pushSubscription`（返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）；排程时该用户尚未登记订阅返回 `409 PUSH_SUBSCRIPTION_MISSING`。存量老任务投递时若查不到用户级订阅，回退读取老任务 payload 内嵌的订阅。
+- **推送订阅改为用户级登记（破坏性，`amsg-server` 3.0.0 · `amsg-client` 2.9.0）**：订阅按用户存进 `push_subscriptions` 表（`PUT / GET / DELETE /api/v1/push-subscription`）。`POST /api/v1/schedule-message` 与 `PUT /api/v1/update-message` 不再接受请求体里的 `pushSubscription`（返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）；排程时该用户尚未登记订阅返回 `409 PUSH_SUBSCRIPTION_MISSING`。存量老任务投递时若查不到用户级订阅，回退读取老任务 payload 内嵌的订阅；内嵌的那份 `endpoint` 不满足 `PUT /push-subscription` 的规则（见 §9 的 `INVALID_PUSH_SUBSCRIPTION`）时视为没有，任务以 `PUSH_SUBSCRIPTION_MISSING` 失败。
 - **第五种 `messageKind: 'result'`（`ResultPush`）**：`@rei-standard/amsg-shared` 0.4.0、`amsg-server` 3.0.0、`amsg-sw` 2.4.0 支持宿主自定义结果推送（如 Fire 时刻 hook 的 `ctx.emitResult()`）。
 - **单用户部署线、服务端收件箱（`/outbox`）、客户端状态镜像（`/client-state`）、用户级 LLM 凭据（`/llm-credentials`）、单条任务查询（`GET /message`）、云端数据管理（`/cloud-data/*`）**：`amsg-server` 3.0.0、`amsg-client` 2.9.0 实装。
 
@@ -184,6 +184,8 @@ export const config = {
 
 `/messages` 是列表、`/message` 是单条：列表的每条任务只投影 `metadata` 里的 `charId` / `clientTaskId`，单条则给出完整的 `metadata`。`update-message` 对 `metadata` 是整体替换，所以「只改其中一个子字段」要先用单条查询把完整的那份读回来。单条查询只返回还没发出去的任务（`pending`），已结束的返回 `409 TASK_ALREADY_COMPLETED`（`details.lastError` 附上次失败摘要），与 `update-message` 同一口径。
 
+`GET /messages` 的查询参数：`status` 取 `all` / `pending` / `sent` / `failed`（默认 `all`），`limit` 取正整数（默认 20，超过 100 按 100 截），`offset` 取非负整数（默认 0）；`status` 不在集合内、`limit` 小于 1 或非数字、`offset` 为负或非数字返回 `400 INVALID_PARAMETERS`。
+
 上表的 `tenantToken` / `cronToken` 是多租户线的鉴权（§5）。**单用户线**（§1.1）同样提供上表里两个 `send-notifications*` 之外的全部端点（它的定时投递不走 HTTP，由平台周期调度直接触发运行时的定时入口），鉴权换成可选的 `X-Client-Token` 共享密钥；并且额外提供以下端点：
 
 | 方法 | 路径 | 描述 |
@@ -239,6 +241,8 @@ query string 原样保留。要绕开补全（代理路径很特殊时），直�
 **`amsg-server` 排程与更新专用字段**：
 
 - **`pushSubscription`（禁止在任务内传入）**：`POST /schedule-message` 与 `PUT /update-message` 传入 `pushSubscription` 字段一律返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`。订阅统一通过 `PUT /api/v1/push-subscription` 按用户登记。
+- **`firstSendTime`（`schedule-message`）与 `nextSendAt`（`update-message`）**：都必须是 ISO 8601 字符串（`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`，时区可省），并且在未来。`schedule-message` 不满足返回 `400 INVALID_TIMESTAMP`（`immediate: true` 时 `firstSendTime` 可省，传了只查格式、不要求在未来，见下条）；`update-message` 不满足返回 `400 INVALID_UPDATE_DATA`（`details.invalidFields: ['nextSendAt']`）。`update-message` 改了 `nextSendAt`，任务 payload 里的 `firstSendTime` 一并改成同一个值。
+- **`metadata`（`schedule-message` / `update-message`，可选）**：传了就必须是普通对象，数组、字符串等返回 `400`（`schedule-message` 是 `INVALID_PARAMETERS`，`update-message` 是 `INVALID_UPDATE_DATA`）；`null` 按没传处理（`update-message` 里即不改）。
 - **`immediate`（仅 `schedule-message` 非 `instant` 任务，可选布尔值）**：传 `true` 时不要求 `firstSendTime` 在未来，任务 `next_send_at` 直接设为当前时刻，由下一跳 cron 立即触发。
 - **`supersedesUuid`（仅 `schedule-message`，可选非空字符串）**：在同一用户名下创建新任务时原子取消（删除）指定 UUID 的旧任务，并撤掉旧任务尚未投递的收件箱分段。
 - **`tzId`（`schedule-message` / `update-message`，可选 IANA 时区字符串或 `null`）**：`daily` / `weekly` 循环任务按该时区的墙钟时间推进（`update-message` 传 `null` 改回按 UTC 推进）。
@@ -537,6 +541,8 @@ Body:
 }
 ```
 
+`tenantToken` 与 `cronToken` 默认不带过期时间，长期有效；要吊销就删掉该租户的 Blob 配置（§8.1），token 随之失效。同一 `tenantId` 并发初始化时先写入者成功，后到者返回 `409 TENANT_ALREADY_INITIALIZED`，已生成的 masterKey 不会被覆盖。
+
 ## 8. 数据存储规范
 
 ### 8.1 Blob（租户配置）
@@ -594,12 +600,12 @@ Body:
 | 400 | `DECRYPTION_FAILED` | 请求体解密失败 |
 | 400 | `INVALID_PARAMETERS` | 参数缺失或格式非法（`init-tenant` / `schedule-message` / `messages` 查询参数） |
 | 400 | `INVALID_MESSAGE_TYPE` | `schedule-message` 的 `messageType` 不在允许集合内 |
-| 400 | `INVALID_TIMESTAMP` | `firstSendTime` 格式非法或未满足未来时间要求 |
+| 400 | `INVALID_TIMESTAMP` | `firstSendTime` 不是 ISO 8601 字符串，或不在未来（`immediate: true` 时不要求未来） |
 | 400 | `PUSH_SUBSCRIPTION_NOT_ACCEPTED` | `schedule-message` 或 `update-message` 请求体携带了已废弃的 `pushSubscription` 字段 |
 | 400 | `TASK_PAYLOAD_TOO_LARGE` | 任务 payload 超过 `MAX_TASK_PAYLOAD_BYTES`（995,871 字节） |
 | 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
 | 400 | `INVALID_PAYLOAD_FORMAT` | 解密后数据非 JSON 对象；或 `amsg-instant` payload 格式非法 |
-| 400 | `INVALID_PUSH_SUBSCRIPTION` | `PUT /push-subscription` 的 `subscription` 缺少非空 `endpoint` |
+| 400 | `INVALID_PUSH_SUBSCRIPTION` | `PUT /push-subscription` 的 `subscription` 不是对象，或 `endpoint` 不是不带用户名密码的 `https` URL（`http`、`localhost` / `*.localhost`、IP 字面量都不收；内网域名不另外拦） |
 | 400 | `INVALID_UPDATED_AT` | `PUT /push-subscription` 的 `updatedAt` 不是正整数毫秒时间戳 |
 | 400 | `LLM_CREDENTIALS_LIMIT_EXCEEDED` | 单用户登记的 LLM 凭据超过上限（500 条） |
 | 400 | `INVALID_OUTBOX_CURSOR` / `INVALID_OUTBOX_LIMIT` / `INVALID_OUTBOX_ACK` / `TOO_MANY_OUTBOX_ACK_IDS` / `INVALID_OUTBOX_DELETE` / `TOO_MANY_OUTBOX_DELETE_IDS` | `/outbox` 与 `/outbox/ack` 参数校验失败 |
@@ -621,13 +627,15 @@ Body:
 | 409 | `TASK_UUID_CONFLICT` | 创建任务时 UUID 冲突 |
 | 409 | `TASK_ALREADY_COMPLETED` | 任务已结束，不可更新或按 pending 详情读取 |
 | 409 | `UPDATE_CONFLICT` | 任务更新失败（可能已被并发修改或删除） |
-| 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化 |
+| 409 | `TENANT_ALREADY_INITIALIZED` | `tenantId` 已初始化，不能重复初始化（并发同 `tenantId` 初始化时后到的一方收到） |
+| 409 | `CLOUD_OWNER_RETIRED` / `CLOUD_OWNER_IMMUTABLE` / `CLOUD_CROSS_OWNER_WRITE` / `CLOUD_GUARD_UNSUPPORTED` / `INVALID_CLOUD_OWNER` / `INVALID_CLOUD_OWNER_GENERATION` / `CLOUD_RESOURCE_CHANGED` | 云端归属守卫拒绝写入：归属已停用、显式归属与已有归属不符、跨归属写入、适配器不支持守卫、宿主解析出的归属形状非法、同一资源连续三次撞上并发写入（单用户 Worker 按错误自带的 4xx 状态码返回；`PUT /client-state` 单条归属形状非法只进 `data.rejected`，`/cloud-data` 清理计划的归属形状非法回 400 `INVALID_CLOUD_OWNER`，见 [`docs/cloud-data-management.md`](../docs/cloud-data-management.md)） |
 | 413 | `REQUEST_BODY_TOO_LARGE` | `Content-Encoding: gzip` 解压后超过 `maxRequestBodyBytes`（默认 32 MB，仅单用户线） |
 | 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding`（仅单用户线） |
 | 500 | `INIT_FAILED` | 单用户 `init-tenant` 建表失败 |
 | 500 | `TASK_CREATE_FAILED` | 创建任务失败 |
 | 500 | `MESSAGE_SEND_FAILED` | in-server instant 同步发送失败（§6.5）；底层错误见 `error.details` |
 | 500 | `VAPID_CONFIG_ERROR` | VAPID 配置不完整 |
+| 500 | `CLOUD_DATA_FAILED` | `/cloud-data/*` 未分类失败（驱动错误码不外露） |
 | 501 | `PUSH_SUBSCRIPTION_NOT_SUPPORTED` / `LLM_CREDENTIALS_NOT_SUPPORTED` / `LLM_CREDENTIALS_PREFIX_DELETE_NOT_SUPPORTED` / `OUTBOX_NOT_SUPPORTED` / `OUTBOX_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACE_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACES_NOT_SUPPORTED` / `CLOUD_DATA_NOT_SUPPORTED` | 当前数据库适配器未实现对应能力 |
 | 503 | `VAPID_NOT_CONFIGURED` | `GET /vapid-public-key` 时服务端未配置 VAPID 公钥 |
 | 503 | `PUSH_SUBSCRIPTION_LOOKUP_FAILED` / `LLM_CREDENTIALS_LOOKUP_FAILED` | 排程或读取时查询订阅表 / 凭据表失败 |
@@ -636,7 +644,7 @@ Body:
 
 ### 9.1 处理阶段错误码（嵌套，非顶层）
 
-in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段）：
+in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段）。同一个 `data.details` 里另有两组既不计成功也不计失败的条目：`cancelledTasks`（`{ taskId, reason, status }`，投递期间任务行被取消或顶替）与 `leaseLostTasks`（`{ taskId, status }`，租约过期后被别的 tick 接手，本跳不再写这条任务）。两组的 `status` 同一套取值，说明是在哪一步发现的：`cancelled_mid_delivery`（推送发出前）、`cancelled_after_delivery`（推送发完、收尾写库时）、`cancelled_before_delivery`（过期收场写库时）：
 
 | code | 含义 |
 |---|---|
@@ -659,7 +667,7 @@ in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MES
 客户端接入四步，缺一步都不完整：
 
 1. 取用户密钥（`GET /api/v1/get-user-key`）。
-2. 订 Web Push 并登记（`PUT /api/v1/push-subscription`）：服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到。公钥从 `GET /api/v1/vapid-public-key` 拿。
+2. 订 Web Push 并登记（`PUT /api/v1/push-subscription`）：服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到。公钥从 `GET /api/v1/vapid-public-key` 拿。订阅的 `endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都返回 `400 INVALID_PUSH_SUBSCRIPTION`。
 3. 发消息 / 排任务（`POST /api/v1/schedule-message`；即时消息用 `messageType: 'instant'`，见 §6.5）。
 4. **应用启动时拉一次服务端收件箱**（`GET /api/v1/outbox` → 处理 → `POST /api/v1/outbox/ack`）。不会弹通知的 payload 只落收件箱、不发推送（§6.7），少了这步它们就等于没发出去过。
 
