@@ -15,6 +15,7 @@
     "amsg-instant-body-limit",
     "amsg-server-custom-push-endpoints",
     "amsg-server-lease-token",
+    "amsg-server-undecryptable-stored-data",
     "amsg-shared-push-send-options",
     "amsg-sw-flush-and-commit",
     "blob-store-engines"
