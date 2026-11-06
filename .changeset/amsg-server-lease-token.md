@@ -23,7 +23,7 @@
 
 **3. 入参校验**
 
-- `PUT /push-subscription`：`endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量回 `400 INVALID_PUSH_SUBSCRIPTION`。已登记的订阅不重新校验；升级前任务 payload 里冻结的老订阅走兜底读取时按同一规则判，不合格视为没有。
+- `PUT /push-subscription`：`endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量回 `400 INVALID_PUSH_SUBSCRIPTION`；`fcm:<token>`、`bark:https://…` 这类不带主机名的自定义前缀地址不受这条限制，由宿主注入的推送通道（`webPush`）自己认格式（`file:`、`data:` 等本地取数前缀除外）。已登记的订阅不重新校验；升级前任务 payload 里冻结的老订阅走兜底读取时按同一规则判，不合格视为没有。
 - `firstSendTime` / `nextSendAt` 只收 ISO 8601 字符串（`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`），否则 `INVALID_TIMESTAMP` / `INVALID_UPDATE_DATA`；`PUT /update-message` 的 `nextSendAt` 必须在未来，改了之后 payload 的 `firstSendTime` 跟着改。
 - `metadata` 必须是普通对象，数组、字符串等回 `400 INVALID_PARAMETERS`（schedule）/ `INVALID_UPDATE_DATA`（update）；`null` 按没传。
 - `GET /messages` 的 `status` 只认 `all / pending / sent / failed`，否则 `400 INVALID_PARAMETERS`。

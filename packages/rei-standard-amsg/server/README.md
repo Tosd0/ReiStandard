@@ -105,7 +105,7 @@ const rei = await createReiServer({
 
 同一版还有几条升级时要留意的：
 
-- **推送订阅的 `endpoint` 收紧**：新登记时 `http`、`localhost` / `*.localhost`、IP 字面量一律 `400 INVALID_PUSH_SUBSCRIPTION`。已登记的用户级订阅不重新校验、照常投递。升级前排的任务 payload 里冻结的老订阅走兜底读取时按同一规则判，不合格视为没有，这时用户级存储里也没有的话任务以 `PUSH_SUBSCRIPTION_MISSING` 失败。本地开发用 `http` 推送 mock 的环境要换成 `https` 域名。
+- **推送订阅的 `endpoint` 收紧**：新登记时 `http`、`localhost` / `*.localhost`、IP 字面量一律 `400 INVALID_PUSH_SUBSCRIPTION`。已登记的用户级订阅不重新校验、照常投递。升级前排的任务 payload 里冻结的老订阅走兜底读取时按同一规则判，不合格视为没有，这时用户级存储里也没有的话任务以 `PUSH_SUBSCRIPTION_MISSING` 失败。本地开发用 `http` 推送 mock 的环境要换成 `https` 域名。`fcm:<token>`、`bark:https://…` 这类不带主机名的自定义前缀地址不受这条限制，由宿主注入的推送通道（`webPush`）自己认格式（`file:`、`data:` 等本地取数前缀除外）。
 - **`firstSendTime` / `nextSendAt` 只收 ISO 8601 字符串**：`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`（时区可省，`±hhmm` 也认，小数秒最多 9 位；以 `isValidISO8601` 为准）。空格分隔的日期时间、RFC 2822、数字时间戳都不收。
 - **过期收场也撤收件箱**：错过触发时刻太久按过期收场（`expired` / `fast_forwarded`）的任务，名下所有还没投递、没 ack 的收件箱行都撤掉，包括之前几次 occurrence 留下的。
 - **租户 token 默认不过期**：`/init-tenant` 新签的 `tenantToken` / `cronToken` 不带 `exp`。升级前签发的、带过期时间的 token 不会自动延长，到期前要重签（删租户配置后重新 init，或用 `createTenantToken` 自己签）。
@@ -283,7 +283,7 @@ createSingleUserCloudflareWorker((env) => ({ …, multipart }));  // CF Worker�
 
 | 端点 | 语义 |
 |---|---|
-| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription.endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都不收（内网域名不另外拦），否则 `400 INVALID_PUSH_SUBSCRIPTION` |
+| `PUT /push-subscription` | 登记 / 覆盖。body =（加密后的）`{ subscription, updatedAt? }`，`subscription.endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都不收（内网域名不另外拦），否则 `400 INVALID_PUSH_SUBSCRIPTION`。`fcm:<token>`、`bark:https://…` 这类不带主机名的自定义前缀地址不受这条限制，由宿主注入的推送通道（`webPush`）自己认格式（`file:`、`data:` 等本地取数前缀除外） |
 | `GET /push-subscription` | `{ exists, updatedAt, endpoint }`。不含订阅的密钥部分——判断「登记过没有、是不是我手里这一个」用 `endpoint` 就够 |
 | `DELETE /push-subscription` | 删掉（设置页的「停止接收推送」） |
 

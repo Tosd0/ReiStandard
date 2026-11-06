@@ -605,7 +605,7 @@ Body:
 | 400 | `TASK_PAYLOAD_TOO_LARGE` | 任务 payload 超过 `MAX_TASK_PAYLOAD_BYTES`（995,871 字节） |
 | 400 | `INVALID_UPDATE_DATA` | `update-message` 字段非法（含 §6.1 / §6.2 校验） |
 | 400 | `INVALID_PAYLOAD_FORMAT` | 解密后数据非 JSON 对象；或 `amsg-instant` payload 格式非法 |
-| 400 | `INVALID_PUSH_SUBSCRIPTION` | `PUT /push-subscription` 的 `subscription` 不是对象，或 `endpoint` 不是不带用户名密码的 `https` URL（`http`、`localhost` / `*.localhost`、IP 字面量都不收；内网域名不另外拦） |
+| 400 | `INVALID_PUSH_SUBSCRIPTION` | `PUT /push-subscription` 的 `subscription` 不是对象，或 `endpoint` 不是不带用户名密码的 `https` URL（`http`、`localhost` / `*.localhost`、IP 字面量都不收；内网域名不另外拦）。`fcm:<token>`、`bark:https://…` 这类不带主机名的自定义前缀地址不受这条限制，由宿主注入的推送通道（`webPush`）自己认格式（`file:`、`data:` 等本地取数前缀除外） |
 | 400 | `INVALID_UPDATED_AT` | `PUT /push-subscription` 的 `updatedAt` 不是正整数毫秒时间戳 |
 | 400 | `LLM_CREDENTIALS_LIMIT_EXCEEDED` | 单用户登记的 LLM 凭据超过上限（500 条） |
 | 400 | `INVALID_OUTBOX_CURSOR` / `INVALID_OUTBOX_LIMIT` / `INVALID_OUTBOX_ACK` / `TOO_MANY_OUTBOX_ACK_IDS` / `INVALID_OUTBOX_DELETE` / `TOO_MANY_OUTBOX_DELETE_IDS` | `/outbox` 与 `/outbox/ack` 参数校验失败 |
@@ -667,7 +667,7 @@ in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MES
 客户端接入四步，缺一步都不完整：
 
 1. 取用户密钥（`GET /api/v1/get-user-key`）。
-2. 订 Web Push 并登记（`PUT /api/v1/push-subscription`）：服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到。公钥从 `GET /api/v1/vapid-public-key` 拿。订阅的 `endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都返回 `400 INVALID_PUSH_SUBSCRIPTION`。
+2. 订 Web Push 并登记（`PUT /api/v1/push-subscription`）：服务端一个用户存一份，所有任务到点都读它，不登记就一条推送都收不到。公钥从 `GET /api/v1/vapid-public-key` 拿。订阅的 `endpoint` 必须是不带用户名密码的 `https` URL，`http`、`localhost` / `*.localhost`、IP 字面量都返回 `400 INVALID_PUSH_SUBSCRIPTION`。`fcm:<token>`、`bark:https://…` 这类不带主机名的自定义前缀地址不受这条限制，由宿主注入的推送通道（`webPush`）自己认格式（`file:`、`data:` 等本地取数前缀除外）。
 3. 发消息 / 排任务（`POST /api/v1/schedule-message`；即时消息用 `messageType: 'instant'`，见 §6.5）。
 4. **应用启动时拉一次服务端收件箱**（`GET /api/v1/outbox` → 处理 → `POST /api/v1/outbox/ack`）。不会弹通知的 payload 只落收件箱、不发推送（§6.7），少了这步它们就等于没发出去过。
 

@@ -27,19 +27,26 @@ export function isValidISO8601(dateString) {
     && !Number.isNaN(Date.parse(dateString));
 }
 
-/**
- * A Web Push endpoint the server may deliver to: https only, no credentials,
- * and never a loopback name or an IP literal (the server would otherwise be
- * talked into calling its own network).
- * @param {unknown} endpoint
- * @returns {boolean}
- */
 /** 排期时刻必须在未来：过去的时刻落库后会被下一跳的过期守卫直接标 failed，
  *  200 等于骗调用方「排上了」。POST 的 firstSendTime 和 PUT 的 nextSendAt 同一条规则。 */
 export function isFutureTimestamp(value) {
   return new Date(value) > new Date();
 }
 
+/** 本地取数用的前缀：没有主机名，但不是哪条推送通道的地址。 */
+const LOCAL_FETCH_SCHEMES = new Set(['file:', 'data:', 'blob:', 'javascript:', 'about:']);
+
+/**
+ * 服务端可以投递的推送地址。
+ *
+ * 带主机名的地址（标准 Web Push）只收 https，URL 里不能带用户名密码，回环名和 IP
+ * 字面量也不收，免得服务端被拿去请求自己的内网。
+ *
+ * `fcm:<token>`、`bark:https://…` 这类自定义前缀的地址没有主机名，默认的 Web Push
+ * 通道发不出去，只有宿主注入的推送通道（`webPush`）认得，格式由那边校验，这里放行。
+ * @param {unknown} endpoint
+ * @returns {boolean}
+ */
 export function isValidPushEndpoint(endpoint) {
   if (typeof endpoint !== 'string') return false;
   let url;
@@ -48,6 +55,7 @@ export function isValidPushEndpoint(endpoint) {
   } catch {
     return false;
   }
+  if (!url.host && !LOCAL_FETCH_SCHEMES.has(url.protocol)) return true;
   if (url.protocol !== 'https:' || url.username || url.password) return false;
   const host = url.hostname;
   return host !== 'localhost'
