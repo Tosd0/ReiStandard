@@ -107,6 +107,14 @@ describe('PUT/GET/DELETE /push-subscription', () => {
     assert.ok(!row.subscription.includes('push.example.com'));
   });
 
+  test('自定义前缀的订阅（宿主自己的推送通道）照常登记', async () => {
+    const { worker, env } = await freshWorker();
+    for (const endpoint of ['fcm:token-abc', 'bark:https://api.day.app/key']) {
+      const res = await putSubscription(worker, env, { endpoint });
+      assert.equal(res.status, 200, endpoint);
+    }
+  });
+
   test('形状不对的订阅 → 400', async () => {
     const { worker, env } = await freshWorker();
     for (const bad of [null, 'string', {}, { endpoint: '' }, { endpoint: 42 }]) {

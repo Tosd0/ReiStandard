@@ -22,9 +22,9 @@ export function supportsPushSubscriptionStore(db) {
 }
 
 /**
- * 一个对象长得像不像 Web Push 订阅。只看投递必需的部分：endpoint 得是服务端
- * 愿意去调的 https 地址（见 validation.js 的 isValidPushEndpoint）。keys 缺失
- * 留给推送服务去拒，这里不替它判。
+ * 一个对象长得像不像推送订阅。只看投递必需的部分：endpoint 得是服务端愿意
+ * 投递的地址（规则见 validation.js 的 isValidPushEndpoint）。keys 缺失留给推送
+ * 服务去拒，这里不替它判。
  *
  * @param {unknown} subscription
  * @returns {boolean}

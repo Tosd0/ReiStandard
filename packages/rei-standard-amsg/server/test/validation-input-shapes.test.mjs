@@ -46,6 +46,29 @@ describe('isValidPushEndpoint', () => {
     }
   });
 
+  // 宿主注入的推送通道（原生 FCM、第三方推送 App）用自定义前缀的地址登记订阅，
+  // 默认 Web Push 通道发不出去，格式由宿主那边校验。
+  test('custom-scheme endpoints without a host are left to the host transport', () => {
+    for (const ok of [
+      'fcm:token-abc',
+      'wxpusher:SPT_abc',
+      'bark:https://api.day.app/key',
+      'meow:https://api.chuckfang.com/nick',
+    ]) {
+      assert.equal(isValidPushEndpoint(ok), true, ok);
+    }
+    for (const bad of [
+      'file:///etc/passwd',
+      'data:text/plain,hi',
+      'blob:https://push.example/uuid',
+      'javascript:alert(1)',
+      'about:blank',
+      'bark://127.0.0.1/key',
+    ]) {
+      assert.equal(isValidPushEndpoint(bad), false, bad);
+    }
+  });
+
   test('isPushSubscriptionShape applies the same endpoint rule', () => {
     assert.equal(isPushSubscriptionShape({ endpoint: 'https://push.example/sub' }), true);
     assert.equal(isPushSubscriptionShape({ endpoint: 'http://push.example/sub' }), false);
