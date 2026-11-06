@@ -1,5 +1,11 @@
 # @rei-standard/blob-store
 
+## 0.1.1-next.0
+
+### Patch Changes
+
+- f4e619c: `package.json` 的 `engines` 定为 `node >= 20.3.0`，与 amsg 系列各包一致。
+
 ## 0.1.0
 
 ### Minor Changes
