@@ -61,7 +61,7 @@
  * @property {(uuid: string, userId: string) => Promise<TaskRow|null>} getTaskByUuid
  *   Fetch a single pending task by uuid + user_id.
  * @property {(uuid: string) => Promise<TaskRow|null>} getTaskByUuidOnly
- *   Fetch a single pending task by uuid only (used by instant processing).
+ *   Fetch a single pending task by uuid only (used by `runTask`).
  *   返回的行要和 `getPendingTasks` 是同一套列（`TASK_DELIVERY_COLUMNS`）：
  *   `runTask` 拿这一行走同一条投递链，少了 `retry_after`，退避守卫读到的永远
  *   是 undefined，还在等重试的任务会被当场再跑一遍。

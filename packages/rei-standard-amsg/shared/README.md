@@ -27,7 +27,7 @@ The two are intentionally independent: any `messageType` can carry any
 
 There is also `source: 'instant' | 'scheduled'` — the **routing
 origin**: `messageType: 'instant'` (both `amsg-instant` and
-`amsg-server`'s in-server instant path) always pairs with
+`amsg-server`'s instant tasks) always pairs with
 `source: 'instant'`; the other three scheduled `messageType`s always
 pair with `source: 'scheduled'`.
 

@@ -17,6 +17,8 @@
  */
 
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
+// instant 起跳器（Durable Object）的默认 binding 名，以及自己包路由的宿主用的叫醒函数。
+export { INSTANT_TICK_BINDING, kickInstantTick } from './cloudflare/instant-tick.js';
 export { createSingleUserServer } from './single-user.js';
 export { createD1Adapter } from './adapters/d1.js';
 export {

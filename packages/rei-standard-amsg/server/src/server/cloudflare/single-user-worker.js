@@ -3,7 +3,7 @@
  *
  * Mirrors instant's createCloudflareWorker: you pass a buildConfig(env) that
  * returns the single-user config; we build the server per request (cheap) and
- * dispatch. Returns { fetch, scheduled } for `export default`.
+ * dispatch. Returns { fetch, scheduled, … } for `export default`.
  *
  * Routes (server endpoints only — NO /send-notifications; cron is scheduled()):
  *   POST /init-tenant       → build tables (idempotent)
@@ -87,15 +87,23 @@
  * 之后，cron 每跳顺手把这些命名空间下超过天数没更新的条目清掉——放旁路大内容
  * 的命名空间用得上，见 lib/run-tick.js。
  *
- * 工厂的第二个参数是 worker 级选项，目前只有一个 `onError`——fetch / cron 任
- * 何一段出错都调它一次。它故意放在 buildConfig 外面：buildConfig 自己抛错
- * （少个 binding、环境变量丢了）时，配置里的东西一个都读不到，而那恰恰是最
- * 需要被看见的一种故障。
+ * 工厂的第二个参数是 worker 级选项：
+ *   - `onError`：fetch / cron / instant 起跳器任何一段出错都调它一次。它故意放在 buildConfig
+ *     外面：buildConfig 自己抛错（少个 binding、环境变量丢了）时，配置里的东西
+ *     一个都读不到，而那恰恰是最需要被看见的一种故障。
+ *   - `instantTickBinding`：instant 起跳器的 Durable Object binding 名，默认
+ *     `AMSG_INSTANT_TICK`。
  *
- * 返回的对象除了 `fetch` / `scheduled`，还有三个给宿主自己调的方法：
+ * `messageType: 'instant'` 的任务落库后回 202，投递交给 instant 起跳器（一个
+ * Durable Object，见 ./instant-tick.js）：env 里有那个 binding 就自动叫醒它，
+ * 没有就等下一跳 cron。config 里自己配了 `dispatchInstant` 的以宿主的为准。
+ *
+ * 返回的对象除了 `fetch` / `scheduled`，还有：
  *   - `runTask(uuid, env)`      → 只跑指定那一条任务（见 lib/run-tick.js）
  *   - `getSchemaVersion(env)`   → 活库的表结构够不够这一版用（只读）
  *   - `ensureSchema(env)`       → 不够就补齐（见 lib/schema-version.js）
+ *   - `InstantTick`             → instant 起跳器的 Durable Object 类，宿主在入口
+ *                                 按 wrangler 里的 class_name 导出它
  */
 
 import { createSingleUserServer } from '../single-user.js';
@@ -105,6 +113,12 @@ import { getSchemaVersion as readSchemaVersion, ensureSchema as applySchema } fr
 import { summarizeErrorCause } from '../lib/errors.js';
 import { resumeCloudDataCleanups } from '../lib/cloud-data-cleanup.js';
 import { readRequestBody } from '../lib/request.js';
+import {
+  INSTANT_TICK_BINDING,
+  createInstantTickClass,
+  isInstantTickNamespace,
+  kickInstantTick
+} from './instant-tick.js';
 
 function headersToObject(h) {
   const out = {};
@@ -271,12 +285,26 @@ function pathOf(request) {
 
 /**
  * @param {(env: Object) => Object|Promise<Object>} buildConfig
- * @param {{ onError?: (info: { stage: 'config'|'request'|'tick'|'cloud-cleanup', error: unknown, cause: import('../lib/errors.js').ErrorCause, path: string|null }) => void|Promise<void> }} [options]
- *   `onError` 在 fetch 或 cron 出错时调一次（best-effort，自身抛错只记日志）。
- *   cron 那条路上没有调用方能看到错误响应，这个 hook 是宿主唯一的出口。
+ * @param {{ onError?: (info: { stage: 'config'|'request'|'tick'|'cloud-cleanup', error: unknown, cause: import('../lib/errors.js').ErrorCause, path: string|null }) => void|Promise<void>, instantTickBinding?: string }} [options]
+ *   `onError` 在 fetch、cron 或 instant 起跳器出错时调一次（best-effort，自身抛错只记日志）。
+ *   cron 和起跳器那两条路上没有调用方能看到错误响应，这个 hook 是宿主唯一的出口。
+ *   `instantTickBinding` 是 instant 起跳器的 Durable Object binding 名（默认 `AMSG_INSTANT_TICK`）。
  */
 export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
   const onError = typeof options.onError === 'function' ? options.onError : null;
+  const instantTickBinding = options.instantTickBinding || INSTANT_TICK_BINDING;
+
+  /**
+   * instant 任务落库后怎么叫醒：config 里配了 dispatchInstant 就用宿主的；否则
+   * env 里有起跳器的 Durable Object binding 就叫醒它；都没有 → null，instant
+   * 等下一跳 cron。
+   */
+  function resolveDispatchInstant(cfg, env) {
+    if (typeof cfg.dispatchInstant === 'function') return cfg.dispatchInstant;
+    const namespace = env ? env[instantTickBinding] : null;
+    if (!isInstantTickNamespace(namespace)) return null;
+    return ({ uuid }) => kickInstantTick(namespace, uuid);
+  }
 
   async function resolveConfig(env) {
     const cfg = await buildConfig(env);
@@ -401,7 +429,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
           : jsonResponse(404, { success: false, error: { code: 'NOT_FOUND', message: 'Unknown route' } });
       }
 
-      const server = createSingleUserServer(cfg);
+      const server = createSingleUserServer({ ...cfg, dispatchInstant: resolveDispatchInstant(cfg, env) });
 
       const url = request.url;
       // Strip trailing slash(es) so `/init-tenant/` routes like `/init-tenant`
@@ -603,5 +631,34 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
     return applySchema(cfg.db);
   }
 
-  return { fetch, scheduled, runTask, getSchemaVersion, ensureSchema };
+  /**
+   * 起跳器的 alarm 里跑的 runTask。alarm 和 cron 一样没有调用方能读到错误，所以
+   * 配置不全、抛错都先递给 `onError` 再照常返回 / 抛出（抛出去 Cloudflare 才会
+   * 重试 alarm）。
+   */
+  async function runInstantTask(uuid, env) {
+    let stage = 'config';
+    try {
+      const cfg = await resolveConfig(env);
+      if (!pushConfigured(cfg)) {
+        const cause = summarizeErrorCause(
+          { name: 'VapidNotConfigured', message: `VAPID / webpush 未配置，instant 任务 ${uuid} 没有跑` },
+          'config'
+        );
+        await reportError({ stage: 'config', error: null, cause, path: null });
+        return { ran: false, reason: 'not_configured' };
+      }
+      stage = 'tick';
+      return await runTaskWithContext(buildTickContext(cfg), uuid);
+    } catch (error) {
+      console.error(`[amsg single-user] instant 任务 ${uuid} 出错:`, error && error.message);
+      await reportError({ stage, error, cause: summarizeErrorCause(error, stage), path: null });
+      throw error;
+    }
+  }
+
+  // instant 起跳器的 Durable Object 类，宿主按 wrangler 里的 class_name 导出它。
+  const InstantTick = createInstantTickClass(runInstantTask);
+
+  return { fetch, scheduled, runTask, getSchemaVersion, ensureSchema, InstantTick };
 }

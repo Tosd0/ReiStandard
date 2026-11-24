@@ -7,6 +7,16 @@ binding = "DB"
 database_name = "amsg"
 database_id = "<你的 D1 database id>"
 
+# messageType: 'instant' 的起跳器：落库后叫醒它，生成在它的 alarm 里跑（15 分钟预算），
+# 请求立刻返回。namespace 随 Worker 上传一起创建，不用预先建资源。
+[[durable_objects.bindings]]
+name = "AMSG_INSTANT_TICK"
+class_name = "AmsgInstantTick"
+
+[[migrations]]
+tag = "amsg-instant-tick-v1"
+new_sqlite_classes = ["AmsgInstantTick"]
+
 # CF Cron Trigger（5 段：分 时 日 月 周，UTC）。每分钟跑一次定时投递：
 [triggers]
 crons = ["* * * * *"]

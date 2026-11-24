@@ -135,6 +135,8 @@ export const SERVER_FEATURES = Object.freeze([
   'agentic-list-tasks',
   'agentic-tool-allowlist',
   'attachments',
+  // messageType: 'instant' 落库即回 202（带 dispatch），投递在后台跑，客户端不用挂着连接。
+  'instant-background',
 ]);
 
 export function createCapabilitiesHandler(ctx) {

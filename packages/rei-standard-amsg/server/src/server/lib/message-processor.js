@@ -2,13 +2,13 @@
  * Message Processor (SDK version)
  *
  * Handles single message content generation and Web Push delivery for
- * scheduled tasks (`fixed` / `prompted` / `auto`) and the
- * in-server instant path (`messageType: 'instant'`).
+ * scheduled tasks (`fixed` / `prompted` / `auto`) and instant tasks
+ * (`messageType: 'instant'`).
  *
  * Push wire shape comes from `@rei-standard/amsg-shared`'s
  * discriminated union (`AmsgPush`). The SW (`@rei-standard/amsg-sw`)
  * routes on `messageKind`. Server-driven pushes always carry
- * `source: 'instant'` (for the in-server instant path) or
+ * `source: 'instant'` (for `messageType: 'instant'` tasks) or
  * `source: 'scheduled'` (for everything else).
  *
  * v2.4.0: when the LLM response carries non-empty
@@ -50,10 +50,8 @@ import {
 } from './outbox-store.js';
 import { shouldSendPush } from './push-policy.js';
 import {
-  buildErrorExtra,
   DeploymentConfigError,
   isNonRetryableError,
-  isPermanentDeliveryFailure,
   isTaskCancelledError,
   markUnrecoverablePartialDelivery,
   readPushStatusCode,
@@ -582,7 +580,7 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
     // retry produces the same id for the same (task, occurrence, sentence)
     // tuple (downstream dedupers can key on it); different occurrences of
     // a recurring task get distinct ids (see occurrenceSuffix). Falls back
-    // to a UUID for the in-server instant path that has no row id.
+    // to a UUID when the row has no id.
     const messageIdBase = task.id != null
       ? `msg_task_${task.id}${occurrenceSuffix(task)}`
       : `msg_${randomUUID()}_instant`;
@@ -728,160 +726,6 @@ export async function processSingleMessage(task, ctx, providedMasterKey, predecr
       pushStatusCode: readPushStatusCode(error),
       permanent: isNonRetryableError(error),
       ...failureRetryDecision(deliveryState, error)
-    };
-  }
-}
-
-/**
- * Process a single message identified by UUID (used for instant type).
- *
- * @param {string} uuid
- * @param {ProcessorContext} ctx
- * @param {number} [maxRetries=2]
- * @param {string} [userId]
- * @param {string} [providedMasterKey]
- * @returns {Promise<{ success: boolean, messagesSent?: number, retriesUsed?: number, reasoningError?: string, error?: Object }>}
- *   `reasoningError` 只在正文都发出去了、思考过程那一条没发成时出现（思考过程是
- *   附赠内容，它发不出去不算这条消息失败）。调用方拿它提示用户这次没有思考过程，
- *   不带这个字段就是整轮都送到了。
- *
- *   这条路是请求里当场投递，不支持 onBeforeFire 的 `{ defer }`：返回它会得到
- *   AGENTIC_DEFER_UNSUPPORTED 的配置错误，按这里的失败流程处理。
- */
-export async function processMessagesByUuid(uuid, ctx, maxRetries = 2, userId, providedMasterKey) {
-  let retryCount = 0;
-  const masterKey = providedMasterKey || ctx.masterKey;
-
-  if (!masterKey) {
-    return {
-      success: false,
-      error: { code: 'TENANT_MASTER_KEY_MISSING', message: '租户主密钥不存在或配置异常' }
-    };
-  }
-
-  while (true) {
-    let task;
-    try {
-      task = userId
-        ? await ctx.db.getTaskByUuid(uuid, userId)
-        : await ctx.db.getTaskByUuidOnly(uuid);
-    } catch (error) {
-      if (retryCount < maxRetries) {
-        retryCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-        continue;
-      }
-
-      return {
-        success: false,
-        error: { code: 'INTERNAL_ERROR', message: error.message, retriesAttempted: retryCount }
-      };
-    }
-
-    if (!task) {
-      return { success: false, error: { code: 'TASK_NOT_FOUND', message: '任务不存在或已处理' } };
-    }
-
-    let attemptDb = ctx.db;
-    if (ctx.db.cloudDataManagement) {
-      try {
-        const userKey = await deriveUserEncryptionKey(task.user_id, masterKey);
-        const payload = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
-        const guard = await captureCloudTaskGuard(ctx.db, task.user_id, payload, ctx.cloudData?.resolveOwner, task);
-        if (guard) attemptDb = createCloudGuardedAdapter(ctx.db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard, userId: task.user_id });
-      } catch (error) {
-        return { success: false, error: { code: error.code || 'PROCESSING_ERROR', message: error.message, retriesAttempted: retryCount } };
-      }
-    }
-    // The same captured generation protects lifecycle writes after processing.
-    const result = await processSingleMessage({ ...task, retry_count: retryCount }, { ...ctx, db: attemptDb, maxDeliveryRetries: maxRetries }, masterKey, null);
-
-    if (!result.success) {
-      if (result.errorCode === 'CLOUD_OWNER_RETIRED') {
-        return { success: false, error: { code: result.errorCode, message: result.error, retriesAttempted: retryCount } };
-      }
-      // 确定性失败不进重试：再跑两轮也是同一个错，白让调用方多等、白烧一整轮
-      // LLM 和 hook 里的计费调用。判定口径跟定时任务那条退避阶梯共用一份（见
-      // lib/errors.js 的 isPermanentDeliveryFailure）——订阅压根没登记、推送服
-      // 务回 410 说订阅没了，这些在哪条链路上都是重试必然同败。
-      const permanent = isPermanentDeliveryFailure({
-        permanent: result.permanent,
-        errorCode: result.errorCode,
-        pushStatus: result.pushStatusCode
-      });
-
-      if (!permanent && result.willRetry !== false && retryCount < (result.retryLimit ?? maxRetries)) {
-        retryCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-        continue;
-      }
-
-      try {
-        await attemptDb.updateTaskById(task.id, {
-          status: 'failed',
-          retry_count: retryCount,
-          // 记录的形状跟定时任务那条路一致（同一个 buildErrorExtra）：reason
-          // 是给用户看的人话，errorCode / pushStatus 是给下游判定用的——410 =
-          // 订阅已注销，客户端要据此引导用户重新登记，而不是回去正则匹配
-          // reason 里那句话。
-          last_error: JSON.stringify({
-            at: new Date().toISOString(),
-            occurrence: task.next_send_at ?? null,
-            reason: sanitizeErrorSummary(result.error),
-            ...(buildErrorExtra(result.errorCode, result.pushStatusCode) || {})
-          })
-        });
-      } catch (_updateError) {
-        if (_updateError?.code === 'CLOUD_OWNER_RETIRED') {
-          return { success: false, error: { code: _updateError.code, message: _updateError.message, retriesAttempted: retryCount } };
-        }
-        // 缺 last_error 列（升级后还没重跑 /init-tenant）或别的写库问题：退掉
-        // 这个字段再试一次，标 failed 不能被一条锦上添花的记录挡住。
-        try {
-          await attemptDb.updateTaskById(task.id, { status: 'failed', retry_count: retryCount });
-        } catch (_retryError) {
-          // best-effort status update; keep original processing error as primary signal
-        }
-      }
-
-      return {
-        success: false,
-        error: {
-          code: 'PROCESSING_ERROR',
-          message: result.error,
-          retriesAttempted: retryCount,
-          ...(permanent ? { permanent: true } : {})
-        }
-      };
-    }
-
-    try {
-      await ctx.db.deleteTaskById(task.id);
-    } catch (error) {
-      try {
-        await attemptDb.updateTaskById(task.id, { status: 'sent', retry_count: 0 });
-      } catch (_markSentError) {
-        // best effort: avoid re-sending if storage mutation partially fails
-      }
-
-      return {
-        success: false,
-        error: {
-          code: 'POST_SEND_CLEANUP_FAILED',
-          message: '消息已发送，但任务清理失败',
-          details: { error: error.message }
-        }
-      };
-    }
-
-    // 思考过程没发成时把原因一路带出去：正文确实发到了，所以这轮仍是成功，但
-    // 「这次没有思考过程」得让调用方看得见——丢在这里的话，那条 push 就是静悄悄
-    // 消失了，而 reasoningError 存在的意义正是提供这份可见性。
-    return {
-      success: true,
-      messagesSent: result.messagesSent,
-      retriesUsed: retryCount,
-      ...(result.reasoningError ? { reasoningError: result.reasoningError } : {}),
     };
   }
 }

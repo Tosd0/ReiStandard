@@ -4,8 +4,7 @@ import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { deriveUserEncryptionKey, encryptForStorage } from '../src/server/lib/encryption.js';
 import { createCloudGuardedAdapter } from '../src/server/lib/cloud-data-guard.js';
-import { runScheduledTick } from '../src/server/lib/run-tick.js';
-import { processMessagesByUuid } from '../src/server/lib/message-processor.js';
+import { runScheduledTick, runTask } from '../src/server/lib/run-tick.js';
 const userId='u',masterKey='task-lifecycle-key',owner={type:'character',id:'one'};
 async function setup(){
  const raw=createTestD1();const db=createD1Adapter(raw);await db.initSchema();
@@ -28,7 +27,7 @@ test('retired tasks are rejected before a scheduler claim or lifecycle update',a
  }finally{raw.close();}
 });
 
-for(const mode of ['scheduled','instant'])test(`${mode} retirement during generation cannot write a late failure/retry state after restore`,async()=>{
+for(const mode of ['tick','runTask'])test(`${mode} retirement during generation cannot write a late failure/retry state after restore`,async()=>{
  const {raw,db,guarded}=await setup();const original=globalThis.fetch;let atRetirement;
  globalThis.fetch=async()=>{
   await db.setCloudOwnerActive(userId,owner,false);await db.setCloudOwnerActive(userId,owner,true);
@@ -37,8 +36,8 @@ for(const mode of ['scheduled','instant'])test(`${mode} retirement during genera
  };
  try{
   const ctx={db:guarded,masterKey,leaseHeartbeatMs:0};
-  if(mode==='scheduled')await runScheduledTick(ctx);
-  else await processMessagesByUuid('owned-task',ctx,0,userId,masterKey);
+  if(mode==='tick')await runScheduledTick(ctx);
+  else await runTask(ctx,'owned-task');
   const after=await db.getTaskByUuid('owned-task',userId);
   assert.ok(atRetirement,'generation was reached');
   assert.ok(after,'revoked task remains for the cleanup operation');

@@ -118,7 +118,7 @@ export function createResultEmitter({
     const seq = emitted++;
     // source 由 messageType 推导（与 message-processor 的聊天推送同一判据）：
     // 标准里 messageType: 'instant' 必配 source: 'instant'，写死 'scheduled'
-    // 会在 in-server instant 的 fire 里凑出一对非法组合。
+    // 会在 instant 任务的 fire 里凑出一对非法组合。
     const messageType = decryptedPayload.messageType || 'auto';
     const push = buildResultPush({
       messageType,

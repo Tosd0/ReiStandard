@@ -12,8 +12,30 @@ import { getHeader, isPlainObject, parseEncryptedBody, requireUserId } from '../
 import { validateScheduleMessagePayload, validateTaskPayloadSize } from '../lib/validation.js';
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
-import { processMessagesByUuid } from '../lib/message-processor.js';
 import { discardUndeliveredPushesForTask } from '../lib/outbox-store.js';
+import { runTask } from '../lib/run-tick.js';
+
+/**
+ * 叫醒 instant 任务的起跳器。宿主的回调抛错只记日志：任务已经落库，叫不醒
+ * 也有 cron 兜底，不该把一次已经受理的请求报成失败。
+ *
+ * 回调是被 await 的（要知道叫醒成没成），所以它只该负责「叫醒」：返回
+ * `task.run()` 的 promise 会让这个请求一直等到整轮生成跑完。
+ *
+ * @param {((task: { uuid: string, userId: string, tenantId: string, run: () => Promise<Object> }) => unknown) | null | undefined} dispatchInstant
+ * @param {{ uuid: string, userId: string, tenantId: string, run: () => Promise<Object> }} task
+ * @returns {Promise<'kicked'|'not_configured'|'kick_failed'>}
+ */
+async function dispatchInstantTask(dispatchInstant, task) {
+  if (typeof dispatchInstant !== 'function') return 'not_configured';
+  try {
+    await dispatchInstant(task);
+    return 'kicked';
+  } catch (error) {
+    console.warn(`[amsg-server] instant 任务 ${task.uuid} 叫醒失败，等下一跳 cron:`, error && error.message);
+    return 'kick_failed';
+  }
+}
 
 export function createScheduleMessageHandler(ctx) {
   async function POST(headers, body) {
@@ -137,7 +159,9 @@ export function createScheduleMessageHandler(ctx) {
 
     // immediate：不排未来，next_send_at = 现在，下一跳 cron（最多一分钟后）
     // 直接捞走。客户端不用再为「严格在未来」预留提前量。
-    const effectiveSendTime = payload.immediate === true
+    // instant 同样落库即到期，只是不等 cron：落库后马上叫醒起跳器（见下方）。
+    const isInstant = payload.messageType === 'instant';
+    const effectiveSendTime = payload.immediate === true || isInstant
       ? new Date().toISOString()
       : payload.firstSendTime;
 
@@ -193,25 +217,9 @@ export function createScheduleMessageHandler(ctx) {
 
     const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
-    /**
-     * In-server instant path. Delivers an instant message through this
-     * server's own task queue (create task → process by UUID → delete task).
-     * The task is written to the database before processing, so delivery is
-     * not tied to the request connection: even if the client disconnects, the
-     * row stays and the generation keeps running (and can be retried) for as
-     * long as it needs. Use this when you have a database and want long or
-     * guaranteed-complete generations with no dropped messages.
-     *
-     * The stateless alternative is `@rei-standard/amsg-instant`: it streams
-     * over SSE with a Web Push backup and needs no database, which makes it a
-     * good fit for edge runtimes (e.g. Cloudflare Workers). Its work rides the
-     * response connection, so after the client disconnects it only has the
-     * platform's brief grace window to finish (≈20-30s observed on Deno
-     * Deploy) — ideal for short instant messages that complete quickly.
-     */
-    // Instant type: check VAPID before creating the task to avoid orphaned rows
-    if (payload.messageType === 'instant') {
-      if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
+    // instant 一建行就要投递，VAPID / webpush 没配齐的话这条注定发不出去，建行之前就报。
+    if (isInstant) {
+      if (!ctx.webpush || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
         return {
           status: 500,
           body: {
@@ -221,6 +229,7 @@ export function createScheduleMessageHandler(ctx) {
               message: 'VAPID 配置缺失，无法发送即时消息',
               details: {
                 missingKeys: [
+                  !ctx.webpush && 'webpush',
                   !ctx.vapid.email && 'VAPID_EMAIL',
                   !ctx.vapid.publicKey && 'NEXT_PUBLIC_VAPID_PUBLIC_KEY',
                   !ctx.vapid.privateKey && 'VAPID_PRIVATE_KEY'
@@ -289,41 +298,38 @@ export function createScheduleMessageHandler(ctx) {
       await discardUndeliveredPushesForTask({ db, userId, taskUuid: supersedesUuid });
     }
 
-    // In-server instant path — rationale documented above the VAPID pre-check.
-    // Instant type: send immediately
-    if (payload.messageType === 'instant') {
-      try {
-        const sendResult = await processMessagesByUuid(taskUuid, {
-          ...ctx,
-          db,
-          masterKey
-        }, 2, userId, masterKey);
-
-        if (!sendResult.success) {
-          return { status: 500, body: { success: false, error: { code: 'MESSAGE_SEND_FAILED', message: '消息发送失败', details: sendResult.error } } };
-        }
-
-        return {
-          status: 200,
-          body: {
-            success: true,
-            data: {
-              uuid: taskUuid,
-              contactName: payload.contactName,
-              messagesSent: sendResult.messagesSent,
-              sentAt: new Date().toISOString(),
-              status: 'sent',
-              retriesUsed: sendResult.retriesUsed || 0,
-              // 思考过程那条 push 没发出去的原因（有才带上）。正文照发，所以
-              // 这次调用仍是成功的；调用方拿它决定要不要提示 / 重发。
-              ...(sendResult.reasoningError ? { reasoningError: sendResult.reasoningError } : {}),
-              ...(supersedesUuid ? { superseded } : {})
-            }
+    // instant：行已落库，这一刻起投递跟这个请求无关。叫醒宿主配的起跳器（单
+    // 用户 Worker 默认是一个 Durable Object，alarm 里跑 runTask）后立刻回 202，
+    // 客户端不用挂着连接等生成。为什么不在请求里跑、也不用 waitUntil，见
+    // README「关于 messageType: 'instant'」。
+    // 起跳器没配或叫醒失败都不算失败：行在库里，下一跳 cron 照样捡走。
+    if (isInstant) {
+      const dispatch = await dispatchInstantTask(ctx.dispatchInstant, {
+        uuid: taskUuid,
+        userId,
+        tenantId: tenantCtx.tenantId,
+        // 绑好这个租户的库和主密钥：多租户线上宿主自己拿不到这两样，没有它就
+        // 调不了 runTask。
+        run: () => runTask({ ...ctx, db, masterKey }, taskUuid)
+      });
+      return {
+        status: 202,
+        body: {
+          success: true,
+          data: {
+            id: dbResult.id,
+            uuid: dbResult.uuid,
+            contactName: payload.contactName,
+            nextSendAt: dbResult.next_send_at,
+            status: dbResult.status,
+            createdAt: dbResult.created_at,
+            // 'kicked'：起跳器已叫醒，马上开始生成；'not_configured' / 'kick_failed'：
+            // 等下一跳 cron（最多一分钟）。
+            dispatch,
+            ...(supersedesUuid ? { superseded } : {})
           }
-        };
-      } catch (error) {
-        return { status: 500, body: { success: false, error: { code: 'MESSAGE_SEND_FAILED', message: '消息发送失败', details: { error: error.message } } } };
-      }
+        }
+      };
     }
 
     // Non-instant: return scheduled response

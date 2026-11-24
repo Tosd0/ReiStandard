@@ -7,7 +7,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runScheduledTick, runTask } from '../src/server/lib/run-tick.js';
-import { processMessagesByUuid } from '../src/server/lib/message-processor.js';
 import { MAX_DEFER_AFTER_MS } from '../src/server/lib/agentic-fire.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
@@ -418,18 +417,19 @@ test('没实现 claimTask 的适配器：defer 报 AGENTIC_DEFER_UNSUPPORTED', a
   assert.equal(f.calls.llm, 0);
 });
 
-test('请求内当场投递的 instant 任务：defer 报 AGENTIC_DEFER_UNSUPPORTED', async (t) => {
+test('instant 任务走 runTask：defer 和定时任务一样生效', async (t) => {
   const f = await fixture(t, {
     messageType: 'instant',
     beforeFire: () => ({ defer: { afterMs: 45 * SECOND } }),
   });
 
-  const result = await processMessagesByUuid('defer-task', f.tickCtx, 0, USER, MASTER_KEY);
+  const result = await runTask(f.tickCtx, 'defer-task');
 
-  assert.equal(result.success, false);
-  assert.match(result.error.message, /AGENTIC_DEFER_UNSUPPORTED/);
-  assert.equal((await f.row()).status, 'failed', '不能当成发完了把任务删掉，也不能悄悄留着');
-  assert.equal(f.calls.settled[0].status, 'failed');
+  assert.equal(result.ran, true);
+  assert.equal(result.summary.details.deferredTasks.length, 1);
+  const row = await f.row();
+  assert.equal(row.status, 'pending');
+  assert.ok(row.retry_after, '推迟写进 retry_after');
   assert.equal(f.calls.llm, 0);
   assert.equal(f.webpush.sent.length, 0);
 });

@@ -258,9 +258,9 @@ async function scanUnackedOutboxForTask(db, userId, taskUuid) {
 // 一个 token 都不再花。
 
 /**
- * 往前多看这么久：行的 created_at 用的是 worker 的时钟，名义触发时刻却可能来
- * 自客户端（`messageType: 'instant'` 的 firstSendTime），两边对不齐时别把本次
- * 触发的行挡在窗口外面。循环任务相邻两次触发至少隔一天，这个余量不会把上一次
+ * 往前多看这么久：行的 created_at 是落 outbox 那台机器的时钟，名义触发时刻是
+ * 建任务时定的（客户端给的 firstSendTime，或受理请求那台机器的当前时刻），两
+ * 边的时钟对不齐时别把本次触发的行挡在窗口外面。循环任务相邻两次触发至少隔一天，这个余量不会把上一次
  * 的行大把捞进来——捞进来也没关系，下面还要按行里的 occurrenceMs 逐条核对。
  */
 const COMMITTED_BATCH_LOOKBACK_MS = 60 * 60 * 1000;

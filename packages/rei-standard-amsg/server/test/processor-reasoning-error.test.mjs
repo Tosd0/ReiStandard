@@ -13,7 +13,6 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { processMessagesByUuid } from '../src/server/lib/message-processor.js';
 import { runScheduledTick } from '../src/server/lib/run-tick.js';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
@@ -73,34 +72,6 @@ async function seedTask(adapter, uuid, payload = LLM_TASK_PAYLOAD) {
 }
 
 describe('思考过程没发出去时的可见性', () => {
-  it('processMessagesByUuid 的返回值带上 reasoningError（正文仍算成功）', async () => {
-    const adapter = createD1Adapter(createTestD1());
-    await adapter.initSchema();
-    await seedTask(adapter, 'instant-reasoning', { ...LLM_TASK_PAYLOAD, messageType: 'instant' });
-
-    const sent = [];
-    const restore = stubLlm('回答。', '先想想再回答');
-    let result;
-    try {
-      result = await processMessagesByUuid('instant-reasoning', {
-        db: withoutOutbox(adapter),
-        masterKey: MASTER_KEY,
-        vapid: VAPID,
-        webpush: webpushRejectingReasoning(sent),
-      }, 2, USER, MASTER_KEY);
-    } finally {
-      restore();
-    }
-
-    assert.equal(result.success, true, '正文送到了，这条 instant 消息就是成功的');
-    assert.equal(result.messagesSent, 1);
-    assert.equal(sent.length, 1, '正文照发');
-    assert.ok(
-      result.reasoningError,
-      `思考过程被丢掉了，返回值里得说出来：${JSON.stringify(result)}`
-    );
-  });
-
   it('tick 汇总里列出「正文送到了、思考过程没送到」的任务', async () => {
     const adapter = createD1Adapter(createTestD1());
     await adapter.initSchema();

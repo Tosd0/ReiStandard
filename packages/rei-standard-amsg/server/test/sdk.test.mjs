@@ -169,10 +169,9 @@ function createFakeAdapter() {
   };
 }
 
-function buildServer() {
-  const fakeAdapter = createFakeAdapter();
-
+function buildServer(extraConfig = {}, fakeAdapter = createFakeAdapter()) {
   return createReiServer({
+    ...extraConfig,
     vapid: {
       email: 'vapid@example.com',
       publicKey: 'BDhAMffLOGHAGMeiU10WAui8vJ75OLtytejvWSTY26CtUd0L4QBlg7zC_EBD-w-xEPSdWxf2WCdBVGySkINp-7c',
@@ -495,6 +494,45 @@ describe('createReiServer v2.0.1 flow', () => {
     assert.equal(result.status, 201);
     assert.equal(result.body.success, true);
     assert.equal(typeof result.body.data.uuid, 'string');
+  });
+
+  it('instant: dispatchInstant 拿到的 run() 绑着这个租户的库', async () => {
+    const fakeAdapter = createFakeAdapter();
+    const calls = [];
+    const instantServer = await buildServer({ dispatchInstant: (task) => { calls.push(task); } }, fakeAdapter);
+    const initResult = await instantServer.handlers.initTenant.POST(
+      { 'x-init-secret': 'init-secret' },
+      { driver: 'neon', databaseUrl: 'postgres://tenant-db' }
+    );
+    const tenantToken = initResult.body.data.tenantToken;
+    const headers = {
+      authorization: `Bearer ${tenantToken}`,
+      'x-user-id': TEST_USER_ID,
+      'x-payload-encrypted': 'true',
+      'x-encryption-version': '1'
+    };
+    const keyResult = await instantServer.handlers.getUserKey.GET('/api/v1/get-user-key', headers);
+    await registerPushSubscription(instantServer, tenantToken, keyResult.body.data.userKey);
+
+    const result = await instantServer.handlers.scheduleMessage.POST(
+      headers,
+      await encryptPayload(
+        { contactName: 'Alice', messageType: 'instant', userMessage: 'hello' },
+        keyResult.body.data.userKey
+      )
+    );
+
+    assert.equal(result.status, 202);
+    assert.equal(result.body.data.dispatch, 'kicked');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].uuid, result.body.data.uuid);
+    assert.equal(typeof calls[0].tenantId, 'string');
+
+    // 把这条挪到未来再跑：run() 认得出这一行并说它没到点，说明它读的是这个
+    // 租户的库（而且不会真的去发推送）。
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await fakeAdapter.updateTaskById(result.body.data.id, { next_send_at: future });
+    assert.deepEqual(await calls[0].run(), { ran: false, reason: 'not_due', nextSendAt: future });
   });
 
   it('sendNotifications accepts cron token from query', async () => {

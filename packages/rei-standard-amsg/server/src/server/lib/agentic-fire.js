@@ -1013,18 +1013,15 @@ async function runFireChain({
     const afterMs = readDeferAfterMs(before.defer);
     // 推迟靠 retry_after 这一列落地，只有定时投递（runScheduledTick / runTask）
     // 且适配器实现了 claimTask 时才有这一列可写，由 run-tick 用 ctx._deferSupported
-    // 告诉这里。别的入口都不行：
-    //   - 没实现 claimTask 的自定义适配器只能把时间写进 next_send_at，而那是
-    //     这次触发的名义时刻（宿主拿它当触发身份、循环推进拿它当基准），不能改；
-    //   - `messageType: 'instant'` 在请求里当场投递（processMessagesByUuid），
-    //     没有「过一会儿再捞起来」这回事。
+    // 告诉这里。没实现 claimTask 的自定义适配器不行：它只能把时间写进
+    // next_send_at，而那是这次触发的名义时刻（宿主拿它当触发身份、循环推进
+    // 拿它当基准），不能改。
     // 这是部署 / 用法层面的问题，按配置错误报（可重试、不判终态），不悄悄当成
     // 跳过或立刻再问。
     if (ctx._deferSupported !== true) {
       throw new DeploymentConfigError(
         'AGENTIC_DEFER_UNSUPPORTED: onBeforeFire 返回了 { defer }，但这条投递路径不支持推迟——'
-        + '只有 runScheduledTick / runTask 且适配器实现了 claimTask（任务表有 retry_after 列）时可用，'
-        + '请求内当场投递的 instant 任务不可用',
+        + '只有 runScheduledTick / runTask 且适配器实现了 claimTask（任务表有 retry_after 列）时可用',
         { code: 'AGENTIC_DEFER_UNSUPPORTED' }
       );
     }

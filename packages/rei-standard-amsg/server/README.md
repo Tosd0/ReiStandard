@@ -130,9 +130,99 @@ const rei = await createReiServer({
 
 ## 关于 `messageType: 'instant'`
 
-> **两条 instant 路径：**
-> - **本端点的 `messageType: 'instant'`**（create task → process by UUID → delete task）：任务先写进数据库再处理，投递不绑在请求连接上——客户端断开也没关系，任务行还在，能继续跑、能重试，想跑多久跑多久。落进收件箱的那份客户端上线也补得回来。有数据库就走这条。
-> - **[@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md)**：纯 SSE 流 + Web Push backup，不需要数据库，跑得动无状态边缘运行时。处理挂在响应连接上，客户端一断开就只剩平台给的那点宽限期把活干完（Deno Deploy 实测 ≈20-30s）；它也没有服务端收件箱，push 漏了的内容补不回来。这个包现在是维护态，新接入不从它起步。
+instant 是「建行就触发」的任务：客户端把拼好的提示词交给 `POST /schedule-message`，服务端落库后立刻回 `202`，生成和推送在后台跑，客户端交完就可以断开，进程被杀也不影响这条消息。除了触发时机，它和定时任务走同一条投递链：占位、租约心跳、失败退避、fire-time hook、收件箱都一样，结果同样从推送和 `GET /outbox?since=` 拿。
+
+请求上和定时任务的区别：
+
+- `firstSendTime` 可省略，服务端取当前时刻；传了只校验格式，不要求在未来。
+- `recurrenceType` 只能是 `none`，也不能再带 `immediate`。
+
+响应是 `202`，`data` 和定时任务的 `201` 同形状，多一个 `dispatch`：
+
+```json
+{ "success": true, "data": { "id": 12, "uuid": "…", "contactName": "Rei", "nextSendAt": "…", "status": "pending", "createdAt": "…", "dispatch": "kicked" } }
+```
+
+| `dispatch` | 意思 |
+|---|---|
+| `kicked` | 起跳器已叫醒，马上开始生成 |
+| `not_configured` | 没配起跳器，等下一跳 cron（单用户 Worker 最多一分钟） |
+| `kick_failed` | 叫醒失败（服务端日志里有原因），同样等下一跳 cron |
+
+后两种都不算失败：任务已经在库里，cron 会捡走。
+
+`202` 只表示任务已受理，投递成没成不在这个响应里。投递失败时没有推送，也不进收件箱，要知道结果有两个办法：
+
+- 查 `GET /message?id=<uuid>`：
+
+  | 响应 | 意思 |
+  |---|---|
+  | `200`，`task.lastError` 为空 | 还没跑，或正在跑 |
+  | `200`，`task.lastError` 有值 | 上一次没发成，在等重试 |
+  | `409 TASK_ALREADY_COMPLETED`，`error.details.status` 是 `failed` | 不会再试了，原因在 `error.details.lastError` |
+  | `404 TASK_NOT_FOUND` | 已经发完（一次性任务发完即删） |
+
+- 配 `onFireSettled`，在 `status: 'failed'` 时用 `emitResult` 给客户端送一条结果（见下文 fire-time hook；只有走 LLM 的任务会调这个 hook）。
+
+建任务时 VAPID 或 `webpush` 没配齐会直接回 `500 VAPID_CONFIG_ERROR`，不建行。
+
+### 起跳器：单用户 Cloudflare Worker
+
+`createSingleUserCloudflareWorker` 自带一个起跳器，是一个 Durable Object。在 wrangler 里加 binding 和 migration，入口导出它的类即可：
+
+```toml
+[[durable_objects.bindings]]
+name = "AMSG_INSTANT_TICK"
+class_name = "AmsgInstantTick"
+
+[[migrations]]
+tag = "amsg-instant-tick-v1"
+new_sqlite_classes = ["AmsgInstantTick"]
+```
+
+```js
+const worker = createSingleUserCloudflareWorker(buildConfig);
+export default worker;
+export const AmsgInstantTick = worker.InstantTick; // 名字与 class_name 一致
+```
+
+- binding 名默认 `AMSG_INSTANT_TICK`，要换就传工厂的第二个参数 `{ instantTickBinding: '…' }`。env 里没有这个 binding 时 instant 退回 cron。
+- 一条任务一个实例（实例名是任务 uuid），叫醒后它设一个立刻到期的 alarm，在 alarm 里调 `worker.runTask(uuid, env)`。alarm 是一次独立的执行，有 15 分钟墙钟预算，几条 instant 同时来各跑各的。
+- 和 cron 同时扫到同一条时，两边都要先抢租约，只有一方会发。
+- alarm 里出错（配置读不出来、读库失败）会调工厂第二个参数里的 `onError`，然后由 Cloudflare 重试 alarm；重试用完任务仍在库里，cron 接手。
+- Durable Object 的 namespace 随 Worker 上传一起创建，不用预先建资源。用 API token 部署时不需要在 Workers Scripts / D1 之外多勾权限。
+- 自己包路由的宿主可以用导出的 `kickInstantTick(namespace, uuid)` 叫醒它。
+
+### 其他运行时
+
+`createSingleUserServer` / `createReiServer` 的 config 认 `dispatchInstant({ uuid, userId, tenantId, run })`：instant 落库后调一次。`run()` 跑这一条任务，库和密钥已经绑好（多租户线上就是这个租户的），返回值和 `runTask` 一样。宿主在回调里把 `run` 交给一个不挂在请求上的执行者。常驻的 Node 进程可以直接在进程里调：
+
+```js
+createSingleUserServer({
+  // …
+  dispatchInstant: ({ uuid, run }) => {
+    // 不要 return / await run()：服务端会等这个回调返回才回 202
+    run().catch((error) => console.error(`instant ${uuid} 出错`, error));
+  },
+});
+```
+
+回调抛错只记日志，响应里报 `kick_failed`；不配就等下一次 cron（多租户线是下一次 `/send-notifications`）。单用户 Worker 的 config 里配了 `dispatchInstant` 的，以它为准，不再用内置起跳器。
+
+### 为什么用 Durable Object 的 alarm
+
+| 做法 | 在 instant 场景下的问题 |
+|---|---|
+| 在请求里同步跑完再响应 | 客户端得挂着连接等生成；Cloudflare 上客户端一断开，请求里没做完的活会被取消 |
+| `ctx.waitUntil` | 响应结束后最多再撑 30 秒，带推理、带工具循环的生成跑不完 |
+| Cloudflare Queues | 消费者要等一整批处理完才会扩容，一条在生成时后来的那条得排队；部署还要多勾 Queues 权限并预先建好队列 |
+| Durable Object alarm（采用） | 每条任务一个实例，各自 15 分钟墙钟，互不排队；不用额外权限 |
+
+代价是计费方式：Durable Object 按活跃时长计费，等 LLM 回话的时间也算。免费档每天 13,000 GB-s，按每个实例 128MB 折算约 104,000 秒，平均每条生成 1 分钟的话一天约 1,700 条、2 分钟约 860 条。用超之后叫醒会失败，任务退回 cron，最多晚一分钟，不会丢。付费档每月含 400,000 GB-s。只有 instant 走起跳器，定时任务走 cron，不占这份额度。实际用量可以在 Cloudflare 面板 Durable Objects 的 Metrics 里看。
+
+### 和 `@rei-standard/amsg-instant` 的区别
+
+[@rei-standard/amsg-instant](https://github.com/Tosd0/ReiStandard/blob/main/packages/rei-standard-amsg/instant/README.md) 是无数据库的另一条路：纯 SSE 流 + Web Push backup，处理挂在响应连接上，客户端一断开就只剩平台给的那点宽限期把活干完（Deno Deploy 实测 ≈20-30s）；它也没有服务端收件箱，push 漏了的内容补不回来。这个包现在是维护态，新接入不从它起步。
 
 ## AI 接口 `apiUrl` 约束
 
@@ -269,10 +359,9 @@ createSingleUserCloudflareWorker((env) => ({ …, multipart }));  // CF Worker�
 
 > 这一节说的是**推送真的发出去过、但发挂了**的情况。有收件箱的部署上思考过程只落行、不推送（见[哪些 payload 会发推送](#哪些-payload-会发推送)），那条路上内容没丢，也就不会有下面这些信号。
 
-思考过程是正文之外的附赠内容：它没发出去不影响正文，任务照样算成功。这件事有三处看得见——
+思考过程是正文之外的附赠内容：它没发出去不影响正文，任务照样算成功。这件事有两处看得见——
 
-- 定时任务的 tick 汇总多一个 `details.reasoningSkippedTasks`：`[{ taskId, reason }]`。这些任务同时计在 `successCount` 里。
-- instant 消息（`POST /schedule-message`）的成功响应带 `reasoningError`（字符串，只在思考过程没送到时出现）。
+- tick 汇总（`runTask` 的 `summary` 也是）多一个 `details.reasoningSkippedTasks`：`[{ taskId, reason }]`。这些任务同时计在 `successCount` 里。
 - 服务端日志各打一行：一行说原因，一行说是哪条任务。
 
 刻意不写进 `last_error`：那一列说的是「上一次没发出去的原因」，一条正文已经送达的消息挂着它，客户端会当成这次投递失败了。
@@ -396,7 +485,7 @@ ctx / metadata / push 上）。
 
 | 字段 | 是什么 |
 |---|---|
-| `taskId` | 任务行 id；没有行的 in-server instant 路径为 `null` |
+| `taskId` | 任务行 id |
 | `taskUuid` | 任务 uuid（排程方选的那个） |
 | `recurrenceType` | `none` / `daily` / `weekly` —— 这条任务还会不会再来 |
 | `occurrenceMs` | 本次触发的名义时刻，epoch 毫秒 |
@@ -566,7 +655,7 @@ async onBeforeFire(ctx) {
 - `afterMs` 必须是有限正数，最大 24 小时（导出为 `MAX_DEFER_AFTER_MS`）。不合法的值按 hook 契约违约处理（`AGENTIC_BAD_BEFORE_FIRE`，一跳终审）。没有下限，但 cron 一分钟一跳，实际是「到点之后的第一跳」才会再问；用 `runTask` 自己触发的话，到点之前调它会得到 `retry_pending`。
 - 推迟不会让任务永远挂着。名义时刻过去超过 `staleAfterMs`（默认 60 分钟）的任务照常按过期处理：一次性任务标 `failed`、循环任务快进到下一次，并调 `onStaleSkip`。某次推迟的唤醒时刻已经越过这条线时，库不再等那一轮，当场按过期收场——这时宿主会先收到 `status: 'deferred'` 的 `onFireSettled`，紧接着收到 `onStaleSkip`。
 - 每次被重新问到都是一次新的 fire：`scratch` 是新的，`onFireSettled` 各调各的。
-- 只有定时投递（`runScheduledTick`、单用户 Worker 的 `scheduled()`、`runTask`）支持推迟，并且适配器要实现 `claimTask`（任务表有 `retry_after` 列，内置适配器都有）。`messageType: 'instant'` 在请求里当场投递的任务、以及没实现 `claimTask` 的自定义适配器返回 `{ defer }` 会得到 `AGENTIC_DEFER_UNSUPPORTED`，按[部署配错了算可重试](#部署配错了算可重试)处理。
+- 只有定时投递（`runScheduledTick`、单用户 Worker 的 `scheduled()`、`runTask`）支持推迟，并且适配器要实现 `claimTask`（任务表有 `retry_after` 列，内置适配器都有）。没实现 `claimTask` 的自定义适配器返回 `{ defer }` 会得到 `AGENTIC_DEFER_UNSUPPORTED`，按[部署配错了算可重试](#部署配错了算可重试)处理。
 - 内容已经落进收件箱、只是推送没发完的重试不调 `onBeforeFire`（见[生成成功之后推送失败：只补推送](#生成成功之后推送失败只补推送)），那一跳也就不会被推迟。
 - 配了 `serializeBy` 时，被推迟的任务不占着分组：同组里排在它后面的任务可以先跑。
 
@@ -867,7 +956,7 @@ await client.scheduleMessage({
 
 `renewTaskLease` 回 `false` 之后库会再读一次任务行，区分「被取消 / 顶替」和「被别的 tick 接手」。`listTasks` 的排序要是 `next_send_at ASC, id ASC`，不然同一触发时刻的几条翻页时会重复或漏掉。`cleanupOldTasks` 一跳最多删 `CLEANUP_BATCH_LIMIT`（100）条。
 
-占位管的是定时触发这条路径。`messageType: 'instant'` 走的是「建行 → 当场投递」，不经过占位。
+`messageType: 'instant'` 的任务同样经过占位：起跳器里跑的 `runTask` 和 cron 抢的是同一份租约。
 
 内置适配器都实现了占位。自定义适配器可以不实现 `claimTask`，跑得动，只是回到不占位的行为。
 
@@ -911,7 +1000,7 @@ await client.scheduleMessage({
 createSingleUserCloudflareWorker((env) => ({ …, maxDeliveryRetries: 1 }));  // 0 = 第一次失败就终审
 ```
 
-`createSingleUserServer` / `createReiServer` 的 config、直接调 `runScheduledTick` 的 ctx 也认同名字段，默认值导出为 `DEFAULT_MAX_DELIVERY_RETRIES`。它只管定时任务这条退避阶梯；`messageType: 'instant'` 在请求里当场投递的那条路有自己的三轮重试，不受它影响。宿主要是自己按「重试次数到 3」判断终态的，调低之后记得跟着改。
+`createSingleUserServer` / `createReiServer` 的 config、直接调 `runScheduledTick` 的 ctx 也认同名字段，默认值导出为 `DEFAULT_MAX_DELIVERY_RETRIES`。`messageType: 'instant'` 的任务走同一条退避阶梯。宿主要是自己按「重试次数到 3」判断终态的，调低之后记得跟着改。
 
 ### 一跳终审、不再重试的失败
 
