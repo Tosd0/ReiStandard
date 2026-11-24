@@ -13,13 +13,17 @@ import { validateScheduleMessagePayload, validateTaskPayloadSize } from '../lib/
 import { supportsPushSubscriptionStore } from '../lib/push-subscription-store.js';
 import { supportsLlmCredentialsStore, findMissingCredIds } from '../lib/llm-credentials-store.js';
 import { discardUndeliveredPushesForTask } from '../lib/outbox-store.js';
+import { runTask } from '../lib/run-tick.js';
 
 /**
  * 叫醒 instant 任务的起跳器。宿主的回调抛错只记日志：任务已经落库，叫不醒
  * 也有 cron 兜底，不该把一次已经受理的请求报成失败。
  *
- * @param {((task: { uuid: string, userId: string, tenantId: string }) => unknown) | null | undefined} dispatchInstant
- * @param {{ uuid: string, userId: string, tenantId: string }} task
+ * 回调是被 await 的（要知道叫醒成没成），所以它只该负责「叫醒」：返回
+ * `task.run()` 的 promise 会让这个请求一直等到整轮生成跑完。
+ *
+ * @param {((task: { uuid: string, userId: string, tenantId: string, run: () => Promise<Object> }) => unknown) | null | undefined} dispatchInstant
+ * @param {{ uuid: string, userId: string, tenantId: string, run: () => Promise<Object> }} task
  * @returns {Promise<'kicked'|'not_configured'|'kick_failed'>}
  */
 async function dispatchInstantTask(dispatchInstant, task) {
@@ -213,9 +217,9 @@ export function createScheduleMessageHandler(ctx) {
 
     const encryptedPayload = await encryptForStorage(serializedTaskData, userKey);
 
-    // instant 一建行就要投递，VAPID 没配齐的话这条注定发不出去，建行之前就报。
+    // instant 一建行就要投递，VAPID / webpush 没配齐的话这条注定发不出去，建行之前就报。
     if (isInstant) {
-      if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
+      if (!ctx.webpush || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
         return {
           status: 500,
           body: {
@@ -225,6 +229,7 @@ export function createScheduleMessageHandler(ctx) {
               message: 'VAPID 配置缺失，无法发送即时消息',
               details: {
                 missingKeys: [
+                  !ctx.webpush && 'webpush',
                   !ctx.vapid.email && 'VAPID_EMAIL',
                   !ctx.vapid.publicKey && 'NEXT_PUBLIC_VAPID_PUBLIC_KEY',
                   !ctx.vapid.privateKey && 'VAPID_PRIVATE_KEY'
@@ -299,7 +304,14 @@ export function createScheduleMessageHandler(ctx) {
     // README「关于 messageType: 'instant'」。
     // 起跳器没配或叫醒失败都不算失败：行在库里，下一跳 cron 照样捡走。
     if (isInstant) {
-      const dispatch = await dispatchInstantTask(ctx.dispatchInstant, { uuid: taskUuid, userId, tenantId: tenantCtx.tenantId });
+      const dispatch = await dispatchInstantTask(ctx.dispatchInstant, {
+        uuid: taskUuid,
+        userId,
+        tenantId: tenantCtx.tenantId,
+        // 绑好这个租户的库和主密钥：多租户线上宿主自己拿不到这两样，没有它就
+        // 调不了 runTask。
+        run: () => runTask({ ...ctx, db, masterKey }, taskUuid)
+      });
       return {
         status: 202,
         body: {

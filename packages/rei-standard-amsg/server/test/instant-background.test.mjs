@@ -6,14 +6,16 @@
  *   - 请求返回时一条推送都还没发（投递不在请求里跑）；
  *   - 起跳器的 alarm 跑完，推送送达、一次性任务删行；
  *   - 起跳器没配 / 叫醒失败都照样 202，任务留给 cron；
- *   - 起跳器和 cron 同时扫到同一条，只发一次（两边都要先抢租约）。
+ *   - 起跳器和 cron 同时扫到同一条，只发一次（两边都要先抢租约）；
+ *   - alarm 跑完清空实例存储；出错时报给 onError、留着 uuid 等重试；
+ *   - 宿主的 dispatchInstant 拿到能直接跑这一条的 run()。
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createD1Adapter } from '../src/server/adapters/d1.js';
 import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/single-user-worker.js';
-import { INSTANT_TICK_BINDING } from '../src/server/cloudflare/instant-tick.js';
+import { INSTANT_TICK_BINDING, kickInstantTick } from '../src/server/cloudflare/instant-tick.js';
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptPayload } from '../src/server/lib/encryption.js';
 import { seedPushSubscription } from './helpers/push-subscription.mjs';
@@ -32,15 +34,23 @@ async function encBody(payload) {
 function fakeState() {
   const store = new Map();
   let alarm = null;
+  let alarmsSet = 0;
+  let wiped = false;
   return {
     storage: {
       async get(key) { return store.get(key); },
       async put(key, value) { store.set(key, value); },
       async delete(key) { return store.delete(key); },
+      async deleteAll() { store.clear(); wiped = true; },
       async getAlarm() { return alarm; },
-      async setAlarm(at) { alarm = at; }
+      async setAlarm(at) { alarm = at; alarmsSet++; }
     },
     get alarm() { return alarm; },
+    /** 实例存储里还剩几个 key。 */
+    get size() { return store.size; },
+    /** 调过 deleteAll 没有：Cloudflare 只认它，逐个删 key 不算清空。 */
+    get wiped() { return wiped; },
+    get alarmsSet() { return alarmsSet; },
     clearAlarm() { alarm = null; }
   };
 }
@@ -66,28 +76,32 @@ function fakeTickNamespace() {
     },
     instances,
     /** 模拟 alarm 到点：Cloudflare 触发前会把 alarm 槽清掉。 */
-    async fireAlarm(id) {
+    async fireAlarm(id, alarmInfo) {
       const instance = instances.get(id);
       instance.state.clearAlarm();
-      await instance.object.alarm();
+      await instance.object.alarm(alarmInfo);
     }
   };
 }
 
 /**
  * 起一个 worker + 同一份库，schema 建好、推送订阅登记好。
- * `tick: false` 表示 env 里没有起跳器 binding。
+ * `tick: false` 表示 env 里没有起跳器 binding。`env.BREAK_CONFIG = true` 让
+ * buildConfig 抛错（模拟 binding 丢了）。
  */
-async function bootstrap({ tick = true, webpush, config = {} } = {}) {
+async function bootstrap({ tick = true, webpush, config = {}, workerOptions } = {}) {
   const d1 = createTestD1();
   const sent = [];
-  const worker = createSingleUserCloudflareWorker((env) => ({
-    db: createD1Adapter(env.DB),
-    masterKey: MASTER_KEY,
-    vapid: VAPID,
-    webpush: webpush || { async sendNotification(_sub, payload) { sent.push(JSON.parse(payload)); } },
-    ...config
-  }));
+  const worker = createSingleUserCloudflareWorker((env) => {
+    if (env.BREAK_CONFIG) throw new Error('binding 丢了');
+    return {
+      db: createD1Adapter(env.DB),
+      masterKey: MASTER_KEY,
+      vapid: VAPID,
+      webpush: webpush || { async sendNotification(_sub, payload) { sent.push(JSON.parse(payload)); } },
+      ...config
+    };
+  }, workerOptions);
   const env = { DB: d1 };
   const namespace = tick ? fakeTickNamespace() : null;
   if (namespace) {
@@ -134,6 +148,60 @@ describe("messageType: 'instant' 落库即回，投递交给起跳器", () => {
     assert.equal(sent[0].message, '你好。');
     assert.equal(sent[0].source, 'instant');
     assert.equal(await adapter.getTaskByUuidOnly(uuid), null, '一次性任务发完即删');
+    assert.equal(instance.state.wiped, true, '跑完用 deleteAll 清空实例存储，Cloudflare 不再为它计存储');
+  });
+
+  test('alarm 里出错：报给 onError，uuid 留着，重试时照样送达', async () => {
+    const errors = [];
+    const { worker, env, namespace, sent } = await bootstrap({
+      workerOptions: { onError: (info) => { errors.push(info); } }
+    });
+    const { body } = await postInstant(worker, env);
+    const uuid = body.data.uuid;
+    const { state } = namespace.instances.get(uuid);
+
+    env.BREAK_CONFIG = true;
+    await assert.rejects(namespace.fireAlarm(uuid), /binding 丢了/, '抛出去 Cloudflare 才会重试 alarm');
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].stage, 'config');
+    assert.equal(state.size, 1, '没跑成，uuid 不能清');
+
+    env.BREAK_CONFIG = false;
+    await namespace.fireAlarm(uuid, { retryCount: 1, isRetry: true });
+    assert.equal(sent.length, 1);
+    assert.equal(state.size, 0);
+  });
+
+  test('最后一次重试也出错：清掉实例存储，任务留在库里等 cron', async () => {
+    const { worker, env, adapter, namespace } = await bootstrap();
+    const { body } = await postInstant(worker, env);
+    const uuid = body.data.uuid;
+
+    env.BREAK_CONFIG = true;
+    await assert.rejects(namespace.fireAlarm(uuid, { retryCount: 6, isRetry: true }));
+
+    assert.equal(namespace.instances.get(uuid).state.wiped, true);
+    assert.equal((await adapter.getTaskByUuidOnly(uuid)).status, 'pending');
+  });
+
+  test('alarm 还挂着时再叫醒一次：合并成一次，不重设 alarm', async () => {
+    const { env, namespace } = await bootstrap();
+
+    await kickInstantTick(env[INSTANT_TICK_BINDING], 'task-1');
+    await kickInstantTick(env[INSTANT_TICK_BINDING], 'task-1');
+
+    assert.equal(namespace.instances.get('task-1').state.alarmsSet, 1);
+  });
+
+  test('webpush 没配：建行之前就报 VAPID_CONFIG_ERROR，不回 202', async () => {
+    const { worker, env, namespace } = await bootstrap({ config: { webpush: null } });
+
+    const { status, body } = await postInstant(worker, env);
+
+    assert.equal(status, 500);
+    assert.equal(body.error.code, 'VAPID_CONFIG_ERROR');
+    assert.deepEqual(body.error.details.missingKeys, ['webpush']);
+    assert.equal(namespace.instances.size, 0, '没建行，也没叫醒起跳器');
   });
 
   test('起跳器和 cron 同时扫到同一条：只发一次', async () => {
@@ -192,9 +260,9 @@ describe("messageType: 'instant' 落库即回，投递交给起跳器", () => {
     assert.equal(row.status, 'pending');
   });
 
-  test('config 里配了 dispatchInstant：以宿主的为准，拿到 uuid / userId / tenantId', async () => {
+  test('config 里配了 dispatchInstant：以宿主的为准，拿到 uuid / userId / tenantId 和 run()', async () => {
     const calls = [];
-    const { worker, env, namespace } = await bootstrap({
+    const { worker, env, namespace, sent } = await bootstrap({
       config: { dispatchInstant: (task) => { calls.push(task); } }
     });
 
@@ -202,8 +270,15 @@ describe("messageType: 'instant' 落库即回，投递交给起跳器", () => {
 
     assert.equal(status, 202);
     assert.equal(body.data.dispatch, 'kicked');
-    assert.deepEqual(calls, [{ uuid: body.data.uuid, userId: USER, tenantId: 'single' }]);
+    assert.equal(calls.length, 1);
+    const { run, ...identity } = calls[0];
+    assert.deepEqual(identity, { uuid: body.data.uuid, userId: USER, tenantId: 'single' });
     assert.equal(namespace.instances.size, 0, '没走默认的 Durable Object 起跳器');
+    assert.equal(sent.length, 0, '回调不调 run() 就不投递');
+
+    const result = await run();
+    assert.equal(result.ran, true);
+    assert.equal(sent.length, 1, 'run() 跑的就是这一条');
   });
 
   test('instant 传了 firstSendTime 只校验格式，过去的时刻也收', async () => {

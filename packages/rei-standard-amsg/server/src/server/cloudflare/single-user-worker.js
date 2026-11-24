@@ -88,7 +88,7 @@
  * 的命名空间用得上，见 lib/run-tick.js。
  *
  * 工厂的第二个参数是 worker 级选项：
- *   - `onError`：fetch / cron 任何一段出错都调它一次。它故意放在 buildConfig
+ *   - `onError`：fetch / cron / instant 起跳器任何一段出错都调它一次。它故意放在 buildConfig
  *     外面：buildConfig 自己抛错（少个 binding、环境变量丢了）时，配置里的东西
  *     一个都读不到，而那恰恰是最需要被看见的一种故障。
  *   - `instantTickBinding`：instant 起跳器的 Durable Object binding 名，默认
@@ -286,8 +286,8 @@ function pathOf(request) {
 /**
  * @param {(env: Object) => Object|Promise<Object>} buildConfig
  * @param {{ onError?: (info: { stage: 'config'|'request'|'tick'|'cloud-cleanup', error: unknown, cause: import('../lib/errors.js').ErrorCause, path: string|null }) => void|Promise<void>, instantTickBinding?: string }} [options]
- *   `onError` 在 fetch 或 cron 出错时调一次（best-effort，自身抛错只记日志）。
- *   cron 那条路上没有调用方能看到错误响应，这个 hook 是宿主唯一的出口。
+ *   `onError` 在 fetch、cron 或 instant 起跳器出错时调一次（best-effort，自身抛错只记日志）。
+ *   cron 和起跳器那两条路上没有调用方能看到错误响应，这个 hook 是宿主唯一的出口。
  *   `instantTickBinding` 是 instant 起跳器的 Durable Object binding 名（默认 `AMSG_INSTANT_TICK`）。
  */
 export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
@@ -631,8 +631,34 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
     return applySchema(cfg.db);
   }
 
+  /**
+   * 起跳器的 alarm 里跑的 runTask。alarm 和 cron 一样没有调用方能读到错误，所以
+   * 配置不全、抛错都先递给 `onError` 再照常返回 / 抛出（抛出去 Cloudflare 才会
+   * 重试 alarm）。
+   */
+  async function runInstantTask(uuid, env) {
+    let stage = 'config';
+    try {
+      const cfg = await resolveConfig(env);
+      if (!pushConfigured(cfg)) {
+        const cause = summarizeErrorCause(
+          { name: 'VapidNotConfigured', message: `VAPID / webpush 未配置，instant 任务 ${uuid} 没有跑` },
+          'config'
+        );
+        await reportError({ stage: 'config', error: null, cause, path: null });
+        return { ran: false, reason: 'not_configured' };
+      }
+      stage = 'tick';
+      return await runTaskWithContext(buildTickContext(cfg), uuid);
+    } catch (error) {
+      console.error(`[amsg single-user] instant 任务 ${uuid} 出错:`, error && error.message);
+      await reportError({ stage, error, cause: summarizeErrorCause(error, stage), path: null });
+      throw error;
+    }
+  }
+
   // instant 起跳器的 Durable Object 类，宿主按 wrangler 里的 class_name 导出它。
-  const InstantTick = createInstantTickClass(runTask);
+  const InstantTick = createInstantTickClass(runInstantTask);
 
   return { fetch, scheduled, runTask, getSchemaVersion, ensureSchema, InstantTick };
 }

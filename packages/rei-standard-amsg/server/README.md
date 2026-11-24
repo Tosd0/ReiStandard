@@ -151,6 +151,21 @@ instant 是「建行就触发」的任务：客户端把拼好的提示词交给
 
 后两种都不算失败：任务已经在库里，cron 会捡走。
 
+`202` 只表示任务已受理，投递成没成不在这个响应里。投递失败时没有推送，也不进收件箱，要知道结果有两个办法：
+
+- 查 `GET /message?id=<uuid>`：
+
+  | 响应 | 意思 |
+  |---|---|
+  | `200`，`task.lastError` 为空 | 还没跑，或正在跑 |
+  | `200`，`task.lastError` 有值 | 上一次没发成，在等重试 |
+  | `409 TASK_ALREADY_COMPLETED`，`error.details.status` 是 `failed` | 不会再试了，原因在 `error.details.lastError` |
+  | `404 TASK_NOT_FOUND` | 已经发完（一次性任务发完即删） |
+
+- 配 `onFireSettled`，在 `status: 'failed'` 时用 `emitResult` 给客户端送一条结果（见下文 fire-time hook；只有走 LLM 的任务会调这个 hook）。
+
+建任务时 VAPID 或 `webpush` 没配齐会直接回 `500 VAPID_CONFIG_ERROR`，不建行。
+
 ### 起跳器：单用户 Cloudflare Worker
 
 `createSingleUserCloudflareWorker` 自带一个起跳器，是一个 Durable Object。在 wrangler 里加 binding 和 migration，入口导出它的类即可：
@@ -174,12 +189,25 @@ export const AmsgInstantTick = worker.InstantTick; // 名字与 class_name 一�
 - binding 名默认 `AMSG_INSTANT_TICK`，要换就传工厂的第二个参数 `{ instantTickBinding: '…' }`。env 里没有这个 binding 时 instant 退回 cron。
 - 一条任务一个实例（实例名是任务 uuid），叫醒后它设一个立刻到期的 alarm，在 alarm 里调 `worker.runTask(uuid, env)`。alarm 是一次独立的执行，有 15 分钟墙钟预算，几条 instant 同时来各跑各的。
 - 和 cron 同时扫到同一条时，两边都要先抢租约，只有一方会发。
+- alarm 里出错（配置读不出来、读库失败）会调工厂第二个参数里的 `onError`，然后由 Cloudflare 重试 alarm；重试用完任务仍在库里，cron 接手。
 - Durable Object 的 namespace 随 Worker 上传一起创建，不用预先建资源。用 API token 部署时不需要在 Workers Scripts / D1 之外多勾权限。
 - 自己包路由的宿主可以用导出的 `kickInstantTick(namespace, uuid)` 叫醒它。
 
 ### 其他运行时
 
-`createSingleUserServer` / `createReiServer` 的 config 认 `dispatchInstant({ uuid, userId, tenantId })`：instant 落库后调一次，宿主在里面把这条交给一个不挂在请求上的执行者去跑 `runTask`。常驻的 Node 进程可以直接在进程里调。抛错只记日志；不配就等下一次 cron（多租户线是下一次 `/send-notifications`）。单用户 Worker 的 config 里配了 `dispatchInstant` 的，以它为准，不再用内置起跳器。
+`createSingleUserServer` / `createReiServer` 的 config 认 `dispatchInstant({ uuid, userId, tenantId, run })`：instant 落库后调一次。`run()` 跑这一条任务，库和密钥已经绑好（多租户线上就是这个租户的），返回值和 `runTask` 一样。宿主在回调里把 `run` 交给一个不挂在请求上的执行者。常驻的 Node 进程可以直接在进程里调：
+
+```js
+createSingleUserServer({
+  // …
+  dispatchInstant: ({ uuid, run }) => {
+    // 不要 return / await run()：服务端会等这个回调返回才回 202
+    run().catch((error) => console.error(`instant ${uuid} 出错`, error));
+  },
+});
+```
+
+回调抛错只记日志，响应里报 `kick_failed`；不配就等下一次 cron（多租户线是下一次 `/send-notifications`）。单用户 Worker 的 config 里配了 `dispatchInstant` 的，以它为准，不再用内置起跳器。
 
 ### 为什么用 Durable Object 的 alarm
 

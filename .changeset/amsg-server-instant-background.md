@@ -20,6 +20,8 @@
 | `firstSendTime` | 必填且在未来 | 可省（服务端取当前时刻），传了只查格式 |
 | 投递链 | 请求内单独的三轮重试 | 与定时任务同一条：占位、租约心跳、失败退避（`maxDeliveryRetries`）、fire-time hook、收件箱；`onBeforeFire` 的 `{ defer }` 也能用 |
 | 结果怎么拿 | 响应体 | 推送 + `GET /outbox?since=`；思考过程没送到的记在 tick 汇总的 `details.reasoningSkippedTasks` |
+| 失败怎么知道 | `500 MESSAGE_SEND_FAILED` | `GET /message?id=`（等重试时 `task.lastError` 有值，终态失败回 `409` 带 `error.details.lastError`），或在 `onFireSettled` 里用 `emitResult` 送一条结果 |
+| 配置不全 | VAPID 缺了回 `500 VAPID_CONFIG_ERROR` | 同上，`webpush` 缺了也在建行前报这个码 |
 
 `dispatch` 取值：`kicked`（起跳器已叫醒）、`not_configured`（没配起跳器）、`kick_failed`（叫醒失败）。后两种都等下一跳 cron，不算失败。
 
@@ -49,7 +51,7 @@ export const AmsgInstantTick = worker.InstantTick;
 
 **3. 其他运行时**
 
-`createSingleUserServer` / `createReiServer` 的 config 认 `dispatchInstant({ uuid, userId, tenantId })`，instant 落库后调一次，宿主在里面把任务交给不挂在请求上的执行者去跑 `runTask`。不配就等下一次 cron（多租户线是下一次 `/send-notifications`）。
+`createSingleUserServer` / `createReiServer` 的 config 认 `dispatchInstant({ uuid, userId, tenantId, run })`，instant 落库后调一次。`run()` 跑这一条任务（库和密钥已绑好），宿主把它交给不挂在请求上的执行者去调；回调本身会被等待，别把 `run()` 的 promise 返回出来。不配就等下一次 cron（多租户线是下一次 `/send-notifications`）。
 
 **升级要做的事**
 

@@ -24,6 +24,9 @@ export const INSTANT_TICK_BINDING = 'AMSG_INSTANT_TICK';
 // 实例存储里记「我要跑哪条」的 key。
 const UUID_KEY = 'uuid';
 
+// alarm 抛错后 Cloudflare 最多重试这么多次。
+const MAX_ALARM_RETRIES = 6;
+
 /**
  * 这个 env 值像不像一个 Durable Object namespace binding。
  *
@@ -78,13 +81,23 @@ export function createInstantTickClass(runTask) {
       return new Response(null, { status: 204 });
     }
 
-    async alarm() {
+    /** @param {{ retryCount?: number }} [alarmInfo] - Cloudflare 传进来的重试信息 */
+    async alarm(alarmInfo) {
       const uuid = await this.state.storage.get(UUID_KEY);
       if (!uuid) return;
-      const result = await runTask(uuid, this.env);
-      // 跑完才清：中途被回收的话，alarm 重试时还知道要跑哪条。清完实例存储为空，
-      // Cloudflare 不再为它计存储。
-      await this.state.storage.delete(UUID_KEY);
+      let result;
+      try {
+        result = await runTask(uuid, this.env);
+      } catch (error) {
+        // 最后一次重试也挂了：Cloudflare 不会再叫醒这个实例，先把存储清掉，任务留给 cron。
+        if (alarmInfo && alarmInfo.retryCount >= MAX_ALARM_RETRIES) {
+          await this.state.storage.deleteAll();
+        }
+        throw error;
+      }
+      // 跑完才清：中途被回收的话，alarm 重试时还知道要跑哪条。用 deleteAll 是因为
+      // Cloudflare 要整个实例存储清空才不再计费，只删这一个 key 不算。
+      await this.state.storage.deleteAll();
       // not_found 多半是 cron 抢先发完了（一次性任务发完即删），属正常。其余几种
       // （配置不全、在退避窗口里……）留一行日志，排障时看得出是哪种。
       if (!result.ran && result.reason !== 'not_found') {

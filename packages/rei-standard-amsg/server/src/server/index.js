@@ -66,10 +66,11 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  * @property {number} [maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试
  *   几次（默认 3，0 = 第一次失败就终审）。只管 `/send-notifications` 的退避阶梯，
  *   `messageType: 'instant'` 的任务也走这条阶梯。
- * @property {(task: { uuid: string, userId: string, tenantId: string }) => void | Promise<void>} [dispatchInstant]
- *   `messageType: 'instant'` 落库后调一次，让这条任务马上开始投递（比如交给一个
- *   不挂在请求上的执行者去跑 `runTask`）。抛错只记日志；不配或抛错时这条任务等下一次
- *   `/send-notifications`。
+ * @property {(task: { uuid: string, userId: string, tenantId: string, run: () => Promise<Object> }) => void | Promise<void>} [dispatchInstant]
+ *   `messageType: 'instant'` 落库后调一次，让这条任务马上开始投递。`task.run()` 跑
+ *   这一条（等于对这个租户的库调 `runTask`），交给一个不挂在请求上的执行者去调。
+ *   回调本身会被 await，所以别把 `task.run()` 的 promise 返回出来，否则请求要等到
+ *   生成跑完才响应。抛错只记日志；不配或抛错时这条任务等下一次 `/send-notifications`。
  */
 
 /**
