@@ -15,6 +15,7 @@
     "amsg-instant-body-limit",
     "amsg-server-custom-push-endpoints",
     "amsg-server-instant-background",
+    "amsg-server-instant-lease-reclaim",
     "amsg-server-lease-token",
     "amsg-server-undecryptable-stored-data",
     "amsg-shared-push-send-options",
