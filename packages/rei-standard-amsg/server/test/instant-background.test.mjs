@@ -164,7 +164,8 @@ describe("messageType: 'instant' 落库即回，投递交给起跳器", () => {
     await assert.rejects(namespace.fireAlarm(uuid), /binding 丢了/, '抛出去 Cloudflare 才会重试 alarm');
     assert.equal(errors.length, 1);
     assert.equal(errors[0].stage, 'config');
-    assert.equal(state.size, 1, '没跑成，uuid 不能清');
+    assert.equal(await state.storage.get('uuid'), uuid, '没跑成，uuid 不能清');
+    assert.ok(await state.storage.get('leaseToken'), '第一次跑之前就把租约 token 存下，重试用同一个');
 
     env.BREAK_CONFIG = false;
     await namespace.fireAlarm(uuid, { retryCount: 1, isRetry: true });
@@ -182,6 +183,48 @@ describe("messageType: 'instant' 落库即回，投递交给起跳器", () => {
 
     assert.equal(namespace.instances.get(uuid).state.wiped, true);
     assert.equal((await adapter.getTaskByUuidOnly(uuid)).status, 'pending');
+  });
+
+  // 实例被重置（部署后的强制代码更新、Cloudflare 的运行时更新）会杀掉正在跑的
+  // alarm，那一轮的租约没放掉也没过期。用 claimTask 占上租约来模拟这个状态。
+  async function holdLease(adapter, uuid, leaseToken) {
+    const row = await adapter.getTaskByUuidOnly(uuid);
+    const until = new Date(Date.now() + 90_000).toISOString();
+    assert.equal(await adapter.claimTask(row.id, row.next_send_at, until, null, null, { leaseToken }), true);
+  }
+
+  test('alarm 重试：上一轮的租约还在、token 是自己的 → 领回来接着送达', async () => {
+    const { worker, env, adapter, namespace, sent } = await bootstrap();
+    const { body } = await postInstant(worker, env);
+    const uuid = body.data.uuid;
+    const { state } = namespace.instances.get(uuid);
+    await state.storage.put('leaseToken', 'tok-prev');
+    await holdLease(adapter, uuid, 'tok-prev');
+
+    await namespace.fireAlarm(uuid, { retryCount: 1, isRetry: true });
+
+    assert.equal(sent.length, 1, '不用等租约过期交给 cron');
+    assert.equal(await adapter.getTaskByUuidOnly(uuid), null);
+    assert.equal(state.wiped, true);
+  });
+
+  test('alarm 重试：租约在别人手里 → 不发，打一行 warn，任务留在库里', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    const { worker, env, adapter, namespace, sent } = await bootstrap();
+    const { body } = await postInstant(worker, env);
+    const uuid = body.data.uuid;
+    const { state } = namespace.instances.get(uuid);
+    await state.storage.put('leaseToken', 'tok-prev');
+    await holdLease(adapter, uuid, 'tok-cron');
+
+    await namespace.fireAlarm(uuid, { retryCount: 1, isRetry: true });
+
+    assert.equal(sent.length, 0);
+    assert.equal((await adapter.getTaskByUuidOnly(uuid)).status, 'pending');
+    assert.ok(
+      warn.mock.calls.some((call) => String(call.arguments[0]).includes(`${uuid} 没领到租约`)),
+      '领不到租约要留日志'
+    );
   });
 
   test('alarm 还挂着时再叫醒一次：合并成一次，不重设 alarm', async () => {

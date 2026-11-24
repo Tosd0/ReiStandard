@@ -386,11 +386,14 @@ async function cleanupExpiredClientState(ctx) {
  *
  * @param {Object} ctx - 与 runScheduledTick 同一份 ctx
  * @param {string} uuid - 任务 uuid（pending 行）
+ * @param {{ leaseToken?: string }} [options] - `leaseToken`：占位用这个 token，
+ *   不现生成。行上的租约还是这个 token 时，即使没过期也领得回来（同一个执行者
+ *   被打断后重试，接着用自己那份租约）。不传就每次现生成
  * @returns {Promise<{ ran: false, reason: 'not_found'|'already_settled'|'not_due'|'retry_pending', status?: string, nextSendAt?: string, retryAfter?: string }
  *   | { ran: true, summary: Object }>} summary 与 runScheduledTick 的返回同构
  *   （totalTasks 恒为 1）；任务被别的执行者占着时体现在 summary.details.claimSkippedTasks。
  */
-export async function runTask(ctx, uuid) {
+export async function runTask(ctx, uuid, options = {}) {
   if (typeof uuid !== 'string' || !uuid.trim()) {
     throw new TypeError('runTask(ctx, uuid) requires a non-empty uuid string');
   }
@@ -419,14 +422,16 @@ export async function runTask(ctx, uuid) {
   if (Number.isFinite(retryAfterMs) && retryAfterMs > Date.now()) {
     return { ran: false, reason: 'retry_pending', retryAfter: task.retry_after };
   }
-  return { ran: true, summary: await deliverTasks(ctx, [task]) };
+  const leaseToken = typeof options?.leaseToken === 'string' && options.leaseToken ? options.leaseToken : null;
+  return { ran: true, summary: await deliverTasks(ctx, [task], leaseToken) };
 }
 
 /**
  * 一批任务的投递主体（不含捞取与收尾清库）。runScheduledTick 喂它 cron 捞到
  * 的到点任务，runTask 喂它单条——两个入口共享同一条投递链。
+ * `fixedLeaseToken` 只有 runTask 会传（单条），批量投递每条各自现生成。
  */
-async function deliverTasks(ctx, tasks) {
+async function deliverTasks(ctx, tasks, fixedLeaseToken = null) {
   const db = ctx.db;
   const masterKey = ctx.masterKey;
   const claimLeaseMs = resolveClaimLeaseMs(ctx);
@@ -1034,7 +1039,7 @@ async function deliverTasks(ctx, tasks) {
       : null;
 
     // 这份租约的标识：占位时写进行里，心跳和收尾写库都带着它比对。
-    const leaseToken = supportsClaim ? globalThis.crypto.randomUUID() : null;
+    const leaseToken = supportsClaim ? (fixedLeaseToken || globalThis.crypto.randomUUID()) : null;
     let claimed;
     try {
       if (decrypted.ok) {

@@ -48,7 +48,8 @@ import { CLEANUP_BATCH_LIMIT } from './schema.js';
  * @param {string|Date} leaseUntil - 租期末尾
  * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
  * @param {{ leaseToken?: string|null }} [options] - `leaseToken`：这份租约的归
- *   属标识，随租约一起写进 lease_token；之后续租 / 收尾写库带同一个值比对
+ *   属标识，随租约一起写进 lease_token；之后续租 / 收尾写库带同一个值比对。
+ *   行上的 lease_token 已经等于它时，租约没过期也领得走
  * @returns {Promise<boolean>} true = 领到了；false = 已被别人领走、同分组有
  *   任务正在跑、排期被改过、或行已不是 pending
  */
@@ -67,9 +68,13 @@ export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, s
              AND busy.status = 'pending' AND busy.lease_until > NOW()
         )`;
   }
+  let ownLease = '';
   if (options?.leaseToken) {
     params.push(options.leaseToken);
     sets.push(`lease_token = $${params.length}`);
+    // 租约仍是自己这份 token 时也领得走（起跳器 alarm 重试领回上一轮的租约，
+    // 见 cloudflare/instant-tick.js）。每次现生成的随机 token 不会撞上别人的。
+    ownLease = ` OR lease_token = $${params.length}`;
   }
   sets.push('updated_at = NOW()');
   const rows = await query(
@@ -78,7 +83,7 @@ export async function claimTask(query, taskId, expectedNextSendAt, leaseUntil, s
       WHERE id = $2 AND status = 'pending'
         AND date_trunc('milliseconds', next_send_at)
           = date_trunc('milliseconds', $3::timestamptz)
-        AND (lease_until IS NULL OR lease_until <= NOW())${groupGuard}
+        AND (lease_until IS NULL OR lease_until <= NOW()${ownLease})${groupGuard}
      RETURNING id`,
     params
   );

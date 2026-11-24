@@ -151,6 +151,28 @@ for (const backend of BACKENDS) {
     assert.doesNotMatch(text, /serialize_group/i);
   });
 
+  // 起跳器 alarm 重试时拿上一轮的 token 领回自己没放掉的租约（见 cloudflare/instant-tick.js）。
+  test(`${backend.name}: 带 leaseToken 时，lease_token 等于它的行即使租约没过期也领得走`, async () => {
+    const { adapter, calls } = backend.make(() => [{ id: 7 }]);
+    const due = '2026-01-01T00:00:00.000Z';
+    const lease = '2026-01-01T00:10:00.000Z';
+    const whereOf = (call) => flat(call.text).split(/\bWHERE\b/i)[1];
+
+    await adapter.claimTask(7, due, lease, null, null, { leaseToken: 'tok' });
+    assert.match(whereOf(calls.at(-1)), /\(lease_until IS NULL OR lease_until <= NOW\(\) OR lease_token = \$4\)/i);
+    assert.equal(calls.at(-1).params[3], 'tok');
+
+    // 带分组时 token 排在分组参数后面。
+    let start = calls.length;
+    await adapter.claimTask(7, due, lease, 'grp-abc', null, { leaseToken: 'tok' });
+    assert.match(whereOf(calls[start]), /OR lease_token = \$5\)/i);
+    assert.deepEqual(calls[start].params.slice(3), ['grp-abc', 'tok']);
+
+    start = calls.length;
+    await adapter.claimTask(7, due, lease);
+    assert.doesNotMatch(whereOf(calls[start]), /lease_token/i, '不带 token 只认空着 / 过期的租约');
+  });
+
   test(`${backend.name}: 改到 0 行就是没领到`, async () => {
     const { adapter } = backend.make(() => []);
     assert.equal(

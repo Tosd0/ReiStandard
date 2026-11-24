@@ -13,7 +13,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { runScheduledTick } from '../src/server/lib/run-tick.js';
+import { runScheduledTick, runTask } from '../src/server/lib/run-tick.js';
 import { processSingleMessage } from '../src/server/lib/message-processor.js';
 import { callLlm } from '../src/server/lib/llm.js';
 import { accumulateUsage } from '../src/server/lib/agentic-fire.js';
@@ -405,6 +405,33 @@ describe('推送 5xx 一次后恢复：重试只补推送，不重新生成', ()
     const rows = await outboxOf(adapter, 'legacy');
     assert.equal(rows.length, 2);
     assert.ok(rows.every((row) => row.delivered && /1。$/.test(row.push.message)));
+  });
+
+  // 起跳器被重置后用同一个 token 领回自己的租约（见 cloudflare/instant-tick.js）：
+  // 上一轮已经落进 outbox 的话，领回来之后也只补推送。
+  test('用自己的 token 领回没放掉的租约：同样只补推送', async () => {
+    const adapter = await makeAdapter();
+    await seedTask(adapter, { uuid: 'reclaim', payload: LLM_PAYLOAD });
+    const webpush = scriptedWebpush([1]);
+    const ctx = tickCtx(adapter, webpush);
+    const llm = stubLlm();
+    try {
+      await runTask(ctx, 'reclaim', { leaseToken: 'tok-prev' });
+      await makeRetryDue(adapter, 'reclaim');
+      // 上一轮被杀时租约还拿在手里、没过期。
+      const row = await adapter.getTaskByUuidOnly('reclaim');
+      const until = new Date(Date.now() + 90_000).toISOString();
+      assert.equal(await adapter.claimTask(row.id, row.next_send_at, until, null, null, { leaseToken: 'tok-prev' }), true);
+
+      const second = await runTask(ctx, 'reclaim', { leaseToken: 'tok-prev' });
+      assert.equal(second.summary.details.claimSkippedTasks, 0, '自己的租约领得回来');
+      assert.equal(second.summary.successCount, 1);
+      assert.equal(second.summary.details.redeliveredTasks.length, 1);
+    } finally {
+      llm.restore();
+    }
+    assert.equal(llm.calls.length, 1, '同一次触发只该生成一次');
+    assert.deepEqual(webpush.received.map((p) => p.message), ['甲1。', '乙1。']);
   });
 
   test('推到一半挂了：补推只推剩下的那几条，已经送到的不重推', async () => {
