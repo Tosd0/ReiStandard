@@ -6,8 +6,7 @@
  * 第二段往后的 delivered_at 仍是 null 等重试。用户在这个窗口里取消（或用
  * supersedesUuid 顶替）了这条消息，接口回 200 说取消成功——但 GET /outbox 只
  * 按「未 ack」选行，客户端下一次补收照样把这几段拉回去并上屏。
- *
- * 顺带钉住 instant 响应对 reasoningError 的透传（有就带上、没有就不出现）。
+
  */
 
 import { test, describe } from 'node:test';
@@ -17,7 +16,6 @@ import { createSingleUserCloudflareWorker } from '../src/server/cloudflare/singl
 import { createTestD1 } from './helpers/sqlite-d1.mjs';
 import { deriveUserEncryptionKey, encryptForStorage, encryptPayload, decryptPayload } from '../src/server/lib/encryption.js';
 import { seedPushSubscription } from './helpers/push-subscription.mjs';
-import { withoutOutbox } from './helpers/no-outbox.mjs';
 
 const USER = '550e8400-e29b-41d4-a716-446655440000';
 const MASTER_KEY = 'a'.repeat(64);
@@ -44,13 +42,11 @@ async function decResponse(body) {
 
 /** 起一个 worker + 同一份库的适配器，schema 建好、推送订阅登记好。 */
 async function bootstrap(extra = {}) {
-  // noOutbox：把适配器包成没有 message_outbox 的样子（内置 pg / neon 的现状）。
-  const { noOutbox, ...config } = extra;
+  const config = extra;
   const d1 = createTestD1();
   const worker = createSingleUserCloudflareWorker((env) => {
-    const db = createD1Adapter(env.DB);
     return {
-      db: noOutbox ? withoutOutbox(db) : db,
+      db: createD1Adapter(env.DB),
       masterKey: MASTER_KEY,
       vapid: VAPID,
       webpush: config.webpush || { async sendNotification() {} },
@@ -327,73 +323,5 @@ describe('取消 / 顶替时清 outbox', () => {
       warnings.some((line) => line.includes('上限') && line.includes(TARGET_UUID)),
       `扫到上限没扫完必须点名这条任务吵出来，实际日志：${JSON.stringify(warnings)}`
     );
-  });
-});
-
-// ─── instant 响应透传 reasoningError ────────────────────────────────────────
-
-/** 让 LLM 那一跳回一段带 reasoning_content 的响应。 */
-function stubLlm(content, reasoningContent) {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({
-    ok: true,
-    async json() {
-      return { choices: [{ message: { content, reasoning_content: reasoningContent } }] };
-    }
-  });
-  return () => { globalThis.fetch = originalFetch; };
-}
-
-describe('instant 响应里的 reasoningError', () => {
-  test('思考过程没发出去时带上原因，正文照常算成功', async () => {
-    const sent = [];
-    const webpush = {
-      async sendNotification(_sub, payload) {
-        const push = JSON.parse(payload);
-        if (push.messageKind === 'reasoning') throw new Error('推送服务拒收');
-        sent.push(push);
-      }
-    };
-    // 有收件箱时思考过程只落行、不推送（见 lib/push-policy.js）。这条用例要验
-    // 的是「推送失败时把原因说出来」，得站在没有收件箱的部署上。
-    const { worker, env } = await bootstrap({ webpush, noOutbox: true });
-    const restore = stubLlm('回答。', '先想想');
-    try {
-      const res = await worker.fetch(new Request('https://w.dev/schedule-message', {
-        method: 'POST', headers: ENC_HEADERS,
-        body: await encBody({
-          contactName: 'Rei', messageType: 'instant',
-          firstSendTime: inFuture(),
-          completePrompt: 'x',
-          apiUrl: 'https://api.example.com/v1/chat/completions',
-          apiKey: 's',
-          primaryModel: 'm'
-        })
-      }), env);
-      assert.equal(res.status, 200);
-      const body = await res.json();
-      assert.equal(body.data.status, 'sent');
-      assert.equal(body.data.messagesSent, 1);
-      assert.equal(sent.length, 1, '正文照发');
-      assert.match(body.data.reasoningError, /拒收/, '思考过程没到，得说出原因');
-    } finally {
-      restore();
-    }
-  });
-
-  test('没有这个字段时响应里也不出现', async () => {
-    const { worker, env } = await bootstrap();
-    const res = await worker.fetch(new Request('https://w.dev/schedule-message', {
-      method: 'POST', headers: ENC_HEADERS,
-      body: await encBody({
-        contactName: 'Rei', messageType: 'instant',
-        firstSendTime: inFuture(),
-        userMessage: '你好。'
-      })
-    }), env);
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.data.status, 'sent');
-    assert.equal('reasoningError' in body.data, false, '没原因就别凭空造一个字段出来');
   });
 });

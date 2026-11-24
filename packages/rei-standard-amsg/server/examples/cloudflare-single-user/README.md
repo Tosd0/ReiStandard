@@ -30,6 +30,8 @@
 `/get-user-key`、`/schedule-message`、`/messages`、`/message`、`/update-message`、`/cancel-message`、`/init-tenant`、`/vapid-public-key`、`/client-state`、`/client-state/namespaces`、`/push-subscription`、`/llm-credentials`、`/outbox`、`/outbox/ack`、`/cloud-data/*`、`/capabilities`。
 **没有 HTTP `/send-notifications`**——定时投递由 CF Cron Trigger 直接触发 `scheduled()`。
 
+`messageType: 'instant'` 的任务落库后立刻回 `202`，生成交给 `wrangler.toml` 里配的 Durable Object 起跳器（`worker.js` 导出的 `AmsgInstantTick`），在它的 alarm 里跑，客户端交完就可以断开。没配这个 binding 时 instant 等下一跳 cron。细节见 [server README](../../README.md#关于-messagetype-instant)。
+
 `GET /messages` 是列表，`GET /message?id=<uuid>` 是单条。单条比列表多给一个**完整的 `metadata`**：`PUT /update-message` 对 `metadata` 是整体替换，只改其中一个键就得先把完整那份读回来。列表不带整份 metadata——一页最多 100 条，每条都驮着它会把响应撑得很大。
 
 `GET /vapid-public-key` 返回本 Worker 的 `VAPID_PUBLIC_KEY`，供前端创建 Web Push 订阅时作 `applicationServerKey`；未配置 VAPID 时返回 503。跟其它端点一样受 CORS 和 `serverToken` 约束。

@@ -32,7 +32,11 @@
  * @param {number} [config.maxScheduledTasksPerFire] - 一次 fire 里 hook 用 ctx.scheduleTask() 最多能建几条后续任务（默认 2，0 表示不许自排）。
  * @param {number | ((task: Object) => number | undefined)} [config.maxGenerationRetries] - Retry limit before a complete batch is committed; defaults to maxDeliveryRetries.
  * @param {number} [config.maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试几次（默认 3，0 = 第一次失败就终审）。
- *   只管 runScheduledTick 的退避阶梯：返回的 ctx 交给 runScheduledTick 时带上它；instant 的请求内重试不受影响。
+ *   只管 runScheduledTick / runTask 的退避阶梯：返回的 ctx 交给 runScheduledTick 时带上它。instant 任务走同一条阶梯。
+ * @param {(task: { uuid: string, userId: string, tenantId: string }) => void | Promise<void>} [config.dispatchInstant]
+ *   `messageType: 'instant'` 落库后调一次，让这条任务马上开始投递（比如叫醒一个能跑
+ *   15 分钟的执行者，在里面调 `runTask(ctx, uuid)`）。抛错只记日志；不配或抛错时这条
+ *   任务等下一跳 cron。`createSingleUserCloudflareWorker` 默认接 Durable Object 起跳器。
  * @param {function} [config.onAfterSend] - 推送发出（或发挂）之后的可选 hook：
  *   ({ task, sentCount, pushedCount, total, error, usage, usageTotal, llmCalls,
  *   outboxed, scratch, readState, writeState }) =>
@@ -95,9 +99,11 @@ export function createSingleUserServer(config) {
     // 这个 ctx 发，所以它要跟着 handlers 一起进来。
     multipart: config.multipart || null,
     tenantManager,
-    // Fire-time hooks (optional): the in-server instant path fires through
-    // processMessagesByUuid with this ctx, so instant-type tasks can take
-    // the agentic path too.
+    // instant 任务落库后叫醒起跳器的回调（见 handlers/schedule-message.js）。
+    // createSingleUserCloudflareWorker 默认接上 Durable Object 起跳器；不配 =
+    // instant 等下一跳 cron。
+    dispatchInstant: config.dispatchInstant || null,
+    // Fire-time hooks (optional; see lib/agentic-fire.js).
     hooks: config.hooks || null,
     maxToolIterations: config.maxToolIterations,
     totalTimeoutMs: config.totalTimeoutMs,

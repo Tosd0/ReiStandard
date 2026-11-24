@@ -56,6 +56,7 @@
 
 - **推送订阅改为用户级登记（破坏性，`amsg-server` 3.0.0 · `amsg-client` 2.9.0）**：订阅按用户存进 `push_subscriptions` 表（`PUT / GET / DELETE /api/v1/push-subscription`）。`POST /api/v1/schedule-message` 与 `PUT /api/v1/update-message` 不再接受请求体里的 `pushSubscription`（返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`）；排程时该用户尚未登记订阅返回 `409 PUSH_SUBSCRIPTION_MISSING`。存量老任务投递时若查不到用户级订阅，回退读取老任务 payload 内嵌的订阅；内嵌的那份 `endpoint` 不满足 `PUT /push-subscription` 的规则（见 §9 的 `INVALID_PUSH_SUBSCRIPTION`）时视为没有，任务以 `PUSH_SUBSCRIPTION_MISSING` 失败。
 - **第五种 `messageKind: 'result'`（`ResultPush`）**：`@rei-standard/amsg-shared` 0.4.0、`amsg-server` 3.0.0、`amsg-sw` 2.4.0 支持宿主自定义结果推送（如 Fire 时刻 hook 的 `ctx.emitResult()`）。
+- **`messageType: 'instant'` 落库即回（破坏性，`amsg-server` 4.0.0）**：`POST /api/v1/schedule-message` 对 instant 任务落库后返回 `202`（带 `dispatch`），投递交给不挂在请求上的执行者，与定时任务同一条投递链，见 §6.5。
 - **单用户部署线、服务端收件箱（`/outbox`）、客户端状态镜像（`/client-state`）、用户级 LLM 凭据（`/llm-credentials`）、单条任务查询（`GET /message`）、云端数据管理（`/cloud-data/*`）**：`amsg-server` 3.0.0、`amsg-client` 2.9.0 实装。
 
 ## 3. 角色与职责
@@ -243,7 +244,7 @@ query string 原样保留。要绕开补全（代理路径很特殊时），直�
 **`amsg-server` 排程与更新专用字段**：
 
 - **`pushSubscription`（禁止在任务内传入）**：`POST /schedule-message` 与 `PUT /update-message` 传入 `pushSubscription` 字段一律返回 `400 PUSH_SUBSCRIPTION_NOT_ACCEPTED`。订阅统一通过 `PUT /api/v1/push-subscription` 按用户登记。
-- **`firstSendTime`（`schedule-message`）与 `nextSendAt`（`update-message`）**：都必须是 ISO 8601 字符串（`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`，时区可省），并且在未来。`schedule-message` 不满足返回 `400 INVALID_TIMESTAMP`（`immediate: true` 时 `firstSendTime` 可省，传了只查格式、不要求在未来，见下条）；`update-message` 不满足返回 `400 INVALID_UPDATE_DATA`（`details.invalidFields: ['nextSendAt']`）。`update-message` 改了 `nextSendAt`，任务 payload 里的 `firstSendTime` 一并改成同一个值。
+- **`firstSendTime`（`schedule-message`）与 `nextSendAt`（`update-message`）**：都必须是 ISO 8601 字符串（`YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±hh:mm]]`，时区可省），并且在未来。`schedule-message` 不满足返回 `400 INVALID_TIMESTAMP`（`immediate: true` 或 `messageType: 'instant'` 时 `firstSendTime` 可省，传了只查格式、不要求在未来，见下条与 §6.5）；`update-message` 不满足返回 `400 INVALID_UPDATE_DATA`（`details.invalidFields: ['nextSendAt']`）。`update-message` 改了 `nextSendAt`，任务 payload 里的 `firstSendTime` 一并改成同一个值。
 - **`metadata`（`schedule-message` / `update-message`，可选）**：传了就必须是普通对象，数组、字符串等返回 `400`（`schedule-message` 是 `INVALID_PARAMETERS`，`update-message` 是 `INVALID_UPDATE_DATA`）；`null` 按没传处理（`update-message` 里即不改）。
 - **`immediate`（仅 `schedule-message` 非 `instant` 任务，可选布尔值）**：传 `true` 时不要求 `firstSendTime` 在未来，任务 `next_send_at` 直接设为当前时刻，由下一跳 cron 立即触发。
 - **`supersedesUuid`（仅 `schedule-message`，可选非空字符串）**：在同一用户名下创建新任务时原子取消（删除）指定 UUID 的旧任务，并撤掉旧任务尚未投递的收件箱分段。
@@ -439,7 +440,7 @@ LLM 思考过程，从 `choices[0].message.reasoning_content`（或 `<think>` / 
 
 ### 6.4 `ReasoningPush` 自动产出不变量
 
-LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 in-server `instant` 路径）在 LLM 返回非空思考内容时，必须**先**产出一条独立的 `ReasoningPush`，**再**产出后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端靠 `sessionId` 把"思考中"UI 拼到真正回复上。
+LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径、`amsg-server` 的 `prompted` / `auto` 路径、`amsg-server` 的 `instant` 任务）在 LLM 返回非空思考内容时，必须**先**产出一条独立的 `ReasoningPush`，**再**产出后续的 `ContentPush` burst。两者共享同一个 `sessionId`，客户端靠 `sessionId` 把"思考中"UI 拼到真正回复上。
 
 这里说的是**产出顺序**，不是到达顺序。`ReasoningPush` 默认不弹通知，因此有服务端收件箱的实现只把它落进收件箱、不发推送（见 §6.7）——那条线上客户端先由推送拿到正文，再由 `GET /outbox?since=` 补到思考过程。所以客户端不能拿"思考过程先到"当前提去切 UI，要靠 `sessionId` 关联，什么时候补到就什么时候补上去。
 
@@ -455,15 +456,19 @@ LLM 驱动路径（`amsg-instant` 的 legacy 路径与 agentic-loop 钩子路径
 5. **非 LLM 路径不触发**：`fixed` 任务与 `userMessage` 显式路径不产 LLM 响应，自然不发 ReasoningPush。
 6. **`messageIndex` / `totalMessages` 不带**：ReasoningPush 不参与分句 burst 计数；server 端的 `messagesSent` 也只数 ContentPush。
 
-### 6.5 `schedule-message` 的 `instant` 同步发送
+### 6.5 `schedule-message` 的 `instant` 任务
 
-`/api/v1/schedule-message` 收到 `messageType: 'instant'` 时，server 在请求内**同步**走完「建任务 → 按 UUID 处理 → 删任务」，不进 cron 队列：
+`/api/v1/schedule-message` 收到 `messageType: 'instant'` 时，server 落库后立刻返回，投递在后台跑，客户端不用挂着连接等生成：
 
-- 发送成功 → HTTP `200`，`data.status = 'sent'`，附 `messagesSent` / `sentAt` / `retriesUsed`。
-- 发送失败 → HTTP `500`，`error.code = MESSAGE_SEND_FAILED`，底层处理错误放在 `error.details`（见 §9）。
-- 其余 `messageType`（`fixed` / `prompted` / `auto`）→ HTTP `201` 的调度响应，任务入库等 cron 触发。
+- 任务 `next_send_at` 设为当前时刻；`firstSendTime` 可省，传了只查格式。`recurrenceType` 只能是 `none`，不能带 `immediate`。
+- 返回 HTTP `202`，`data` 与非 instant 任务的 `201` 同形状（`id` / `uuid` / `contactName` / `nextSendAt` / `status: 'pending'` / `createdAt`），另带 `dispatch`：
+  - `kicked`：已叫醒宿主配置的执行者，马上开始投递；
+  - `not_configured`：没有配置执行者，任务等下一次 cron 触发；
+  - `kick_failed`：叫醒失败，同样等下一次 cron。
+- 投递与定时任务是同一条链（占位、租约、失败退避、fire-time hook、收件箱 §6.7），结果从推送与 `GET /outbox` 获取。执行者与 cron 同时处理同一条任务时，只有领到租约的一方投递。
+- 其余 `messageType`（`fixed` / `prompted` / `auto`）→ HTTP `201`，任务入库等 cron 触发。
 
-这条 in-server instant 路径要数据库，任务先落库再处理，投递不绑请求连接（客户端断开仍会跑完、可重试），发出去的内容还落进服务端收件箱（§6.7）。无状态的 `@rei-standard/amsg-instant` worker 是另一条路径：不要数据库，处理挂在响应连接上，也没有收件箱兜底；它继续维护，新接入从 in-server instant 起步。详见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md)。
+`amsg-server` 的单用户 Cloudflare Worker 内置一个 Durable Object 执行者（一条任务一个实例，在 alarm 里投递，每次有 15 分钟预算）；其他运行时通过 config 的 `dispatchInstant` 接入。部署方式与取舍见 [`amsg-server` README](../packages/rei-standard-amsg/server/README.md#关于-messagetype-instant)。无状态的 `@rei-standard/amsg-instant` worker 是另一条路径：不要数据库，处理挂在响应连接上，也没有收件箱兜底；它继续维护，新接入从 `amsg-server` 起步。
 
 ### 6.6 投递裁决（delivery adjudication）
 
@@ -636,7 +641,6 @@ Body:
 | 415 | `UNSUPPORTED_CONTENT_ENCODING` | 使用了除 `gzip` / `x-gzip` / `identity` 以外的 `Content-Encoding`（仅单用户线） |
 | 500 | `INIT_FAILED` | 单用户 `init-tenant` 建表失败 |
 | 500 | `TASK_CREATE_FAILED` | 创建任务失败 |
-| 500 | `MESSAGE_SEND_FAILED` | in-server instant 同步发送失败（§6.5）；底层错误见 `error.details` |
 | 500 | `VAPID_CONFIG_ERROR` | VAPID 配置不完整 |
 | 500 | `CLOUD_DATA_FAILED` | `/cloud-data/*` 未分类失败（驱动错误码不外露） |
 | 501 | `PUSH_SUBSCRIPTION_NOT_SUPPORTED` / `LLM_CREDENTIALS_NOT_SUPPORTED` / `LLM_CREDENTIALS_PREFIX_DELETE_NOT_SUPPORTED` / `OUTBOX_NOT_SUPPORTED` / `OUTBOX_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACE_DELETE_NOT_SUPPORTED` / `CLIENT_STATE_NAMESPACES_NOT_SUPPORTED` / `CLOUD_DATA_NOT_SUPPORTED` | 当前数据库适配器未实现对应能力 |
@@ -647,7 +651,7 @@ Body:
 
 ### 9.1 处理阶段错误码（嵌套，非顶层）
 
-in-server instant 路径（§6.5）同步发送失败时，顶层返回 `500 MESSAGE_SEND_FAILED`，底层处理阶段错误码放在 `error.details.code` 中（cron `send-notifications` 路径则保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段）。同一个 `data.details` 里另有两组既不计成功也不计失败的条目：`cancelledTasks`（`{ taskId, reason, status }`，投递期间任务行被取消或顶替）与 `leaseLostTasks`（`{ taskId, status }`，租约过期后被别的 tick 接手，本跳不再写这条任务）。两组的 `status` 同一套取值，说明是在哪一步发现的：`cancelled_mid_delivery`（推送发出前）、`cancelled_after_delivery`（推送发完、收尾写库时）、`cancelled_before_delivery`（过期收场写库时）：
+投递阶段的错误不出现在 `schedule-message` 的响应里（instant 任务也一样，见 §6.5）。cron `send-notifications` 路径保持 HTTP `200`，在 `data.details.failedTasks` 中逐条返回失败条目，至少含 `taskId` 与 `reason`，按处置结果另带 `status`、`retryCount`、`nextRetryAt`、`nextSendAt`、`permanent` 等字段。同一个 `data.details` 里另有两组既不计成功也不计失败的条目：`cancelledTasks`（`{ taskId, reason, status }`，投递期间任务行被取消或顶替）与 `leaseLostTasks`（`{ taskId, status }`，租约过期后被别的 tick 接手，本跳不再写这条任务）。两组的 `status` 同一套取值，说明是在哪一步发现的：`cancelled_mid_delivery`（推送发出前）、`cancelled_after_delivery`（推送发完、收尾写库时）、`cancelled_before_delivery`（过期收场写库时）：
 
 | code | 含义 |
 |---|---|

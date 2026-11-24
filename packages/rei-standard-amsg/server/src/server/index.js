@@ -64,8 +64,12 @@ import { normalizeVapidSubject } from '@rei-standard/amsg-shared';
  *   或者整批没能在重组窗口内发完，一条也拼不回来。不配 = 两边都用默认值。
  * @property {number | ((task: Object) => number | undefined)} [maxGenerationRetries] - Retry limit before a complete batch is committed; defaults to maxDeliveryRetries.
  * @property {number} [maxDeliveryRetries] - 定时任务一次触发投递失败后最多再重试
- *   几次（默认 3，0 = 第一次失败就终审）。只管 `/send-notifications` 的退避阶梯；
- *   `messageType: 'instant'` 的请求内重试不受它影响。
+ *   几次（默认 3，0 = 第一次失败就终审）。只管 `/send-notifications` 的退避阶梯，
+ *   `messageType: 'instant'` 的任务也走这条阶梯。
+ * @property {(task: { uuid: string, userId: string, tenantId: string }) => void | Promise<void>} [dispatchInstant]
+ *   `messageType: 'instant'` 落库后调一次，让这条任务马上开始投递（比如交给一个
+ *   不挂在请求上的执行者去跑 `runTask`）。抛错只记日志；不配或抛错时这条任务等下一次
+ *   `/send-notifications`。
  */
 
 /**
@@ -139,10 +143,10 @@ export async function createReiServer(config) {
       privateKey: vapid.privateKey || ''
     },
     webpush: webpushModule,
-    // 分片传输的限额（与 installReiSW 的 multipart 同一份）。instant 消息在
-    // schedule-message 里就地投递、定时消息走 send-notifications 的 tick，两条路
-    // 都从这个 ctx 展开，所以配一次两边都认。
+    // 分片传输的限额（与 installReiSW 的 multipart 同一份）。
     multipart: config.multipart || null,
+    // instant 任务落库后叫醒执行者的回调（见 handlers/schedule-message.js）。
+    dispatchInstant: config.dispatchInstant || null,
     // 定时任务投递失败后的重试次数上限（默认 3），send-notifications 展开 ctx
     // 时带进 runScheduledTick。
     maxGenerationRetries: config.maxGenerationRetries,
@@ -223,6 +227,7 @@ export {
   WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES,
 } from './lib/webpush-webcrypto.js';
 export { createSingleUserCloudflareWorker } from './cloudflare/single-user-worker.js';
+export { INSTANT_TICK_BINDING, kickInstantTick } from './cloudflare/instant-tick.js';
 export { deriveUserEncryptionKey, decryptPayload, encryptPayload, encryptForStorage, decryptFromStorage } from './lib/encryption.js';
 export { validateScheduleMessagePayload, validateLlmMessagesArray, validateSplitPattern, validateAvatarUrl, isValidISO8601, isValidUrl, isValidUUID, isValidUUIDv4, isValidTimeZoneId } from './lib/validation.js';
 // 请求正文的读取口（`Content-Encoding: gzip` 在这一步还原）。自己包路由的宿主

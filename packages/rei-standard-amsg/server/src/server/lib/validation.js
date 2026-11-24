@@ -275,8 +275,8 @@ export function validateScheduleMessagePayload(payload) {
     return { valid: false, errorCode: 'INVALID_PARAMETERS', errorMessage: "messageType 'instant' 本就立即投递，不能再带 immediate", details: { invalidFields: ['immediate'] } };
   }
 
-  if (immediate) {
-    // immediate 时 firstSendTime 可省略（服务端取当前时刻）；传了只校验格式，
+  if (immediate || payload.messageType === 'instant') {
+    // immediate / instant 时 firstSendTime 可省略（服务端取当前时刻）；传了只校验格式，
     // 不再要求在未来——它只是客户端本地的「想发的时刻」，不参与排期。
     if (payload.firstSendTime !== undefined && payload.firstSendTime !== null && !isValidISO8601(payload.firstSendTime)) {
       return { valid: false, errorCode: 'INVALID_TIMESTAMP', errorMessage: '时间格式无效', details: { field: 'firstSendTime' } };

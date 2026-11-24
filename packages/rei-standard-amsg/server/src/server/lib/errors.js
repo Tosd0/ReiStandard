@@ -188,8 +188,8 @@ export function markUnrecoverablePartialDelivery(error, { outboxed, pushedCount 
 
 // ─── 「重试也好不了」的判定 ──────────────────────────────────────────────
 //
-// 定时任务（run-tick 的退避阶梯）和 instant 任务（processMessagesByUuid 的
-// 三轮重试）用的是同一套口径：判成永久性失败就不再重试。投递是先跑 LLM 再
+// 所有任务（run-tick 的退避阶梯，instant 任务也走这条）用的是同一套口径：
+// 判成永久性失败就不再重试。投递是先跑 LLM 再
 // 推送，每多试一轮都要把整轮生成重跑一次，真花钱。
 
 /**
@@ -385,8 +385,7 @@ export function readPushStatusCode(error) {
  * 没有 → undefined，不往记录里塞空字段。
  *
  * reason 那句是给用户看的人话、措辞随时会变，判断「该让用户重建订阅还是裁短
- * 内容」得读这两个字段。定时任务（run-tick）与 instant 任务
- * （processMessagesByUuid）共用这一份，两条路记下来的形状一致。
+ * 内容」得读这两个字段。
  *
  * code 是标识符不是人话，不用脱敏，但也别让一个来路不明的超长 code 撑大明文
  * 列——截到 64 字符，够放所有约定过的码。

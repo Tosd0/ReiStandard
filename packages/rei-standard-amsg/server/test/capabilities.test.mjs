@@ -72,6 +72,7 @@ const EXPECTED_FEATURES = [
   'agentic-list-tasks',
   'agentic-tool-allowlist',
   'attachments',
+  'instant-background',
 ];
 
 function makeWorker(extra = {}) {

@@ -572,9 +572,12 @@ export class ReiClient {
    * Schedule a message.
    *
    * `messageType: 'instant'` goes through this method too: `amsg-server`
-   * writes the task, processes it, and lands every payload in the server
-   * outbox before pushing, so the client can refill it with `getOutbox()`
-   * after coming online. That's the path new integrations use.
+   * writes the task and answers `202` right away (`data.dispatch` says
+   * whether delivery was kicked off immediately or left to the next cron
+   * tick). Generation and push run in the background, and every payload
+   * lands in the server outbox before pushing, so the client can refill it
+   * with `getOutbox()` after coming online. That's the path new
+   * integrations use.
    *
    * `deliver()` / `sendInstant()` target `@rei-standard/amsg-instant`
    * instead — stateless, no DB, and no outbox to refill from. That package

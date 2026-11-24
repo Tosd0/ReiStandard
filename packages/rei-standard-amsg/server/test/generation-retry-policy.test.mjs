@@ -165,19 +165,6 @@ test('delivery retry exhaustion and permanent failures agree with the receipt', 
   assert.equal(delivery.settled[0].failureStage, 'delivery');
 });
 
-test('legacy UUID entry point honors the same task policy', async t => {
-  const { processMessagesByUuid } = await import('../src/server/lib/message-processor.js');
-  let requests = 0;
-  t.mock.method(globalThis, 'fetch', async () => { requests++; throw new TypeError('fetch failed'); });
-  const { ctx, row, settled } = await fixture();
-  const result = await processMessagesByUuid('generation-policy', ctx, 2, USER);
-  assert.equal(result.success, false);
-  assert.equal(result.error.retriesAttempted, 0);
-  assert.equal((await row()).status, 'failed');
-  assert.equal(settled[0].willRetry, false);
-  assert.equal(requests, 1);
-});
-
 test('cancelled attempt cannot advertise another retry after an unrelated in-flight error', async () => {
   const { processSingleMessage } = await import('../src/server/lib/message-processor.js');
   let cancelled = false;

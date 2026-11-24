@@ -14,7 +14,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { runScheduledTick } from '../src/server/lib/run-tick.js';
-import { processSingleMessage, processMessagesByUuid } from '../src/server/lib/message-processor.js';
+import { processSingleMessage } from '../src/server/lib/message-processor.js';
 import { callLlm } from '../src/server/lib/llm.js';
 import { accumulateUsage } from '../src/server/lib/agentic-fire.js';
 import { isPermanentDeliveryFailure, isPermanentLlmFailure } from '../src/server/lib/errors.js';
@@ -323,21 +323,6 @@ describe('LLM 401：定时任务一跳终审，不再把整条生成重跑几遍
     assert.notEqual(settled[0].error.permanent, true);
   });
 
-  test('instant 任务的请求内重试：401 只跑一轮', async () => {
-    const adapter = await makeAdapter();
-    await seedTask(adapter, { uuid: 'instant-401', payload: { ...LLM_PAYLOAD, messageType: 'instant' } });
-    const llm = stubLlm(() => llmError(401));
-    let result;
-    try {
-      result = await processMessagesByUuid('instant-401', tickCtx(adapter, scriptedWebpush()), 2, USER, MASTER_KEY);
-    } finally {
-      llm.restore();
-    }
-    assert.equal(result.success, false);
-    assert.equal(result.error.permanent, true);
-    assert.equal(result.error.retriesAttempted, 0);
-    assert.equal(llm.calls.length, 1);
-  });
 });
 
 // ─── 2. 生成成功之后推送失败：重试只补推送 ───────────────────────────────
@@ -539,22 +524,6 @@ describe('推送 5xx 一次后恢复：重试只补推送，不重新生成', ()
     assert.equal(llm.calls.length, 1);
   });
 
-  test('instant 任务的请求内重试：推送 503 一次后恢复，LLM 只调一次', async () => {
-    const adapter = await makeAdapter();
-    await seedTask(adapter, { uuid: 'instant', payload: { ...LLM_PAYLOAD, messageType: 'instant' } });
-    const webpush = scriptedWebpush([1]);
-    const llm = stubLlm();
-    let result;
-    try {
-      result = await processMessagesByUuid('instant', tickCtx(adapter, webpush), 2, USER, MASTER_KEY);
-    } finally {
-      llm.restore();
-    }
-    assert.equal(result.success, true);
-    assert.equal(result.retriesUsed, 1);
-    assert.equal(llm.calls.length, 1);
-    assert.deepEqual(webpush.received.map((p) => p.message), ['甲1。', '乙1。']);
-  });
 
   test('用户在重试窗口里改了任务：补推那一跳照样只补推送', async () => {
     const adapter = await makeAdapter();

@@ -137,7 +137,7 @@ describe('ctx.emitResult', () => {
     assert.equal(returned.pushed, true);
   });
 
-  test('in-server instant 的 fire 里发结果：source 跟着 messageType 走', async () => {
+  test('instant 任务的 fire 里发结果：source 跟着 messageType 走', async () => {
     // 标准的配对规则：messageType 'instant' 必配 source 'instant'。写死
     // 'scheduled' 会凑出一对非法组合，客户端按 source 分流时走岔。
     const { adapter, ctx, pushes } = await bootstrap();

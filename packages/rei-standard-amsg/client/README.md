@@ -56,7 +56,7 @@ const client = new ReiClient({
 await client.init();
 ```
 
-发送即时消息（单用户线：任务先落库再处理，客户端断开也跑得完，内容同时落收件箱）：
+发送即时消息（单用户线：服务端落库后立刻返回，生成和推送在后台跑，客户端交完就可以断开；内容同时落收件箱）：
 
 ```js
 const result = await client.scheduleMessage({
@@ -64,7 +64,9 @@ const result = await client.scheduleMessage({
   messageType: 'instant',
   userMessage: '帮我看看今天的日程',
 });
-// result.status === 'sent'，附 messagesSent / sentAt
+// HTTP 202：result.data.status === 'pending'，result.data.dispatch 为
+// 'kicked'（已开始投递）或 'not_configured' / 'kick_failed'（等下一跳 cron）。
+// 回复从推送和 getOutbox() 拿。
 ```
 
 接 `@rei-standard/amsg-instant` 那条线的话，即时消息走 `deliver()`，见[下面那节](#deliver-标准用法)。

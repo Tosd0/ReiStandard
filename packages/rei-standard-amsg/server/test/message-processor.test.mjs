@@ -992,7 +992,7 @@ describe('splitPattern support', () => {
   });
 
   it('processSingleMessage: sessionId/messageId use UUID fallback when task.id is null', async () => {
-    // The legacy in-server instant path can receive a task row with
+    // A host calling processSingleMessage directly can pass a task row with
     // `id == null`. In that case there's no stable key to derive the
     // sessionId/messageId from, so we fall back to UUIDs.
     const userKey = await deriveUserEncryptionKey(TEST_USER_ID, TEST_MASTER_KEY);

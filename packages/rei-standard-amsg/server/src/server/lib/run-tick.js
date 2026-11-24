@@ -112,7 +112,7 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
 // 「重试也好不了」的判定（永久性错误码、终态推送状态码、payload 超限）住在
-// lib/errors.js —— 定时任务的退避阶梯和 instant 任务的三轮重试用同一份口径。
+// lib/errors.js。
 
 // 投递期间发现「这条已经不归我了」时，推送侧抛的错误码住在 lib/errors.js
 // （见 guardWebpushWithLease）：发送方要靠它把「取消」和「发失败」分开处置。
