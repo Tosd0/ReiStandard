@@ -1020,10 +1020,15 @@ export class D1Adapter {
     sets.push('updated_at = ?');
     values.push(now);
 
+    // 租约仍是自己这份 token 时也领得走：起跳器 alarm 重试时用上一轮的 token
+    // 领回自己的租约（见 cloudflare/instant-tick.js）。每次现生成的随机 token
+    // 不会撞上别人的，所以这一条只对刻意复用 token 的调用方生效。
+    const ownLease = options?.leaseToken ? ' OR lease_token = ?' : '';
     let where =
       `id = ? AND status = 'pending' AND next_send_at = ?
-          AND (lease_until IS NULL OR lease_until <= ?)`;
+          AND (lease_until IS NULL OR lease_until <= ?${ownLease})`;
     values.push(taskId, expected, now);
+    if (ownLease) values.push(options.leaseToken);
     if (grouped) {
       where +=
         `

@@ -636,7 +636,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
    * 配置不全、抛错都先递给 `onError` 再照常返回 / 抛出（抛出去 Cloudflare 才会
    * 重试 alarm）。
    */
-  async function runInstantTask(uuid, env) {
+  async function runInstantTask(uuid, env, options) {
     let stage = 'config';
     try {
       const cfg = await resolveConfig(env);
@@ -649,7 +649,7 @@ export function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         return { ran: false, reason: 'not_configured' };
       }
       stage = 'tick';
-      return await runTaskWithContext(buildTickContext(cfg), uuid);
+      return await runTaskWithContext(buildTickContext(cfg), uuid, options);
     } catch (error) {
       console.error(`[amsg single-user] instant 任务 ${uuid} 出错:`, error && error.message);
       await reportError({ stage, error, cause: summarizeErrorCause(error, stage), path: null });

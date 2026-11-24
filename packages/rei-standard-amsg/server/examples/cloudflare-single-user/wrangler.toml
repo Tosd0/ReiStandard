@@ -17,6 +17,13 @@ class_name = "AmsgInstantTick"
 tag = "amsg-instant-tick-v1"
 new_sqlite_classes = ["AmsgInstantTick"]
 
+# 部署新版本后，旧实例最多再跑 max_delay 秒才换成新代码（单位秒，默认 300）。
+# alarm 的墙钟上限是 15 分钟，设成 900 让正在跑的生成能在旧代码上跑完，不被部署打断。
+# 尽力而为：Cloudflare 自己的运行时更新仍可能提前重置实例。
+[durable_objects.code_update_strategy]
+mode = "deferred"
+max_delay = 900
+
 # CF Cron Trigger（5 段：分 时 日 月 周，UTC）。每分钟跑一次定时投递：
 [triggers]
 crons = ["* * * * *"]

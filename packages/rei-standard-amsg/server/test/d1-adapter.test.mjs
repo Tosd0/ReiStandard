@@ -120,6 +120,19 @@ test('claimTask 领到一次后，租约没到期之前别人领不到', async (
   assert.equal(after.lease_until, lease);
 });
 
+// 起跳器 alarm 重试时拿上一轮的 token 领回自己没放掉的租约（见 cloudflare/instant-tick.js）。
+test('claimTask：租约没过期，但 lease_token 就是传入的这个 → 领得回来；别人的 token 领不到', async () => {
+  const { adapter } = await freshAdapter();
+  const due = '2020-01-01T00:00:00.000Z';
+  const row = await adapter.createTask(baseTask({ uuid: 'own', next_send_at: due }));
+  const lease = new Date(Date.now() + 600_000).toISOString();
+
+  assert.equal(await adapter.claimTask(row.id, due, lease, null, null, { leaseToken: 'mine' }), true);
+  assert.equal(await adapter.claimTask(row.id, due, lease, null, null, { leaseToken: 'other' }), false, '别人的 token 照样挡住');
+  assert.equal(await adapter.claimTask(row.id, due, lease), false, '不带 token 只认空着 / 过期的租约');
+  assert.equal(await adapter.claimTask(row.id, due, lease, null, null, { leaseToken: 'mine' }), true, '自己的 token 领得回来');
+});
+
 // 领了任务的 tick 中途没了，没人来放租约。租约到期后这条任务要能被接手，
 // 否则它就永远卡在那儿再也不触发。
 test('租约到期后这条任务可以被重新领取', async () => {

@@ -24,6 +24,9 @@ export const INSTANT_TICK_BINDING = 'AMSG_INSTANT_TICK';
 // 实例存储里记「我要跑哪条」的 key。
 const UUID_KEY = 'uuid';
 
+// 实例存储里记「这条任务我占位用的租约 token」的 key（见 alarm 里的说明）。
+const LEASE_TOKEN_KEY = 'leaseToken';
+
 // alarm 抛错后 Cloudflare 最多重试这么多次。
 const MAX_ALARM_RETRIES = 6;
 
@@ -55,7 +58,7 @@ export async function kickInstantTick(namespace, uuid) {
 /**
  * 造出 Durable Object 类。宿主在 Worker 入口里把它按 wrangler 配的 class_name 导出。
  *
- * @param {(uuid: string, env: Object) => Promise<{ ran: boolean, reason?: string }>} runTask -
+ * @param {(uuid: string, env: Object, options?: { leaseToken?: string }) => Promise<{ ran: boolean, reason?: string, summary?: Object }>} runTask -
  *   Worker 工厂返回的 runTask
  */
 export function createInstantTickClass(runTask) {
@@ -85,9 +88,22 @@ export function createInstantTickClass(runTask) {
     async alarm(alarmInfo) {
       const uuid = await this.state.storage.get(UUID_KEY);
       if (!uuid) return;
+      // 占位用的租约 token 第一次跑之前生成、存进实例存储，alarm 重试时取出同一个
+      // 传给 runTask。实例被重置（部署后的强制代码更新、Cloudflare 的运行时更新）
+      // 会杀掉正在跑的 alarm，那一轮的租约还没过期；换个新 token 就领不回来，只
+      // 能等租约过期交给 cron。拿同一个 token 领回是安全的：一个实例同时只会有一
+      // 个 alarm 在跑（Cloudflare 的保证），所以重试时上一轮一定已经不在跑了；行
+      // 上的租约还是这个 token，说明 cron 没接手过。
+      // 这依赖「一条任务一个实例」。以后要是改成一个实例管多条任务，token 必须按
+      // uuid 分开存，不能共用一个。
+      let leaseToken = await this.state.storage.get(LEASE_TOKEN_KEY);
+      if (!leaseToken) {
+        leaseToken = globalThis.crypto.randomUUID();
+        await this.state.storage.put(LEASE_TOKEN_KEY, leaseToken);
+      }
       let result;
       try {
-        result = await runTask(uuid, this.env);
+        result = await runTask(uuid, this.env, { leaseToken });
       } catch (error) {
         // 最后一次重试也挂了：Cloudflare 不会再叫醒这个实例，先把存储清掉，任务留给 cron。
         if (alarmInfo && alarmInfo.retryCount >= MAX_ALARM_RETRIES) {
@@ -102,6 +118,11 @@ export function createInstantTickClass(runTask) {
       // （配置不全、在退避窗口里……）留一行日志，排障时看得出是哪种。
       if (!result.ran && result.reason !== 'not_found') {
         console.warn(`[amsg single-user] instant 任务 ${uuid} 没有跑：${result.reason}`);
+      }
+      // 跑了但没领到租约：cron 或别的执行者正拿着它，或者同分组有任务在跑。任务
+      // 留在库里等 cron，这里留一行日志，不然从外面看不出这条为什么晚了。
+      if (result.ran && result.summary?.details?.claimSkippedTasks > 0) {
+        console.warn(`[amsg single-user] instant 任务 ${uuid} 没领到租约，留给 cron`);
       }
     }
   };

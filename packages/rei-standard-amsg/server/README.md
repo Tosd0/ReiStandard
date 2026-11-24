@@ -192,6 +192,16 @@ export const AmsgInstantTick = worker.InstantTick; // 名字与 class_name 一�
 - alarm 里出错（配置读不出来、读库失败）会调工厂第二个参数里的 `onError`，然后由 Cloudflare 重试 alarm；重试用完任务仍在库里，cron 接手。
 - Durable Object 的 namespace 随 Worker 上传一起创建，不用预先建资源。用 API token 部署时不需要在 Workers Scripts / D1 之外多勾权限。
 - 自己包路由的宿主可以用导出的 `kickInstantTick(namespace, uuid)` 叫醒它。
+- 建议同时配上代码更新策略（示例 `examples/cloudflare-single-user/wrangler.toml` 里有）：
+
+  ```toml
+  [durable_objects.code_update_strategy]
+  mode = "deferred"
+  max_delay = 900
+  ```
+
+  部署新版本后，正在跑的实例默认 300 秒后就被换成新代码，正在跑的 alarm 会被打断再重试。设成 900 秒（alarm 的墙钟上限）能让一次生成在旧代码上跑完。这是尽力而为，Cloudflare 自己的运行时更新仍可能随时重置实例。
+- 实例被重置后，alarm 重试会带着上一轮的租约 token 再去占位，所以能直接领回自己那份还没过期的租约接着投递，不用等租约过期后交给 cron。上一轮如果已经把结果写进收件箱，重试只补推送，不重新生成。领不到租约（被 cron 或别的执行者拿着）时会打一行 warn。
 
 ### 其他运行时
 
@@ -949,7 +959,7 @@ await client.scheduleMessage({
 
 | 方法 | `options` 里认什么 | 返回 |
 |---|---|---|
-| `claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup?, cloudGuard?, options?)` | `leaseToken`：领到时写进 `lease_token`；`userId`：给 cloudGuard 做归属断言，适配器不用再查一次 | 占到位 `true`，否则 `false` |
+| `claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup?, cloudGuard?, options?)` | `leaseToken`：领到时写进 `lease_token`，另外 `lease_token` 已经等于它时，即使租约没过期也领得到（起跳器在 alarm 重试时用同一个 token 领回自己上一轮的租约）；`userId`：给 cloudGuard 做归属断言，适配器不用再查一次 | 占到位 `true`，否则 `false` |
 | `renewTaskLease(taskId, leaseUntil, cloudGuard?, options?)` | `leaseToken`：只给 `lease_token` 仍等于它、且行仍是 pending 的续租 | 续到了 `true`；行没了或租约已归别人 `false`（必须是 `false`，不能是 `undefined`） |
 | `updateTaskById(taskId, updates, cloudGuard?, options?)` | `leaseToken`：只改 `lease_token` 仍等于它的行 | 改到的行；改不到 `null` |
 | `deleteTaskById(taskId, options?)` | `leaseToken`：只删 `lease_token` 仍等于它的行 | 删到 `true`，否则 `false` |

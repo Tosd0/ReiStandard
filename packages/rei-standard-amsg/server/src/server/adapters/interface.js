@@ -106,7 +106,11 @@
  *   `options.leaseToken`（可选）：这份租约的归属标识（调用方每次占位现生成的随
  *   机串），领到时写进 `lease_token` 列。之后的 renewTaskLease / updateTaskById /
  *   deleteTaskById 都带同一个值比对，所以租约过期后行被别的 tick 接手时，原执行
- *   者迟到的心跳和收尾写库会落空，而不是把接手者的租约续上或改掉。忽略这个参
+ *   者迟到的心跳和收尾写库会落空，而不是把接手者的租约续上或改掉。
+ *   行上的 `lease_token` 已经等于传入的值时，`lease_until` 没过期也领得走：调用
+ *   方复用自己上一轮的 token（起跳器在 alarm 重试时这么做，见
+ *   cloudflare/instant-tick.js），就能领回自己那份没放掉的租约。不支持这一条的
+ *   适配器只认空着 / 已过期的租约，调用方领不到就等租约过期。忽略这个参
  *   数（以及下面三个方法上的同名参数）的适配器退回今天的行为：心跳只看
  *   `lease_until` 非空，写库按 id 直写。
  *   `options.userId`（可选）：这行的 user_id。带 cloudGuard 的写要按它做归属断
