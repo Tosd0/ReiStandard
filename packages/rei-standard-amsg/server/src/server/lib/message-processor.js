@@ -424,7 +424,7 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
  * @param {string} [providedMasterKey]
  * @param {{ userKey: string, payload: Object } | null} [predecrypted] - 调用方
  *   （run-tick 的预扫描）已经解好的 payload；传了就不再解第二遍。
- * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, deferred?: boolean, retryAfter?: string, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean, willRetry?: boolean, retryLimit?: number, failureStage?: string }>}
+ * @returns {Promise<{ success: boolean, messagesSent: number, redelivered?: boolean, pushedCount?: number, deferred?: boolean, retryAfter?: string, reschedule?: boolean, error?: string, errorCode?: string|null, pushStatusCode?: number|null, permanent?: boolean, willRetry?: boolean, retryLimit?: number, failureStage?: string }>}
  *   失败时 `pushStatusCode` 是推送服务回的 HTTP 状态码（不是推送阶段炸的 → null）。
  *   `deferred: true` 表示 onBeforeFire 把这次触发推迟了（`retryAfter` 是唤醒
  *   时刻）：`success` 为 false 但不是失败，调用方要先看这个字段。只有 ctx 带

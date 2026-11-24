@@ -658,12 +658,13 @@ async onBeforeFire(ctx) {
 | 多久之后再来 | 固定 2 / 4 / 6 分钟 | 宿主给的 `afterMs` |
 | `onFireSettled` 的 `status` | `failed` | `deferred`，带 `retryAfter` |
 
-两边相同的是 `next_send_at` 都不动：它一直是这次触发的名义时刻，`ctx.task.nextSendAt`、`occurrenceMs`、推送的 `messageId` 在推迟前后都是同一套。循环任务被推迟时不会推进到下一次。
+两边相同的是 `next_send_at` 都不动（带 `reschedule` 的一次性任务除外，见下）：它一直是这次触发的名义时刻，`ctx.task.nextSendAt`、`occurrenceMs`、推送的 `messageId` 在推迟前后都是同一套。循环任务被推迟时不会推进到下一次。
 
 几条规矩：
 
 - `afterMs` 必须是有限正数，最大 24 小时（导出为 `MAX_DEFER_AFTER_MS`）。不合法的值按 hook 契约违约处理（`AGENTIC_BAD_BEFORE_FIRE`，一跳终审）。没有下限，但 cron 一分钟一跳，实际是「到点之后的第一跳」才会再问；用 `runTask` 自己触发的话，到点之前调它会得到 `retry_pending`。
 - 推迟不会让任务永远挂着。名义时刻过去超过 `staleAfterMs`（默认 60 分钟）的任务照常按过期处理：一次性任务标 `failed`、循环任务快进到下一次，并调 `onStaleSkip`。某次推迟的唤醒时刻已经越过这条线时，库不再等那一轮，当场按过期收场——这时宿主会先收到 `status: 'deferred'` 的 `onFireSettled`，紧接着收到 `onStaleSkip`。
+- 发送时刻事先定不下来的一次性任务（比如「用户走开 5 分钟后提醒」，走开的时刻要到点才知道），返回 `{ defer: { afterMs, reschedule: true } }`。这时不写 `retry_after`，而是把 `next_send_at` 改成唤醒时刻，相当于把这次触发重新排到那个时刻：过期线从新时刻算起，推多少次都不会因为离最初的时刻太远而作废；`ctx.task.nextSendAt`、`occurrenceMs` 和推送的 `messageId` 也跟着换成新时刻。循环任务不认 `reschedule`（名义时刻是整串排期的基准），照普通推迟处理。`GET /capabilities` 的 features 里有 `before-fire-defer-reschedule`。
 - 每次被重新问到都是一次新的 fire：`scratch` 是新的，`onFireSettled` 各调各的。
 - 只有定时投递（`runScheduledTick`、单用户 Worker 的 `scheduled()`、`runTask`）支持推迟，并且适配器要实现 `claimTask`（任务表有 `retry_after` 列，内置适配器都有）。没实现 `claimTask` 的自定义适配器返回 `{ defer }` 会得到 `AGENTIC_DEFER_UNSUPPORTED`，按[部署配错了算可重试](#部署配错了算可重试)处理。
 - 内容已经落进收件箱、只是推送没发完的重试不调 `onBeforeFire`（见[生成成功之后推送失败：只补推送](#生成成功之后推送失败只补推送)），那一跳也就不会被推迟。

@@ -67,6 +67,7 @@ const EXPECTED_FEATURES = [
   'max-delivery-retries',
   'max-generation-retries',
   'before-fire-defer',
+  'before-fire-defer-reschedule',
   'task-input',
   'client-state-key',
   'agentic-list-tasks',

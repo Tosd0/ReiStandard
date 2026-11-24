@@ -318,6 +318,53 @@ test('反复 defer：循环任务越线时快进到下一次', async (t) => {
   assert.equal(f.calls.stale[0].info.action, 'fast_forwarded');
 });
 
+// 一次性提醒的发送时刻取决于用户什么时候走开，宿主只能一路往后推。带 reschedule
+// 时名义时刻跟着挪，推得再久也不撞过期线。
+test('defer + reschedule：一次性任务改到唤醒时刻，一路推过过期线也不作废', async (t) => {
+  const advance = controllableClock(t);
+  const f = await fixture(t, {
+    beforeFire: (_ctx, callIndex) => (callIndex < 8 ? { defer: { afterMs: 10 * MINUTE, reschedule: true } } : { skip: true }),
+  });
+
+  for (let i = 0; i < 8; i++) {
+    const before = Date.now();
+    const res = await runScheduledTick(f.tickCtx);
+    assert.equal(res.details.deferredTasks.length, 1, `第 ${i + 1} 次应当照常推迟`);
+    const row = await f.row();
+    assert.equal(row.status, 'pending');
+    assert.equal(row.next_send_at, new Date(before + 10 * MINUTE).toISOString(), '名义时刻挪到唤醒时刻');
+    assert.equal(row.retry_after, null);
+    assert.equal(row.retry_count, 0);
+    advance(10 * MINUTE + SECOND);
+  }
+
+  // 距最初的名义时刻已经 80 多分钟，照样放行。
+  const last = await runScheduledTick(f.tickCtx);
+  assert.equal(last.successCount, 1);
+  assert.deepEqual(last.details.staleTasks, []);
+  assert.equal(f.calls.stale.length, 0);
+  assert.equal(await f.row(), null);
+  assert.deepEqual(f.calls.settled.map((s) => s.status), [...Array(8).fill('deferred'), 'skipped']);
+});
+
+test('defer + reschedule：循环任务不认，名义时刻不动，过期线照常管', async (t) => {
+  const advance = controllableClock(t);
+  const f = await fixture(t, { recurrenceType: 'daily', beforeFire: () => ({ defer: { afterMs: 20 * MINUTE, reschedule: true } }) });
+
+  await runScheduledTick(f.tickCtx);
+  const row = await f.row();
+  assert.equal(row.next_send_at, f.dueAt);
+  assert.ok(row.retry_after);
+
+  // 第三次被问到时唤醒时刻越线，跟不带 reschedule 的循环任务一样快进。
+  let res;
+  for (let i = 0; i < 2; i++) {
+    advance(20 * MINUTE + SECOND);
+    res = await runScheduledTick(f.tickCtx);
+  }
+  assert.deepEqual(res.details.staleTasks.map((s) => s.action), ['fast_forwarded']);
+});
+
 for (const [label, defer] of [
   ['0', { afterMs: 0 }],
   ['负数', { afterMs: -1000 }],

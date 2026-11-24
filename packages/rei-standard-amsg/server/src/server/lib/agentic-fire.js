@@ -274,14 +274,16 @@ export function buildHookTask(task, decryptedPayload) {
  * @typedef {Array<Object>
  *   | { messages: Array<Object>, maxToolIterations?: number, totalTimeoutMs?: number, tools?: Array<Object>, toolChoice?: any, allowedToolNames?: string[] }
  *   | { skip: true }
- *   | { defer: { afterMs: number } }
+ *   | { defer: { afterMs: number, reschedule?: boolean } }
  *   | null
  *   | undefined} BeforeFireResult
  *   - 消息数组 / `{ messages, ... }`：用这份 prompt 生成；
  *   - `{ skip: true }`：这次不发，按零推送的成功收场（一次性任务删行、循环任务
  *     推进到下一次）；
  *   - `{ defer: { afterMs } }`：现在不合适，afterMs 毫秒后再来问。afterMs 必须
- *     是有限正数，且不超过 MAX_DEFER_AFTER_MS（24 小时）；
+ *     是有限正数，且不超过 MAX_DEFER_AFTER_MS（24 小时）。带上 `reschedule: true`
+ *     时，一次性任务把这次触发改到唤醒时刻（next_send_at 跟着挪，过期线从新时刻
+ *     算起），循环任务不认这个选项；
  *   - `null` / `undefined`：交还给排程时冻结的 prompt 老链路。
  */
 
@@ -1032,6 +1034,8 @@ async function runFireChain({
         deferred: true,
         // 用真实时钟：这个时刻要落进 retry_after，跟数据库捞取条件里的「现在」比。
         retryAfter: new Date(Date.now() + afterMs).toISOString(),
+        // 宿主要把这次触发整个改到唤醒时刻（一次性任务才生效，见 run-tick 的 handleDeferred）。
+        reschedule: before.defer.reschedule === true,
         messagesSent: 0,
         status: 'deferred',
         iterations: 0,
