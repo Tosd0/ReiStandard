@@ -14,6 +14,7 @@
     "amsg-client-non-json-response",
     "amsg-instant-body-limit",
     "amsg-server-custom-push-endpoints",
+    "amsg-server-defer-reschedule",
     "amsg-server-instant-background",
     "amsg-server-instant-lease-reclaim",
     "amsg-server-lease-token",
