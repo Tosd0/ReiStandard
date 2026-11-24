@@ -55,7 +55,8 @@
  * lib/agentic-fire.js.
  *
  * `onBeforeFire` 除了返回 prompt，还可以返回 `{ skip: true }`（这次不发）或
- * `{ defer: { afterMs } }`（现在不合适，afterMs 毫秒后再来问；不占重试次数）。
+ * `{ defer: { afterMs } }`（现在不合适，afterMs 毫秒后再来问；不占重试次数。一次性
+ * 任务带 `reschedule: true` 时把这次触发改到唤醒时刻）。
  *
  * scheduled() 每次触发都会先给任务占位（在行的 lease_until 上写租约），同一
  * 条任务不会被相邻两跳重复触发（见 lib/run-tick.js）。投递期间租约按心跳滚动

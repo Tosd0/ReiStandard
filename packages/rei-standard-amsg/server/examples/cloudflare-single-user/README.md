@@ -163,6 +163,7 @@ export default createSingleUserCloudflareWorker((env) => ({
       // 或返回 { defer: { afterMs: 30_000 } }：现在不合适，30 秒后再来问。
       //   这次不调 LLM、不推送，任务原样留着（不占重试次数、不留报错、触发
       //   时刻不变），到点后从 onBeforeFire 重新走一遍。afterMs 最大 24 小时。
+      //   一次性任务加 reschedule: true 时，名义时刻改到唤醒时刻，过期线从新时刻算起。
     },
 
     // 每轮 LLM 输出后分类。ctx 形状与 @rei-standard/amsg-instant 的

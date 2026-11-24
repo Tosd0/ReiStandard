@@ -25,7 +25,8 @@
  * @param {(fireCtx: Object) => import('./lib/agentic-fire.js').BeforeFireResult | Promise<import('./lib/agentic-fire.js').BeforeFireResult>} [config.hooks.onBeforeFire]
  *   返回消息数组或 `{ messages, ... }` 继续生成；`{ skip: true }` 这次不发；
  *   `{ defer: { afterMs } }` 现在不合适、afterMs 毫秒后再来问（不占重试次数，
- *   只在 runScheduledTick / runTask 投递时可用）；`null` 交还给冻结 prompt。
+ *   只在 runScheduledTick / runTask 投递时可用；一次性任务带 `reschedule: true`
+ *   时把这次触发改到唤醒时刻）；`null` 交还给冻结 prompt。
  * @param {number} [config.maxToolIterations] - factory default LLM-round cap for the agentic loop (default 5).
  * @param {number} [config.totalTimeoutMs] - factory default wall-time ceiling for the agentic loop (default 240000).
  * @param {number} [config.maxStateValueBytes] - client_state 单条 value 的总上限（默认 5MB）。超过 200KB 的值由服务端透明分块存储（见 lib/state-chunks.js）。

@@ -107,7 +107,8 @@ export const DEFAULT_HEARTBEAT_LEASE_TTL_MS = 90 * 1000;
 // 一直是名义时刻，重试拖过一小时不等于用户错过了它——但重试时刻（retry_after）
 // 本身也被拖过了这个时长的除外：那说明停摆发生在重试窗口里，内容一样旧。
 // 被 onBeforeFire 推迟（defer）的任务同样受它管：推迟不涨 retry_count，一直推
-// 下去的任务最后在这里收场。
+// 下去的任务最后在这里收场。一次性任务带 reschedule 推迟时名义时刻跟着挪，过期
+// 线也从新时刻算起——那是宿主有意改期，不是服务晚到。
 // 宿主可用 ctx.staleAfterMs 覆盖（与 claimLeaseMs 同一模式）。
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
@@ -1228,19 +1229,26 @@ async function deliverTasks(ctx, tasks, fixedLeaseToken = null) {
      * 新，而每推迟一次都会把它刷新，光靠那道守卫的话这条任务可以被无限期推
      * 下去。
      *
+     * 带 `reschedule` 的一次性任务例外：宿主要的是「这次触发改到唤醒时刻」，
+     * 比如提醒的发送时刻取决于用户什么时候走开，事先定不下来。这时
+     * `next_send_at` 直接写成唤醒时刻、`retry_after` 清空，相当于重新排了一次，
+     * 过期线从新时刻算起，不按上面那条线判。循环任务的名义时刻是整串排期的基准，
+     * 挪了会把后面每一次都带偏，所以不认这个选项，照普通推迟处理。
+     *
      * @param {string} retryAfter - 唤醒时刻（ISO），runAgenticFire 算好的
+     * @param {boolean} [reschedule] - onBeforeFire 要求把这次触发改到唤醒时刻
      */
-    const handleDeferred = async (retryAfter) => {
+    const handleDeferred = async (retryAfter, reschedule) => {
       const wakeMs = Date.parse(retryAfter);
-      if (Number.isFinite(occurrenceMs) && wakeMs - occurrenceMs > staleAfterMs) {
+      const moveOccurrence = reschedule === true && !isRecurringType(recurrenceType);
+      if (!moveOccurrence && Number.isFinite(occurrenceMs) && wakeMs - occurrenceMs > staleAfterMs) {
         await settleAsStale();
         return;
       }
       try {
-        const updated = await updateTaskWithLastError(task.id, {
-          retry_after: retryAfter,
-          lease_until: null
-        });
+        const updated = await updateTaskWithLastError(task.id, moveOccurrence
+          ? { next_send_at: retryAfter, retry_after: null, lease_until: null }
+          : { retry_after: retryAfter, lease_until: null });
         if (rowVanished(updated)) {
           await recordLostLease(task, 'cancelled_mid_delivery');
           return;
@@ -1300,7 +1308,7 @@ async function deliverTasks(ctx, tasks, fixedLeaseToken = null) {
         await recordLostLease(task, 'cancelled_mid_delivery');
         return;
       }
-      await handleDeferred(sendResult.retryAfter);
+      await handleDeferred(sendResult.retryAfter, sendResult.reschedule);
       return;
     }
 
